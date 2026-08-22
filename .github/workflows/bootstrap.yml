@@ -1,0 +1,88 @@
+name: Publish Pair Notebook 0.3.1
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout bootstrap snapshot
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify and unpack source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "2904938c7d0677a82128b7023522640fc84c4e7505b6043b3a0ed04c81215758  .bootstrap/pair-notebook-source.zip" | sha256sum -c -
+          rm -rf /tmp/pair-notebook-source
+          mkdir -p /tmp/pair-notebook-source
+          unzip -q .bootstrap/pair-notebook-source.zip -d /tmp/pair-notebook-source
+          rsync -a --delete --exclude='.git/' /tmp/pair-notebook-source/ ./
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies from lockfile
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Compile and test extension
+        run: npm test
+
+      - name: Test Python bridge
+        run: python -m unittest discover -s test -p jupyter_bridge_unit.py -v
+
+      - name: Validate dependency tree
+        run: npm ls --all
+
+      - name: Build release artifacts
+        run: npm run artifacts
+
+      - name: Publish verified source to main
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish Pair Notebook 0.3.1"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          VSIX="artifacts/pair-notebook-${VERSION}.vsix"
+          ZIP="artifacts/pair-notebook-complete-${VERSION}.zip"
+          cat > /tmp/release-notes.md <<EOF
+          Pair Notebook ${VERSION} — verified release build.
+
+          - Install the `.vsix` directly in VS Code.
+          - The `complete` ZIP contains the full source snapshot and the same VSIX.
+          - This release was created only after dependency installation, linting, TypeScript build/tests, Python bridge tests, and packaging completed successfully on GitHub Actions.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$VSIX" "$ZIP" --clobber
+          else
+            gh release create "$TAG" "$VSIX" "$ZIP" --target "$SOURCE_SHA" --title "Pair Notebook ${VERSION}" --notes-file /tmp/release-notes.md
+          fi
