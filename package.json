@@ -1,0 +1,298 @@
+{
+  "name": "pair-notebook",
+  "displayName": "Pair Notebook",
+  "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
+  "version": "0.3.2",
+  "publisher": "pair-notebook",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Notebooks"
+  ],
+  "keywords": [
+    "collaboration",
+    "jupyter",
+    "yjs",
+    "trystero",
+    "webrtc",
+    "pair programming"
+  ],
+  "activationEvents": [
+    "onView:pairNotebook.dashboard",
+    "workspaceContains:.pair-notebook-session.json"
+  ],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Pair Notebook exchanges project files and can launch explicitly enabled Python kernels, so the workspace must be trusted first."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "pairNotebook.startSession",
+        "title": "Pair Notebook: Start Session"
+      },
+      {
+        "command": "pairNotebook.joinSession",
+        "title": "Pair Notebook: Join Session"
+      },
+      {
+        "command": "pairNotebook.leaveSession",
+        "title": "Pair Notebook: Leave Session"
+      },
+      {
+        "command": "pairNotebook.endSession",
+        "title": "Pair Notebook: End Session for Everyone"
+      },
+      {
+        "command": "pairNotebook.copyInvite",
+        "title": "Pair Notebook: Copy Invite"
+      },
+      {
+        "command": "pairNotebook.openPanel",
+        "title": "Pair Notebook: Open Session Panel"
+      },
+      {
+        "command": "pairNotebook.transferHost",
+        "title": "Pair Notebook: Transfer Host"
+      },
+      {
+        "command": "pairNotebook.showDiagnostics",
+        "title": "Pair Notebook: Show Network Diagnostics"
+      },
+      {
+        "command": "pairNotebook.selectBackingFolder",
+        "title": "Pair Notebook: Select Backing Folder"
+      },
+      {
+        "command": "pairNotebook.flush",
+        "title": "Pair Notebook: Flush to Backing Folder"
+      },
+      {
+        "command": "pairNotebook.selectAutosaveFolder",
+        "title": "Pair Notebook: Select Local Autosave Folder"
+      },
+      {
+        "command": "pairNotebook.createAutosave",
+        "title": "Pair Notebook: Create Local Autosave Now"
+      },
+      {
+        "command": "pairNotebook.reconnect",
+        "title": "Pair Notebook: Reconnect"
+      },
+      {
+        "command": "pairNotebook.changeCompute",
+        "title": "Pair Notebook: Change Compute"
+      },
+      {
+        "command": "pairNotebook.refreshHardware",
+        "title": "Pair Notebook: Refresh Hardware"
+      },
+      {
+        "command": "pairNotebook.showComputeResources",
+        "title": "Pair Notebook: Show Compute Resources"
+      },
+      {
+        "command": "pairNotebook.selectPythonEnvironment",
+        "title": "Pair Notebook: Select Python Environment"
+      },
+      {
+        "command": "pairNotebook.allowRemoteCompute",
+        "title": "Pair Notebook: Allow Remote Compute"
+      },
+      {
+        "command": "pairNotebook.runActiveCell",
+        "title": "Pair Notebook: Run Active Cell on Compute"
+      },
+      {
+        "command": "pairNotebook.restartKernel",
+        "title": "Pair Notebook: Restart Jupyter Kernel"
+      },
+      {
+        "command": "pairNotebook.toggleShareMyCursor",
+        "title": "Pair Notebook: Toggle Sharing My Cursor"
+      },
+      {
+        "command": "pairNotebook.toggleRemoteCursors",
+        "title": "Pair Notebook: Toggle Remote Cursors"
+      },
+      {
+        "command": "pairNotebook.toggleRemoteCursorNames",
+        "title": "Pair Notebook: Toggle Remote Cursor Names"
+      },
+      {
+        "command": "pairNotebook.changeMyCursorColor",
+        "title": "Pair Notebook: Change My Cursor Color"
+      },
+      {
+        "command": "pairNotebook.manageParticipantCursors",
+        "title": "Pair Notebook: Manage Participant Cursors"
+      },
+      {
+        "command": "pairNotebook.openRecentProject",
+        "title": "Pair Notebook: Open Recent Project"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pairNotebook",
+          "title": "Pair Notebook",
+          "icon": "media/pair-notebook.svg"
+        }
+      ]
+    },
+    "views": {
+      "pairNotebook": [
+        {
+          "id": "pairNotebook.dashboard",
+          "name": "Pair Notebook",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "notebook/cell/title": [
+        {
+          "command": "pairNotebook.runActiveCell",
+          "group": "navigation@20",
+          "when": "pairNotebook.inSession"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Pair Notebook",
+      "properties": {
+        "pairNotebook.displayName": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Default name shown in the start/join prompt. Pair Notebook always asks before entering a session."
+        },
+        "pairNotebook.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "scope": "machine",
+          "description": "Python executable used by the local compute executor."
+        },
+        "pairNotebook.allowRemoteCompute": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Allow trusted session participants to run notebook code on this computer."
+        },
+        "pairNotebook.allowCpu": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Advertise this computer as a CPU compute target."
+        },
+        "pairNotebook.allowGpu": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Advertise compatible local GPUs as compute targets."
+        },
+        "pairNotebook.selectedCudaDevice": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "scope": "machine",
+          "description": "CUDA device index exposed to the Pair Notebook Python kernel."
+        },
+        "pairNotebook.shareMyCursor": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Share the current text/notebook-cell cursor with session participants."
+        },
+        "pairNotebook.showRemoteCursors": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Show cursors shared by other participants."
+        },
+        "pairNotebook.showRemoteCursorNames": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Show participant names next to their shared cursors."
+        },
+        "pairNotebook.myCursorColor": {
+          "type": "string",
+          "default": "#4FC3F7",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "scope": "application",
+          "description": "Six-digit color advertised with your shared cursor."
+        },
+        "pairNotebook.persistenceDebounceMs": {
+          "type": "number",
+          "default": 750,
+          "minimum": 100,
+          "maximum": 5000,
+          "scope": "application",
+          "description": "Host-folder write debounce. It never delays live network updates or repeatedly force-saves the open editor."
+        },
+        "pairNotebook.autosaveFolder": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Host-only local recovery folder. Empty uses C:\\Temp\\PairNotebook\\autosaves on Windows. A snapshot is created every five minutes and only the latest three are retained."
+        },
+        "pairNotebook.logLevel": {
+          "type": "string",
+          "enum": [
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "info",
+          "scope": "application"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "rimraf out",
+    "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap",
+    "lint": "eslint .",
+    "test": "npm run compile && mocha --timeout 15000 \"out/test/**/*.test.js\"",
+    "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
+    "package": "npm run clean && npm run lint && npm test && vsce package --no-yarn --no-rewrite-relative-links --allow-missing-repository",
+    "artifacts": "npm run package && node scripts/make-artifacts.mjs"
+  },
+  "dependencies": {
+    "trystero": "^0.25.3",
+    "werift": "^0.24.4",
+    "ws": "^8.18.3",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.19.43",
+    "@types/vscode": "1.95.0",
+    "@types/ws": "^8.18.1",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.9",
+    "eslint": "^9.34.0",
+    "mocha": "^11.7.2",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.41.0",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1"
+  },
+  "overrides": {
+    "diff": "8.0.3",
+    "serialize-javascript": "7.0.5"
+  }
+}

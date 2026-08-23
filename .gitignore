@@ -1,0 +1,9 @@
+node_modules/
+out/
+*.vsix
+!pair-notebook-0.3.2.vsix
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

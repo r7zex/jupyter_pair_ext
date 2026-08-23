@@ -1,0 +1,158 @@
+import { EventEmitter } from 'node:events';
+import { HostClock, PeerRuntime, SessionMode, compareClock, normalizeHostClock } from './types';
+
+/**
+ * How many heartbeat lease periods may elapse between two `evaluate` calls
+ * before the gap is attributed to a local stall rather than to a lost Host.
+ */
+const STALL_FACTOR = 4;
+/** Bounds recovery after a participant missed many legitimate host transitions. */
+export const MAX_HOST_RECONCILIATION_ADVANCE = 1024;
+
+export interface CoordinatorOptions {
+
+  selfId: string;
+  mode: SessionMode;
+  clock: HostClock;
+  heartbeatTimeoutMs?: number;
+}
+
+export class SessionCoordinator extends EventEmitter {
+  public readonly peers = new Map<string, PeerRuntime>();
+  public clock: HostClock;
+  public closed = false;
+  private readonly heartbeatTimeoutMs: number;
+  /** Wall-clock time of the previous `evaluate` call, used to detect a stall. */
+  private lastEvaluateAt = 0;
+  /** No election may run before this instant after a detected local stall. */
+  private graceUntil = 0;
+  /** First instant at which the host lease was observed as expired. */
+  private hostSuspectSince: number | undefined;
+
+  public constructor(private readonly options: CoordinatorOptions) {
+    super();
+    this.clock = { ...options.clock };
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 1600;
+  }
+
+  public upsertPeer(peer: PeerRuntime): void {
+    this.peers.set(peer.peerId, { ...peer });
+  }
+
+  public markHeartbeat(peerId: string, at = Date.now()): void {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    peer.lastHeartbeat = at;
+    peer.online = true;
+    peer.missedHeartbeats = 0;
+    if (peerId === this.clock.hostId) this.hostSuspectSince = undefined;
+  }
+
+  public markDisconnected(peerId: string): void {
+    const peer = this.peers.get(peerId);
+    if (peer) peer.online = false;
+  }
+
+  public evaluate(now = Date.now()): HostClock | undefined {
+    if (this.closed || this.clock.hostId === this.options.selfId) {
+      this.lastEvaluateAt = now;
+      this.hostSuspectSince = undefined;
+      return undefined;
+    }
+    // A blocked event loop (large notebook render, snapshot, GC pause, laptop
+    // sleep) delays both this timer and the inbound heartbeat processing.  In
+    // that case every lease looks expired although the Host is perfectly
+    // alive, so the observed stall grants a fresh grace period instead of
+    // triggering a failover.
+    const sinceLastEvaluation = this.lastEvaluateAt ? now - this.lastEvaluateAt : 0;
+    this.lastEvaluateAt = now;
+    // `evaluate` runs on a sub-second timer, so a gap several times longer than
+    // the heartbeat lease means *we* were frozen, not that the Host vanished.
+    if (sinceLastEvaluation > this.heartbeatTimeoutMs * STALL_FACTOR) {
+
+      this.graceUntil = now + this.heartbeatTimeoutMs;
+      this.hostSuspectSince = undefined;
+      return undefined;
+    }
+    if (now < this.graceUntil) return undefined;
+
+    const host = this.peers.get(this.clock.hostId);
+    // A WebRTC disconnect can be transient. Election starts only after the
+    // heartbeat lease expires, which gives reconnect/state-vector recovery a
+    // chance and avoids incrementing the host epoch for a brief network flap.
+    const leaseExpired = !host || now - host.lastHeartbeat > this.heartbeatTimeoutMs;
+    if (!leaseExpired) {
+      this.hostSuspectSince = undefined;
+      return undefined;
+    }
+    // An observed socket close is authoritative; a merely late heartbeat has to
+    // stay expired across a confirmation window before the role is taken away.
+    const hardLoss = !host || host.online === false;
+    if (!hardLoss) {
+      this.hostSuspectSince ??= now;
+      if (now - this.hostSuspectSince < this.heartbeatTimeoutMs) return undefined;
+    }
+    this.hostSuspectSince = undefined;
+
+    if (this.options.mode === 'host-only') {
+      this.closed = true;
+      this.emit('closed', 'host-lost');
+      return undefined;
+    }
+    const candidates = [...this.peers.values()]
+      .filter((peer) => peer.online && now - peer.lastHeartbeat <= this.heartbeatTimeoutMs)
+      .sort((a, b) => a.joinOrder - b.joinOrder || a.peerId.localeCompare(b.peerId));
+    const self = this.peers.get(this.options.selfId);
+    if (self && !candidates.some((candidate) => candidate.peerId === self.peerId)) candidates.push(self);
+    candidates.sort((a, b) => a.joinOrder - b.joinOrder || a.peerId.localeCompare(b.peerId));
+    const winner = candidates[0];
+    if (!winner) return undefined;
+    const next = { ...this.clock, hostEpoch: this.clock.hostEpoch + 1, hostId: winner.peerId };
+    this.clock = next;
+    this.emit('hostChanged', next, 'election');
+    return next;
+  }
+
+  public manualTransfer(targetPeerId: string): HostClock {
+    const target = this.peers.get(targetPeerId);
+    if (!target?.online) throw new Error('The selected participant is offline.');
+    const next = { ...this.clock, hostEpoch: this.clock.hostEpoch + 1, hostId: targetPeerId };
+    this.clock = next;
+    this.emit('hostChanged', next, 'manual');
+    return next;
+  }
+
+  public applyAnnouncement(incoming: HostClock): boolean {
+    const normalized = normalizeHostClock(incoming, this.clock.sessionEpoch);
+    if (!normalized
+      || normalized.hostEpoch !== this.clock.hostEpoch + 1
+      || compareClock(normalized, this.clock) <= 0) return false;
+    this.clock = normalized;
+    this.emit('hostChanged', this.clock, 'remote');
+    return true;
+  }
+
+  /**
+   * Applies a newer clock only after the runtime has independently established
+   * a trusted reconciliation path (the old host, or a deterministic candidate
+   * after the old host is unavailable). Ordinary announcements still advance
+   * exactly one epoch through `applyAnnouncement`.
+   */
+  public applyReconciledAnnouncement(incoming: HostClock): boolean {
+    const normalized = normalizeHostClock(incoming, this.clock.sessionEpoch);
+    const advance = normalized ? normalized.hostEpoch - this.clock.hostEpoch : 0;
+    const equalEpochConflict = Boolean(normalized
+      && advance === 0
+      && normalized.hostId !== this.clock.hostId);
+    if (!normalized || (!equalEpochConflict && (advance <= 0 || advance > MAX_HOST_RECONCILIATION_ADVANCE))) {
+      return false;
+    }
+    this.clock = normalized;
+    this.emit('hostChanged', this.clock, 'reconciliation');
+    return true;
+  }
+
+  public isCurrentHost(): boolean {
+    return this.clock.hostId === this.options.selfId && !this.closed;
+  }
+}

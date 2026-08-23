@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Generated TypeScript/build output
+out/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Old packaged artifacts
+*.vsix
+*.zip
+
+# Misc caches
+.coverage
+*.log
