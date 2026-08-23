@@ -245,3 +245,91 @@ describe('mesh network configuration', () => {
     }
   });
 });
+
+describe('mesh relay fallback integration', function () {
+  this.timeout(30_000);
+
+  it('joins a peer through the Nostr relay when WebRTC never connects', async () => {
+    const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
+    const { NostrFrameRelay: RelayCtor } = await import('../src/runtime/nostrRelay.js');
+    const { WebSocketServer } = await import('ws');
+
+    const hub = new WebSocketServer({ port: 0 });
+    await new Promise<void>((resolve) => hub.on('listening', resolve));
+    const hubPort = (hub.address() as { port: number }).port;
+    hub.on('connection', (socket) => {
+      socket.on('message', (raw) => {
+        const message = JSON.parse(String(raw)) as unknown[];
+        if (message[0] === 'EVENT') {
+          for (const client of hub.clients) {
+            if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
+          }
+        }
+      });
+    });
+
+    // A room that never introduces peers: the WebRTC path is fully dead, so
+    // any connection must come from the emergency relay.
+    const deadRoom = {
+      makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+      onPeerJoin: () => undefined,
+      onPeerLeave: () => undefined,
+      ping: async () => -1,
+      leave: async () => undefined,
+    };
+    const deadRoomFactory = () => deadRoom as never;
+
+    configureMeshNetwork({
+      disableRelayFallback: false,
+      relayFactory: ({ token, sessionId, localPeerId }) => new RelayCtor({
+        token, sessionId, localPeerId,
+        relays: [`ws://127.0.0.1:${hubPort}`],
+      }),
+    });
+
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host-r' };
+    const identityA = { peerId: 'host-r', displayName: 'Host R', joinOrder: 0 };
+    const identityB = { peerId: 'guest-r', displayName: 'Guest R', joinOrder: 1 };
+
+    const commonToken = 'relay-mesh-token-that-is-long-enough';
+    const host = new MeshTransport({
+      sessionId: 'relay-mesh', token: commonToken,
+      localPeer: identityA, hostClock: () => clock, isHost: () => true, roomFactory: deadRoomFactory,
+    });
+    const guest = new MeshTransport({
+      sessionId: 'relay-mesh', token: commonToken,
+      localPeer: identityB, hostClock: () => clock, isHost: () => false, roomFactory: deadRoomFactory,
+    });
+
+    try {
+      await host.start();
+      await guest.start();
+      guest.connect(identityA);
+
+      const connected = Promise.all([
+        new Promise<void>((resolve) => host.once('peerConnected', resolve)),
+        new Promise<void>((resolve) => guest.once('peerConnected', resolve)),
+      ]);
+      // Nudge both sides like an ICE failure / announce would.
+      (guest as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('host-r');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      (host as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('guest-r');
+      await connected;
+
+      const gotFrame = new Promise<Buffer>((resolve) => {
+        host.on('message', (frame: { type: string; payload: Uint8Array }) => {
+          if (frame.type === 'probePing') resolve(Buffer.from(frame.payload));
+        });
+      });
+      guest.sendTo('host-r', 'probePing', {}, Buffer.from('via-relay'));
+      assert.equal((await gotFrame).toString('utf8'), 'via-relay');
+      const route = host.peerRuntime().find((peer) => peer.peerId === 'guest-r')?.route;
+      assert.equal(route, 'Relay');
+    } finally {
+      await host.stop();
+      await guest.stop();
+      await new Promise<void>((resolve) => hub.close(() => resolve()));
+      configureMeshNetwork({});
+    }
+  });
+});

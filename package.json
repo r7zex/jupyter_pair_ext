@@ -263,7 +263,9 @@
         },
         "pairNotebook.turnUrls": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "scope": "application",
           "description": "Custom TURN relay URLs (turn:/turns:), tried in order UDP, TCP, TLS before the built-in public fallback. Use your own TURN deployment for restricted networks."
@@ -287,6 +289,7 @@
     "artifacts": "npm run package && node scripts/make-artifacts.mjs"
   },
   "dependencies": {
+    "@noble/secp256k1": "^3.1.0",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",

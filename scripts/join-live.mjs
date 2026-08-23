@@ -7,7 +7,6 @@
  * Usage:
  *   node scripts/join-live.mjs '<pair-notebook://join/...>' [destination]
  */
-import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
