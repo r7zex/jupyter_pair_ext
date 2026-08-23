@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events';
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
-import NodeWebSocket from 'ws';
 import {
   joinRoom,
   type HandshakePayload,
@@ -30,6 +29,17 @@ import {
   validateDisplayName,
 } from '../core/types';
 import { decodeFrame, encodeFrame, MAX_WIRE_FRAME_BYTES, MAX_WIRE_HEADER_BYTES, WireFrame } from '../core/wire';
+import {
+  DEFAULT_TURN_URLS,
+  orderTurnEndpoints,
+  parseTurnEndpoints,
+  probeTurnEndpoints,
+  selectTurnEndpoints,
+  type TurnEndpoint,
+  type TurnProbeResult,
+} from './turn';
+import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
+import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -55,29 +65,57 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://offchain.pub',
 ];
 /**
- * Free public TURN relay used as a last-resort connectivity fallback.
+ * Default TURN relay endpoints, used as a last-resort connectivity fallback.
  *
  * Trystero's default STUN servers cannot traverse symmetric NATs or
  * restrictive firewalls, which made joins stall for a long time and then
  * fail with "could not connect to peer ... configure TURN servers".
- * These Open Relay (Metered) endpoints provide relay candidates on ports
- * 80/443 over UDP and TCP. Trystero appends them after its default STUN
- * servers, so direct peer-to-peer connections are still preferred
- * whenever the network allows them. The list must stay identical on every
- * participant because ICE needs both sides to attempt the same relays.
+ * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is
+ * what the werift ICE stack actually uses (it consumes only one TURN URL),
+ * so MeshTransport probes reachability and reorders this list in place,
+ * always keeping direct peer-to-peer ICE preferred over relaying.
+ * The list must stay compatible on every participant because ICE needs both
+ * sides to attempt usable relays. The Open Relay (Metered) demo credentials
+ * are publicly published by that provider for free-tier testing; they are
+ * overridden via `pairNotebook.turnUrls` + secret storage in production.
  */
 export const TRYSTERO_TURN_SERVERS = [
   {
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-      'turn:openrelay.metered.ca:80?transport=tcp',
-    ],
+    urls: [...DEFAULT_TURN_URLS],
     username: 'openrelayproject',
     credential: 'openrelayproject',
   },
 ];
+
+export interface MeshNetworkConfig {
+  /** Overrides the default TURN endpoint URL list. */
+  turnUrls?: readonly string[];
+  turnUsername?: string;
+  /** TURN credential; supplied from VS Code secret storage, never logged. */
+  turnPassword?: string;
+  /** Disables the live TURN Allocate probe when true. */
+  disableTurnProbe?: boolean;
+  /** Proxy options applied to signalling WebSockets. */
+  proxy?: ProxyWebSocketRuntimeOptions;
+}
+
+const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> & MeshNetworkConfig = {
+  disableTurnProbe: false,
+};
+
+/**
+ * Applies extension-level networking configuration (settings + secrets).
+ * Safe to call again before any transport start; running transports keep
+ * their captured configuration.
+ */
+export function configureMeshNetwork(config: MeshNetworkConfig): void {
+  meshNetworkConfig.turnUrls = config.turnUrls;
+  meshNetworkConfig.turnUsername = config.turnUsername;
+  meshNetworkConfig.turnPassword = config.turnPassword;
+  meshNetworkConfig.disableTurnProbe = config.disableTurnProbe ?? false;
+  meshNetworkConfig.proxy = config.proxy;
+}
+
 const RELAY_REDUNDANCY = 8;
 const HANDSHAKE_VERSION = 2;
 const ACTION_NAMESPACE = 'pair-notebook-frame-v2';
@@ -225,6 +263,8 @@ export class MeshTransport extends EventEmitter {
   private lastReceivedRate = 0;
   private hasStarted = false;
   private pingInFlight = false;
+  private turnEndpoints: TurnEndpoint[] | undefined;
+  private turnProbes: TurnProbeResult[] | undefined;
   private readonly identityPrivateKey: string;
 
   public static setRoomFactoryForTesting(factory: TrysteroRoomFactory | undefined): void {
@@ -313,7 +353,7 @@ export class MeshTransport extends EventEmitter {
         redundancy: RELAY_REDUNDANCY,
         warnOnRelayFailure: false,
       },
-      turnConfig: TRYSTERO_TURN_SERVERS,
+      turnConfig: this.buildTurnConfig(),
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
     try {
@@ -336,6 +376,88 @@ export class MeshTransport extends EventEmitter {
     ];
     if (restarting) this.emit('restarted');
     return 0;
+  }
+
+  /**
+   * Builds the Trystero TURN configuration from the configured endpoints.
+   *
+   * werift consumes only the first TURN URL of the resulting iceServers
+   * list, so ordering is the selection mechanism: the static order is the
+   * preferred UDP -> TCP -> TLS fallback chain, and a non-blocking live
+   * Allocate probe reorders the same array in place once local reachability
+   * is known. Peers connect seconds after discovery, so the reorder lands
+   * before the first peer connection in practice; direct ICE remains
+   * preferred by ordinary candidate priority regardless of TURN ordering.
+   */
+  private buildTurnConfig(): NostrRoomConfig['turnConfig'] {
+    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : DEFAULT_TURN_URLS;
+    const username = meshNetworkConfig.turnUsername || TRYSTERO_TURN_SERVERS[0].username;
+    const password = meshNetworkConfig.turnPassword || TRYSTERO_TURN_SERVERS[0].credential;
+    const endpoints = parseTurnEndpoints(urls);
+    if (endpoints.length === 0) return undefined;
+    const ordered = orderTurnEndpoints(endpoints);
+    const entry = {
+      urls: ordered.map((endpoint) => endpoint.url),
+      username,
+      credential: password,
+    };
+    this.turnEndpoints = ordered;
+    if (!meshNetworkConfig.disableTurnProbe) {
+      void this.probeTurnEndpointsSafely(endpoints, entry, username, password);
+    }
+    return [entry];
+  }
+
+  /**
+   * Runs the reachability probe without letting werift's internal socket
+   * failures crash the extension host: unreachable TURN endpoints surface
+   * TLS/TCP resets as unhandled rejections from library-internal promises
+   * that are not tied to our awaited call. The guard swallows only network
+   * errors during the probe window; anything else is re-thrown unchanged.
+   */
+  private async probeTurnEndpointsSafely(
+    endpoints: readonly TurnEndpoint[],
+    entry: { urls: string[] },
+    username: string,
+    password: string,
+  ): Promise<void> {
+    const guard = (reason: unknown): void => {
+      const error = reason as { code?: string; message?: string } | undefined;
+      const text = `${error?.code ?? ''} ${error?.message ?? String(reason)}`;
+      if (/econnreset|etimedout|ehostunreach|enetunreach|econnrefused|timeout|tls|ssl|turn/i.test(text)) return;
+      throw reason;
+    };
+    process.on('unhandledRejection', guard);
+    try {
+      const probes = await probeTurnEndpoints(endpoints, { username, password, timeoutMs: 4_000 });
+      this.turnProbes = probes;
+      entry.urls = selectTurnEndpoints(endpoints, probes).ordered.map((endpoint) => endpoint.url);
+    } catch {
+      // Probing is an optimization; the static fallback chain still works.
+    } finally {
+      // Late socket failures can arrive well after our own timeouts gave up
+      // on an unreachable relay; keep the guard for a grace period instead of
+      // removing it while werift's internal sockets are still pending.
+      const removeGuard = setTimeout(() => process.off('unhandledRejection', guard), 90_000);
+      removeGuard.unref?.();
+    }
+  }
+
+  /** Sanitized networking diagnostics safe for UI display. */
+  public networkDiagnostics(): Record<string, unknown> {
+    return {
+      relays: [...TRYSTERO_RELAY_URLS],
+      relayRedundancy: RELAY_REDUNDANCY,
+      turnEndpoints: (this.turnEndpoints ?? []).map((endpoint) => ({ ...endpoint })),
+      turnProbes: (this.turnProbes ?? []).map((probe) => ({
+        url: probe.endpoint.url,
+        transport: probe.endpoint.transport,
+        ok: probe.ok,
+        ...(probe.ok ? { latencyMs: probe.latencyMs } : { error: probe.error }),
+      })),
+      proxy: describeProxy(resolveSignallingProxy('wss://nos.lol')),
+      stunServers: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
+    };
   }
 
   /** Trystero discovers room peers automatically; this re-announces identity to an already connected peer. */
@@ -1235,6 +1357,15 @@ function formatError(error: unknown): string {
 }
 
 function ensureWebSocketRuntime(): void {
-  const runtime = globalThis as unknown as { WebSocket?: unknown };
-  if (!runtime.WebSocket) runtime.WebSocket = NodeWebSocket;
+  // Always install the proxy-aware WebSocket: Node's `ws` ignores system,
+  // VS Code and environment proxy configuration, so a plain global breaks
+  // discovery on proxy-only networks even when WebRTC could still work.
+  installProxyAwareWebSocket(meshNetworkConfig.proxy ?? {});
 }
+
+/** Resolves the effective proxy for a signalling URL, for diagnostics. */
+function resolveSignallingProxy(url: string): ProxyDescriptor | undefined {
+  return resolveProxy(url, meshNetworkConfig.proxy ?? {});
+}
+
+

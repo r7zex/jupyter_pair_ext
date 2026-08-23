@@ -35,6 +35,7 @@ import {
   validateProjectName,
 } from './core/types';
 import { SnapshotBootstrapError, downloadProjectSnapshot } from './runtime/bootstrap';
+import { configureMeshNetwork } from './runtime/mesh';
 import { SessionRuntime } from './runtime/session';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
@@ -58,6 +59,7 @@ let hostFolderPromptOpen = false;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
   output = vscode.window.createOutputChannel('Pair Notebook');
+  applyMeshNetworkConfiguration(context);
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
@@ -83,6 +85,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   register(context, 'pairNotebook.transferHost', () => transferHost());
   register(context, 'pairNotebook.showDiagnostics', () => showDiagnostics());
+  register(context, 'pairNotebook.setTurnPassword', async () => {
+    const password = await vscode.window.showInputBox({
+      prompt: 'TURN password for the configured turnUrls (stored in VS Code secret storage, never in settings or logs)',
+      password: true,
+    });
+    if (password === undefined) return;
+    await context.secrets.store('pairNotebook.turnPassword', password);
+    applyMeshNetworkConfiguration(context);
+    void vscode.window.showInformationMessage('Pair Notebook: TURN пароль сохранён в защищённом хранилище.');
+  });
   register(context, 'pairNotebook.selectBackingFolder', () => selectBackingFolder());
   register(context, 'pairNotebook.flush', async () => {
     await requireRuntime().saveAsHost();
@@ -676,8 +688,37 @@ async function changeCompute(): Promise<void> {
   if (confirm === 'Switch') active.changeCompute(selected.peerId, notebookKey, selected.device, selected.pythonPath);
 }
 
+/**
+ * Feeds VS Code settings, secret storage and proxy configuration into the
+ * mesh transport layer. Called at activation and whenever the TURN password
+ * changes; running transports keep their captured configuration.
+ */
+function applyMeshNetworkConfiguration(context: vscode.ExtensionContext): void {
+  const configuration = vscode.workspace.getConfiguration('pairNotebook');
+  void context.secrets.get('pairNotebook.turnPassword').then((turnPassword) => {
+    configureMeshNetwork({
+      turnUrls: configuration.get<string[]>('turnUrls', []),
+      turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
+      turnPassword: turnPassword || undefined,
+      proxy: {
+        vscodeProxy: vscode.workspace.getConfiguration('http').get<string>('proxy') || undefined,
+        vscodeProxySupport: vscode.workspace.getConfiguration('http').get<string>('proxySupport'),
+      },
+    });
+  });
+}
+
 async function showDiagnostics(): Promise<void> {
   const snapshot = requireRuntime().snapshot();
+  // networkDiagnostics is sanitized: no tokens, TURN or proxy credentials.
+  const network = (() => {
+    try { return runtime?.networkDiagnostics(); } catch { return undefined; }
+  })() as {
+    relays?: string[];
+    turnEndpoints?: Array<{ url: string; transport: string }>;
+    turnProbes?: Array<{ url: string; transport: string; ok: boolean; latencyMs?: number }>;
+    proxy?: string;
+  } | undefined;
   const lines = [
     'PAIR NOTEBOOK NETWORK DIAGNOSTICS',
     '',
@@ -691,6 +732,20 @@ async function showDiagnostics(): Promise<void> {
     `Waiting for host folder: ${snapshot.waitingForHostFolder ? 'yes' : 'no'}`,
     `Traffic: ↓ ${snapshot.metrics.bytesReceivedPerSecond} B/s ↑ ${snapshot.metrics.bytesSentPerSecond} B/s`,
   ];
+  if (network) {
+    lines.push(
+      '',
+      'Discovery (Nostr relays):',
+      ...(network.relays ?? []).map((relay, index) => `  ${index + 1}. ${relay}`),
+      'TURN fallback order:',
+      ...(network.turnEndpoints ?? []).map((endpoint, index) => {
+        const probe = (network.turnProbes ?? []).find((item) => item.url === endpoint.url);
+        const state = !probe ? 'not probed yet' : probe.ok ? `reachable (${probe.latencyMs} ms)` : 'unreachable';
+        return `  ${index + 1}. [${endpoint.transport.toUpperCase()}] ${endpoint.url} — ${state}`;
+      }),
+      `Proxy for signalling: ${network.proxy ?? 'Direct'}`,
+    );
+  }
   const diagnostics = lines.join('\n');
   output.appendLine(diagnostics);
   output.show(true);

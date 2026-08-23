@@ -1338,8 +1338,11 @@ describe('real transport and compute', () => {
       assert.ok((config.relayConfig?.redundancy ?? 0) >= 2);
       assert.equal(config.turnConfig?.length, TRYSTERO_TURN_SERVERS.length);
       for (const server of config.turnConfig ?? []) {
-        assert.ok(Array.isArray(server.urls) && server.urls.length >= 4);
-        for (const url of server.urls) assert.match(url, /^turn:openrelay\.metered\.ca:(80|443)/);
+        assert.ok(Array.isArray(server.urls) && server.urls.length >= 3);
+        // UDP first (preferred TURN transport), then TCP, then TLS.
+        assert.match(server.urls[0], /^turn:openrelay\.metered\.ca:80$/);
+        assert.match(server.urls[1], /^turn:openrelay\.metered\.ca:443\?transport=tcp$/);
+        assert.match(server.urls[2], /^turns:openrelay\.metered\.ca:443$/);
         assert.ok(server.username && server.credential);
       }
     } finally {
