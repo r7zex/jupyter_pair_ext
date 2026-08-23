@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events';
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
-import NodeWebSocket from 'ws';
 import {
   joinRoom,
   type HandshakePayload,
@@ -30,6 +29,18 @@ import {
   validateDisplayName,
 } from '../core/types';
 import { decodeFrame, encodeFrame, MAX_WIRE_FRAME_BYTES, MAX_WIRE_HEADER_BYTES, WireFrame } from '../core/wire';
+import {
+  DEFAULT_TURN_URLS,
+  orderTurnEndpoints,
+  parseTurnEndpoints,
+  probeTurnEndpoints,
+  selectTurnEndpoints,
+  type TurnEndpoint,
+  type TurnProbeResult,
+} from './turn';
+import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
+import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
+import { NostrFrameRelay } from './nostrRelay';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -54,6 +65,70 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://relay.orangepill.dev',
   'wss://offchain.pub',
 ];
+/**
+ * Default TURN relay endpoints, used as a last-resort connectivity fallback.
+ *
+ * Trystero's default STUN servers cannot traverse symmetric NATs or
+ * restrictive firewalls, which made joins stall for a long time and then
+ * fail with "could not connect to peer ... configure TURN servers".
+ * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is
+ * what the werift ICE stack actually uses (it consumes only one TURN URL),
+ * so MeshTransport probes reachability and reorders this list in place,
+ * always keeping direct peer-to-peer ICE preferred over relaying.
+ * The list must stay compatible on every participant because ICE needs both
+ * sides to attempt usable relays. The Open Relay (Metered) demo credentials
+ * are publicly published by that provider for free-tier testing; they are
+ * overridden via `pairNotebook.turnUrls` + secret storage in production.
+ */
+export const TRYSTERO_TURN_SERVERS = [
+  {
+    urls: [...DEFAULT_TURN_URLS],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+];
+
+export interface MeshNetworkConfig {
+  /** Overrides the default TURN endpoint URL list. */
+  turnUrls?: readonly string[];
+  turnUsername?: string;
+  /** TURN credential; supplied from VS Code secret storage, never logged. */
+  turnPassword?: string;
+  /** Disables the live TURN Allocate probe when true. */
+  disableTurnProbe?: boolean;
+  /** Proxy options applied to signalling WebSockets. */
+  proxy?: ProxyWebSocketRuntimeOptions;
+  /** Disables the emergency Nostr data relay (default: enabled). */
+  disableRelayFallback?: boolean;
+  /** Test hook: builds the relay channel instead of the real one. */
+  relayFactory?: (options: {
+    token: string;
+    sessionId: string;
+    localPeerId: string;
+  }) => NostrFrameRelay;
+}
+
+const RELAY_TRANSPORT_PREFIX = 'relay:';
+
+const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> & MeshNetworkConfig = {
+  disableTurnProbe: false,
+};
+
+/**
+ * Applies extension-level networking configuration (settings + secrets).
+ * Safe to call again before any transport start; running transports keep
+ * their captured configuration.
+ */
+export function configureMeshNetwork(config: MeshNetworkConfig): void {
+  meshNetworkConfig.turnUrls = config.turnUrls;
+  meshNetworkConfig.turnUsername = config.turnUsername;
+  meshNetworkConfig.turnPassword = config.turnPassword;
+  meshNetworkConfig.disableTurnProbe = config.disableTurnProbe ?? false;
+  meshNetworkConfig.proxy = config.proxy;
+  meshNetworkConfig.disableRelayFallback = config.disableRelayFallback;
+  meshNetworkConfig.relayFactory = config.relayFactory;
+}
+
 const RELAY_REDUNDANCY = 8;
 const HANDSHAKE_VERSION = 2;
 const ACTION_NAMESPACE = 'pair-notebook-frame-v2';
@@ -201,6 +276,19 @@ export class MeshTransport extends EventEmitter {
   private lastReceivedRate = 0;
   private hasStarted = false;
   private pingInFlight = false;
+  private turnEndpoints: TurnEndpoint[] | undefined;
+  private turnProbes: TurnProbeResult[] | undefined;
+  private relay: NostrFrameRelay | undefined;
+  private readonly relayNegotiations = new Map<string, {
+    role: 'initiator' | 'responder';
+    localHs: HandshakeMessage;
+    sentLocalHs: boolean;
+    sentProof: boolean;
+    remoteHs?: HandshakeMessage;
+    remoteProof?: string;
+  }>();
+  private readonly relayAttempts = new Map<string, number>();
+
   private readonly identityPrivateKey: string;
 
   public static setRoomFactoryForTesting(factory: TrysteroRoomFactory | undefined): void {
@@ -289,6 +377,7 @@ export class MeshTransport extends EventEmitter {
         redundancy: RELAY_REDUNDANCY,
         warnOnRelayFailure: false,
       },
+      turnConfig: this.buildTurnConfig(),
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
     try {
@@ -303,14 +392,110 @@ export class MeshTransport extends EventEmitter {
       throw new Error(`Could not start Trystero: ${formatError(error)}`, { cause: error });
     }
     this.hasStarted = true;
+    this.startRelayFallback();
     this.timers = [
       setInterval(() => this.heartbeatTick(), 500),
       setInterval(() => void this.pingTick(), 1000),
       setInterval(() => this.metricsTick(), 1000),
       setInterval(() => this.cleanupSeenIds(), 10_000),
+      setInterval(() => this.relaySweepTick(), 20_000),
     ];
     if (restarting) this.emit('restarted');
     return 0;
+  }
+
+  /**
+   * Builds the Trystero TURN configuration from the configured endpoints.
+   *
+   * werift consumes only the first TURN URL of the resulting iceServers
+   * list, so ordering is the selection mechanism: the static order is the
+   * preferred UDP -> TCP -> TLS fallback chain, and a non-blocking live
+   * Allocate probe reorders the same array in place once local reachability
+   * is known. Peers connect seconds after discovery, so the reorder lands
+   * before the first peer connection in practice; direct ICE remains
+   * preferred by ordinary candidate priority regardless of TURN ordering.
+   */
+  private buildTurnConfig(): NostrRoomConfig['turnConfig'] {
+    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : DEFAULT_TURN_URLS;
+    const username = meshNetworkConfig.turnUsername || TRYSTERO_TURN_SERVERS[0].username;
+    const password = meshNetworkConfig.turnPassword || TRYSTERO_TURN_SERVERS[0].credential;
+    const endpoints = parseTurnEndpoints(urls);
+    if (endpoints.length === 0) return undefined;
+    const ordered = orderTurnEndpoints(endpoints);
+    const entry = {
+      urls: ordered.map((endpoint) => endpoint.url),
+      username,
+      credential: password,
+    };
+    this.turnEndpoints = ordered;
+    const testMode = Boolean(this.options.roomFactory || MeshTransport.testingRoomFactory);
+    if (!meshNetworkConfig.disableTurnProbe && !testMode) {
+      // Live probing dials real relays; skip it for in-memory test rooms.
+      void this.probeTurnEndpointsSafely(endpoints, entry, username, password);
+    }
+    return [entry];
+  }
+
+  /**
+   * Runs the reachability probe without letting werift's internal socket
+   * failures crash the extension host: unreachable TURN endpoints surface
+   * TLS/TCP resets as unhandled rejections from library-internal promises
+   * that are not tied to our awaited call. The guard swallows only network
+   * errors during the probe window; anything else is re-thrown unchanged.
+   */
+  private async probeTurnEndpointsSafely(
+    endpoints: readonly TurnEndpoint[],
+    entry: { urls: string[] },
+    username: string,
+    password: string,
+  ): Promise<void> {
+    const guard = (reason: unknown): void => {
+      const error = reason as { code?: string; message?: string } | undefined;
+      const text = `${error?.code ?? ''} ${error?.message ?? String(reason)}`;
+      if (/econnreset|etimedout|ehostunreach|enetunreach|econnrefused|timeout|tls|ssl|turn/i.test(text)) return;
+      throw reason;
+    };
+    process.on('unhandledRejection', guard);
+    try {
+      const probes = await probeTurnEndpoints(endpoints, { username, password, timeoutMs: 4_000 });
+      this.turnProbes = probes;
+      entry.urls = selectTurnEndpoints(endpoints, probes).ordered.map((endpoint) => endpoint.url);
+    } catch {
+      // Probing is an optimization; the static fallback chain still works.
+    } finally {
+      // Late socket failures can arrive well after our own timeouts gave up
+      // on an unreachable relay; keep the guard for a grace period instead of
+      // removing it while werift's internal sockets are still pending.
+      const removeGuard = setTimeout(() => process.off('unhandledRejection', guard), 90_000);
+      removeGuard.unref?.();
+    }
+  }
+
+  /** Sanitized networking diagnostics safe for UI display. */
+  public networkDiagnostics(): Record<string, unknown> {
+    return {
+      relays: [...TRYSTERO_RELAY_URLS],
+      relayRedundancy: RELAY_REDUNDANCY,
+      turnEndpoints: (this.turnEndpoints ?? []).map((endpoint) => ({ ...endpoint })),
+      turnProbes: (this.turnProbes ?? []).map((probe) => ({
+        url: probe.endpoint.url,
+        transport: probe.endpoint.transport,
+        ok: probe.ok,
+        ...(probe.ok ? { latencyMs: probe.latencyMs } : { error: probe.error }),
+      })),
+      proxy: describeProxy(resolveSignallingProxy('wss://nos.lol')),
+      stunServers: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
+      relayFallback: {
+        enabled: !meshNetworkConfig.disableRelayFallback,
+        connectedRelays: this.relay?.connectedRelayCount ?? 0,
+        peers: [...this.connections.keys()]
+          .filter((transportPeerId) => transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX))
+          .map((transportPeerId) => {
+            const connection = this.connections.get(transportPeerId);
+            return connection?.identity.peerId ?? transportPeerId;
+          }),
+      },
+    };
   }
 
   /** Trystero discovers room peers automatically; this re-announces identity to an already connected peer. */
@@ -457,6 +642,177 @@ export class MeshTransport extends EventEmitter {
     }
   }
 
+  /** Starts the emergency Nostr data relay unless disabled by configuration. */
+  private startRelayFallback(): void {
+    if (this.relay || meshNetworkConfig.disableRelayFallback || this.stopped) return;
+    // Tests inject a custom room factory (options or the testing hook) to run
+    // in-memory transports; a relay there would dial real public Nostr relays
+    // from unit tests. Production callers never inject one, so the fallback
+    // stays on for them (tests can still opt in via an explicit relayFactory).
+    const testRoomFactory = this.options.roomFactory || MeshTransport.testingRoomFactory;
+    if (testRoomFactory && !meshNetworkConfig.relayFactory) return;
+    try {
+      this.relay = meshNetworkConfig.relayFactory?.({
+        token: this.options.token,
+        sessionId: this.options.sessionId,
+        localPeerId: this.options.localPeer.peerId,
+      }) ?? new NostrFrameRelay({
+        token: this.options.token,
+        sessionId: this.options.sessionId,
+        localPeerId: this.options.localPeer.peerId,
+      });
+    } catch {
+      this.relay = undefined;
+      return;
+    }
+    this.relay.onPeerAnnounce = (peerId) => {
+      if (!this.identityToTransport.has(peerId)) this.considerRelayFallback(peerId);
+    };
+    this.relay.onFrame = (fromPeerId, bytes) => this.handleRelayData(fromPeerId, bytes);
+    this.relay.start();
+    // Announce presence a few times so peers joining via WebRTC-less paths
+    // find each other even if some early publishes race the socket open.
+    for (const delayMs of [500, 4_000, 12_000]) {
+      const timer = setTimeout(() => {
+        if (!this.stopped) this.relay?.sendAnnounce();
+      }, delayMs);
+      timer.unref?.();
+    }
+  }
+
+  /** Periodically looks for directory peers that never got any transport. */
+  private relaySweepTick(): void {
+    if (this.stopped || !this.relay) return;
+    for (const peerId of this.directory.keys()) {
+      if (peerId === this.options.localPeer.peerId) continue;
+      if (this.identityToTransport.has(peerId)) continue;
+      this.considerRelayFallback(peerId);
+    }
+  }
+
+  private considerRelayFallback(peerId: string): void {
+    if (this.stopped || !this.relay) return;
+    if (peerId === this.options.localPeer.peerId) return;
+    if (this.identityToTransport.has(peerId)) return; // connected via another transport
+    const attempts = this.relayAttempts.get(peerId) ?? 0;
+    if (attempts >= 6 || this.relayNegotiations.has(peerId)) return;
+    this.relayAttempts.set(peerId, attempts + 1);
+    this.sendRelayHandshake(peerId);
+  }
+
+  private sendRelayHandshake(peerId: string): void {
+    const existing = this.relayNegotiations.get(peerId);
+    const negotiation = existing ?? {
+      role: (this.options.localPeer.peerId < peerId ? 'initiator' : 'responder') as 'initiator' | 'responder',
+      localHs: this.localHandshake(),
+      sentLocalHs: false,
+      sentProof: false,
+      remoteHs: undefined as HandshakeMessage | undefined,
+      remoteProof: undefined as string | undefined,
+    };
+    this.relayNegotiations.set(peerId, negotiation);
+    if (!negotiation.sentLocalHs) {
+      negotiation.sentLocalHs = true;
+      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+    }
+  }
+
+  private handleRelayData(fromPeerId: string, bytes: Buffer): void {
+    let envelope: { k?: string; hs?: unknown; pr?: unknown; d?: string };
+    try {
+      envelope = JSON.parse(bytes.toString('utf8')) as typeof envelope;
+    } catch {
+      return;
+    }
+    if (envelope.k === 'hs' || envelope.k === 'pr') {
+      this.advanceRelayHandshake(fromPeerId, envelope.k, envelope.hs, envelope.pr);
+      return;
+    }
+    if (envelope.k === 'fr' && typeof envelope.d === 'string') {
+      const connection = this.connections.get(RELAY_TRANSPORT_PREFIX + fromPeerId);
+      if (!connection) return;
+      this.handleAction(exactArrayBuffer(Buffer.from(envelope.d, 'base64')), RELAY_TRANSPORT_PREFIX + fromPeerId);
+    }
+  }
+
+  private advanceRelayHandshake(
+    fromPeerId: string,
+    kind: 'hs' | 'pr',
+    rawHs: unknown,
+    rawPr: unknown,
+  ): void {
+    let negotiation = this.relayNegotiations.get(fromPeerId);
+    if (!negotiation) {
+      if (kind !== 'hs') {
+        // A proof without a locally started negotiation is meaningless.
+        return;
+      }
+      // An inbound hs IS the announcement of a new relay-only peer.
+      negotiation = {
+        role: 'responder',
+        localHs: this.localHandshake(),
+        sentLocalHs: false,
+        sentProof: false,
+        remoteHs: undefined,
+        remoteProof: undefined,
+      };
+      this.relayNegotiations.set(fromPeerId, negotiation);
+    }
+    if (kind === 'hs') {
+      const parsed = this.parseHandshake(rawHs);
+      if (parsed.sessionId !== this.options.sessionId || parsed.peer.peerId !== fromPeerId) return;
+      negotiation.remoteHs = parsed;
+      // Always re-answer with our own handshake: both sides may start the
+      // negotiation simultaneously and the first copy can arrive before the
+      // other side registered the negotiation.
+      negotiation.sentLocalHs = true;
+      this.sendRelayEnvelope(fromPeerId, { k: 'hs', hs: negotiation.localHs });
+    } else if (typeof rawPr === 'object' && rawPr !== null) {
+      const proof = rawPr as HandshakeProof;
+      if (typeof proof.signature === 'string') negotiation.remoteProof = proof.signature;
+    } else {
+      return;
+    }
+    if (!negotiation.remoteHs) return;
+    // Both sides know both handshakes after the hs exchange; send our own
+    // proof immediately instead of waiting for the remote one (otherwise
+    // both sides deadlock waiting for each other).
+    if (!negotiation.sentProof) {
+      negotiation.sentProof = true;
+      const initiator = negotiation.role === 'initiator' ? negotiation.localHs : negotiation.remoteHs;
+      const responder = negotiation.role === 'initiator' ? negotiation.remoteHs : negotiation.localHs;
+      const transcript = handshakeTranscript(initiator, responder);
+      const signature = signIdentityTranscript(this.identityPrivateKey, transcript);
+      this.sendRelayEnvelope(fromPeerId, { k: 'pr', pr: { version: HANDSHAKE_VERSION, signature } });
+    }
+    // Finalize when the remote proof has also arrived.
+    if (typeof negotiation.remoteProof !== 'string') return;
+    const initiator = negotiation.role === 'initiator' ? negotiation.localHs : negotiation.remoteHs;
+    const responder = negotiation.role === 'initiator' ? negotiation.remoteHs : negotiation.localHs;
+    const transcript = handshakeTranscript(initiator, responder);
+    const identityKey = negotiation.remoteHs.peer.identityKey;
+    if (!identityKey
+      || !verifyIdentityTranscript(identityKey, transcript, negotiation.remoteProof)) {
+      throw new Error(`Relay peer ${fromPeerId} failed the identity proof.`);
+    }
+    const transportPeerId = RELAY_TRANSPORT_PREFIX + fromPeerId;
+    this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
+    this.pendingHandshakes.set(transportPeerId, {
+      version: HANDSHAKE_VERSION,
+      sessionId: negotiation.remoteHs.sessionId,
+      purpose: negotiation.remoteHs.purpose,
+      peer: negotiation.remoteHs.peer,
+      nonce: negotiation.remoteHs.nonce,
+    });
+    this.relayNegotiations.delete(fromPeerId);
+    this.onPeerJoin(transportPeerId);
+    this.routes.set(fromPeerId, 'Relay');
+  }
+
+  private sendRelayEnvelope(peerId: string, payload: Record<string, unknown>): void {
+    this.relay?.send(Buffer.from(JSON.stringify(payload), 'utf8'), peerId);
+  }
+
   public peerRuntime(): PeerRuntime[] {
     const activeRuntimeIds = new Set(
       [...this.connections.values()]
@@ -513,6 +869,10 @@ export class MeshTransport extends EventEmitter {
     this.seenIds.clear();
     this.inboundWindows.clear();
     if (room) await room.leave();
+    this.relay?.stop();
+    this.relay = undefined;
+    this.relayNegotiations.clear();
+    this.relayAttempts.clear();
   }
 
   private localHandshake(): HandshakeMessage {
@@ -671,6 +1031,11 @@ export class MeshTransport extends EventEmitter {
       joinOrder: Number.MAX_SAFE_INTEGER,
     };
     this.emit('connectionError', peer, error);
+    // A failed WebRTC attempt is the primary trigger for the emergency
+    // Nostr relay path; the sweep timer covers the no-error-at-all case.
+    if (this.directory.has(details.peerId) || pending) {
+      this.considerRelayFallback(details.peerId);
+    }
   }
 
   private sendHelloAck(peerId: string): void {
@@ -757,7 +1122,16 @@ export class MeshTransport extends EventEmitter {
         try {
           const action = this.action;
           if (!action) throw new Error('Trystero transport stopped during send.');
-          await action.send(exactArrayBuffer(item.bytes), { target: transportPeerId });
+          if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
+            const relayChannel = this.relay;
+            if (!relayChannel) throw new Error('Relay fallback transport stopped during send.');
+            relayChannel.send(
+              Buffer.from(JSON.stringify({ k: 'fr', d: item.bytes.toString('base64') }), 'utf8'),
+              transportPeerId.slice(RELAY_TRANSPORT_PREFIX.length),
+            );
+          } else {
+            await action.send(exactArrayBuffer(item.bytes), { target: transportPeerId });
+          }
           this.sentWindow += item.bytes.byteLength;
           this.totalSent += item.bytes.byteLength;
         } finally {
@@ -1210,6 +1584,15 @@ function formatError(error: unknown): string {
 }
 
 function ensureWebSocketRuntime(): void {
-  const runtime = globalThis as unknown as { WebSocket?: unknown };
-  if (!runtime.WebSocket) runtime.WebSocket = NodeWebSocket;
+  // Always install the proxy-aware WebSocket: Node's `ws` ignores system,
+  // VS Code and environment proxy configuration, so a plain global breaks
+  // discovery on proxy-only networks even when WebRTC could still work.
+  installProxyAwareWebSocket(meshNetworkConfig.proxy ?? {});
 }
+
+/** Resolves the effective proxy for a signalling URL, for diagnostics. */
+function resolveSignallingProxy(url: string): ProxyDescriptor | undefined {
+  return resolveProxy(url, meshNetworkConfig.proxy ?? {});
+}
+
+

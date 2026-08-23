@@ -306,6 +306,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public readonly coordinator: SessionCoordinator;
   public readonly startedAt = Date.now();
   private transport: MeshTransport;
+
+  /** Sanitized networking diagnostics for the diagnostics command. */
+  public networkDiagnostics(): Record<string, unknown> {
+    return this.transport.networkDiagnostics();
+  }
+
   private storage: StorageAdapter | undefined;
   private watcher: vscode.FileSystemWatcher | undefined;
   private timers: NodeJS.Timeout[] = [];

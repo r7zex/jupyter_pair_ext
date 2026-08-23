@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "publisher": "pair-notebook",
   "license": "MIT",
   "engines": {
@@ -67,6 +67,10 @@
       {
         "command": "pairNotebook.showDiagnostics",
         "title": "Pair Notebook: Show Network Diagnostics"
+      },
+      {
+        "command": "pairNotebook.setTurnPassword",
+        "title": "Pair Notebook: Set TURN Password"
       },
       {
         "command": "pairNotebook.selectBackingFolder",
@@ -256,6 +260,21 @@
           ],
           "default": "info",
           "scope": "application"
+        },
+        "pairNotebook.turnUrls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "application",
+          "description": "Custom TURN relay URLs (turn:/turns:), tried in order UDP, TCP, TLS before the built-in public fallback. Use your own TURN deployment for restricted networks."
+        },
+        "pairNotebook.turnUsername": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Username for the custom TURN servers. Store the password with 'Pair Notebook: Set TURN Password' so it never appears in settings or logs."
         }
       }
     }
@@ -264,12 +283,16 @@
     "clean": "rimraf out",
     "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap",
     "lint": "eslint .",
-    "test": "npm run compile && mocha --timeout 15000 \"out/test/**/*.test.js\"",
+    "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
-    "package": "npm run clean && npm run lint && npm test && vsce package --no-yarn --no-rewrite-relative-links --allow-missing-repository",
+    "package": "npm run clean && npm run lint && npm test && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
     "artifacts": "npm run package && node scripts/make-artifacts.mjs"
   },
   "dependencies": {
+    "@noble/secp256k1": "^3.1.0",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
+    "socks-proxy-agent": "^8.0.5",
     "trystero": "^0.25.3",
     "werift": "^0.24.4",
     "ws": "^8.18.3",
