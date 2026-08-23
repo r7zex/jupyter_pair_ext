@@ -54,6 +54,30 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://relay.orangepill.dev',
   'wss://offchain.pub',
 ];
+/**
+ * Free public TURN relay used as a last-resort connectivity fallback.
+ *
+ * Trystero's default STUN servers cannot traverse symmetric NATs or
+ * restrictive firewalls, which made joins stall for a long time and then
+ * fail with "could not connect to peer ... configure TURN servers".
+ * These Open Relay (Metered) endpoints provide relay candidates on ports
+ * 80/443 over UDP and TCP. Trystero appends them after its default STUN
+ * servers, so direct peer-to-peer connections are still preferred
+ * whenever the network allows them. The list must stay identical on every
+ * participant because ICE needs both sides to attempt the same relays.
+ */
+export const TRYSTERO_TURN_SERVERS = [
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp',
+      'turn:openrelay.metered.ca:80?transport=tcp',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+];
 const RELAY_REDUNDANCY = 8;
 const HANDSHAKE_VERSION = 2;
 const ACTION_NAMESPACE = 'pair-notebook-frame-v2';
@@ -289,6 +313,7 @@ export class MeshTransport extends EventEmitter {
         redundancy: RELAY_REDUNDANCY,
         warnOnRelayFailure: false,
       },
+      turnConfig: TRYSTERO_TURN_SERVERS,
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
     try {

@@ -1,7 +1,7 @@
 node_modules/
 out/
 *.vsix
-!pair-notebook-0.3.2.vsix
+!pair-notebook-0.3.3.vsix
 *.zip
 __pycache__/
 *.py[cod]

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3 — 2026-08-23
+
+- Fixed joins that stalled for one or two minutes and then failed with "could not connect to peer ... after exchanging SDP; configure TURN servers": STUN-only ICE traversal cannot cross symmetric NATs and restrictive firewalls.
+- The transport now appends a free public TURN relay (Open Relay by Metered) on ports 80/443 over UDP and TCP as a last-resort fallback. Direct peer-to-peer connections are still preferred whenever the network allows them, and the relay list is identical on every participant so both sides attempt the same relays.
+- Joins on difficult networks now establish connectivity quickly through relay candidates instead of timing out after the long STUN-only ICE attempts.
+- Added a regression test asserting the curated Nostr relay list and TURN fallback are passed to Trystero on every connection.
+
 ## 0.3.2 — 2026-08-23
 
 - Fixed joins failing or stalling for a very long time: two of the five default Nostr discovery relays Trystero picked for the app id are offline, so discovery ran through too few relays. The transport now uses an explicit, health-checked list of ten fast public relays with redundancy eight, identical on every participant.

@@ -59,7 +59,7 @@ import {
   validateProjectName,
 } from '../src/core/types';
 import { decodeFrame, encodeFrame, MAX_WIRE_FRAME_BYTES, MAX_WIRE_HEADER_BYTES } from '../src/core/wire';
-import { MeshTransport } from '../src/runtime/mesh';
+import { MeshTransport, TRYSTERO_RELAY_URLS, TRYSTERO_TURN_SERVERS } from '../src/runtime/mesh';
 import { createInMemoryTrysteroFactory, resetInMemoryTrystero } from './support/in_memory_trystero';
 
 const notebook: NotebookSnapshot = {
@@ -1309,6 +1309,41 @@ describe('real transport and compute', () => {
       await transport.stop();
       if (descriptor) Object.defineProperty(globalThis, 'WebSocket', descriptor);
       else delete (globalThis as { WebSocket?: unknown }).WebSocket;
+      resetInMemoryTrystero();
+    }
+  });
+
+  it('passes curated Nostr relays and a public TURN fallback to Trystero', async () => {
+    const capturedConfigs: unknown[] = [];
+    const inMemoryFactory = createInMemoryTrysteroFactory();
+    const transport = new MeshTransport({
+      sessionId: 'ice-fallback',
+      token: 'ice-fallback-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }),
+      isHost: () => true,
+      roomFactory: (config, roomId, callbacks) => {
+        capturedConfigs.push(config);
+        return inMemoryFactory(config, roomId, callbacks);
+      },
+    });
+    try {
+      await transport.start();
+      assert.equal(capturedConfigs.length, 1);
+      const config = capturedConfigs[0] as {
+        relayConfig?: { urls?: string[]; redundancy?: number };
+        turnConfig?: Array<{ urls: string | string[]; username?: string; credential?: string }>;
+      };
+      assert.deepEqual(config.relayConfig?.urls, TRYSTERO_RELAY_URLS);
+      assert.ok((config.relayConfig?.redundancy ?? 0) >= 2);
+      assert.equal(config.turnConfig?.length, TRYSTERO_TURN_SERVERS.length);
+      for (const server of config.turnConfig ?? []) {
+        assert.ok(Array.isArray(server.urls) && server.urls.length >= 4);
+        for (const url of server.urls) assert.match(url, /^turn:openrelay\.metered\.ca:(80|443)/);
+        assert.ok(server.username && server.credential);
+      }
+    } finally {
+      await transport.stop();
       resetInMemoryTrystero();
     }
   });

@@ -1,13 +1,13 @@
-# Pair Notebook 0.3.1
+# Pair Notebook 0.3.3
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.3.1.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.3.3.vsix` from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.3.1.vsix --force
+code --install-extension .\pair-notebook-0.3.3.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule.
@@ -57,11 +57,11 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 Trystero uses public Nostr relays only to exchange encrypted discovery/session data. Project data travels through encrypted WebRTC data channels. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
-Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Version 0.3.1 requires a fresh authenticated invite and intentionally does not resume legacy token-only sessions.
+Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Version 0.3.3 requires a fresh authenticated invite and intentionally does not resume legacy token-only sessions.
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
-Most consumer and office networks work with Trystero's built-in STUN configuration. Some restrictive networks block direct WebRTC; those network conditions may require an administrator-provided TURN service or a different network. This is a WebRTC limitation, not an additional Pair Notebook installation requirement.
+Most consumer and office networks connect directly or through STUN alone. Symmetric NATs and restrictive firewalls fall back to a free public TURN relay (Open Relay by Metered) bundled into the connection configuration, so joins succeed where STUN-only setups previously timed out. Direct peer-to-peer connections are always preferred when the network allows them; the relay only carries already-encrypted traffic as a last resort.
 
 ## Development
 
@@ -77,7 +77,7 @@ npm run artifacts
 
 The final artifacts are:
 
-- `pair-notebook-0.3.1.vsix` — installable extension.
-- `pair-notebook-complete-0.3.1.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.3.3.vsix` — installable extension.
+- `pair-notebook-complete-0.3.3.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and [acceptance report](docs/acceptance-report.md) for implementation details.
