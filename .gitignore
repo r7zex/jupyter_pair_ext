@@ -1,5 +1,9 @@
 node_modules/
-out/
+# Ignore everything in out/ except the esbuild bundle, which vsce must see
+# inside the VSIX. (vsce respects .gitignore; a bare "out/" would hide the
+# extension entrypoint from packaging entirely.)
+out/*
+!out/extension.js
 *.vsix
 !pair-notebook-0.3.3.vsix
 *.zip
