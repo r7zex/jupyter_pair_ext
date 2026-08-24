@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "publisher": "pair-notebook",
   "license": "MIT",
   "engines": {
@@ -67,6 +67,10 @@
       {
         "command": "pairNotebook.showDiagnostics",
         "title": "Pair Notebook: Show Network Diagnostics"
+      },
+      {
+        "command": "pairNotebook.tryImproveConnection",
+        "title": "Pair Notebook: Try To Improve Connection"
       },
       {
         "command": "pairNotebook.setTurnPassword",

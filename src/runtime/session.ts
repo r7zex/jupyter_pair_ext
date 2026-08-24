@@ -86,7 +86,7 @@ import {
   MAX_TRANSFER_BYTES,
   validateIncomingTransfer,
 } from '../core/transfer';
-import { MeshMetrics, MeshTransport } from './mesh';
+import { MeshMetrics, MeshTransport, RouteUpgradeState, RouteUpgradeStatus } from './mesh';
 
 export interface PresenceState {
   peer: PeerIdentity;
@@ -311,6 +311,18 @@ export interface SessionSnapshot {
   isHost: boolean;
   waitingForHostFolder: boolean;
   autosave: AutosaveStatus;
+  /** Per-participant connection view for the sidebar connection section. */
+  connections: PeerConnectionView[];
+}
+
+export interface PeerConnectionView {
+  peerId: string;
+  displayName: string;
+  routeType: 'direct' | 'relay';
+  latencyMs: number;
+  upgradeStatus?: RouteUpgradeStatus;
+  /** Rate-limited migration notice advertised by the remote participant. */
+  remoteStatus?: string;
 }
 
 export type RuntimeState = 'connecting' | 'connected' | 'syncing' | 'ready' | 'executing'
@@ -630,7 +642,49 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       isHost: this.coordinator.isCurrentHost(),
       waitingForHostFolder: this.waitingForHostFolder,
       autosave: { ...this.autosaveState },
+      connections: this.buildConnectionViews(),
     };
+  }
+
+  /** Builds the per-participant connection view shown in the sidebar. */
+  private buildConnectionViews(): PeerConnectionView[] {
+    const upgrades = new Map(
+      this.transport.activeRouteUpgrades().map((upgrade) => [upgrade.peerId, upgrade.status] as const),
+    );
+    const selfId = this.descriptor.localPeer.peerId;
+    return this.transport.peerRuntime()
+      .filter((peer) => peer.peerId !== selfId)
+      .map((peer) => ({
+        peerId: peer.peerId,
+        displayName: peer.displayName,
+        routeType: peer.route === 'Relay' ? 'relay' as const : 'direct' as const,
+        latencyMs: peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
+        ...(upgrades.has(peer.peerId) ? { upgradeStatus: upgrades.get(peer.peerId) } : {}),
+        ...(this.transport.getRemoteRouteStatus(peer.peerId)
+          ? { remoteStatus: this.transport.getRemoteRouteStatus(peer.peerId) } : {}),
+      }));
+  }
+
+  /**
+   * Runs the safe make-before-break improvement attempt for every participant
+   * currently reachable only through the emergency relay. Participants on a
+   * direct route are already optimal and are never touched. The current
+   * connection is never disconnected by this call.
+   */
+  public tryImproveConnection(): { attempted: number; alreadyOptimal: boolean } {
+    const targets = this.transport.improvablePeerIds();
+    if (targets.length === 0) return { attempted: 0, alreadyOptimal: true };
+    let attempted = 0;
+    for (const peerId of targets) {
+      if (this.transport.tryImproveRoute(peerId)) attempted += 1;
+    }
+    return { attempted, alreadyOptimal: false };
+  }
+
+  public cancelConnectionImprovement(): void {
+    for (const upgrade of this.transport.activeRouteUpgrades()) {
+      this.transport.cancelRouteUpgrade(upgrade.peerId);
+    }
   }
 
   public localComputePresence(): PresenceState | undefined {
@@ -1554,6 +1608,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         && (currentHostFailed || this.runtimeState === 'connecting')) {
         this.transition('reconnecting', detail);
       }
+    });
+    // Real-time connection-quality/migration events for the sidebar.
+    this.transport.on('routeUpgradeStatus', (state: RouteUpgradeState) => {
+      this.log.appendLine(`[debug] Route upgrade ${state.peerId}: ${state.status}${state.detail ? ` (${state.detail})` : ''}`);
+      this.emit('connectionUpdated', { kind: 'route-upgrade', ...state });
+    });
+    this.transport.on('routeChanged', (peer: PeerIdentity, from: string, to: string) => {
+      this.log.appendLine(`[debug] Route to ${peer.displayName} changed: ${from} -> ${to}`);
+      this.emit('connectionUpdated', { kind: 'route-changed', peerId: peer.peerId, from, to });
+    });
+    this.transport.on('remoteRouteStatus', (peerId: string, status: string) => {
+      this.emit('connectionUpdated', { kind: 'remote-status', peerId, status });
     });
   }
 

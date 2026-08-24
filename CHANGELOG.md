@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-08-24 (connection quality, make-before-break route optimization)
+
+- New **Connection** section in the left Pair Notebook panel: per-participant route type (direct P2P / encrypted relay fallback), measured latency, theme-aware colour-coded quality dot with text labels (never colour alone), and an evidence-based assessment ("Соединение уже оптимально" vs "Возможно доступно более прямое соединение").
+- New **Try to improve** button (`Pair Notebook: Try To Improve Connection`): safe make-before-break optimization. When a participant is reachable only through the emergency relay, a candidate direct WebRTC connection is built in a separate short-lived negotiation room while the working relay keeps carrying all traffic. The candidate must complete the signed identity handshake, pass bidirectional probe frames and one-second pings through a stability window before it is promoted atomically; only then is the relay route retired. Failure, cancellation or timeout leaves the current connection untouched and says so in the UI.
+- Logical participants are never duplicated or marked offline during migration: no disconnect events fire across the promotion boundary, pending outbound frames migrate from the old queue to the promoted route, and frame-id deduplication keeps delivery exactly-once.
+- Real-time migration status: the optimizing side broadcasts rate-limited status notices over its existing connection, so the remote panel can show "Иван проверяет лучший маршрут… / переключает сетевой путь…" without falsely marking the peer offline.
+- New passive diagnostics engine (`src/runtime/diagnostics.ts`): adapter classification via ordinary user-level APIs (VPN/TUN detection), UDP-availability inference from live TURN probes, configured-proxy detection, bounded DNS checks of signalling hosts — every conclusion carries an explicit confidence level (confirmed/high/medium/low). Filtering software (zapret/Flowseal) is never claimed as a confirmed cause without direct evidence; correlated symptoms are listed as possible causes. Diagnostics never modify system state and never require elevation.
+- Fixed a proxy blind spot: the emergency Nostr data relay now builds its sockets through exactly the same proxy resolution as Trystero signalling (`http.proxy`, `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`, SOCKS4/SOCKS5/SOCKS5h), so the last-resort transport works on proxy-only networks too.
+- 9 new deterministic regression tests covering the mandatory make-before-break acceptance scenarios (candidate failure/success/cancelled attempts, exactly-once delivery across the migration boundary, no duplicate or offline participants, remote status propagation) plus diagnostics confidence calibration and credential redaction.
+
 ## 0.3.5 - 2026-08-24 (snapshot retransmission over lossy relays)
 
 - Fixed joins failing with "Snapshot is missing chunks for <file>" on the emergency Nostr relay route: a relay socket blip silently dropped individual `snapshotFileChunk` frames (the relay tunnel skips lost packets by design), and the snapshot protocol had no recovery, so the whole join failed even though the host was reachable.

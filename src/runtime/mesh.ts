@@ -2,7 +2,6 @@ import { EventEmitter } from 'node:events';
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
 import {
   joinRoom,
-  type HandshakePayload,
   type JoinError,
   type JoinRoomCallbacks,
   type MessageAction,
@@ -41,6 +40,7 @@ import {
 import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
 import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
 import { NostrFrameRelay } from './nostrRelay';
+import { assessUdpAvailability } from './diagnostics';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -109,6 +109,54 @@ export interface MeshNetworkConfig {
 }
 
 const RELAY_TRANSPORT_PREFIX = 'relay:';
+/**
+ * Transport-id prefix for peers met inside the dedicated route-upgrade room.
+ * A candidate direct connection created by "Try to improve" is fully built
+ * and verified BEFORE it may replace the working emergency-relay route
+ * (make-before-break); the prefix lets the frame drain and ping paths route
+ * candidate traffic without touching the active identity mapping.
+ */
+export const UPGRADE_TRANSPORT_PREFIX = 'upgrade:';
+/** Room id suffix for the short-lived make-before-break negotiation room. */
+export const ROUTE_UPGRADE_ROOM_SUFFIX = '-route-upgrade-v1';
+/** Overall deadline for one improvement attempt. */
+export const ROUTE_UPGRADE_TIMEOUT_MS = 45_000;
+/** Consecutive successful candidate pings required before promotion. */
+export const ROUTE_UPGRADE_REQUIRED_PINGS = 3;
+/** Minimum time the candidate must stay alive before promotion. */
+export const ROUTE_UPGRADE_STABILITY_WINDOW_MS = 3_000;
+
+export type RouteUpgradeStatus =
+  | 'requesting'
+  | 'waiting-peer'
+  | 'authenticating'
+  | 'verifying'
+  | 'promoting'
+  | 'completed'
+  | 'failed';
+
+export interface RouteUpgradeState {
+  peerId: string;
+  role: 'initiator' | 'responder';
+  status: RouteUpgradeStatus;
+  startedAt: number;
+  detail?: string;
+}
+
+interface RouteUpgrade {
+  peerId: string;
+  role: 'initiator' | 'responder';
+  status: RouteUpgradeStatus;
+  startedAt: number;
+  candidateTransportId?: string;
+  candidateRawId?: string;
+  connectedAt?: number;
+  verifiedPings: number;
+  lastError?: string;
+  deadlineTimer?: NodeJS.Timeout;
+  verifyTimer?: NodeJS.Timeout;
+}
+
 
 const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> & MeshNetworkConfig = {
   disableTurnProbe: false,
@@ -288,6 +336,15 @@ export class MeshTransport extends EventEmitter {
     remoteProof?: string;
   }>();
   private readonly relayAttempts = new Map<string, number>();
+  /** Make-before-break improvement attempts, keyed by logical peer id. */
+  private readonly routeUpgrades = new Map<string, RouteUpgrade>();
+  private upgradeRoom: Room | undefined;
+  private upgradeAction: MessageAction<ArrayBuffer> | undefined;
+  private upgradeJoining = false;
+  /** Rate-limited remote migration notices for the participants panel. */
+  private readonly remoteRouteStatuses = new Map<string, { status: string; at: number }>();
+  private lastRemoteStatusSentAt = 0;
+
 
   private readonly identityPrivateKey: string;
 
@@ -333,38 +390,7 @@ export class MeshTransport extends EventEmitter {
     const callbacks: JoinRoomCallbacks = {
       handshakeTimeoutMs: 15_000,
       onPeerHandshake: async (transportPeerId, send, receive, isInitiator) => {
-        const local = this.localHandshake();
-        let incoming: HandshakePayload;
-        if (isInitiator) {
-          await send(local as unknown as Parameters<typeof send>[0]);
-          incoming = await receive();
-        } else {
-          incoming = await receive();
-          await send(local as unknown as Parameters<typeof send>[0]);
-        }
-        const remote = this.parseHandshake(incoming.data);
-        const transcript = handshakeTranscript(
-          isInitiator ? local : remote,
-          isInitiator ? remote : local,
-        );
-        const localProof: HandshakeProof = {
-          version: HANDSHAKE_VERSION,
-          signature: signIdentityTranscript(this.identityPrivateKey, transcript),
-        };
-        let incomingProof: HandshakePayload;
-        if (isInitiator) {
-          await send(localProof as unknown as Parameters<typeof send>[0]);
-          incomingProof = await receive();
-        } else {
-          incomingProof = await receive();
-          await send(localProof as unknown as Parameters<typeof send>[0]);
-        }
-        const remoteProof = this.parseHandshakeProof(incomingProof.data);
-        if (!verifyIdentityTranscript(remote.peer.identityKey!, transcript, remoteProof.signature)) {
-          throw new Error(`Peer ${remote.peer.peerId} did not prove ownership of its identity key.`);
-        }
-        this.assertPeerCanJoin(remote.peer, transportPeerId);
-        this.pendingHandshakes.set(transportPeerId, { ...remote, admittedAt: Date.now() });
+        await this.runPeerHandshake(transportPeerId, send as (data: unknown) => Promise<void>, receive as () => Promise<{ data: unknown }>, isInitiator);
       },
       onJoinError: (details) => this.onJoinError(details),
     };
@@ -485,6 +511,7 @@ export class MeshTransport extends EventEmitter {
       })),
       proxy: describeProxy(resolveSignallingProxy('wss://nos.lol')),
       stunServers: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
+      udpAvailability: assessUdpAvailability(this.turnProbes ?? []),
       relayFallback: {
         enabled: !meshNetworkConfig.disableRelayFallback,
         connectedRelays: this.relay?.connectedRelayCount ?? 0,
@@ -680,6 +707,467 @@ export class MeshTransport extends EventEmitter {
     }
   }
 
+  /**
+   * Shared signed identity handshake used by both the discovery room and the
+   * short-lived route-upgrade room. `transportKey` is the pending-handshake
+   * map key, which may carry the UPGRADE_TRANSPORT_PREFIX.
+   */
+  private async runPeerHandshake(
+    transportKey: string,
+    send: (data: unknown) => Promise<void>,
+    receive: () => Promise<{ data: unknown }>,
+    isInitiator: boolean,
+  ): Promise<void> {
+    const local = this.localHandshake();
+    let incoming: { data: unknown };
+    if (isInitiator) {
+      await send(local);
+      incoming = await receive();
+    } else {
+      incoming = await receive();
+      await send(local);
+    }
+    const remote = this.parseHandshake(incoming.data);
+    const transcript = handshakeTranscript(
+      isInitiator ? local : remote,
+      isInitiator ? remote : local,
+    );
+    const localProof: HandshakeProof = {
+      version: HANDSHAKE_VERSION,
+      signature: signIdentityTranscript(this.identityPrivateKey, transcript),
+    };
+    let incomingProof: { data: unknown };
+    if (isInitiator) {
+      await send(localProof);
+      incomingProof = await receive();
+    } else {
+      incomingProof = await receive();
+      await send(localProof);
+    }
+    const remoteProof = this.parseHandshakeProof(incomingProof.data);
+    if (!verifyIdentityTranscript(remote.peer.identityKey!, transcript, remoteProof.signature)) {
+      throw new Error(`Peer ${remote.peer.peerId} did not prove ownership of its identity key.`);
+    }
+    // During an explicit upgrade the working route must survive the candidate
+    // handshake, so assertPeerCanJoin defers retirement for prefixed keys.
+    this.assertPeerCanJoin(remote.peer, transportKey);
+    this.pendingHandshakes.set(transportKey, { ...remote, admittedAt: Date.now() });
+  }
+
+  /**
+   * Opens (or reuses) the dedicated make-before-break negotiation room. This
+   * is a SECOND Trystero room derived deterministically from the session id,
+   * so both sides reach it without any extra configuration. Joining it never
+   * touches existing transports: the working relay route stays fully alive
+   * while the direct candidate is being built inside this room.
+   */
+  private ensureUpgradeRoom(): void {
+    if (this.upgradeRoom || this.stopped || this.upgradeJoining) return;
+    const buildCallbacks = (): JoinRoomCallbacks => ({
+      handshakeTimeoutMs: 15_000,
+      onPeerHandshake: async (rawId, send, receive, isInitiator) => {
+        await this.runPeerHandshake(UPGRADE_TRANSPORT_PREFIX + rawId, send as (data: unknown) => Promise<void>, receive as () => Promise<{ data: unknown }>, isInitiator);
+      },
+      // Candidate failures are expected outcomes of probing; they are
+      // reported through the upgrade state machine instead of the global
+      // connectionError channel that would alarm the session runtime.
+      onJoinError: () => undefined,
+    });
+    this.upgradeJoining = true;
+    try {
+      const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
+      const config: NostrRoomConfig = {
+        appId: TRYSTERO_APP_ID,
+        password: this.options.token,
+        rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
+        relayConfig: {
+          urls: TRYSTERO_RELAY_URLS,
+          redundancy: RELAY_REDUNDANCY,
+          warnOnRelayFailure: false,
+        },
+      };
+      this.upgradeRoom = factory(config, `${this.options.sessionId}${ROUTE_UPGRADE_ROOM_SUFFIX}`, buildCallbacks());
+      this.upgradeAction = this.upgradeRoom.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
+      this.upgradeAction.onMessage = (data, { peerId }) =>
+        this.handleAction(data, UPGRADE_TRANSPORT_PREFIX + peerId);
+      this.upgradeRoom.onPeerJoin = (rawId) => this.onUpgradeCandidateJoin(rawId);
+      this.upgradeRoom.onPeerLeave = (rawId) => this.onUpgradeCandidateLeave(rawId);
+    } catch {
+      this.upgradeRoom = undefined;
+      this.upgradeAction = undefined;
+    } finally {
+      this.upgradeJoining = false;
+    }
+  }
+
+  /** True while at least one make-before-break attempt is in flight. */
+  public hasActiveRouteUpgrades(): boolean {
+    return this.routeUpgrades.size > 0;
+  }
+
+  /** Directory peers currently reachable ONLY through the emergency relay. */
+public improvablePeerIds(): string[] {
+    if (this.stopped || !this.relay) return [];
+    const result: string[] = [];
+    for (const [peerId, transportId] of this.identityToTransport) {
+      if (!transportId.startsWith(RELAY_TRANSPORT_PREFIX)) continue;
+      if (this.routeUpgrades.has(peerId)) continue;
+      if (!this.connections.has(transportId)) continue;
+      result.push(peerId);
+    }
+    return result;
+  }
+
+  /** Snapshot of running improvement attempts for UI rendering. */
+  public activeRouteUpgrades(): RouteUpgradeState[] {
+    return [...this.routeUpgrades.values()].map((upgrade) => ({
+      peerId: upgrade.peerId,
+      role: upgrade.role,
+      status: upgrade.status,
+      startedAt: upgrade.startedAt,
+      ...(upgrade.lastError ? { detail: upgrade.lastError } : {}),
+    }));
+  }
+
+  /**
+   * Starts a safe improvement attempt for a peer currently reachable only
+   * through the emergency relay. CRITICAL INVARIANT: the working relay route
+   * is never disconnected by this call; the candidate direct connection is
+   * built, authenticated, health-checked and kept stable BEFORE promotion,
+   * and failure leaves the current route untouched.
+   *
+   * Returns false when no improvable route exists (e.g. already direct).
+   */
+  public tryImproveRoute(peerId: string): boolean {
+    if (this.stopped || !this.relay) return false;
+    if (peerId === this.options.localPeer.peerId) return false;
+    if (this.routeUpgrades.has(peerId)) return true; // already optimizing
+    const current = this.identityToTransport.get(peerId);
+    if (!current || !current.startsWith(RELAY_TRANSPORT_PREFIX)) return false;
+    if (!this.connections.has(current)) return false;
+    this.ensureUpgradeRoom();
+    if (!this.upgradeRoom) return false;
+    const upgrade: RouteUpgrade = {
+      peerId,
+      role: this.options.localPeer.peerId < peerId ? 'initiator' : 'responder',
+      status: 'requesting',
+      startedAt: Date.now(),
+      verifiedPings: 0,
+    };
+    this.routeUpgrades.set(peerId, upgrade);
+    // Ask the peer over the WORKING relay channel to meet us in the upgrade
+    // room. If this message is lost the deadline fails the attempt cleanly.
+    try {
+      this.sendRelayEnvelope(peerId, { k: 'up' });
+    } catch {
+      this.failRouteUpgrade(upgrade, 'Could not reach the peer through the current connection.');
+      return false;
+    }
+    this.armUpgradeDeadline(upgrade);
+    this.emitRouteUpgradeEvent(upgrade);
+    return true;
+  }
+
+  /** Cancels an in-flight improvement attempt without touching the active route. */
+  public cancelRouteUpgrade(peerId: string): void {
+    const upgrade = this.routeUpgrades.get(peerId);
+    if (!upgrade) return;
+    this.discardCandidate(upgrade);
+    this.failRouteUpgrade(upgrade, 'The improvement attempt was cancelled.');
+  }
+
+  private armUpgradeDeadline(upgrade: RouteUpgrade): void {
+    upgrade.deadlineTimer ??= setTimeout(() => {
+      if (this.routeUpgrades.get(upgrade.peerId) !== upgrade) return;
+      this.discardCandidate(upgrade);
+      upgrade.status = 'failed';
+      upgrade.lastError = 'The improvement attempt timed out.';
+      this.finishUpgrade(upgrade);
+    }, ROUTE_UPGRADE_TIMEOUT_MS);
+    upgrade.deadlineTimer.unref?.();
+  }
+
+  private emitRouteUpgradeEvent(upgrade: RouteUpgrade): void {
+    this.emit('routeUpgradeStatus', {
+      peerId: upgrade.peerId,
+      role: upgrade.role,
+      status: upgrade.status,
+      startedAt: upgrade.startedAt,
+      ...(upgrade.lastError ? { detail: upgrade.lastError } : {}),
+    } satisfies RouteUpgradeState);
+    // Let the remote participant see our migration progress in real time.
+    if (upgrade.status === 'verifying') this.announceLocalRouteStatus('checking-better-route');
+    else if (upgrade.status === 'promoting') this.announceLocalRouteStatus('switching-path');
+    else if (upgrade.status === 'completed') this.announceLocalRouteStatus('switched-path');
+  }
+
+  /** Peer side of "Try to improve": join the upgrade room when asked. */
+  private handleUpgradeRequest(fromPeerId: string): void {
+    if (this.stopped || !this.relay) return;
+    const current = this.identityToTransport.get(fromPeerId);
+    if (!current || !current.startsWith(RELAY_TRANSPORT_PREFIX)) return;
+    let upgrade = this.routeUpgrades.get(fromPeerId);
+    if (!upgrade) {
+      this.ensureUpgradeRoom();
+      if (!this.upgradeRoom) return;
+      upgrade = {
+        peerId: fromPeerId,
+        role: 'responder',
+        status: 'waiting-peer',
+        startedAt: Date.now(),
+        verifiedPings: 0,
+      };
+      this.routeUpgrades.set(fromPeerId, upgrade);
+      this.armUpgradeDeadline(upgrade);
+      this.emitRouteUpgradeEvent(upgrade);
+    }
+  }
+
+  /** Rate-limited publication of OUR migration state to all connected peers. */
+  private announceLocalRouteStatus(status: string): void {
+    const now = Date.now();
+    if (now - this.lastRemoteStatusSentAt < 3_000) return;
+    this.lastRemoteStatusSentAt = now;
+    try {
+      this.broadcast('routeStatus', { messageId: newId(), status });
+    } catch { /* best effort: visibility only */ }
+  }
+
+  /** Stores a peer's migration notice; bounded and rate-limited by the sender. */
+  private acceptRemoteRouteStatus(peerId: string, status: string): void {
+    const clean = status.slice(0, 64);
+    this.remoteRouteStatuses.set(peerId, { status: clean, at: Date.now() });
+    this.emit('remoteRouteStatus', peerId, clean);
+  }
+
+  public getRemoteRouteStatus(peerId: string): string | undefined {
+    return this.remoteRouteStatuses.get(peerId)?.status;
+  }
+
+  private pruneRemoteRouteStatuses(): void {
+    const cutoff = Date.now() - 120_000;
+    for (const [peerId, entry] of this.remoteRouteStatuses) {
+      if (entry.at < cutoff) this.remoteRouteStatuses.delete(peerId);
+    }
+  }
+
+  /**
+   * A candidate direct connection completed its signed handshake inside the
+   * upgrade room. Register it WITHOUT touching the active identity mapping:
+   * application traffic keeps flowing over the working route until the
+   * candidate passes the stability window.
+   */
+  private onUpgradeCandidateJoin(rawId: string): void {
+    if (this.stopped) return;
+    const key = UPGRADE_TRANSPORT_PREFIX + rawId;
+    const handshake = this.pendingHandshakes.get(key);
+    this.pendingHandshakes.delete(key);
+    if (!handshake) return;
+    const identity = handshake.peer;
+    let upgrade = this.routeUpgrades.get(identity.peerId);
+    if (!upgrade) {
+      // A signed candidate can also arrive before our own request round-trip;
+      // treat it as a responder-side attempt rather than dropping it.
+      upgrade = {
+        peerId: identity.peerId,
+        role: 'responder',
+        status: 'authenticating',
+        startedAt: Date.now(),
+        verifiedPings: 0,
+      };
+      this.routeUpgrades.set(identity.peerId, upgrade);
+      this.armUpgradeDeadline(upgrade);
+    }
+    // The candidate must present exactly the directory identity it claims:
+    // a mismatched identity key would have failed the signature check above.
+    const remembered = this.directory.get(identity.peerId);
+    if (remembered?.identityKey && remembered.identityKey !== identity.identityKey) return;
+    upgrade.candidateRawId = rawId;
+    upgrade.candidateTransportId = key;
+    upgrade.connectedAt = Date.now();
+    upgrade.status = 'verifying';
+    upgrade.verifiedPings = 0;
+    this.connections.set(key, {
+      transportPeerId: key,
+      identity,
+      purpose: handshake.purpose,
+      connectedAt: upgrade.connectedAt,
+      lastSeen: Date.now(),
+      snapshotRequested: false,
+    });
+    this.emitRouteUpgradeEvent(upgrade);
+    // Bidirectional application-level probe: the reply proves frames travel
+    // in both directions over the CANDIDATE channel specifically.
+    try {
+      this.enqueueCandidateFrame(
+        key,
+        this.createFrame('routeProbe', { messageId: newId() }, new Uint8Array()),
+      );
+    } catch { /* verification pings will fail the attempt */ }
+    upgrade.verifyTimer ??= setInterval(() => this.verifyCandidateTick(upgrade!), 1_000);
+    upgrade.verifyTimer.unref?.();
+  }
+
+  /** Candidate vanished: if it was already ACTIVE, treat it as a real disconnect. */
+  private onUpgradeCandidateLeave(rawId: string): void {
+    const key = UPGRADE_TRANSPORT_PREFIX + rawId;
+    for (const transportId of this.identityToTransport.values()) {
+      if (transportId === key) {
+        // A promoted direct route died: normal disconnect semantics apply and
+        // the relay sweep will rebuild an emergency route for this identity.
+        this.onPeerLeave(key);
+        return;
+      }
+    }
+    const connection = this.connections.get(key);
+    if (connection) {
+      // Only clean candidate-scoped state; never global identity mappings.
+      this.connections.delete(key);
+      this.outboundQueues.delete(key);
+      this.takePendingInboundFrames(key);
+    }
+    for (const upgrade of this.routeUpgrades.values()) {
+      if (upgrade.candidateTransportId !== key || upgrade.status === 'completed') continue;
+      this.failRouteUpgrade(upgrade, 'The candidate connection dropped during verification.');
+    }
+  }
+
+  /** One verification step: candidate ping + stability window accounting. */
+  private verifyCandidateTick(upgrade: RouteUpgrade): void {
+    if (this.routeUpgrades.get(upgrade.peerId) !== upgrade) return;
+    const rawId = upgrade.candidateRawId;
+    const room = this.upgradeRoom;
+    if (!rawId || !room || !upgrade.candidateTransportId) return;
+    void (async () => {
+      try {
+        const current = await room.ping(rawId);
+        if (!Number.isFinite(current) || current < 0) throw new Error('no rtt');
+        const bounded = Math.min(60_000, current);
+        const connectedFor = Date.now() - (upgrade.connectedAt ?? upgrade.startedAt);
+        if (connectedFor < ROUTE_UPGRADE_STABILITY_WINDOW_MS) return;
+        upgrade.verifiedPings += 1;
+        if (upgrade.verifiedPings >= ROUTE_UPGRADE_REQUIRED_PINGS) {
+          this.promoteCandidate(upgrade, bounded);
+        }
+      } catch {
+        // A candidate that cannot hold one-second pings through the stability
+        // window is not proven better than the working route: fail closed.
+        this.discardCandidate(upgrade);
+        this.failRouteUpgrade(upgrade, 'The new route did not stay stable during verification.');
+      }
+    })();
+  }
+
+  /**
+   * Atomic promotion: switch the logical identity to the verified candidate
+   * FIRST, then retire the superseded relay route. Frames enqueued before the
+   * swap stay owned by their original queues; frame ids deduplicate any
+   * boundary overlap on the receiver.
+   */
+  private promoteCandidate(upgrade: RouteUpgrade, measuredRttMs: number): void {
+    const key = upgrade.candidateTransportId!;
+    if (upgrade.status === 'promoting' || upgrade.status === 'completed') return;
+    upgrade.status = 'promoting';
+    this.emitRouteUpgradeEvent(upgrade);
+    const previous = this.identityToTransport.get(upgrade.peerId);
+    this.identityToTransport.set(upgrade.peerId, key);
+    this.routes.set(upgrade.peerId, 'Direct');
+    this.latency.set(upgrade.peerId, { current: measuredRttMs, ema: measuredRttMs });
+    // NOW retire the old route - only after the candidate is active.
+    if (previous?.startsWith(RELAY_TRANSPORT_PREFIX)) {
+      const oldConnection = this.connections.get(previous);
+      // Frames already enqueued for the old route must not be lost at the
+      // switch boundary: move them (order-preserving) to the candidate queue.
+      const oldQueue = this.outboundQueues.get(previous);
+      if (oldQueue && !oldQueue.failure && (oldQueue.realtimeFrames.length || oldQueue.bulkFrames.length)) {
+        const newQueue = this.outboundQueues.get(key) ?? {
+          realtimeFrames: [],
+          bulkFrames: [],
+          queuedBytes: 0,
+          inFlightBytes: 0,
+          inFlightFrames: 0,
+          draining: false,
+        };
+        newQueue.realtimeFrames.unshift(...oldQueue.realtimeFrames);
+        newQueue.bulkFrames.unshift(...oldQueue.bulkFrames);
+        newQueue.queuedBytes += oldQueue.queuedBytes;
+        this.outboundQueues.set(key, newQueue);
+        void this.drain(key, newQueue);
+      }
+      this.outboundQueues.delete(previous);
+      this.connections.delete(previous);
+      this.inboundWindows.delete(previous);
+      if (oldConnection) {
+        // Deliberately no peerDisconnected event: the logical participant
+        // stayed online throughout the migration (make-before-break).
+        this.emit('routeChanged', oldConnection.identity, 'relay', 'direct');
+      }
+    }
+    upgrade.status = 'completed';
+    this.emitRouteUpgradeEvent(upgrade);
+    this.finishUpgrade(upgrade);
+  }
+
+  /** Removes candidate transport state without touching the active route. */
+  private discardCandidate(upgrade: RouteUpgrade): void {
+    if (upgrade.verifyTimer) clearInterval(upgrade.verifyTimer);
+    upgrade.verifyTimer = undefined;
+    const key = upgrade.candidateTransportId;
+    if (key) {
+      this.connections.delete(key);
+      this.outboundQueues.delete(key);
+      this.takePendingInboundFrames(key);
+      try {
+        const rawId = upgrade.candidateRawId;
+        if (rawId && this.upgradeRoom) this.upgradeRoom.getPeers()[rawId]?.close();
+      } catch { /* best-effort cleanup */ }
+    }
+    upgrade.candidateTransportId = undefined;
+    upgrade.candidateRawId = undefined;
+  }
+
+  /** Reports failure and releases the attempt; the active route is untouched. */
+  private failRouteUpgrade(upgrade: RouteUpgrade, reason: string): void {
+    if (this.routeUpgrades.get(upgrade.peerId) !== upgrade) return;
+    upgrade.status = 'failed';
+    upgrade.lastError = reason;
+    this.emitRouteUpgradeEvent(upgrade);
+    this.finishUpgrade(upgrade);
+  }
+
+  private finishUpgrade(upgrade: RouteUpgrade): void {
+    if (upgrade.deadlineTimer) clearTimeout(upgrade.deadlineTimer);
+    upgrade.deadlineTimer = undefined;
+    if (upgrade.verifyTimer) clearInterval(upgrade.verifyTimer);
+    upgrade.verifyTimer = undefined;
+    this.routeUpgrades.delete(upgrade.peerId);
+    // Leave the negotiation room only when it no longer hosts anything: not
+    // just running attempts but also PROMOTED direct routes, whose peer
+    // connections physically live inside this room.
+    if (!this.hasUpgradeRoomDependents()) {
+      const room = this.upgradeRoom;
+      this.upgradeRoom = undefined;
+      this.upgradeAction = undefined;
+      if (room && !this.stopped) void room.leave().catch(() => undefined);
+    }
+  }
+
+  /** True while any attempt or any promoted route still needs the upgrade room. */
+  private hasUpgradeRoomDependents(): boolean {
+    if (this.routeUpgrades.size > 0) return true;
+    for (const transportId of this.identityToTransport.values()) {
+      if (transportId.startsWith(UPGRADE_TRANSPORT_PREFIX)) return true;
+    }
+    return false;
+  }
+
+  /** Sends one application frame over a candidate transport (probe frames only). */
+  private enqueueCandidateFrame(transportKey: string, frame: Buffer): void {
+    if (!this.upgradeAction) throw new Error('Route upgrade room is not active.');
+    const rawId = transportKey.slice(UPGRADE_TRANSPORT_PREFIX.length);
+    void this.upgradeAction.send(exactArrayBuffer(frame), { target: rawId });
+  }
+
   /** Periodically looks for directory peers that never got any transport. */
   private relaySweepTick(): void {
     if (this.stopped || !this.relay) return;
@@ -718,10 +1206,20 @@ export class MeshTransport extends EventEmitter {
   }
 
   private handleRelayData(fromPeerId: string, bytes: Buffer): void {
-    let envelope: { k?: string; hs?: unknown; pr?: unknown; d?: string };
+    let envelope: { k?: string; hs?: unknown; pr?: unknown; d?: string; s?: string };
     try {
       envelope = JSON.parse(bytes.toString('utf8')) as typeof envelope;
     } catch {
+      return;
+    }
+    if (envelope.k === 'up') {
+      // Remote peer asked us to help build a better route. The working relay
+      // channel stays up; we merely join the negotiation room.
+      this.handleUpgradeRequest(fromPeerId);
+      return;
+    }
+    if (envelope.k === 'st' && typeof envelope.s === 'string') {
+      this.acceptRemoteRouteStatus(fromPeerId, envelope.s);
       return;
     }
     if (envelope.k === 'hs' || envelope.k === 'pr') {
@@ -873,6 +1371,16 @@ export class MeshTransport extends EventEmitter {
     this.relay = undefined;
     this.relayNegotiations.clear();
     this.relayAttempts.clear();
+    for (const upgrade of [...this.routeUpgrades.values()]) {
+      if (upgrade.deadlineTimer) clearTimeout(upgrade.deadlineTimer);
+      if (upgrade.verifyTimer) clearInterval(upgrade.verifyTimer);
+    }
+    this.routeUpgrades.clear();
+    const upgradeRoom = this.upgradeRoom;
+    this.upgradeRoom = undefined;
+    this.upgradeAction = undefined;
+    this.remoteRouteStatuses.clear();
+    if (upgradeRoom) await upgradeRoom.leave().catch(() => undefined);
   }
 
   private localHandshake(): HandshakeMessage {
@@ -942,7 +1450,9 @@ export class MeshTransport extends EventEmitter {
       throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
     }
     const activeTransport = this.identityToTransport.get(identity.peerId);
-    if (activeTransport && activeTransport !== transportPeerId) {
+    const isUpgradeCandidate = transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
+      && this.routeUpgrades.has(identity.peerId);
+    if (activeTransport && activeTransport !== transportPeerId && !isUpgradeCandidate) {
       // Both call sites verify the identity-proof signature before this point,
       // so a second handshake for a connected identity comes from the genuine
       // identity holder re-connecting. A lossy relay route can swallow the old
@@ -950,6 +1460,9 @@ export class MeshTransport extends EventEmitter {
       // peer's only live route forever. Retire the stale route and admit.
       this.retireIdentityRoute(activeTransport);
     }
+    // An explicit make-before-break upgrade keeps the working route mapped
+    // until the candidate has been verified; promotion happens later in
+    // promoteCandidate() only after the stability window passes.
     for (const [pendingTransport, pending] of this.pendingHandshakes) {
       if (pendingTransport !== transportPeerId && pending.peer.peerId === identity.peerId) {
         this.retireIdentityRoute(pendingTransport);
@@ -1158,6 +1671,13 @@ export class MeshTransport extends EventEmitter {
               Buffer.from(JSON.stringify({ k: 'fr', d: item.bytes.toString('base64') }), 'utf8'),
               transportPeerId.slice(RELAY_TRANSPORT_PREFIX.length),
             );
+          } else if (transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)) {
+            // Promoted direct route living in the upgrade negotiation room.
+            const upgradeAction = this.upgradeAction;
+            if (!upgradeAction) throw new Error('Route upgrade room stopped during send.');
+            void upgradeAction.send(exactArrayBuffer(item.bytes), {
+              target: transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length),
+            });
           } else {
             await action.send(exactArrayBuffer(item.bytes), { target: transportPeerId });
           }
@@ -1263,6 +1783,17 @@ export class MeshTransport extends EventEmitter {
         this.sendTo(sourceId, 'appPong', { pingAt: frame.meta.pingAt });
       } else if (frame.type === 'appPong') {
         this.acceptPong(frame, sourceId);
+      } else if (frame.type === 'routeStatus') {
+        const status = typeof frame.meta.status === 'string' ? frame.meta.status : '';
+        if (status) this.acceptRemoteRouteStatus(sourceId, status);
+      } else if (frame.type === 'routeProbe') {
+        // Candidate-route bidirectional health check: answer on the same
+        // transport the probe arrived on.
+        this.enqueue(
+          transportPeerId,
+          this.createFrame('routeProbeAck', { messageId: newId() }, new Uint8Array()),
+          framePriority('routeProbeAck'),
+        );
       }
       const suppressBootstrapHello = (this.options.purpose ?? 'runtime') === 'runtime'
         && connection.purpose === 'bootstrap'
@@ -1389,13 +1920,20 @@ export class MeshTransport extends EventEmitter {
   }
 
   private async pingTick(): Promise<void> {
-    const room = this.room;
-    if (!room || this.stopped || this.pingInFlight) return;
+    const roomRef = this.room;
+    if ((!roomRef && !this.upgradeRoom) || this.stopped || this.pingInFlight) return;
     this.pingInFlight = true;
     try {
       await Promise.all([...this.connections.values()].map(async (connection) => {
         try {
-          const current = await room.ping(connection.transportPeerId);
+          // Promoted routes live in the upgrade room; ping them there.
+          const isUpgrade = connection.transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX);
+          const room = isUpgrade ? this.upgradeRoom : roomRef;
+          if (!room) return;
+          const rawId = isUpgrade
+            ? connection.transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length)
+            : connection.transportPeerId;
+          const current = await room.ping(rawId);
           if (!Number.isFinite(current) || current < 0) return;
           const bounded = Math.min(60_000, current);
           const previous = this.latency.get(connection.identity.peerId)?.ema ?? bounded;
@@ -1425,6 +1963,7 @@ export class MeshTransport extends EventEmitter {
       for (const [id, timestamp] of ids) if (timestamp < oldest) ids.delete(id);
       if (!ids.size) this.seenIds.delete(peerId);
     }
+    this.pruneRemoteRouteStatuses();
     for (const [transportPeerId, handshake] of this.pendingHandshakes) {
       if ((handshake.admittedAt ?? now) >= now - PENDING_HANDSHAKE_TTL_MS) continue;
       this.pendingHandshakes.delete(transportPeerId);

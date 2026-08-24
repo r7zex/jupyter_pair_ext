@@ -1,16 +1,52 @@
-# Pair Notebook 0.3.3
+# Pair Notebook 0.4.0
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.3.3.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.4.0.vsix` from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.3.3.vsix --force
+code --install-extension .\pair-notebook-0.4.0.vsix --force
 ```
 
-That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule.
+That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
+
+VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are only required on a computer selected to execute notebook cells; text and notebook collaboration itself does not require them.
+
+## How Pair Notebook connects
+
+Pair Notebook tries several independent ways to reach the other participant and always shows which one is currently in use:
+
+1. **Direct P2P** — encrypted WebRTC over ICE (STUN-assisted). Near-ping latency; this is the normal path.
+2. **TURN relay** — when direct paths fail (symmetric NAT, restrictive firewall), WebRTC is relayed through TURN; UDP, TCP and TLS transports are probed at startup and the reachable ones are preferred.
+3. **Encrypted emergency relay** — if ICE cannot build any path (cross-VPN setups, UDP blocked), session frames tunnel as AES-256-GCM ciphertext through public Nostr relays. The session token never reaches the relays.
+
+Signalling runs through multiple health-checked public Nostr relays with reconnection and rotation, so one dead relay does not stall discovery. All WebSocket-based channels honour `http.proxy` from VS Code and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, including SOCKS4/SOCKS5/SOCKS5h proxies. Proxy credentials are never logged or displayed.
+
+## The Connection section
+
+The left Pair Notebook panel shows, per participant:
+
+- the current route (`Direct P2P · WebRTC · 23 мс` or the encrypted-relay fallback) with a colour-coded dot (theme-aware green/yellow/orange/gray plus text labels);
+- an honest assessment: "Соединение уже оптимально" for healthy direct routes, "Возможно доступно более прямое соединение" only when diagnostics support it;
+- live optimization progress ("Проверяем прямой канал… Текущее соединение активно") and remote migration notices ("Иван проверяет лучший маршрут…").
+
+### Try to improve
+
+The **Попробовать улучшить** button launches a safe route-optimization attempt with a make-before-break guarantee:
+
+- the current connection keeps carrying traffic during the whole attempt;
+- a candidate direct connection is built in parallel, authenticated with the same signed identity handshake, pinged and observed through a short stability window;
+- only a proven better candidate is promoted atomically; the old route is retired afterwards;
+- a failed attempt changes nothing — the message is "Улучшить не удалось — текущее соединение сохранено".
+
+The button never modifies VPN/DNS/zapret/firewall/router settings and never requires administrator rights.
+
+## Diagnostics
+
+Passive diagnostics run automatically with ordinary user permissions: adapter classification (VPN/TUN detection), configured-proxy detection, DNS resolution checks of signalling hosts, and TURN probe results that reveal whether UDP appears unavailable on the path. Every conclusion carries an explicit confidence level (confirmed/high/medium/low); filtering software such as zapret/Flowseal is never named as a confirmed cause without direct evidence — correlated symptoms are listed as possible causes instead. Nothing is ever changed on the system by diagnostics.
+
 
 VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are only required on a computer selected to execute notebook cells; text and notebook collaboration itself does not require them.
 
@@ -77,7 +113,7 @@ npm run artifacts
 
 The final artifacts are:
 
-- `pair-notebook-0.3.3.vsix` — installable extension.
-- `pair-notebook-complete-0.3.3.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.4.0.vsix` — installable extension.
+- `pair-notebook-complete-0.4.0.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and [acceptance report](docs/acceptance-report.md) for implementation details.
