@@ -313,6 +313,8 @@ export interface SessionSnapshot {
   autosave: AutosaveStatus;
   /** Per-participant connection view for the sidebar connection section. */
   connections: PeerConnectionView[];
+  /** Signalling families with a live room right now (e.g. nostr, mqtt). */
+  signallingFamilies: string[];
 }
 
 export interface PeerConnectionView {
@@ -643,6 +645,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       waitingForHostFolder: this.waitingForHostFolder,
       autosave: { ...this.autosaveState },
       connections: this.buildConnectionViews(),
+      signallingFamilies: this.transport.activeSignallingFamilies(),
     };
   }
 
@@ -1620,6 +1623,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
     this.transport.on('remoteRouteStatus', (peerId: string, status: string) => {
       this.emit('connectionUpdated', { kind: 'remote-status', peerId, status });
+    });
+    this.transport.on('networkChanged', () => {
+      this.log.appendLine('[debug] Network interfaces changed; re-evaluating routes (make-before-break).');
+      this.emit('connectionUpdated', { kind: 'network-changed' });
     });
   }
 

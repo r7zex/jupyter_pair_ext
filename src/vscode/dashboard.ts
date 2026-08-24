@@ -152,6 +152,7 @@ const commandMap: Record<string, string> = {
   end: 'pairNotebook.endSession',
   transfer: 'pairNotebook.transferHost',
   diagnostics: 'pairNotebook.showDiagnostics',
+  advancedDiag: 'pairNotebook.showAdvancedDiagnostics',
   improve: 'pairNotebook.tryImproveConnection',
   flush: 'pairNotebook.flush',
   autosaveFolder: 'pairNotebook.selectAutosaveFolder',
@@ -492,8 +493,8 @@ function html(): string {
         section('network','СЕТЬ',networkCard)+
         section('cursorsSection','КУРСОРЫ',cursorActions)+
         section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
-        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost||paused})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
-      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','cursorShare','cursors','cursorNames','cursorPeople','cursorColor']) {
+        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost||paused})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
+      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag','cursorShare','cursors','cursorNames','cursorPeople','cursorColor']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
       }

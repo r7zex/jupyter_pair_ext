@@ -88,6 +88,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.transferHost', () => transferHost());
   register(context, 'pairNotebook.showDiagnostics', () => showDiagnostics());
   register(context, 'pairNotebook.tryImproveConnection', () => tryImproveConnection());
+  register(context, 'pairNotebook.showAdvancedDiagnostics', () => showDiagnostics(true));
   register(context, 'pairNotebook.setTurnPassword', async () => {
     const password = await vscode.window.showInputBox({
       prompt: 'TURN password for the configured turnUrls (stored in VS Code secret storage, never in settings or logs)',
@@ -711,7 +712,7 @@ function applyMeshNetworkConfiguration(context: vscode.ExtensionContext): void {
   });
 }
 
-async function showDiagnostics(): Promise<void> {
+async function showDiagnostics(advanced = false): Promise<void> {
   const snapshot = requireRuntime().snapshot();
   // networkDiagnostics is sanitized: no tokens, TURN or proxy credentials.
   const network = (() => {
@@ -739,6 +740,7 @@ async function showDiagnostics(): Promise<void> {
 
   const lines = [
     'PAIR NOTEBOOK NETWORK DIAGNOSTICS',
+    advanced ? 'MODE: advanced (passive, read-only; administrator rights are NOT required and nothing is modified)' : '',
     '',
     ...snapshot.peers.map((peer) => `${peer.displayName.padEnd(20)} ${peer.route.padEnd(8)} ${peer.latency >= 0 ? `${peer.latency} ms` : '—'}  heartbeat ${Math.max(0, Date.now() - peer.lastHeartbeat)} ms`),
     '',

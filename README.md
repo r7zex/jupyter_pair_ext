@@ -1,13 +1,13 @@
-# Pair Notebook 0.4.0
+# Pair Notebook 0.5.0
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.4.0.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.5.0.vsix` from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.4.0.vsix --force
+code --install-extension .\pair-notebook-0.5.0.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
@@ -22,7 +22,7 @@ Pair Notebook tries several independent ways to reach the other participant and 
 2. **TURN relay** — when direct paths fail (symmetric NAT, restrictive firewall), WebRTC is relayed through TURN; UDP, TCP and TLS transports are probed at startup and the reachable ones are preferred.
 3. **Encrypted emergency relay** — if ICE cannot build any path (cross-VPN setups, UDP blocked), session frames tunnel as AES-256-GCM ciphertext through public Nostr relays. The session token never reaches the relays.
 
-Signalling runs through multiple health-checked public Nostr relays with reconnection and rotation, so one dead relay does not stall discovery. All WebSocket-based channels honour `http.proxy` from VS Code and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, including SOCKS4/SOCKS5/SOCKS5h proxies. Proxy credentials are never logged or displayed.
+Signalling runs over TWO independent families concurrently — multiple health-checked public Nostr relays plus a public MQTT broker set — so the failure of one family or relay no longer stalls discovery; a participant discovered through both families still appears exactly once. All WebSocket-based channels honour `http.proxy` from VS Code and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, including SOCKS4/SOCKS5/SOCKS5h proxies. Proxy credentials are never logged or displayed.
 
 ## The Connection section
 
@@ -113,7 +113,7 @@ npm run artifacts
 
 The final artifacts are:
 
-- `pair-notebook-0.4.0.vsix` — installable extension.
-- `pair-notebook-complete-0.4.0.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.5.0.vsix` — installable extension.
+- `pair-notebook-complete-0.5.0.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and [acceptance report](docs/acceptance-report.md) for implementation details.
