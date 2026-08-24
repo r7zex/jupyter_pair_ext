@@ -149,7 +149,7 @@ const PENDING_HANDSHAKE_TTL_MS = 30_000;
 const MESSAGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const BULK_CHUNK_TYPES = new Set(['binaryChunk', 'snapshotFileChunk']);
 const BOOTSTRAP_TO_RUNTIME_TYPES = new Set([
-  'helloAck', 'snapshotRequest', 'snapshotCheckpointAck', 'appPing', 'appPong',
+  'helloAck', 'snapshotRequest', 'snapshotCheckpointAck', 'snapshotFileRetry', 'appPing', 'appPong',
 ]);
 const RUNTIME_TO_BOOTSTRAP_TYPES = new Set([
   'helloAck', 'peerAdmission', 'snapshotBegin', 'snapshotManifest', 'snapshotManifestEnd', 'snapshotDirectory',
@@ -159,7 +159,7 @@ const RUNTIME_TO_BOOTSTRAP_TYPES = new Set([
 const SNAPSHOT_PROTOCOL_TYPES = new Set([
   'snapshotRequest', 'snapshotBegin', 'snapshotManifest', 'snapshotManifestEnd', 'snapshotDirectory',
   'snapshotFileStart', 'snapshotFileChunk', 'snapshotFileEnd', 'snapshotCheckpoint',
-  'snapshotCheckpointAck', 'snapshotEnd', 'snapshotError',
+  'snapshotCheckpointAck', 'snapshotFileRetry', 'snapshotEnd', 'snapshotError',
 ]);
 
 export type PeerConnectionPurpose = 'runtime' | 'bootstrap';
@@ -943,16 +943,45 @@ export class MeshTransport extends EventEmitter {
     }
     const activeTransport = this.identityToTransport.get(identity.peerId);
     if (activeTransport && activeTransport !== transportPeerId) {
-      throw new Error(`Peer identity ${identity.peerId} is already connected.`);
+      // Both call sites verify the identity-proof signature before this point,
+      // so a second handshake for a connected identity comes from the genuine
+      // identity holder re-connecting. A lossy relay route can swallow the old
+      // route's leave event, and the zombie mapping would then reject the
+      // peer's only live route forever. Retire the stale route and admit.
+      this.retireIdentityRoute(activeTransport);
     }
     for (const [pendingTransport, pending] of this.pendingHandshakes) {
       if (pendingTransport !== transportPeerId && pending.peer.peerId === identity.peerId) {
-        throw new Error(`Peer identity ${identity.peerId} is already connecting.`);
+        this.retireIdentityRoute(pendingTransport);
       }
     }
     const conflictingPeer = this.connectedDisplayNameOwner(identity, transportPeerId);
     if (conflictingPeer) {
       throw new Error(`Display name is already in use: ${conflictingPeer.displayName}.`);
+    }
+  }
+
+  /**
+   * Drops one transport route of an identity whose holder has just completed
+   * a fresh, signature-verified handshake on another route. Only the genuine
+   * identity holder can reach that point, so this can never be abused to
+   * evict a live peer; it only clears zombie mappings whose leave event was
+   * lost (typically over the lossy Nostr relay) or settles a simultaneous
+   * dual-path handshake in favour of the route that completed last.
+   */
+  private retireIdentityRoute(transportPeerId: string): void {
+    try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* best effort */ }
+    this.pendingHandshakes.delete(transportPeerId);
+    this.takePendingInboundFrames(transportPeerId);
+    const connection = this.connections.get(transportPeerId);
+    this.connections.delete(transportPeerId);
+    this.outboundQueues.delete(transportPeerId);
+    this.inboundWindows.delete(transportPeerId);
+    if (!connection) return;
+    this.seenIds.delete(connection.identity.peerId);
+    this.latency.delete(connection.identity.peerId);
+    if (this.identityToTransport.get(connection.identity.peerId) === transportPeerId) {
+      this.identityToTransport.delete(connection.identity.peerId);
     }
   }
 
