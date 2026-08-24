@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Passive network diagnostics for Pair Notebook.
  *
  * Everything in this module runs with ordinary user permissions and never
@@ -193,4 +193,3 @@ export async function buildNetworkDiagnostics(input: DiagnosticsInput = {}): Pro
 
   return { observations, udp, proxy, vpnTunDetected, dnsFailures };
 }
-

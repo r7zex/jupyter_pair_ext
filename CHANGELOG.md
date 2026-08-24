@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 - 2026-08-24 (secondary signalling family, route policy, network-change recovery)
+
+- **Secondary signalling family (MQTT)**: Pair Notebook now joins a concurrent MQTT-signalling room (`@trystero-p2p/mqtt`, public WSS brokers) in addition to Nostr. Failure of one signalling family no longer kills discovery: peers met through the surviving family connect with the full signed identity handshake. The same logical participant discovered through BOTH families appears exactly once — a provably-alive incumbent transport wins deterministically, the duplicate is closed, and zombie/lost-leave retirement semantics are unchanged. After the winning route dies, the peer is re-discovered through the surviving family. Failures of the secondary family are fully contained and never affect the primary.
+- **Route-selection policy** (`src/runtime/routeScoring.ts`): explicit hysteresis for make-before-break promotion — relay→direct always migrates when verified; direct→direct requires a ≥20% RTT improvement plus zero recent failures; direct→relay never happens. The policy is the final gate inside `promoteCandidate`.
+- **Passive network-change detection** (`src/runtime/netWatch.ts`): fingerprints adapter/address sets on a slow timer; a change triggers a BOUNDED search for better routes (fresh relay negotiation round for unmapped peers, one safe improvement attempt per relay-routed peer). A healthy active route is never torn down by the event.
+- **Advanced diagnostics entry point**: new command `Pair Notebook: Run Advanced Network Diagnostics` plus an explicit sidebar button; the report header states the permission model — everything is passive/read-only and never requires elevation.
+- New deterministic tests for all of the above (signalling failover/dedupe/recovery, migration-policy hysteresis incl. the "1 ms gain must not flap" case, change-detection fingerprinting); the in-memory Trystero test harness now implements real `close()` room-peer semantics. 210 tests passing.
+- Live evidence recorded: public Nostr/WebRTC smoke passes from this environment; public MQTT brokers were unreachable at test time (`ECONNRESET`) — the secondary family degrades gracefully by design; `npm run test:live:mqtt` re-checks it.
+
 ## 0.4.0 - 2026-08-24 (connection quality, make-before-break route optimization)
 
 - New **Connection** section in the left Pair Notebook panel: per-participant route type (direct P2P / encrypted relay fallback), measured latency, theme-aware colour-coded quality dot with text labels (never colour alone), and an evidence-based assessment ("Соединение уже оптимально" vs "Возможно доступно более прямое соединение").

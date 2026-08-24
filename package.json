@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "pair-notebook",
   "license": "MIT",
   "engines": {
@@ -147,6 +147,10 @@
       {
         "command": "pairNotebook.openRecentProject",
         "title": "Pair Notebook: Open Recent Project"
+      },
+      {
+        "command": "pairNotebook.showAdvancedDiagnostics",
+        "title": "Pair Notebook: Run Advanced Network Diagnostics"
       }
     ],
     "viewsContainers": {
@@ -290,10 +294,12 @@
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
     "package": "npm run clean && npm run lint && npm test && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
-    "artifacts": "npm run package && node scripts/make-artifacts.mjs"
+    "artifacts": "npm run package && node scripts/make-artifacts.mjs",
+    "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs "
   },
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",
+    "@trystero-p2p/mqtt": "^0.25.3",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",

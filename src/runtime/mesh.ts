@@ -8,6 +8,7 @@ import {
   type NostrRoomConfig,
   type Room,
 } from 'trystero';
+import { joinRoom as joinMqttRoom } from '@trystero-p2p/mqtt';
 import {
   generateIdentityCredentials,
   newIdentityNonce,
@@ -41,6 +42,8 @@ import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
 import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
 import { NostrFrameRelay } from './nostrRelay';
 import { assessUdpAvailability } from './diagnostics';
+import { shouldMigrateRoute } from './routeScoring';
+import { NetworkChangeWatcher } from './netWatch';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -109,6 +112,15 @@ export interface MeshNetworkConfig {
 }
 
 const RELAY_TRANSPORT_PREFIX = 'relay:';
+/**
+ * Transport-id prefix for peers discovered through the SECONDARY signalling
+ * family (MQTT). Both families run concurrently and may discover the same
+ * logical participant twice; assertPeerCanJoin deduplicates them by keeping
+ * the already-connected transport while it is provably fresh.
+ */
+export const MQTT_TRANSPORT_PREFIX = 'mqtt:';
+/** A connected transport younger than this is not replaced by a duplicate. */
+export const DUPLICATE_HANDSHAKE_WINDOW_MS = 20_000;
 /**
  * Transport-id prefix for peers met inside the dedicated route-upgrade room.
  * A candidate direct connection created by "Try to improve" is fully built
@@ -221,6 +233,10 @@ export interface MeshOptions {
   hostReady?: () => boolean;
   purpose?: PeerConnectionPurpose;
   roomFactory?: TrysteroRoomFactory;
+  /** Test hook: builds the SECONDARY (MQTT) signalling room. */
+  secondaryRoomFactory?: TrysteroRoomFactory;
+  /** Disables the concurrent MQTT signalling family (default: enabled). */
+  disableSecondarySignalling?: boolean;
   /** Required by production callers; omitted tests receive an ephemeral key. */
   identityPrivateKey?: string;
 }
@@ -341,6 +357,11 @@ export class MeshTransport extends EventEmitter {
   private upgradeRoom: Room | undefined;
   private upgradeAction: MessageAction<ArrayBuffer> | undefined;
   private upgradeJoining = false;
+  /** Secondary (MQTT) signalling family: runs concurrently with Nostr. */
+  private mqttRoom: Room | undefined;
+  private mqttAction: MessageAction<ArrayBuffer> | undefined;
+  private mqttJoining = false;
+  private readonly networkWatcher = new NetworkChangeWatcher(() => this.onNetworkChanged());
   /** Rate-limited remote migration notices for the participants panel. */
   private readonly remoteRouteStatuses = new Map<string, { status: string; at: number }>();
   private lastRemoteStatusSentAt = 0;
@@ -390,7 +411,22 @@ export class MeshTransport extends EventEmitter {
     const callbacks: JoinRoomCallbacks = {
       handshakeTimeoutMs: 15_000,
       onPeerHandshake: async (transportPeerId, send, receive, isInitiator) => {
-        await this.runPeerHandshake(transportPeerId, send as (data: unknown) => Promise<void>, receive as () => Promise<{ data: unknown }>, isInitiator);
+        try {
+          await this.runPeerHandshake(
+            transportPeerId,
+            send as (data: unknown) => Promise<void>,
+            receive as () => Promise<{ data: unknown }>,
+            isInitiator,
+          );
+        } catch (error) {
+          if (isDuplicatePeerError(error)) {
+            // Same participant already connected via the other signalling
+            // family: close this duplicate transport instead of admitting it.
+            try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* gone */ }
+            return;
+          }
+          throw error;
+        }
       },
       onJoinError: (details) => this.onJoinError(details),
     };
@@ -426,8 +462,124 @@ export class MeshTransport extends EventEmitter {
       setInterval(() => this.cleanupSeenIds(), 10_000),
       setInterval(() => this.relaySweepTick(), 20_000),
     ];
+    // Secondary signalling family and passive network-change watching are
+    // strictly additive: neither can affect an already-working session.
+    try { this.startSecondarySignalling(); } catch { /* primary stays up */ }
+    if (!this.options.roomFactory && !MeshTransport.testingRoomFactory) {
+      this.networkWatcher.start();
+    }
     if (restarting) this.emit('restarted');
     return 0;
+  }
+
+  /**
+   * Opens the SECONDARY signalling room (MQTT strategy). It runs
+   * concurrently with the Nostr room so the failure of one public signalling
+   * family does not kill discovery; duplicate discoveries of the same logical
+   * participant are deduplicated at admission time. Failures here are
+   * contained: the primary Nostr room is never affected.
+   */
+  private startSecondarySignalling(): void {
+    if (this.mqttRoom || this.stopped || this.options.disableSecondarySignalling) return;
+    const testFactory = this.options.roomFactory || MeshTransport.testingRoomFactory;
+    const factory = this.options.secondaryRoomFactory ?? (testFactory ? undefined : joinMqttRoom);
+    if (!factory) return;
+    this.mqttJoining = true;
+    try {
+      const config: NostrRoomConfig = {
+        appId: TRYSTERO_APP_ID,
+        password: this.options.token,
+        rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
+        turnConfig: this.buildTurnConfig(),
+      };
+      this.mqttRoom = factory(config, `${this.options.sessionId}`, {
+        handshakeTimeoutMs: 15_000,
+        onPeerHandshake: async (rawId, send, receive, isInitiator) => {
+          try {
+            await this.runPeerHandshake(
+              MQTT_TRANSPORT_PREFIX + rawId,
+              send as (data: unknown) => Promise<void>,
+              receive as () => Promise<{ data: unknown }>,
+              isInitiator,
+            );
+          } catch (error) {
+            if (isDuplicatePeerError(error)) {
+              // The same logical participant is already connected through the
+              // other signalling family: drop this duplicate transport.
+              try { this.mqttRoom?.getPeers()[rawId]?.close(); } catch { /* already gone */ }
+              return;
+            }
+            throw error;
+          }
+        },
+        onJoinError: () => undefined,
+      });
+      this.mqttAction = this.mqttRoom.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
+      this.mqttAction.onMessage = (data, { peerId }) =>
+        this.handleAction(data, MQTT_TRANSPORT_PREFIX + peerId);
+      this.mqttRoom.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
+      this.mqttRoom.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
+    } catch {
+      this.mqttRoom = undefined;
+      this.mqttAction = undefined;
+    } finally {
+      this.mqttJoining = false;
+    }
+  }
+
+  /** Resolves the room/action pair owning a transport id. */
+  private roomForTransport(transportPeerId: string): {
+    room: Room | undefined;
+    action: MessageAction<ArrayBuffer> | undefined;
+    rawId: string;
+  } {
+    if (transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)) {
+      return {
+        room: this.mqttRoom,
+        action: this.mqttAction,
+        rawId: transportPeerId.slice(MQTT_TRANSPORT_PREFIX.length),
+      };
+    }
+    if (transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)) {
+      return {
+        room: this.upgradeRoom,
+        action: this.upgradeAction,
+        rawId: transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length),
+      };
+    }
+    return { room: this.room, action: this.action, rawId: transportPeerId };
+  }
+
+  /**
+   * Bounded reaction to a network change: NEVER tears down a healthy route.
+   * The change is only used as a reason to search for alternatives - relay
+   * fallback for unmapped peers and a safe improvement attempt for peers
+   * stuck on the emergency relay. All guards inside those paths apply.
+   */
+  private onNetworkChanged(): void {
+    if (this.stopped) return;
+    this.emit('networkChanged');
+    for (const peerId of this.directory.keys()) {
+      if (peerId === this.options.localPeer.peerId) continue;
+      if (!this.identityToTransport.has(peerId) && !this.relayNegotiations.has(peerId)) {
+        this.relayAttempts.delete(peerId); // allow one fresh negotiation round
+        this.considerRelayFallback(peerId);
+      }
+    }
+    for (const peerId of [...this.identityToTransport.keys()]) {
+      const transportId = this.identityToTransport.get(peerId);
+      if (transportId?.startsWith(RELAY_TRANSPORT_PREFIX) && !this.routeUpgrades.has(peerId)) {
+        this.tryImproveRoute(peerId);
+      }
+    }
+  }
+
+  /** Signalling families with a live room right now (diagnostics/UI). */
+  public activeSignallingFamilies(): string[] {
+    const families: string[] = [];
+    if (this.room) families.push('nostr');
+    if (this.mqttRoom) families.push('mqtt');
+    return families;
   }
 
   /**
@@ -512,6 +664,7 @@ export class MeshTransport extends EventEmitter {
       proxy: describeProxy(resolveSignallingProxy('wss://nos.lol')),
       stunServers: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
       udpAvailability: assessUdpAvailability(this.turnProbes ?? []),
+      signallingFamilies: this.activeSignallingFamilies(),
       relayFallback: {
         enabled: !meshNetworkConfig.disableRelayFallback,
         connectedRelays: this.relay?.connectedRelayCount ?? 0,
@@ -1067,6 +1220,21 @@ public improvablePeerIds(): string[] {
   private promoteCandidate(upgrade: RouteUpgrade, measuredRttMs: number): void {
     const key = upgrade.candidateTransportId!;
     if (upgrade.status === 'promoting' || upgrade.status === 'completed') return;
+    // Route-selection policy (hysteresis + minimum improvement): the final
+    // gate before promotion. The candidate already passed authentication and
+    // the stability window; this only rejects migrations that would not be a
+    // MEANINGFUL improvement.
+    const previousTransportId = this.identityToTransport.get(upgrade.peerId) ?? '';
+    const decision = shouldMigrateRoute({
+      kind: previousTransportId.startsWith(RELAY_TRANSPORT_PREFIX) ? 'relay' : 'direct',
+      rttMs: this.latency.get(upgrade.peerId)?.ema ?? -1,
+      recentFailures: 0,
+    }, { kind: 'direct', rttMs: measuredRttMs, recentFailures: 0 });
+    if (!decision.migrate) {
+      this.discardCandidate(upgrade);
+      this.failRouteUpgrade(upgrade, `Route selection kept the current connection (${decision.reason}).`);
+      return;
+    }
     upgrade.status = 'promoting';
     this.emitRouteUpgradeEvent(upgrade);
     const previous = this.identityToTransport.get(upgrade.peerId);
@@ -1379,8 +1547,13 @@ public improvablePeerIds(): string[] {
     const upgradeRoom = this.upgradeRoom;
     this.upgradeRoom = undefined;
     this.upgradeAction = undefined;
+    const mqttRoom = this.mqttRoom;
+    this.mqttRoom = undefined;
+    this.mqttAction = undefined;
     this.remoteRouteStatuses.clear();
+    this.networkWatcher.stop();
     if (upgradeRoom) await upgradeRoom.leave().catch(() => undefined);
+    if (mqttRoom) await mqttRoom.leave().catch(() => undefined);
   }
 
   private localHandshake(): HandshakeMessage {
@@ -1455,9 +1628,19 @@ public improvablePeerIds(): string[] {
     if (activeTransport && activeTransport !== transportPeerId && !isUpgradeCandidate) {
       // Both call sites verify the identity-proof signature before this point,
       // so a second handshake for a connected identity comes from the genuine
-      // identity holder re-connecting. A lossy relay route can swallow the old
-      // route's leave event, and the zombie mapping would then reject the
-      // peer's only live route forever. Retire the stale route and admit.
+      // identity holder re-connecting. If the existing route is provably ALIVE
+      // at its room level, this is the SAME participant discovered through the
+      // other signalling family: keep the incumbent (deterministic, no
+      // flapping) and let the caller drop the duplicate. A dead or zombie
+      // route - lost leave events, vanished trystero peers - has no live room
+      // peer and is retired below exactly as before, so lost-leave recovery
+      // is unchanged.
+      const existing = this.connections.get(activeTransport);
+      const activeOwner = this.roomForTransport(activeTransport);
+      const roomPeerAlive = Boolean(activeOwner.room?.getPeers()[activeOwner.rawId]);
+      if (existing && roomPeerAlive && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
+        throw new DuplicateSignallingPeerError(identity.peerId);
+      }
       this.retireIdentityRoute(activeTransport);
     }
     // An explicit make-before-break upgrade keeps the working route mapped
@@ -1506,6 +1689,19 @@ public improvablePeerIds(): string[] {
       this.rejectProtocolPeer(transportPeerId, new Error(`Trystero admitted peer ${transportPeerId} without a completed handshake.`));
       return;
     }
+    // Centralized duplicate-signalling dedupe: the same signed identity can
+    // complete handshakes in BOTH families around the same moment. Whichever
+    // transport is admitted first wins while it is provably fresh; the other
+    // one is closed instead of creating a second live route for the identity.
+        const active = this.identityToTransport.get(handshake.peer.peerId);
+    if (active && active !== transportPeerId) {
+      const existing = this.connections.get(active);
+      if (existing && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
+        const owner = this.roomForTransport(transportPeerId);
+        try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* already gone */ }
+        return;
+      }
+    }
     const connection: ConnectedPeer = {
       transportPeerId,
       identity: handshake.peer,
@@ -1536,6 +1732,13 @@ public improvablePeerIds(): string[] {
   }
 
   private onPeerLeave(transportPeerId: string): void {
+    // Propagate the death to the room level so the REMOTE side also learns
+    // its route died (otherwise a half-dead route stays "fresh" there and
+    // blocks symmetric recovery through the surviving signalling family).
+    try {
+      const owner = this.roomForTransport(transportPeerId);
+      owner.room?.getPeers()[owner.rawId]?.close();
+    } catch { /* best-effort propagation */ }
     this.pendingHandshakes.delete(transportPeerId);
     this.takePendingInboundFrames(transportPeerId);
     const connection = this.connections.get(transportPeerId);
@@ -1678,6 +1881,13 @@ public improvablePeerIds(): string[] {
             void upgradeAction.send(exactArrayBuffer(item.bytes), {
               target: transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length),
             });
+          } else if (transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)) {
+            // Direct route discovered through the secondary signalling family.
+            const mqttChannel = this.mqttAction;
+            if (!mqttChannel) throw new Error('MQTT signalling stopped during send.');
+            void mqttChannel.send(exactArrayBuffer(item.bytes), {
+              target: transportPeerId.slice(MQTT_TRANSPORT_PREFIX.length),
+            });
           } else {
             await action.send(exactArrayBuffer(item.bytes), { target: transportPeerId });
           }
@@ -1711,7 +1921,7 @@ public improvablePeerIds(): string[] {
     const connection = this.connections.get(transportPeerId);
     if (!connection) return;
     try {
-      this.room?.getPeers()[transportPeerId]?.close();
+      this.roomForTransport(transportPeerId).room?.getPeers()[this.roomForTransport(transportPeerId).rawId]?.close();
     } catch {
       // Local cleanup below does not depend on RTC close succeeding.
     }
@@ -1866,7 +2076,8 @@ public improvablePeerIds(): string[] {
   private rejectProtocolPeer(transportPeerId: string, value: unknown): void {
     const error = value instanceof Error ? value : new Error(String(value));
     try {
-      this.room?.getPeers()[transportPeerId]?.close();
+      const owner = this.roomForTransport(transportPeerId);
+      owner.room?.getPeers()[owner.rawId]?.close();
     } catch {
       // Local cleanup below is authoritative even if the RTC implementation has
       // already closed the connection.
@@ -1921,19 +2132,16 @@ public improvablePeerIds(): string[] {
 
   private async pingTick(): Promise<void> {
     const roomRef = this.room;
-    if ((!roomRef && !this.upgradeRoom) || this.stopped || this.pingInFlight) return;
+    if ((!roomRef && !this.upgradeRoom && !this.mqttRoom) || this.stopped || this.pingInFlight) return;
     this.pingInFlight = true;
     try {
       await Promise.all([...this.connections.values()].map(async (connection) => {
         try {
-          // Promoted routes live in the upgrade room; ping them there.
-          const isUpgrade = connection.transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX);
-          const room = isUpgrade ? this.upgradeRoom : roomRef;
+          // Promoted routes and MQTT-family routes live in their own rooms.
+          const owner = this.roomForTransport(connection.transportPeerId);
+          const room = owner.room;
           if (!room) return;
-          const rawId = isUpgrade
-            ? connection.transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length)
-            : connection.transportPeerId;
-          const current = await room.ping(rawId);
+          const current = await room.ping(owner.rawId);
           if (!Number.isFinite(current) || current < 0) return;
           const bounded = Math.min(60_000, current);
           const previous = this.latency.get(connection.identity.peerId)?.ema ?? bounded;
@@ -1968,7 +2176,8 @@ public improvablePeerIds(): string[] {
       if ((handshake.admittedAt ?? now) >= now - PENDING_HANDSHAKE_TTL_MS) continue;
       this.pendingHandshakes.delete(transportPeerId);
       this.takePendingInboundFrames(transportPeerId);
-      try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* best effort */ }
+      const owner = this.roomForTransport(transportPeerId);
+      try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* best effort */ }
       this.emit('protocolError', new Error(`Expired incomplete peer admission ${transportPeerId}.`));
     }
   }
@@ -2149,6 +2358,22 @@ function delay(ms: number): Promise<void> {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Thrown when a fully verified handshake arrives for a participant whose
+ * existing transport is still provably fresh: this is the same logical peer
+ * discovered through the second signalling family, not a reconnection.
+ */
+class DuplicateSignallingPeerError extends Error {
+  public constructor(public readonly identityPeerId: string) {
+    super(`Peer identity ${identityPeerId} is already connected through another signalling family.`);
+    this.name = 'DuplicateSignallingPeerError';
+  }
+}
+
+function isDuplicatePeerError(error: unknown): boolean {
+  return error instanceof DuplicateSignallingPeerError;
 }
 
 function ensureWebSocketRuntime(): void {
