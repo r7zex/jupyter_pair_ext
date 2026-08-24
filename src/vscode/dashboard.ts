@@ -32,6 +32,24 @@ interface DashboardState {
   runtimeState?: string;
   runtimeDetail?: string;
   waitingForHostFolder?: boolean;
+  /** Connection-quality section rendered at the top of the sidebar. */
+  connection?: DashboardConnection;
+}
+
+export interface DashboardConnection {
+  peers: Array<{
+    id: string;
+    name: string;
+    routeType: 'direct' | 'relay';
+    latencyMs: number;
+    quality: 'good' | 'degraded' | 'unknown';
+    upgradeStatus?: string;
+    remoteStatus?: string;
+  }>;
+  optimizing: boolean;
+  statusLine?: string;
+  assessment: string;
+  canImprove: boolean;
 }
 
 export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -134,6 +152,8 @@ const commandMap: Record<string, string> = {
   end: 'pairNotebook.endSession',
   transfer: 'pairNotebook.transferHost',
   diagnostics: 'pairNotebook.showDiagnostics',
+  advancedDiag: 'pairNotebook.showAdvancedDiagnostics',
+  improve: 'pairNotebook.tryImproveConnection',
   flush: 'pairNotebook.flush',
   autosaveFolder: 'pairNotebook.selectAutosaveFolder',
   autosaveNow: 'pairNotebook.createAutosave',
@@ -229,6 +249,57 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
     runtimeState: snapshot.runtimeState,
     runtimeDetail: snapshot.runtimeDetail,
     waitingForHostFolder: snapshot.waitingForHostFolder,
+    connection: buildConnectionView(snapshot),
+  };
+}
+
+const UPGRADE_STATUS_LINES: Record<string, string> = {
+  requesting: '↻ Проверяем возможность прямого соединения…',
+  'waiting-peer': '↻ Согласуем проверку нового маршрута…',
+  authenticating: '↻ Проверяем новое соединение…',
+  verifying: '↻ Проверяем стабильность прямого канала…',
+  promoting: '↻ Переключаемся на лучшее соединение…',
+  completed: '✓ Соединение улучшено',
+};
+
+/**
+ * Evidence-based assessment for the sidebar. A relay route means direct ICE
+ * previously failed, so a better path MAY exist - phrased as possibility,
+ * never as certainty. Direct routes are reported as optimal without
+ * speculative claims.
+ */
+function buildConnectionView(snapshot: SessionSnapshot): DashboardConnection | undefined {
+  const connections = (snapshot as unknown as { connections?: Array<import('../runtime/session').PeerConnectionView> }).connections;
+  if (!connections) return undefined;
+  const peers = connections.map((connection) => ({
+    id: connection.peerId,
+    name: connection.displayName,
+    routeType: connection.routeType,
+    latencyMs: connection.latencyMs,
+    quality: connection.routeType === 'direct'
+      ? (connection.latencyMs >= 0 && connection.latencyMs <= 120 ? 'good' as const : 'unknown' as const)
+      : 'degraded' as const,
+    ...(connection.upgradeStatus ? { upgradeStatus: connection.upgradeStatus } : {}),
+    ...(connection.remoteStatus ? { remoteStatus: connection.remoteStatus } : {}),
+  }));
+  const optimizing = peers.some((peer) => peer.upgradeStatus
+    && !['completed', 'failed'].includes(peer.upgradeStatus));
+  const activeUpgrade = connections.find((connection) => connection.upgradeStatus);
+  const statusLine = optimizing && activeUpgrade?.upgradeStatus
+    ? UPGRADE_STATUS_LINES[activeUpgrade.upgradeStatus]
+    : undefined;
+  const relayPeer = peers.find((peer) => peer.routeType === 'relay');
+  let assessment: string;
+  if (optimizing) assessment = 'Текущее соединение продолжает работать';
+  else if (relayPeer) assessment = 'Возможно доступно более прямое соединение';
+  else if (peers.length === 0) assessment = '';
+  else assessment = '✓ Соединение уже оптимально';
+  return {
+    peers,
+    optimizing,
+    ...(statusLine ? { statusLine } : {}),
+    assessment,
+    canImprove: Boolean(relayPeer) || optimizing,
   };
 }
 
@@ -297,6 +368,13 @@ function html(): string {
     .section { position: relative; overflow: visible; border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); border-radius: 6px; margin: 10px 0; background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background)); }
     .section > h2 { padding: 7px 8px; border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); background: var(--vscode-sideBarSectionHeader-background, var(--vscode-editorWidget-background)); }
     .section-content { padding: 7px; }
+    .section-connection { border-left: 3px solid var(--vscode-charts-green, var(--vscode-testing-iconPassed)); }
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
+    .q-good { background: var(--vscode-charts-green, #89d185); }
+    .q-degraded { background: var(--vscode-charts-orange, #d18616); }
+    .q-unknown { background: var(--vscode-descriptionForeground); opacity: .7; }
+    .q-warn { color: var(--vscode-editorWarning-foreground); }
+    .q-ok { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
     .section-participants { border-left: 3px solid var(--vscode-charts-blue, var(--vscode-focusBorder)); }
     .section-compute { border-left: 3px solid var(--vscode-charts-yellow, var(--vscode-editorWarning-foreground)); }
     .card { border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; margin: 4px 0; padding: 7px; background: var(--vscode-sideBar-background); }
@@ -329,6 +407,7 @@ function html(): string {
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const duration = (seconds) => [Math.floor(seconds/3600), Math.floor(seconds/60)%60, seconds%60].map(x => String(x).padStart(2,'0')).join(':');
     const bytes = (value) => value < 1024 ? value + ' B/s' : (value/1024).toFixed(1) + ' KB/s';
+    const qualityLabel = (quality) => quality === 'good' ? 'хорошее соединение' : quality === 'degraded' ? 'резервное соединение' : 'качество определяется';
     const stateNames = { connecting:'Подключение', connected:'Подключено', syncing:'Синхронизация', ready:'Готово', executing:'Выполнение', 'waiting-for-stdin':'Ожидание ввода', reconnecting:'Переподключение', 'host-unavailable':'Хост недоступен', 'executor-unavailable':'Вычислитель недоступен', 'waiting-for-host-folder':'Пауза: нужна папка нового хоста', 'kernel-starting':'Запуск ядра', 'kernel-failed':'Ошибка ядра', 'file-synchronization-failed':'Ошибка синхронизации файлов' };
     const kernelNames = { Idle:'ожидает', Busy:'занято', Offline:'выключено' };
     const palette = [['красный','#F44336'],['оранжевый','#FF9800'],['жёлтый','#FFEB3B'],['зелёный','#4CAF50'],['голубой','#4FC3F7'],['синий','#2196F3'],['фиолетовый','#9C27B0'],['розовый','#E91E63'],['белый','#FFFFFF'],['серый','#9E9E9E']];
@@ -371,6 +450,29 @@ function html(): string {
       const onlineParticipants = (state.participants || []).filter(p => p.online);
       const people = onlineParticipants.map(p => '<div class="card participant"><div class="row"><strong>🟢 '+esc(p.name)+'</strong><span>'+ (p.latency >= 0 ? p.latency+' мс' : '—') +'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>').join('') || '<div class="tiny">Нет подключённых участников</div>';
       const connectionState = connection();
+      const conn = state.connection;
+      const remoteStatusLines = { 'checking-better-route': 'проверяет лучший маршрут…', 'switching-path': 'переключает сетевой путь…', 'switched-path': 'сменил(а) сетевой путь' };
+      const upgradeLines = { requesting: 'Проверяем возможность прямого соединения…', 'waiting-peer': 'Согласуем проверку нового маршрута…', authenticating: 'Проверяем новое соединение…', verifying: 'Проверяем стабильность прямого канала…', promoting: 'Переключаемся на лучшее соединение…', completed: 'Соединение улучшено', failed: 'Улучшить не удалось — текущее соединение сохранено' };
+      let connCard = '<div class="tiny">Нет подключённых участников</div>';
+      if (conn && conn.peers.length) {
+        const rows = conn.peers.map(p => {
+          const cls = p.quality === 'good' ? 'q-good' : p.quality === 'degraded' ? 'q-degraded' : 'q-unknown';
+          const routeLabel = p.routeType === 'direct' ? 'Прямой P2P · WebRTC' : 'Резервный шифрованный релей';
+          const rtt = p.latencyMs >= 0 ? ' · ' + p.latencyMs + ' мс' : '';
+          let line = '<div class="row"><span class="dot ' + cls + '" role="img" aria-label="' + esc(qualityLabel(p.quality)) + '"></span><strong>' + esc(p.name) + '</strong><span class="muted">' + esc(routeLabel) + esc(rtt) + '</span></div>';
+          if (p.upgradeStatus && !['completed','failed'].includes(p.upgradeStatus)) {
+            line += '<div class="tiny q-warn">↻ ' + esc(upgradeLines[p.upgradeStatus] || 'Проверяем лучший маршрут…') + ' Текущее соединение активно.</div>';
+          } else if (p.upgradeStatus === 'failed') {
+            line += '<div class="tiny q-warn">△ Улучшить не удалось — текущее соединение сохранено</div>';
+          } else if (p.remoteStatus) {
+            line += '<div class="tiny q-warn">' + esc(p.name) + ' ' + esc(remoteStatusLines[p.remoteStatus] || 'меняет соединение…') + '</div>';
+          }
+          return line;
+        }).join('');
+        const assessmentCls = conn.optimizing ? 'q-warn' : (conn.peers.some(p => p.routeType === 'relay') ? 'q-warn' : 'q-ok');
+        const improveBtn = action('improve', 'Попробовать улучшить', conn.optimizing ? 'ПРОВЕРЯЕМ…' : 'ЗАПУСТИТЬ', { disabled: conn.optimizing, secondary: true, wide: true, title: 'Текущее соединение не будет разорвано: новый путь проверяется параллельно' });
+        connCard = '<div class="card">' + rows + '<div class="tiny ' + assessmentCls + '">' + esc(conn.assessment) + '</div>' + improveBtn + '</div>';
+      }
       const statusCard = '<div class="card"><strong>'+esc(stateNames[state.runtimeState]||state.runtimeState)+'</strong><div class="tiny">'+esc(state.runtimeDetail)+'</div></div>';
       const hostCard = '<div class="card"><strong>👑 '+esc(state.hostName)+'</strong></div>';
       const computeCard = '<div class="card"><div class="row"><strong>🖥 '+esc(state.compute?.name)+'</strong><span class="badge">'+esc(state.compute?.device)+'</span></div><div class="tiny">'+esc(state.compute?.cpu)+'</div><div class="tiny">'+esc(state.compute?.execution)+'</div><div class="tiny">Python '+esc(state.compute?.python)+' • '+esc(kernelNames[state.compute?.kernel]||state.compute?.kernel)+'</div></div>';
@@ -383,6 +485,7 @@ function html(): string {
       const endAction = state.isHost ? action('end','Завершить сессию','ДЛЯ ВСЕХ',{danger:true,disabled:paused,title:'Завершить сессию для всех участников'}) : '';
       const pauseNotice = paused ? '<div class="card"><strong>Совместная сессия приостановлена</strong><div class="tiny">'+esc(state.isHost?'Выберите папку на этом компьютере. Текущее состояние будет полностью записано туда перед продолжением.':'Новый хост выбирает папку на своём компьютере. Дождитесь продолжения сессии.')+'</div></div>' : '';
       root.innerHTML = '<div class="connection '+connectionState.className+'">'+esc(connectionState.text)+'</div><div class="titleline"><div class="title">'+esc(state.projectName)+'</div><span class="badge" title="Режим сессии">'+esc(state.mode)+'</span></div><div class="muted">'+duration(state.durationSeconds||0)+'</div>'+pauseNotice+
+        section('connectionSection','СОЕДИНЕНИЕ',connCard,'section-connection')+
         section('status','СОСТОЯНИЕ',statusCard)+
         section('host','ХОСТ СЕССИИ',hostCard)+
         section('participants','УЧАСТНИКИ В СЕТИ: '+onlineParticipants.length,people,'section-participants')+
@@ -390,8 +493,8 @@ function html(): string {
         section('network','СЕТЬ',networkCard)+
         section('cursorsSection','КУРСОРЫ',cursorActions)+
         section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
-        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost||paused})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
-      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','cursorShare','cursors','cursorNames','cursorPeople','cursorColor']) {
+        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost||paused})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
+      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag','cursorShare','cursors','cursorNames','cursorPeople','cursorColor']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
       }

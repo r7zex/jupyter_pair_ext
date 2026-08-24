@@ -86,7 +86,7 @@ import {
   MAX_TRANSFER_BYTES,
   validateIncomingTransfer,
 } from '../core/transfer';
-import { MeshMetrics, MeshTransport } from './mesh';
+import { MeshMetrics, MeshTransport, RouteUpgradeState, RouteUpgradeStatus } from './mesh';
 
 export interface PresenceState {
   peer: PeerIdentity;
@@ -133,6 +133,8 @@ interface RenameOrigin {
 
 /** Small chunks let live edits overtake bulk transfers instead of waiting behind megabytes of buffered data. */
 const BINARY_CHUNK_SIZE = DEFAULT_TRANSFER_CHUNK_SIZE;
+/** How many recent snapshot file transfers stay retransmittable for lossy relay routes. */
+const MAX_SENT_SNAPSHOT_TRANSFERS = 256;
 /** A transfer that makes no progress for this long is abandoned and cleaned up. */
 const BINARY_IDLE_TIMEOUT_MS = 60_000;
 const MAX_ACTIVE_BINARY_TRANSFERS = 16;
@@ -274,6 +276,22 @@ interface SnapshotSource {
   absolutePath?: string;
 }
 
+/**
+ * Metadata for a snapshot file transfer already announced to a joining peer.
+ * A lossy relay route can silently drop chunk frames while their end frame
+ * still arrives, so the receiver asks for exactly the missing indices and the
+ * host re-reads them from this record instead of restarting the snapshot.
+ */
+interface SentSnapshotTransfer {
+  peerId: string;
+  relativePath: string;
+  size: number;
+  chunkSize: number;
+  chunks: number;
+  bytes?: Uint8Array;
+  absolutePath?: string;
+}
+
 export interface SessionSnapshot {
   descriptor: SessionDescriptor;
   clock: HostClock;
@@ -293,6 +311,20 @@ export interface SessionSnapshot {
   isHost: boolean;
   waitingForHostFolder: boolean;
   autosave: AutosaveStatus;
+  /** Per-participant connection view for the sidebar connection section. */
+  connections: PeerConnectionView[];
+  /** Signalling families with a live room right now (e.g. nostr, mqtt). */
+  signallingFamilies: string[];
+}
+
+export interface PeerConnectionView {
+  peerId: string;
+  displayName: string;
+  routeType: 'direct' | 'relay';
+  latencyMs: number;
+  upgradeStatus?: RouteUpgradeStatus;
+  /** Rate-limited migration notice advertised by the remote participant. */
+  remoteStatus?: string;
 }
 
 export type RuntimeState = 'connecting' | 'connected' | 'syncing' | 'ready' | 'executing'
@@ -331,6 +363,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingExecutions = new Map<string, PendingExecution>();
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
+  private readonly sentSnapshotTransfers = new Map<string, SentSnapshotTransfer>();
   private readonly preparedHostTransfers = new Map<string, PreparedHostTransfer>();
   private readonly awarenessOwnerByClientId = new Map<number, string>();
   private readonly awarenessClientsByPeer = new Map<string, Set<number>>();
@@ -611,7 +644,50 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       isHost: this.coordinator.isCurrentHost(),
       waitingForHostFolder: this.waitingForHostFolder,
       autosave: { ...this.autosaveState },
+      connections: this.buildConnectionViews(),
+      signallingFamilies: this.transport.activeSignallingFamilies(),
     };
+  }
+
+  /** Builds the per-participant connection view shown in the sidebar. */
+  private buildConnectionViews(): PeerConnectionView[] {
+    const upgrades = new Map(
+      this.transport.activeRouteUpgrades().map((upgrade) => [upgrade.peerId, upgrade.status] as const),
+    );
+    const selfId = this.descriptor.localPeer.peerId;
+    return this.transport.peerRuntime()
+      .filter((peer) => peer.peerId !== selfId)
+      .map((peer) => ({
+        peerId: peer.peerId,
+        displayName: peer.displayName,
+        routeType: peer.route === 'Relay' ? 'relay' as const : 'direct' as const,
+        latencyMs: peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
+        ...(upgrades.has(peer.peerId) ? { upgradeStatus: upgrades.get(peer.peerId) } : {}),
+        ...(this.transport.getRemoteRouteStatus(peer.peerId)
+          ? { remoteStatus: this.transport.getRemoteRouteStatus(peer.peerId) } : {}),
+      }));
+  }
+
+  /**
+   * Runs the safe make-before-break improvement attempt for every participant
+   * currently reachable only through the emergency relay. Participants on a
+   * direct route are already optimal and are never touched. The current
+   * connection is never disconnected by this call.
+   */
+  public tryImproveConnection(): { attempted: number; alreadyOptimal: boolean } {
+    const targets = this.transport.improvablePeerIds();
+    if (targets.length === 0) return { attempted: 0, alreadyOptimal: true };
+    let attempted = 0;
+    for (const peerId of targets) {
+      if (this.transport.tryImproveRoute(peerId)) attempted += 1;
+    }
+    return { attempted, alreadyOptimal: false };
+  }
+
+  public cancelConnectionImprovement(): void {
+    for (const upgrade of this.transport.activeRouteUpgrades()) {
+      this.transport.cancelRouteUpgrade(upgrade.peerId);
+    }
   }
 
   public localComputePresence(): PresenceState | undefined {
@@ -996,6 +1072,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         hash: file.hash,
       });
       recordFrame();
+      this.rememberSentSnapshotTransfer(transferId, {
+        peerId,
+        relativePath: file.relativePath,
+        size: file.size,
+        chunkSize,
+        chunks,
+        ...(file.bytes ? { bytes: file.bytes } : {}),
+        ...(file.absolutePath ? { absolutePath: file.absolutePath } : {}),
+      });
       const sendChunk = (index: number, chunk: Uint8Array) => {
         this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
         recordFrame(chunk.byteLength);
@@ -1131,6 +1216,75 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private rememberSentSnapshotTransfer(transferId: string, record: SentSnapshotTransfer): void {
+    // Bounded: only recent transfers need retransmission, and each entry is
+    // metadata (plus a reference to already-in-memory bytes), never a copy.
+    while (this.sentSnapshotTransfers.size >= MAX_SENT_SNAPSHOT_TRANSFERS) {
+      const oldest = this.sentSnapshotTransfers.keys().next().value;
+      if (oldest === undefined) break;
+      this.sentSnapshotTransfers.delete(oldest);
+    }
+    this.sentSnapshotTransfers.set(transferId, record);
+  }
+
+  /**
+   * Answers a receiver's `snapshotFileRetry` by resending exactly the missing
+   * chunk indices plus a fresh end frame. The temporary file on the receiver
+   * is addressed by absolute chunk offsets, so retransmitted chunks splice in
+   * without restarting the file or the snapshot.
+   */
+  private async resendSnapshotChunks(peerId: string, meta: Record<string, unknown>): Promise<void> {
+    const transferId = String(meta.transferId ?? '');
+    if (!TRANSFER_ID_PATTERN.test(transferId)) {
+      throw new Error('Joining peer sent a malformed snapshot retry request.');
+    }
+    const record = this.sentSnapshotTransfers.get(transferId);
+    if (!record || record.peerId !== peerId || !this.coordinator.isCurrentHost()) return;
+    const requested = Array.isArray(meta.indices) ? meta.indices : [];
+    if (requested.length > record.chunks) {
+      throw new Error('Joining peer requested more snapshot chunks than the transfer declared.');
+    }
+    const indices = new Set<number>();
+    for (const value of requested) {
+      const index = Number(value);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= record.chunks) {
+        throw new Error('Joining peer requested an out-of-range snapshot chunk index.');
+      }
+      indices.add(index);
+    }
+    for (const index of [...indices].sort((left, right) => left - right)) {
+      const chunk = await this.readSnapshotChunk(record, index);
+      this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
+    }
+    await this.transport.awaitDrain(peerId);
+    this.transport.sendTo(peerId, 'snapshotFileEnd', { transferId });
+  }
+
+  private async readSnapshotChunk(record: SentSnapshotTransfer, index: number): Promise<Buffer> {
+    const start = index * record.chunkSize;
+    const length = index === record.chunks - 1
+      ? record.size - start
+      : record.chunkSize;
+    if (record.bytes) {
+      if (start + length > record.bytes.byteLength) {
+        throw new Error(`Snapshot source shrank during retransmission: ${record.relativePath}`);
+      }
+      return Buffer.from(record.bytes.subarray(start, start + length));
+    }
+    if (!record.absolutePath) throw new Error(`Snapshot source is unavailable: ${record.relativePath}`);
+    const handle = await open(record.absolutePath, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      if (bytesRead !== length) {
+        throw new Error(`Snapshot source changed during retransmission: ${record.relativePath}`);
+      }
+      return buffer;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
   public async leave(): Promise<void> {
     if (this.closed) return;
     if (this.coordinator.isCurrentHost() && this.descriptor.mode === 'resilient') {
@@ -1257,6 +1411,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(new Error('Pair Notebook session closed during project snapshot transfer.'));
     }
     this.pendingSnapshotCheckpoints.clear();
+    this.sentSnapshotTransfers.clear();
     for (const prepared of this.preparedHostTransfers.values()) clearTimeout(prepared.timer);
     this.preparedHostTransfers.clear();
     if (this.pendingSessionEndFence) {
@@ -1456,6 +1611,22 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         && (currentHostFailed || this.runtimeState === 'connecting')) {
         this.transition('reconnecting', detail);
       }
+    });
+    // Real-time connection-quality/migration events for the sidebar.
+    this.transport.on('routeUpgradeStatus', (state: RouteUpgradeState) => {
+      this.log.appendLine(`[debug] Route upgrade ${state.peerId}: ${state.status}${state.detail ? ` (${state.detail})` : ''}`);
+      this.emit('connectionUpdated', { kind: 'route-upgrade', ...state });
+    });
+    this.transport.on('routeChanged', (peer: PeerIdentity, from: string, to: string) => {
+      this.log.appendLine(`[debug] Route to ${peer.displayName} changed: ${from} -> ${to}`);
+      this.emit('connectionUpdated', { kind: 'route-changed', peerId: peer.peerId, from, to });
+    });
+    this.transport.on('remoteRouteStatus', (peerId: string, status: string) => {
+      this.emit('connectionUpdated', { kind: 'remote-status', peerId, status });
+    });
+    this.transport.on('networkChanged', () => {
+      this.log.appendLine('[debug] Network interfaces changed; re-evaluating routes (make-before-break).');
+      this.emit('connectionUpdated', { kind: 'network-changed' });
     });
   }
 
@@ -1729,6 +1900,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }
         case 'snapshotCheckpointAck':
           this.acceptSnapshotCheckpoint(sourceId, String(frame.meta.checkpointId ?? ''));
+          break;
+        case 'snapshotFileRetry':
+          await this.resendSnapshotChunks(sourceId, frame.meta);
           break;
         case 'snapshotRequest':
           if (!this.coordinator.isCurrentHost()) {
@@ -5064,7 +5238,7 @@ function sameBinaryVersion(a: BinaryFileVersion, b: BinaryFileVersion): boolean 
 function isClockAgnosticFrame(type: string): boolean {
   return new Set([
     'helloAck', 'projectUpdate', 'stateDocument', 'stateDiff', 'stateVector', 'filesystemState', 'fileState', 'stateEnd', 'awareness',
-    'snapshotRequest', 'snapshotCheckpointAck', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
+    'snapshotRequest', 'snapshotCheckpointAck', 'snapshotFileRetry', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
     'fileDelete', 'directoryCreate', 'fileRename', 'computeChanged', 'computeState', 'hostTransferFinalize',
     'executionBarrierCheck', 'executionBarrierStatus', 'executionBarrierCommit', 'executionBarrierAck',
     'executeRequest', 'executionEvent', 'executeResult', 'inputReply', 'kernelCommand', 'kernelCommandResult',

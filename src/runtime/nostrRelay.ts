@@ -24,7 +24,7 @@
 
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto';
 import { schnorr } from '@noble/secp256k1';
-import NodeWebSocket from 'ws';
+import { createProxiedNodeWebSocket } from './proxyWebSocket';
 
 /** Relays used for the fallback channel; a subset of the discovery list. */
 export const RELAY_DATA_URLS = [
@@ -329,7 +329,8 @@ export class NostrFrameRelay {
 
 function defaultSocketFactory(url: string): RelaySocketLike {
   // Deliberately NOT the global WebSocket: Node >= 22 ships an undici-based
-  // WebSocket with addEventListener semantics and no `.on()`. The `ws`
-  // package is what Trystero's own signalling uses in this environment.
-  return new NodeWebSocket(url);
+  // WebSocket with addEventListener semantics and no `.on()`. This helper
+  // builds a `ws` socket through the SAME proxy resolution as Trystero
+  // signalling, so the emergency relay works on proxy-only networks too.
+  return createProxiedNodeWebSocket(url);
 }

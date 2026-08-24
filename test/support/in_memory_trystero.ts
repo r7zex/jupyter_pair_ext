@@ -17,6 +17,8 @@ interface TestClient {
   room: Room;
   actions: Map<string, MessageAction<DataPayload>>;
   peers: Set<TestClient>;
+  /** Per-peer handles surfaced through getPeers(); close() removes the edge. */
+  peerHandles: Map<string, { id: string; close: () => void }>;
   left: boolean;
 }
 
@@ -67,6 +69,28 @@ export function partitionInMemoryTrystero(): void {
   }
 }
 
+/**
+ * Simulates a peer whose leave event was lost (as happens over the lossy
+ * Nostr relay): the client vanishes from the room without any onPeerLeave
+ * callback on the surviving peers, leaving zombie identity routes behind.
+ */
+export function abandonInMemoryTrystero(transportPeerId: string): void {
+  for (const clients of clientsByKey.values()) {
+    for (const client of [...clients]) {
+      if (client.id !== transportPeerId) continue;
+      client.left = true;
+      clients.delete(client);
+      for (const peer of [...client.peers]) {
+        client.peers.delete(peer);
+        peer.peers.delete(client);
+        client.peerHandles.delete(peer.id);
+        peer.peerHandles.delete(client.id);
+        // Deliberately no peer.room.onPeerLeave: that is the lost event.
+      }
+    }
+  }
+}
+
 export function healInMemoryTrystero(): void {
   partitioned = false;
   for (const clients of clientsByKey.values()) {
@@ -90,6 +114,7 @@ function createClient(key: string, callbacks?: JoinRoomCallbacks): TestClient {
     callbacks,
     actions,
     peers: new Set<TestClient>(),
+    peerHandles: new Map<string, { id: string; close: () => void }>(),
     left: false,
     room: undefined as unknown as Room,
   } satisfies TestClient;
@@ -124,7 +149,9 @@ function createClient(key: string, callbacks?: JoinRoomCallbacks): TestClient {
     },
     leave: async () => leave(client),
     isPassive: () => false,
-    getPeers: () => Object.fromEntries([...client.peers].map((peer) => [peer.id, {}])) as ReturnType<Room['getPeers']>,
+    getPeers: () => Object.fromEntries(
+      [...client.peerHandles].map(([peerId, handle]) => [peerId, handle]),
+    ) as ReturnType<Room['getPeers']>,
     addStream: () => [],
     removeStream: () => undefined,
     addTrack: () => [],
@@ -161,6 +188,22 @@ async function connect(left: TestClient, right: TestClient): Promise<void> {
     if (left.left || right.left) return;
     left.peers.add(right);
     right.peers.add(left);
+    // Room-level handles: close() removes the edge on both sides and fires
+    // the corresponding leave callbacks, mirroring real Trystero semantics.
+    const leftHandle = {
+      id: right.id,
+      close: (): void => {
+        left.peers.delete(right);
+        right.peers.delete(left);
+        left.peerHandles.delete(right.id);
+        right.peerHandles.delete(left.id);
+        left.room.onPeerLeave?.(right.id);
+        right.room.onPeerLeave?.(left.id);
+      },
+    };
+    const rightHandle = { id: left.id, close: leftHandle.close };
+    left.peerHandles.set(right.id, leftHandle);
+    right.peerHandles.set(left.id, rightHandle);
     left.room.onPeerJoin?.(right.id);
     right.room.onPeerJoin?.(left.id);
   } catch (error) {
@@ -177,6 +220,8 @@ function leave(client: TestClient): void {
   for (const peer of [...client.peers]) {
     client.peers.delete(peer);
     peer.peers.delete(client);
+    client.peerHandles.delete(peer.id);
+    peer.peerHandles.delete(client.id);
     peer.room.onPeerLeave?.(client.id);
   }
 }

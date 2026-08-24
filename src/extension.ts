@@ -1,8 +1,10 @@
 import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { lookup } from 'node:dns/promises';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from './core/atomicFile';
+import { buildNetworkDiagnostics } from './runtime/diagnostics';
 import { GpuInfo } from './core/hardware';
 import {
   generateIdentityCredentials,
@@ -85,6 +87,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   register(context, 'pairNotebook.transferHost', () => transferHost());
   register(context, 'pairNotebook.showDiagnostics', () => showDiagnostics());
+  register(context, 'pairNotebook.tryImproveConnection', () => tryImproveConnection());
+  register(context, 'pairNotebook.showAdvancedDiagnostics', () => showDiagnostics(true));
   register(context, 'pairNotebook.setTurnPassword', async () => {
     const password = await vscode.window.showInputBox({
       prompt: 'TURN password for the configured turnUrls (stored in VS Code secret storage, never in settings or logs)',
@@ -708,7 +712,7 @@ function applyMeshNetworkConfiguration(context: vscode.ExtensionContext): void {
   });
 }
 
-async function showDiagnostics(): Promise<void> {
+async function showDiagnostics(advanced = false): Promise<void> {
   const snapshot = requireRuntime().snapshot();
   // networkDiagnostics is sanitized: no tokens, TURN or proxy credentials.
   const network = (() => {
@@ -718,9 +722,25 @@ async function showDiagnostics(): Promise<void> {
     turnEndpoints?: Array<{ url: string; transport: string }>;
     turnProbes?: Array<{ url: string; transport: string; ok: boolean; latencyMs?: number }>;
     proxy?: string;
+    relayFallback?: { enabled?: boolean; connectedRelays?: number };
+    udpAvailability?: { state?: string; confidence?: string };
   } | undefined;
+  // Passive diagnostics run automatically with ordinary user permissions and
+  // never modify system state; every inference carries an explicit confidence.
+  const passive = await buildNetworkDiagnostics({
+    turnProbes: (network?.turnProbes ?? []).map((probe) => ({
+      endpoint: { url: probe.url, host: probe.url, port: 0, transport: probe.transport as 'udp' | 'tcp' | 'tls' },
+      ok: probe.ok,
+      ...(probe.latencyMs !== undefined ? { latencyMs: probe.latencyMs } : {}),
+    })),
+    relayFallbackEnabled: network?.relayFallback?.enabled,
+    connectedRelayCount: network?.relayFallback?.connectedRelays,
+    resolveDns: async (host) => (await lookup(host)),
+  });
+
   const lines = [
     'PAIR NOTEBOOK NETWORK DIAGNOSTICS',
+    advanced ? 'MODE: advanced (passive, read-only; administrator rights are NOT required and nothing is modified)' : '',
     '',
     ...snapshot.peers.map((peer) => `${peer.displayName.padEnd(20)} ${peer.route.padEnd(8)} ${peer.latency >= 0 ? `${peer.latency} ms` : '—'}  heartbeat ${Math.max(0, Date.now() - peer.lastHeartbeat)} ms`),
     '',
@@ -744,6 +764,12 @@ async function showDiagnostics(): Promise<void> {
         return `  ${index + 1}. [${endpoint.transport.toUpperCase()}] ${endpoint.url} — ${state}`;
       }),
       `Proxy for signalling: ${network.proxy ?? 'Direct'}`,
+      `UDP availability: ${network.udpAvailability?.state ?? 'unknown'} (${network.udpAvailability?.confidence ?? 'low'} confidence)`,
+      '',
+      'Passive diagnostics:',
+      ...passive.observations.map((item) =>
+        `  [${item.confidence.toUpperCase()}] ${item.observation}\n      impact: ${item.impact}${item.possibleCauses?.length ? `\n      possible causes: ${item.possibleCauses.join(', ')}` : ''}`),
+      ...(passive.observations.length === 0 ? ['  No network limitations detected.'] : []),
     );
   }
   const diagnostics = lines.join('\n');
@@ -751,6 +777,33 @@ async function showDiagnostics(): Promise<void> {
   output.show(true);
   const choice = await vscode.window.showInformationMessage('Pair Notebook diagnostics opened. Session tokens are excluded.', 'Copy Diagnostics');
   if (choice === 'Copy Diagnostics') await vscode.env.clipboard.writeText(diagnostics);
+}
+
+/**
+ * "Try to improve": safe make-before-break optimization. The working
+ * connection is never disconnected; a candidate route is built, verified and
+ * only promoted after it proves itself. Failure keeps the current route.
+ */
+async function tryImproveConnection(): Promise<void> {
+  const active = runtime;
+  if (!active) return;
+  if (!active.snapshot().connections?.length) {
+    void vscode.window.showInformationMessage('Pair Notebook: нет подключённых участников для оптимизации.');
+    return;
+  }
+  const result = active.tryImproveConnection();
+  if (result.alreadyOptimal) {
+    void vscode.window.showInformationMessage(
+      'Pair Notebook: соединение уже оптимально (прямой P2P). Улучшение не требуется.',
+    );
+    return;
+  }
+  // The final result arrives via the connectionUpdated event stream, which the
+  // sidebar renders live. Do not block or spam dialogs here: the sidebar is the
+  // source of truth for progress ("Checking direct P2P…", success/failure).
+  void vscode.window.showInformationMessage(
+    `Pair Notebook: проверяем лучший маршрут для ${result.attempted} участник(а/ов). Текущее соединение остаётся активным.`,
+  );
 }
 
 async function showComputeResources(): Promise<void> {
