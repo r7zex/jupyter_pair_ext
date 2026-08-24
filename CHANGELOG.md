@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5 - 2026-08-24 (snapshot retransmission over lossy relays)
+
+- Fixed joins failing with "Snapshot is missing chunks for <file>" on the emergency Nostr relay route: a relay socket blip silently dropped individual `snapshotFileChunk` frames (the relay tunnel skips lost packets by design), and the snapshot protocol had no recovery, so the whole join failed even though the host was reachable.
+- The joining receiver now answers an incomplete file with a `snapshotFileRetry` request listing exactly the missing chunk indices (up to 5 rounds per file). The host keeps bounded metadata for recent transfers and re-reads the requested chunks from memory or disk, resends them, and re-emits the file end frame; the receiver splices them into its temporary file by absolute offset, so a single lost frame no longer restarts or kills the transfer.
+- Fixed joins failing with "Peer identity ... is already connected" after a peer's route died without a leave event (also a lossy-relay symptom): a second handshake that passes full identity-proof verification now retires the zombie route and admits the genuine re-connection instead of deadlocking. Impersonation protection is unchanged - forged claims still fail signature and identity-key checks before any route is touched.
+- Registered the new frame type in the bootstrap/runtime purpose filters, snapshot protocol set, and clock-agnostic list; malformed or out-of-range retry requests are rejected.
+- Added regression tests for both scenarios: a dropped snapshot chunk recovered via retransmission, and a genuine re-connection evicting a zombie identity route (plus a lost-leave simulation helper in the in-memory Trystero transport).
+
 ## 0.3.4 - 2026-08-23 (networking continuation)
 
 - Proved with the installed werift ICE stack that only the FIRST `turn:`/`turns:` URL of the iceServers list is consumed; the previous four-URL TURN list silently degraded to a single transport. TURN endpoints are now modelled explicitly (`src/runtime/turn.ts`) with an ordered UDP -> TCP -> TLS fallback chain.

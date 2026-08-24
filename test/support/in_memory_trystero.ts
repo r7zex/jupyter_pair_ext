@@ -67,6 +67,26 @@ export function partitionInMemoryTrystero(): void {
   }
 }
 
+/**
+ * Simulates a peer whose leave event was lost (as happens over the lossy
+ * Nostr relay): the client vanishes from the room without any onPeerLeave
+ * callback on the surviving peers, leaving zombie identity routes behind.
+ */
+export function abandonInMemoryTrystero(transportPeerId: string): void {
+  for (const clients of clientsByKey.values()) {
+    for (const client of [...clients]) {
+      if (client.id !== transportPeerId) continue;
+      client.left = true;
+      clients.delete(client);
+      for (const peer of [...client.peers]) {
+        client.peers.delete(peer);
+        peer.peers.delete(client);
+        // Deliberately no peer.room.onPeerLeave: that is the lost event.
+      }
+    }
+  }
+}
+
 export function healInMemoryTrystero(): void {
   partitioned = false;
   for (const clients of clientsByKey.values()) {

@@ -25,6 +25,8 @@ const MAX_ACTIVE_SNAPSHOT_TRANSFERS = 4;
 const MAX_SNAPSHOT_TRANSFER_BYTES = 8 * 1024 * 1024 * 1024;
 const MAX_PENDING_SNAPSHOT_MESSAGES = 2048;
 const MAX_PENDING_SNAPSHOT_BYTES = 128 * 1024 * 1024;
+/** A lossy relay route may drop individual chunk frames; ask the host to resend before giving up. */
+const MAX_SNAPSHOT_FILE_RETRIES = 5;
 
 export type SnapshotBootstrapErrorKind = 'display-name-conflict' | 'connection-failed';
 
@@ -50,6 +52,7 @@ interface SnapshotFile {
   handle: FileHandle;
   bytesWritten: number;
   shape: IncomingTransferShape;
+  retries: number;
 }
 
 export interface SnapshotProgress {
@@ -359,6 +362,7 @@ export async function downloadProjectSnapshot(
               handle: await open(temporaryPath, 'wx'),
               bytesWritten: 0,
               shape,
+              retries: 0,
             });
             arm();
             onProgress?.({ completedFiles: completed.size, totalFiles, currentFile: relativePath });
@@ -384,12 +388,32 @@ export async function downloadProjectSnapshot(
             const transferId = String(frame.meta.transferId);
             const transfer = transfers.get(transferId);
             if (!transfer) throw new Error('Snapshot file ended without a start frame.');
-            transfers.delete(transferId);
-            await transfer.handle.close().catch(() => undefined);
             if (transfer.received.size !== transfer.expectedChunks || transfer.bytesWritten !== transfer.shape.size) {
-              await rm(transfer.temporaryPath, { force: true }).catch(() => undefined);
+              const abandon = (): void => {
+                transfers.delete(transferId);
+                void transfer.handle.close().catch(() => undefined);
+                void rm(transfer.temporaryPath, { force: true }).catch(() => undefined);
+              };
+              // A lossy route (the emergency Nostr relay drops whole frames when
+              // a relay socket blips) can silently swallow chunk frames. The
+              // end frame still arrived, so the host is reachable: request the
+              // exact missing indices instead of failing the whole join.
+              if (transfer.received.size < transfer.expectedChunks
+                && transfer.retries < MAX_SNAPSHOT_FILE_RETRIES) {
+                transfer.retries += 1;
+                const missing: number[] = [];
+                for (let index = 0; index < transfer.expectedChunks; index += 1) {
+                  if (!transfer.received.has(index)) missing.push(index);
+                }
+                arm();
+                transport.sendTo(sourceId, 'snapshotFileRetry', { transferId, indices: missing });
+                return;
+              }
+              abandon();
               throw new Error(`Snapshot is missing chunks for ${transfer.relativePath}.`);
             }
+            transfers.delete(transferId);
+            await transfer.handle.close().catch(() => undefined);
             const hash = await hashFileContents(transfer.temporaryPath);
             if (hash !== transfer.hash) {
               await rm(transfer.temporaryPath, { force: true }).catch(() => undefined);

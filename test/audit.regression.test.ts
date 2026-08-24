@@ -1,13 +1,19 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { SessionCoordinator } from '../src/core/election';
+import { generateIdentityCredentials } from '../src/core/identity';
 import { StorageAdapter } from '../src/core/persistence';
 import { HostClock, PeerIdentity, PeerRuntime } from '../src/core/types';
 import { SnapshotBootstrapError, downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { MeshTransport, TrysteroRoomFactory } from '../src/runtime/mesh';
-import { createInMemoryTrysteroFactory, resetInMemoryTrystero } from './support/in_memory_trystero';
+import {
+  abandonInMemoryTrystero,
+  createInMemoryTrysteroFactory,
+  resetInMemoryTrystero,
+} from './support/in_memory_trystero';
 
 function peer(peerId: string, joinOrder: number, lastHeartbeat: number, online = true): PeerRuntime {
   return {
@@ -191,6 +197,47 @@ describe('audit regressions', () => {
       }
     });
 
+    it('retires a zombie identity route when the genuine peer re-connects', async () => {
+      const roomFactory = createInMemoryTrysteroFactory();
+      const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
+      const host = transport(identity('host'), true, roomFactory, clock, sessionId, token);
+      // Two transports sharing one identity key model the same participant
+      // re-connecting after its previous route died without a leave event.
+      const credentials = generateIdentityCredentials();
+      const makeClient = (): MeshTransport => new MeshTransport({
+        sessionId,
+        token,
+        localPeer: {
+          peerId: 'client', displayName: 'Client', joinOrder: 1, identityKey: credentials.publicKey,
+        },
+        hostClock: () => clock,
+        isHost: () => false,
+        roomFactory,
+        identityPrivateKey: credentials.privateKey,
+      });
+      const zombie = makeClient();
+      let reconnected: MeshTransport | undefined;
+      try {
+        await host.start();
+        const connected = onceEvent(host, 'peerConnected');
+        await zombie.start();
+        await connected;
+        // The first transport vanishes without its leave event ever firing.
+        abandonInMemoryTrystero('test-peer-2');
+        const rejoined = onceEvent(host, 'peerConnected');
+        reconnected = makeClient();
+        await reconnected.start();
+        await rejoined;
+        assert.equal(host.peerRuntime().find((entry) => entry.peerId === 'client')?.online, true);
+        assert.equal(host.peerRuntime().filter((entry) => entry.peerId === 'client').length, 1);
+      } finally {
+        const stops: Array<Promise<void>> = [zombie.stop(), host.stop()];
+        if (reconnected) stops.push(reconnected.stop());
+        await Promise.all(stops);
+        resetInMemoryTrystero();
+      }
+    });
+
     it('refuses an invite holder impersonating a known offline peer', async () => {
       const roomFactory = createInMemoryTrysteroFactory();
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
@@ -319,6 +366,67 @@ describe('audit regressions', () => {
         }, destination, undefined, roomFactory);
         assert.deepEqual(acknowledgements, ['checkpoint-one', 'checkpoint-two']);
         assert.equal((await stat(path.join(destination, 'empty', 'nested'))).isDirectory(), true);
+      } finally {
+        await host.stop();
+        resetInMemoryTrystero();
+        await rm(destination, { recursive: true, force: true });
+      }
+    });
+
+    it('retransmits missing snapshot chunks over a lossy link instead of failing the join', async function () {
+      this.timeout(10_000);
+      const roomFactory = createInMemoryTrysteroFactory();
+      const token = 'bootstrap-retransmit-token-that-is-long-enough';
+      const clock: HostClock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host' };
+      const host = transport(
+        { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+        true,
+        roomFactory,
+        clock,
+        'retransmit-snapshot',
+        token,
+      );
+      const chunkSize = 64 * 1024;
+      const fileBytes = Buffer.alloc(chunkSize + 4096);
+      for (let index = 0; index < fileBytes.byteLength; index += 1) fileBytes[index] = index % 251;
+      const fileHash = createHash('sha256').update(fileBytes).digest('hex');
+      const retryRequests: number[][] = [];
+      host.on('message', (frame, sourceId) => {
+        if (frame.type === 'snapshotRequest') {
+          host.sendTo(sourceId, 'snapshotBegin', {
+            expectedFiles: ['notes.bin'], expectedDirectories: [], totalFiles: 1, fileCount: 1,
+          });
+          host.sendTo(sourceId, 'snapshotFileStart', {
+            transferId: 'transfer-one', relativePath: 'notes.bin',
+            size: fileBytes.byteLength, chunks: 2, chunkSize, hash: fileHash,
+          });
+          // Simulate the lossy relay route: the second chunk frame is silently
+          // dropped while the end frame still arrives.
+          host.sendTo(sourceId, 'snapshotFileChunk', { transferId: 'transfer-one', index: 0 }, fileBytes.subarray(0, chunkSize));
+          host.sendTo(sourceId, 'snapshotFileEnd', { transferId: 'transfer-one' });
+          return;
+        }
+        if (frame.type === 'snapshotFileRetry') {
+          assert.equal(String(frame.meta.transferId), 'transfer-one');
+          const indices = [...(frame.meta.indices as number[])];
+          retryRequests.push(indices);
+          host.sendTo(sourceId, 'snapshotFileChunk', { transferId: 'transfer-one', index: 1 }, fileBytes.subarray(chunkSize));
+          host.sendTo(sourceId, 'snapshotFileEnd', { transferId: 'transfer-one' });
+          host.sendTo(sourceId, 'snapshotEnd', {});
+          return;
+        }
+      });
+      const destination = await temporaryDirectory('pair-bootstrap-retransmit-');
+      try {
+        await host.start();
+        await downloadProjectSnapshot({
+          sessionId: 'retransmit-snapshot', projectId: 'project', projectName: 'Retransmit', mode: 'resilient',
+          token, sessionEpoch: 1, hostPeerId: 'host', hostDisplayName: 'Host',
+        }, {
+          peerId: 'joining-peer', displayName: 'Joining Peer', joinOrder: 1,
+        }, destination, undefined, roomFactory);
+        assert.deepEqual(retryRequests, [[1]]);
+        assert.deepEqual(await readFile(path.join(destination, 'notes.bin')), fileBytes);
       } finally {
         await host.stop();
         resetInMemoryTrystero();

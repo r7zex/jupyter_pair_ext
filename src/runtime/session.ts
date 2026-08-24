@@ -133,6 +133,8 @@ interface RenameOrigin {
 
 /** Small chunks let live edits overtake bulk transfers instead of waiting behind megabytes of buffered data. */
 const BINARY_CHUNK_SIZE = DEFAULT_TRANSFER_CHUNK_SIZE;
+/** How many recent snapshot file transfers stay retransmittable for lossy relay routes. */
+const MAX_SENT_SNAPSHOT_TRANSFERS = 256;
 /** A transfer that makes no progress for this long is abandoned and cleaned up. */
 const BINARY_IDLE_TIMEOUT_MS = 60_000;
 const MAX_ACTIVE_BINARY_TRANSFERS = 16;
@@ -274,6 +276,22 @@ interface SnapshotSource {
   absolutePath?: string;
 }
 
+/**
+ * Metadata for a snapshot file transfer already announced to a joining peer.
+ * A lossy relay route can silently drop chunk frames while their end frame
+ * still arrives, so the receiver asks for exactly the missing indices and the
+ * host re-reads them from this record instead of restarting the snapshot.
+ */
+interface SentSnapshotTransfer {
+  peerId: string;
+  relativePath: string;
+  size: number;
+  chunkSize: number;
+  chunks: number;
+  bytes?: Uint8Array;
+  absolutePath?: string;
+}
+
 export interface SessionSnapshot {
   descriptor: SessionDescriptor;
   clock: HostClock;
@@ -331,6 +349,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingExecutions = new Map<string, PendingExecution>();
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
+  private readonly sentSnapshotTransfers = new Map<string, SentSnapshotTransfer>();
   private readonly preparedHostTransfers = new Map<string, PreparedHostTransfer>();
   private readonly awarenessOwnerByClientId = new Map<number, string>();
   private readonly awarenessClientsByPeer = new Map<string, Set<number>>();
@@ -996,6 +1015,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         hash: file.hash,
       });
       recordFrame();
+      this.rememberSentSnapshotTransfer(transferId, {
+        peerId,
+        relativePath: file.relativePath,
+        size: file.size,
+        chunkSize,
+        chunks,
+        ...(file.bytes ? { bytes: file.bytes } : {}),
+        ...(file.absolutePath ? { absolutePath: file.absolutePath } : {}),
+      });
       const sendChunk = (index: number, chunk: Uint8Array) => {
         this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
         recordFrame(chunk.byteLength);
@@ -1131,6 +1159,75 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private rememberSentSnapshotTransfer(transferId: string, record: SentSnapshotTransfer): void {
+    // Bounded: only recent transfers need retransmission, and each entry is
+    // metadata (plus a reference to already-in-memory bytes), never a copy.
+    while (this.sentSnapshotTransfers.size >= MAX_SENT_SNAPSHOT_TRANSFERS) {
+      const oldest = this.sentSnapshotTransfers.keys().next().value;
+      if (oldest === undefined) break;
+      this.sentSnapshotTransfers.delete(oldest);
+    }
+    this.sentSnapshotTransfers.set(transferId, record);
+  }
+
+  /**
+   * Answers a receiver's `snapshotFileRetry` by resending exactly the missing
+   * chunk indices plus a fresh end frame. The temporary file on the receiver
+   * is addressed by absolute chunk offsets, so retransmitted chunks splice in
+   * without restarting the file or the snapshot.
+   */
+  private async resendSnapshotChunks(peerId: string, meta: Record<string, unknown>): Promise<void> {
+    const transferId = String(meta.transferId ?? '');
+    if (!TRANSFER_ID_PATTERN.test(transferId)) {
+      throw new Error('Joining peer sent a malformed snapshot retry request.');
+    }
+    const record = this.sentSnapshotTransfers.get(transferId);
+    if (!record || record.peerId !== peerId || !this.coordinator.isCurrentHost()) return;
+    const requested = Array.isArray(meta.indices) ? meta.indices : [];
+    if (requested.length > record.chunks) {
+      throw new Error('Joining peer requested more snapshot chunks than the transfer declared.');
+    }
+    const indices = new Set<number>();
+    for (const value of requested) {
+      const index = Number(value);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= record.chunks) {
+        throw new Error('Joining peer requested an out-of-range snapshot chunk index.');
+      }
+      indices.add(index);
+    }
+    for (const index of [...indices].sort((left, right) => left - right)) {
+      const chunk = await this.readSnapshotChunk(record, index);
+      this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
+    }
+    await this.transport.awaitDrain(peerId);
+    this.transport.sendTo(peerId, 'snapshotFileEnd', { transferId });
+  }
+
+  private async readSnapshotChunk(record: SentSnapshotTransfer, index: number): Promise<Buffer> {
+    const start = index * record.chunkSize;
+    const length = index === record.chunks - 1
+      ? record.size - start
+      : record.chunkSize;
+    if (record.bytes) {
+      if (start + length > record.bytes.byteLength) {
+        throw new Error(`Snapshot source shrank during retransmission: ${record.relativePath}`);
+      }
+      return Buffer.from(record.bytes.subarray(start, start + length));
+    }
+    if (!record.absolutePath) throw new Error(`Snapshot source is unavailable: ${record.relativePath}`);
+    const handle = await open(record.absolutePath, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      if (bytesRead !== length) {
+        throw new Error(`Snapshot source changed during retransmission: ${record.relativePath}`);
+      }
+      return buffer;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
   public async leave(): Promise<void> {
     if (this.closed) return;
     if (this.coordinator.isCurrentHost() && this.descriptor.mode === 'resilient') {
@@ -1257,6 +1354,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(new Error('Pair Notebook session closed during project snapshot transfer.'));
     }
     this.pendingSnapshotCheckpoints.clear();
+    this.sentSnapshotTransfers.clear();
     for (const prepared of this.preparedHostTransfers.values()) clearTimeout(prepared.timer);
     this.preparedHostTransfers.clear();
     if (this.pendingSessionEndFence) {
@@ -1729,6 +1827,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }
         case 'snapshotCheckpointAck':
           this.acceptSnapshotCheckpoint(sourceId, String(frame.meta.checkpointId ?? ''));
+          break;
+        case 'snapshotFileRetry':
+          await this.resendSnapshotChunks(sourceId, frame.meta);
           break;
         case 'snapshotRequest':
           if (!this.coordinator.isCurrentHost()) {
@@ -5062,7 +5163,7 @@ function sameBinaryVersion(a: BinaryFileVersion, b: BinaryFileVersion): boolean 
 function isClockAgnosticFrame(type: string): boolean {
   return new Set([
     'helloAck', 'projectUpdate', 'stateDocument', 'stateDiff', 'stateVector', 'filesystemState', 'fileState', 'stateEnd', 'awareness',
-    'snapshotRequest', 'snapshotCheckpointAck', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
+    'snapshotRequest', 'snapshotCheckpointAck', 'snapshotFileRetry', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
     'fileDelete', 'directoryCreate', 'fileRename', 'computeChanged', 'computeState', 'hostTransferFinalize',
     'executionBarrierCheck', 'executionBarrierStatus', 'executionBarrierCommit', 'executionBarrierAck',
     'executeRequest', 'executionEvent', 'executeResult', 'inputReply', 'kernelCommand', 'kernelCommandResult',
