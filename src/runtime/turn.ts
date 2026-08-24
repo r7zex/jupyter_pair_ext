@@ -39,10 +39,22 @@ export interface TurnProbeResult {
 const TRANSPORT_PRIORITY: Record<TurnTransport, number> = { udp: 0, tcp: 1, tls: 2 };
 
 /**
- * Default public relay endpoints. The Open Relay (Metered) demo credentials
- * are published openly by the provider for exactly this free-tier use; they
- * are not a Pair Notebook secret. Production deployments should override
- * them via `pairNotebook.turnUrls` plus the secret-storage TURN password.
+ * Default public relay endpoints, used as a last-resort connectivity fallback.
+ *
+ * STATUS (verified live 2026-08-24): the Metered Open Relay demo endpoint
+ * no longer resolves publicly, and its CURRENT documentation gates TURN
+ * credentials behind a free account/API key, so these built-in endpoints are
+ * effectively NON-OPERATIONAL today. They are kept only as a stable ordering
+ * skeleton for deployments that override `pairNotebook.turnUrls`; Pair
+ * Notebook does NOT depend on them: when all TURN transports fail, direct ICE
+ * still works on normal networks and the encrypted Nostr emergency relay
+ * covers the rest without any registration. There is currently NO trustworthy
+ * anonymous, registration-free, production-grade public TURN provider that
+ * could be shipped as a built-in default.
+ * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is what
+ * the werift ICE stack actually uses (it consumes only one TURN URL), so
+ * MeshTransport probes reachability and reorders this list in place, always
+ * keeping direct peer-to-peer ICE preferred over relaying.
  */
 export const DEFAULT_TURN_URLS = [
   'turn:openrelay.metered.ca:80',

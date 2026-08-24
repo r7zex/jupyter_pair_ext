@@ -97,7 +97,7 @@ Each participant also owns an Ed25519 identity key. The private key remains in V
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
-Most consumer and office networks connect directly or through STUN alone. Symmetric NATs and restrictive firewalls fall back to a free public TURN relay (Open Relay by Metered) bundled into the connection configuration, so joins succeed where STUN-only setups previously timed out. Direct peer-to-peer connections are always preferred when the network allows them; the relay only carries already-encrypted traffic as a last resort.
+Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook relies on two independent fallbacks: a configured TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate their own TURN), and the built-in encrypted emergency relay over public Nostr, which needs nothing from the user. Note: the previously bundled free public TURN demo (Open Relay by Metered) is no longer operational without an account and is therefore treated as non-functional by the built-in configuration; the emergency relay keeps joins working where TURN is unavailable. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
 
 ## Development
 
