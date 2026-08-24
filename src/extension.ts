@@ -241,8 +241,8 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
         const completedDelta = Math.max(0, state.completedFiles - lastCompletedFiles);
         lastCompletedFiles = state.completedFiles;
         progress.report({
-          message: state.currentFile,
-          increment: state.totalFiles ? completedDelta * 100 / state.totalFiles : undefined,
+          ...(state.currentFile !== undefined ? { message: state.currentFile } : {}),
+          ...(state.totalFiles ? { increment: completedDelta * 100 / state.totalFiles } : {}),
         });
       }, undefined, identity.privateKey));
       break;

@@ -14,8 +14,8 @@ export interface AutosaveStatus {
   copies: number;
   lastAt: number;
   nextAt: number;
-  lastSnapshotPath?: string;
-  lastError?: string;
+  lastSnapshotPath?: string | undefined;
+  lastError?: string | undefined;
 }
 
 export interface LocalAutosaveOptions {

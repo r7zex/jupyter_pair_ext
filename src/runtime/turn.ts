@@ -58,28 +58,34 @@ export function parseTurnEndpoint(rawUrl: string): TurnEndpoint | undefined {
   const trimmed = rawUrl.trim();
   const match = /^(turn|turns):(\/\/)?([^/?#]+)(\?.*)?$/i.exec(trimmed);
   if (!match) return undefined;
-  const scheme = match[1].toLowerCase();
+  const rawScheme = match[1];
   let hostPort = match[3];
+  if (!rawScheme || hostPort === undefined) return undefined;
+  const scheme = rawScheme.toLowerCase() as 'turn' | 'turns';
   // Strip IPv6 brackets for the host value while keeping the canonical form.
-  const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(hostPort);
+  const bracketed = /^\[([^\]]+)\](:((\d+)))?$/.exec(hostPort);
   let port: number;
   let host: string;
-  if (bracketed) {
-    host = `[${bracketed[1]}]`;
-    if (bracketed[2] === undefined) {
+  const bracketedHost = bracketed?.[1];
+  const bracketedPort = bracketed?.[3];
+  if (bracketed && bracketedHost !== undefined) {
+    host = `[${bracketedHost}]`;
+    if (bracketedPort === undefined) {
       port = DEFAULT_TURN_PORTS[scheme];
     } else {
-      port = Number(bracketed[2]);
+      port = Number(bracketedPort);
     }
-    hostPort = `[${bracketed[1]}]${bracketed[2] !== undefined ? `:${bracketed[2]}` : ''}`;
+    hostPort = `[${bracketedHost}]${bracketedPort !== undefined ? `:${bracketedPort}` : ''}`;
   } else {
     // A trailing ":digits" is an explicit port; any other colon suffix
     // (e.g. "host:notaport") makes the URL invalid rather than falling back
     // to the default port with a corrupted host.
     const colonSplit = /^(.+):(\d+)$/.exec(hostPort);
-    if (colonSplit) {
-      host = colonSplit[1];
-      port = Number(colonSplit[2]);
+    const colonHost = colonSplit?.[1];
+    const colonPort = colonSplit?.[2];
+    if (colonSplit && colonHost !== undefined && colonPort !== undefined) {
+      host = colonHost;
+      port = Number(colonPort);
     } else if (hostPort.includes(':')) {
       return undefined;
     } else {
@@ -118,7 +124,7 @@ export function parseTurnEndpoints(urls: readonly string[]): TurnEndpoint[] {
   return endpoints;
 }
 
-const DEFAULT_TURN_PORTS: Record<string, number> = { turn: 3478, turns: 5349 };
+const DEFAULT_TURN_PORTS: Record<'turn' | 'turns', number> = { turn: 3478, turns: 5349 };
 
 /** Stable sort into the preferred fallback order: UDP, then TCP, then TLS. */
 export function orderTurnEndpoints(endpoints: readonly TurnEndpoint[]): TurnEndpoint[] {

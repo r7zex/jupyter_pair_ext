@@ -90,22 +90,22 @@ import { MeshMetrics, MeshTransport } from './mesh';
 
 export interface PresenceState {
   peer: PeerIdentity;
-  activeFile?: string;
-  activeNotebookCell?: number;
-  activeNotebookCellId?: string;
-  cursor?: SharedCursorPosition;
+  activeFile?: string | undefined;
+  activeNotebookCell?: number | undefined;
+  activeNotebookCellId?: string | undefined;
+  cursor?: SharedCursorPosition | undefined;
   shareCursor: boolean;
   cursorColor: string;
-  typing?: boolean;
-  autosaveFolder?: string;
-  hardware?: HardwareInfo;
-  environments?: PythonEnvironment[];
-  resources?: ResourceSample;
+  typing?: boolean | undefined;
+  autosaveFolder?: string | undefined;
+  hardware?: HardwareInfo | undefined;
+  environments?: PythonEnvironment[] | undefined;
+  resources?: ResourceSample | undefined;
   allowRemoteCompute: boolean;
   allowCpu: boolean;
   allowGpu: boolean;
   kernelStatus: 'Idle' | 'Busy' | 'Offline';
-  kernelStatuses?: Record<string, 'Idle' | 'Busy' | 'Offline'>;
+  kernelStatuses?: Record<string, 'Idle' | 'Busy' | 'Offline'> | undefined;
 }
 
 interface PendingBinary {
@@ -4457,6 +4457,7 @@ function inspectAwarenessUpdate(update: Uint8Array): InspectedAwarenessRecord[] 
     for (let index = 0; index < 8; index += 1) {
       if (offset >= update.byteLength) throw new Error('Awareness update ended inside a variable-length integer.');
       const byte = update[offset++];
+      if (byte === undefined) throw new Error('Awareness update ended inside a variable-length integer.');
       value += (byte & 0x7f) * multiplier;
       if (!Number.isSafeInteger(value)) throw new Error('Awareness update contains an unsafe integer.');
       if ((byte & 0x80) === 0) return value;
@@ -5042,6 +5043,7 @@ function portablePathCaseConflict(left: string, right: string): boolean {
   for (let index = 0; index < shared; index += 1) {
     const leftSegment = leftSegments[index];
     const rightSegment = rightSegments[index];
+    if (leftSegment === undefined || rightSegment === undefined) return false;
     if (portablePathComparisonKey(leftSegment) !== portablePathComparisonKey(rightSegment)) return false;
     if (leftSegment !== rightSegment) return true;
   }

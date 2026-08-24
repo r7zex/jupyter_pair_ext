@@ -61,7 +61,7 @@ export interface PeerIdentity {
   displayName: string;
   joinOrder: number;
   /** Canonical Ed25519 SPKI public key. Optional only while parsing legacy markers and test fixtures. */
-  identityKey?: string;
+  identityKey?: string | undefined;
 }
 
 export type ComputeDevice = 'cpu' | `gpu:${number}`;
@@ -83,9 +83,9 @@ export interface BinaryFileVersion {
 export interface NotebookComputeTarget {
   executorId: string;
   device: ComputeDevice;
-  pythonPath?: string;
+  pythonPath?: string | undefined;
   epoch: number;
-  author?: string;
+  author?: string | undefined;
 }
 
 export function computeSelectionChanged(
@@ -142,14 +142,14 @@ export interface SessionDescriptor {
   sessionEpoch: number;
   hostEpoch: number;
   computeExecutorId: string;
-  notebookCompute?: Record<string, NotebookComputeTarget>;
-  notebookPythonPaths?: Record<string, string>;
+  notebookCompute?: Record<string, NotebookComputeTarget> | undefined;
+  notebookPythonPaths?: Record<string, string> | undefined;
   pythonPath: string;
   freshStart?: boolean;
   knownPeers?: PeerIdentity[];
-  fileStates?: Record<string, FileLifecycleState>;
-  fileRevisionCounter?: number;
-  binaryVersions?: Record<string, BinaryFileVersion>;
+  fileStates?: Record<string, FileLifecycleState> | undefined;
+  fileRevisionCounter?: number | undefined;
+  binaryVersions?: Record<string, BinaryFileVersion> | undefined;
 }
 
 export interface InviteData {
@@ -161,7 +161,7 @@ export interface InviteData {
   sessionEpoch: number;
   hostPeerId: string;
   hostDisplayName: string;
-  hostIdentityKey?: string;
+  hostIdentityKey?: string | undefined;
 }
 
 export const REMOTE_ORIGIN = Symbol('pair-notebook-remote');

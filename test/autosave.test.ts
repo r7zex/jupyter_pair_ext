@@ -26,7 +26,9 @@ describe('host local autosaves', () => {
       for (let index = 0; index < 4; index += 1) await manager.runNow();
       const sessionFolders = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
       assert.equal(sessionFolders.length, 1);
-      const sessionRoot = path.join(root, sessionFolders[0].name);
+      const firstSessionFolder = sessionFolders[0];
+      assert.ok(firstSessionFolder);
+      const sessionRoot = path.join(root, firstSessionFolder.name);
       const snapshots = (await readdir(sessionRoot, { withFileTypes: true }))
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name)
@@ -57,12 +59,13 @@ describe('host local autosaves', () => {
     try {
       await manager.start();
       for (let index = 0; index < 12; index += 1) await manager.runNow();
-      const [session] = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
-      const snapshots = (await readdir(path.join(root, session.name), { withFileTypes: true }))
+      const [firstEntry] = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+      assert.ok(firstEntry);
+      const snapshots = (await readdir(path.join(root, firstEntry.name), { withFileTypes: true }))
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
       const suffixes = snapshots.map((name) => Number(/-(\d+)$/.exec(name)?.[1] ?? 0)).sort((a, b) => a - b);
       assert.equal(snapshots.length, 3);
-      assert.ok(suffixes[0] > 9, `expected latest numeric suffixes, got ${suffixes.join(', ')}`);
+      assert.ok((suffixes[0] ?? 0) > 9, `expected latest numeric suffixes, got ${suffixes.join(', ')}`);
     } finally {
       await manager.stop();
       await rm(root, { recursive: true, force: true });

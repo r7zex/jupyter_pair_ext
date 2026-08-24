@@ -90,22 +90,22 @@ export const TRYSTERO_TURN_SERVERS = [
 
 export interface MeshNetworkConfig {
   /** Overrides the default TURN endpoint URL list. */
-  turnUrls?: readonly string[];
-  turnUsername?: string;
+  turnUrls?: readonly string[] | undefined;
+  turnUsername?: string | undefined;
   /** TURN credential; supplied from VS Code secret storage, never logged. */
-  turnPassword?: string;
+  turnPassword?: string | undefined;
   /** Disables the live TURN Allocate probe when true. */
   disableTurnProbe?: boolean;
   /** Proxy options applied to signalling WebSockets. */
-  proxy?: ProxyWebSocketRuntimeOptions;
+  proxy?: ProxyWebSocketRuntimeOptions | undefined;
   /** Disables the emergency Nostr data relay (default: enabled). */
-  disableRelayFallback?: boolean;
+  disableRelayFallback?: boolean | undefined;
   /** Test hook: builds the relay channel instead of the real one. */
-  relayFactory?: (options: {
+  relayFactory?: ((options: {
     token: string;
     sessionId: string;
     localPeerId: string;
-  }) => NostrFrameRelay;
+  }) => NostrFrameRelay) | undefined;
 }
 
 const RELAY_TRANSPORT_PREFIX = 'relay:';
@@ -172,9 +172,9 @@ export interface MeshOptions {
   isHost: () => boolean;
   hostReady?: () => boolean;
   purpose?: PeerConnectionPurpose;
-  roomFactory?: TrysteroRoomFactory;
+  roomFactory?: TrysteroRoomFactory | undefined;
   /** Required by production callers; omitted tests receive an ephemeral key. */
-  identityPrivateKey?: string;
+  identityPrivateKey?: string | undefined;
 }
 
 export type TrysteroRoomFactory = (
@@ -284,8 +284,8 @@ export class MeshTransport extends EventEmitter {
     localHs: HandshakeMessage;
     sentLocalHs: boolean;
     sentProof: boolean;
-    remoteHs?: HandshakeMessage;
-    remoteProof?: string;
+    remoteHs?: HandshakeMessage | undefined;
+    remoteProof?: string | undefined;
   }>();
   private readonly relayAttempts = new Map<string, number>();
 
@@ -368,6 +368,7 @@ export class MeshTransport extends EventEmitter {
       },
       onJoinError: (details) => this.onJoinError(details),
     };
+    const turnConfig = this.buildTurnConfig();
     const config: NostrRoomConfig = {
       appId: TRYSTERO_APP_ID,
       password: this.options.token,
@@ -377,7 +378,7 @@ export class MeshTransport extends EventEmitter {
         redundancy: RELAY_REDUNDANCY,
         warnOnRelayFailure: false,
       },
-      turnConfig: this.buildTurnConfig(),
+      ...(turnConfig !== undefined ? { turnConfig } : {}),
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
     try {
@@ -417,8 +418,9 @@ export class MeshTransport extends EventEmitter {
    */
   private buildTurnConfig(): NostrRoomConfig['turnConfig'] {
     const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : DEFAULT_TURN_URLS;
-    const username = meshNetworkConfig.turnUsername || TRYSTERO_TURN_SERVERS[0].username;
-    const password = meshNetworkConfig.turnPassword || TRYSTERO_TURN_SERVERS[0].credential;
+    const fallbackTurn = TRYSTERO_TURN_SERVERS[0];
+    const username = meshNetworkConfig.turnUsername || fallbackTurn?.username || '';
+    const password = meshNetworkConfig.turnPassword || fallbackTurn?.credential || '';
     const endpoints = parseTurnEndpoints(urls);
     if (endpoints.length === 0) return undefined;
     const ordered = orderTurnEndpoints(endpoints);

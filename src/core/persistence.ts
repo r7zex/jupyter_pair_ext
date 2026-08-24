@@ -19,13 +19,13 @@ const RETRY_DELAY_MS = 5_000;
 
 export interface PersistenceOptions {
   workingRoot: string;
-  backingRoot?: string;
+  backingRoot?: string | undefined;
   debounceMs: number;
   serialize: SerializeDocument;
   /** Returns true when an open editor persisted the working copy itself. */
-  writeWorkingCopy?: (relativePath: string, bytes: Uint8Array) => Promise<boolean>;
+  writeWorkingCopy?: ((relativePath: string, bytes: Uint8Array) => Promise<boolean>) | undefined;
   /** Records extension-owned writes so the filesystem watcher cannot feed them back into the CRDT. */
-  onWorkingCopyWrite?: (relativePath: string, bytes: Uint8Array) => void;
+  onWorkingCopyWrite?: ((relativePath: string, bytes: Uint8Array) => void) | undefined;
 }
 
 export class StorageAdapter extends EventEmitter {
@@ -499,7 +499,9 @@ export async function safeProjectTarget(root: string, relativePath: string, incl
   const checkedSegments = includeTarget ? segments.length : Math.max(0, segments.length - 1);
   let current = rootPath;
   for (let index = 0; index < checkedSegments; index += 1) {
-    current = path.join(current, segments[index]);
+    const segment = segments[index];
+    if (segment === undefined) break;
+    current = path.join(current, segment);
     try {
       const info = await lstat(current);
       if (info.isSymbolicLink()) {

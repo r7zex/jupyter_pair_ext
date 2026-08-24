@@ -233,7 +233,7 @@ describe('Pair Notebook CRDT', () => {
   it('deletes a notebook cell on every peer', () => {
     const [a, b] = pairedNotebookProjects();
     const updates = captureLocalUpdates(a);
-    a.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1]] });
+    a.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1]!] });
     for (const update of updates) b.applyRemoteUpdate('article.ipynb', 'notebook', update);
     assert.deepEqual(b.notebookSnapshot('article.ipynb').cells.map((cell) => cell.id), ['cell-b']);
   });
@@ -241,7 +241,7 @@ describe('Pair Notebook CRDT', () => {
   it('moves a notebook cell with an incremental Y.Array order change', () => {
     const [a, b] = pairedNotebookProjects();
     const updates = captureLocalUpdates(a);
-    a.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1], notebook.cells[0]] });
+    a.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1]!, notebook.cells[0]!] });
     for (const update of updates) b.applyRemoteUpdate('article.ipynb', 'notebook', update);
     assert.deepEqual(b.notebookSnapshot('article.ipynb').cells.map((cell) => cell.id), ['cell-b', 'cell-a']);
   });
@@ -253,7 +253,7 @@ describe('Pair Notebook CRDT', () => {
     a.applyCellTextChanges('article.ipynb', 'cell-a', [{ offset: 0, deleteCount: 0, insertText: 'A' }]);
     b.applyCellTextChanges('article.ipynb', 'cell-a', [{ offset: 0, deleteCount: 0, insertText: 'B' }]);
     exchange(a, b, updatesA, updatesB, 'article.ipynb', 'notebook');
-    assert.equal(a.notebookSnapshot('article.ipynb').cells[0].source, b.notebookSnapshot('article.ipynb').cells[0].source);
+    assert.equal(a.notebookSnapshot('article.ipynb').cells[0]!.source, b.notebookSnapshot('article.ipynb').cells[0]!.source);
   });
 
   it('converges when peers concurrently edit different cells and notebook metadata', () => {
@@ -266,8 +266,8 @@ describe('Pair Notebook CRDT', () => {
     b.setCellMetadata('article.ipynb', 'cell-b', { editedBy: 'B' });
     exchange(a, b, updatesA, updatesB, 'article.ipynb', 'notebook');
     assert.deepEqual(a.notebookSnapshot('article.ipynb'), b.notebookSnapshot('article.ipynb'));
-    assert.match(a.notebookSnapshot('article.ipynb').cells[0].source, /\+ 1/);
-    assert.equal(a.notebookSnapshot('article.ipynb').cells[1].metadata.editedBy, 'B');
+    assert.match(a.notebookSnapshot('article.ipynb').cells[0]!.source, /\+ 1/);
+    assert.equal(a.notebookSnapshot('article.ipynb').cells[1]!.metadata.editedBy, 'B');
   });
 
   it('converges after concurrent notebook insertion and deletion without duplicate IDs', () => {
@@ -276,9 +276,9 @@ describe('Pair Notebook CRDT', () => {
     const updatesB = captureLocalUpdates(b);
     a.reconcileNotebook('article.ipynb', {
       ...notebook,
-      cells: [notebook.cells[0], { id: 'cell-new', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] }, notebook.cells[1]],
+      cells: [notebook.cells[0]!, { id: 'cell-new', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] }, notebook.cells[1]!],
     });
-    b.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1]] });
+    b.reconcileNotebook('article.ipynb', { ...notebook, cells: [notebook.cells[1]!] });
     exchange(a, b, updatesA, updatesB, 'article.ipynb', 'notebook');
     const idsA = a.notebookSnapshot('article.ipynb').cells.map((cell) => cell.id);
     const idsB = b.notebookSnapshot('article.ipynb').cells.map((cell) => cell.id);
@@ -306,7 +306,7 @@ describe('Pair Notebook CRDT', () => {
     b.on('update', (event: ProjectUpdate) => { if (event.origin !== REMOTE_ORIGIN) forwarded += 1; });
     const update = captureLocalUpdates(a);
     a.applyTextChanges('a.py', [{ offset: 1, deleteCount: 0, insertText: 'y' }]);
-    b.applyRemoteUpdate('a.py', 'text', update[0]);
+    b.applyRemoteUpdate('a.py', 'text', update[0]!);
     assert.equal(forwarded, 0);
   });
 
@@ -360,8 +360,8 @@ describe('Pair Notebook CRDT', () => {
     project.applyRemoteUpdate('unsafe.ipynb', 'notebook', Y.encodeStateAsUpdate(attacker));
     const snapshot = project.notebookSnapshot('unsafe.ipynb');
     assert.deepEqual(snapshot.cells.map((cell) => cell.id), ['safe-cell']);
-    assert.deepEqual(snapshot.cells[0].metadata, {});
-    assert.deepEqual(snapshot.cells[0].outputs, []);
+    assert.deepEqual(snapshot.cells[0]!.metadata, {});
+    assert.deepEqual(snapshot.cells[0]!.outputs, []);
   });
 
   it('bounds notebook output block counts before storing them in Yjs', () => {
@@ -1014,7 +1014,7 @@ describe('compute launch and recent projects', () => {
     assert.equal(launch.cwd, '/work/project');
     assert.equal(launch.env.CUDA_VISIBLE_DEVICES, '3');
     assert.equal(launch.env.PAIR_NOTEBOOK_CWD, '/work/project');
-    assert.match(launch.args[0], /media[/\\]jupyter_kernel_bridge\.py$/);
+    assert.match(launch.args[0] ?? '', /media[/\\]jupyter_kernel_bridge\.py$/);
   });
 
   it('deduplicates recent paths and removes inaccessible entries', async () => {
@@ -1179,8 +1179,8 @@ describe('protocol and notebook compatibility', () => {
       metadata: { language_info: { name: 'python' } }, nbformat: 4, nbformat_minor: 5,
     });
     const parsed = parseIpynb(raw);
-    assert.equal(parsed.cells[0].execution?.executionOrder, 7);
-    const image = parsed.cells[0].outputs[0].items.find((item) => item.mime === 'image/png');
+    assert.equal(parsed.cells[0]!.execution?.executionOrder, 7);
+    const image = parsed.cells[0]!.outputs[0]?.items.find((item) => item.mime === 'image/png');
     assert.deepEqual(Buffer.from(image?.dataBase64 ?? '', 'base64'), png);
     const restored = JSON.parse(Buffer.from(serializeIpynb(parsed)).toString('utf8')) as any;
     assert.equal(restored.cells[0].execution_count, 7);
@@ -1340,9 +1340,9 @@ describe('real transport and compute', () => {
       for (const server of config.turnConfig ?? []) {
         assert.ok(Array.isArray(server.urls) && server.urls.length >= 3);
         // UDP first (preferred TURN transport), then TCP, then TLS.
-        assert.match(server.urls[0], /^turn:openrelay\.metered\.ca:80$/);
-        assert.match(server.urls[1], /^turn:openrelay\.metered\.ca:443\?transport=tcp$/);
-        assert.match(server.urls[2], /^turns:openrelay\.metered\.ca:443$/);
+        assert.match(server.urls[0] ?? '', /^turn:openrelay\.metered\.ca:80$/);
+        assert.match(server.urls[1] ?? '', /^turn:openrelay\.metered\.ca:443\?transport=tcp$/);
+        assert.match(server.urls[2] ?? '', /^turns:openrelay\.metered\.ca:443$/);
         assert.ok(server.username && server.credential);
       }
     } finally {

@@ -30,7 +30,7 @@ export interface PythonInfo {
 
 export interface HardwareInfo {
   cpuModel: string;
-  physicalCores?: number;
+  physicalCores?: number | undefined;
   logicalThreads: number;
   totalRamMb: number;
   availableRamMb: number;

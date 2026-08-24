@@ -407,12 +407,14 @@ export class EditorSynchronizer implements vscode.Disposable {
 
       for (let index = 0; index < snapshot.cells.length; index += 1) {
         const target = snapshot.cells[index];
+        if (!target) continue;
         const current = notebook.cellAt(index);
         await this.applyText(current.document, target.source);
       }
       const notebookEdits: vscode.NotebookEdit[] = [];
       for (let index = 0; index < snapshot.cells.length; index += 1) {
         const target = snapshot.cells[index];
+        if (!target) continue;
         const current = notebook.cellAt(index);
         const desiredMetadata = { ...target.metadata, pairNotebookCellId: target.id };
         const outputChanged = JSON.stringify(outputsFromCell(current)) !== JSON.stringify(target.outputs);
@@ -596,7 +598,7 @@ function executionFromCell(cell: vscode.NotebookCell): CellExecutionSnapshot | u
 function toNotebookOutput(output: OutputSnapshot): vscode.NotebookCellOutput {
   return new vscode.NotebookCellOutput(
     output.items.map((item) => new vscode.NotebookCellOutputItem(Buffer.from(item.dataBase64, 'base64'), item.mime)),
-    output.metadata,
+    ...(output.metadata !== undefined ? [output.metadata] : []),
   );
 }
 
@@ -604,7 +606,13 @@ function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
   const result = new vscode.NotebookCellData(cell.kind, cell.source, cell.language);
   result.metadata = { ...cell.metadata, pairNotebookCellId: cell.id };
   result.outputs = cell.outputs.map(toNotebookOutput);
-  result.executionSummary = cell.execution;
+  if (cell.execution !== undefined) {
+    const { executionOrder, success } = cell.execution;
+    result.executionSummary = {
+      ...(executionOrder !== undefined ? { executionOrder } : {}),
+      ...(success !== undefined ? { success } : {}),
+    };
+  }
   return result;
 }
 

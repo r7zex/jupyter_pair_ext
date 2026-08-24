@@ -68,7 +68,10 @@ export function matchInitialCellIds(
   for (const [fingerprint, indexes] of currentBuckets) {
     const targets = targetBuckets.get(fingerprint);
     if (indexes.length !== 1 || targets?.length !== 1) continue;
-    result[indexes[0]] = targets[0].id;
+    const sourceIndex = indexes[0];
+    const matched = targets[0];
+    if (sourceIndex === undefined || !matched) continue;
+    result[sourceIndex] = matched.id;
   }
   return result;
 }
@@ -95,15 +98,20 @@ export function minimalNotebookSplice(
   target: readonly CellSnapshot[],
 ): NotebookSplice | undefined {
   let start = 0;
-  while (start < current.length && start < target.length && sameStructure(current[start], target[start])) {
+  while (start < current.length && start < target.length) {
+    const currentCell = current[start];
+    const targetCell = target[start];
+    if (!currentCell || !targetCell || !sameStructure(currentCell, targetCell)) break;
     start += 1;
   }
   if (start === current.length && start === target.length) return undefined;
 
   let currentEnd = current.length;
   let targetEnd = target.length;
-  while (currentEnd > start && targetEnd > start
-    && sameStructure(current[currentEnd - 1], target[targetEnd - 1])) {
+  while (currentEnd > start && targetEnd > start) {
+    const currentCell = current[currentEnd - 1];
+    const targetCell = target[targetEnd - 1];
+    if (!currentCell || !targetCell || !sameStructure(currentCell, targetCell)) break;
     currentEnd -= 1;
     targetEnd -= 1;
   }

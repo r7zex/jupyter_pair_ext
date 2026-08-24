@@ -13,7 +13,7 @@ import { TrysteroRoomFactory } from '../../src/runtime/mesh';
 interface TestClient {
   id: string;
   key: string;
-  callbacks?: JoinRoomCallbacks;
+  callbacks?: JoinRoomCallbacks | undefined;
   room: Room;
   actions: Map<string, MessageAction<DataPayload>>;
   peers: Set<TestClient>;
@@ -73,7 +73,10 @@ export function healInMemoryTrystero(): void {
     const active = [...clients].filter((client) => !client.left);
     for (let left = 0; left < active.length; left += 1) {
       for (let right = left + 1; right < active.length; right += 1) {
-        void connect(active[left], active[right]);
+        const leftClient = active[left];
+        const rightClient = active[right];
+        if (!leftClient || !rightClient) continue;
+        void connect(leftClient, rightClient);
       }
     }
   }
@@ -105,7 +108,7 @@ function createClient(key: string, callbacks?: JoinRoomCallbacks): TestClient {
             if (!receiver) return;
             await receiver(clonePayload(data) as T, {
               peerId: client.id,
-              metadata: options?.metadata,
+              ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
             });
           }));
         },
@@ -144,13 +147,13 @@ async function connect(left: TestClient, right: TestClient): Promise<void> {
     await Promise.all([
       left.callbacks?.onPeerHandshake?.(
         right.id,
-        async (data, metadata) => leftToRight.push({ data, metadata }),
+        async (data, metadata) => leftToRight.push(metadata === undefined ? { data } : { data, metadata }),
         () => rightToLeft.take(),
         initiatorIsLeft,
       ),
       right.callbacks?.onPeerHandshake?.(
         left.id,
-        async (data, metadata) => rightToLeft.push({ data, metadata }),
+        async (data, metadata) => rightToLeft.push(metadata === undefined ? { data } : { data, metadata }),
         () => leftToRight.take(),
         !initiatorIsLeft,
       ),
