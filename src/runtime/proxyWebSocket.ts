@@ -52,8 +52,31 @@ export function createProxyAgent(
   }
 }
 
+/** Module-level copy of the active proxy runtime options. */
+let activeProxyRuntimeOptions: ProxyWebSocketRuntimeOptions = {};
+
+/**
+ * Creates a raw Node WebSocket for first-party channels (e.g. the emergency
+ * Nostr data relay) that honours exactly the same proxy resolution as
+ * Trystero signalling. Keeping one resolver prevents two divergent proxy
+ * implementations; credentials only ever reach the agent.
+ */
+export function createProxiedNodeWebSocket(url: string): NodeWebSocket {
+  let agent: Agent | undefined;
+  try {
+    agent = createProxyAgent(url, activeProxyRuntimeOptions)?.agent;
+  } catch {
+    agent = undefined;
+  }
+  const socket = new NodeWebSocket(url, agent ? { agent } : undefined);
+  // Same crash-safety rationale as ProxyAwareWebSocket above.
+  socket.on('error', () => { /* handled via close/reconnect */ });
+  return socket;
+}
+
 /** Installs the proxy-aware WebSocket as the global used by Trystero. */
 export function installProxyAwareWebSocket(options: ProxyWebSocketRuntimeOptions = {}): void {
+  activeProxyRuntimeOptions = { ...options };
   const runtime = globalThis as unknown as { WebSocket?: unknown };
 
   class ProxyAwareWebSocket extends NodeWebSocket {
