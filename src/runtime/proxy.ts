@@ -8,10 +8,10 @@
  * made discovery fail even when a perfectly good proxy was available.
  *
  * This module resolves an explicit proxy descriptor from, in priority order:
- *   1. VS Code `http.proxy` (when `http.proxySupport` is not "off")
- *   2. `HTTPS_PROXY` / `https_proxy`
- *   3. `HTTP_PROXY` / `http_proxy`
- *   4. `ALL_PROXY` / `all_proxy`
+ *   1. Pair Notebook `proxyUrl`
+ *   2. VS Code `http.proxy` (when `http.proxySupport` is not "off")
+ *   3. `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+ *   4. the Windows system proxy
  * honouring `NO_PROXY`/`no_proxy` exclusions. HTTP(S) CONNECT proxies,
  * authenticated proxies (userinfo), SOCKS5 and SOCKS4 URLs are supported.
  *
@@ -33,8 +33,12 @@ export interface ProxyDescriptor {
 }
 
 export interface ProxyResolutionInput {
+  explicitProxy?: string | undefined;
   vscodeProxy?: string | undefined;
   vscodeProxySupport?: string | undefined;
+  vscodeNoProxy?: readonly string[] | undefined;
+  systemProxy?: string | undefined;
+  systemNoProxy?: string | undefined;
   env?: Record<string, string | undefined>;
 }
 
@@ -65,7 +69,10 @@ export function parseProxyUrl(rawUrl: string): ProxyDescriptor | undefined {
   else if (scheme === 'socks5h') kind = 'socks5h';
   else if (scheme === 'socks4' || scheme === 'socks4a') kind = 'socks4';
   if (!kind) return undefined;
-  const port = url.port ? Number(url.port) : kind === 'https' ? 443 : 1080;
+  const port = url.port ? Number(url.port)
+    : kind === 'http' ? 80
+      : kind === 'https' ? 443
+        : 1080;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) return undefined;
   const host = url.hostname;
   if (!host) return undefined;
@@ -78,20 +85,52 @@ export function parseProxyUrl(rawUrl: string): ProxyDescriptor | undefined {
   };
 }
 
-function hostMatchesPattern(host: string, pattern: string): boolean {
-  const clean = pattern.trim().toLowerCase().replace(/^\./, '');
+function hostMatchesPattern(host: string, port: string, pattern: string): boolean {
+  let clean = pattern.trim().toLowerCase();
   if (!clean) return false;
   if (clean === '*') return true;
-  if (host === clean) return true;
+  if (clean === '<local>') return !host.includes('.');
+  if (clean.includes('://')) {
+    try {
+      const parsed = new URL(clean);
+      clean = parsed.hostname + (parsed.port ? `:${parsed.port}` : '');
+    } catch {
+      return false;
+    }
+  }
+  let patternHost = clean;
+  let patternPort = '';
+  if (clean.startsWith('[')) {
+    const closingBracket = clean.indexOf(']');
+    if (closingBracket < 0) return false;
+    patternHost = clean.slice(1, closingBracket);
+    if (clean[closingBracket + 1] === ':') patternPort = clean.slice(closingBracket + 2);
+  } else if (clean.indexOf(':') === clean.lastIndexOf(':')) {
+    const colon = clean.lastIndexOf(':');
+    if (colon > 0) {
+      patternHost = clean.slice(0, colon);
+      patternPort = clean.slice(colon + 1);
+    }
+  }
+  if (patternPort && patternPort !== port) return false;
+  patternHost = patternHost.replace(/^\*?\./, '');
+  if (!patternHost) return false;
+  if (patternHost.includes('*')) {
+    const wildcard = patternHost
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*/g, '.*');
+    return new RegExp(`^${wildcard}$`).test(host);
+  }
+  if (host === patternHost) return true;
   // A suffix entry like "example.com" also covers subdomains per NO_PROXY
   // convention; require a dot boundary so "notexample.com" never matches.
-  return host.endsWith(`.${clean}`);
+  return host.endsWith(`.${patternHost}`);
 }
 
-export function isHostExcluded(host: string, noProxy: string | undefined): boolean {
+export function isHostExcluded(host: string, noProxy: string | undefined, port = ''): boolean {
   if (!noProxy) return false;
   const normalizedHost = host.toLowerCase();
-  return noProxy.split(',').some((pattern) => hostMatchesPattern(normalizedHost, pattern));
+  return noProxy.split(/[,;]/).some((pattern) => hostMatchesPattern(normalizedHost, port, pattern));
 }
 
 /**
@@ -109,21 +148,28 @@ export function resolveProxy(
     return undefined;
   }
   const env = input.env ?? process.env as Record<string, string | undefined>;
-  const noProxy = env.NO_PROXY ?? env.no_proxy;
-  if (isHostExcluded(target.hostname, noProxy)) return undefined;
+  const targetPort = target.port || ((target.protocol === 'wss:' || target.protocol === 'https:') ? '443' : '80');
+  const noProxy = [
+    env.NO_PROXY ?? env.no_proxy,
+    input.vscodeNoProxy?.join(','),
+    input.systemNoProxy,
+  ].filter((value): value is string => Boolean(value?.trim())).join(',');
+  if (isHostExcluded(target.hostname, noProxy, targetPort)) return undefined;
 
   const candidates: string[] = [];
   const vscodeSupportOff = input.vscodeProxySupport === 'off';
+  if (input.explicitProxy) candidates.push(input.explicitProxy);
   if (input.vscodeProxy && !vscodeSupportOff) candidates.push(input.vscodeProxy);
   if (target.protocol === 'wss:' || target.protocol === 'https:') {
     for (const key of ['HTTPS_PROXY', 'https_proxy']) if (env[key]?.trim()) candidates.push(env[key]!.trim());
+    // Many local VPN clients expose one HTTP CONNECT endpoint and set only
+    // HTTP_PROXY. CONNECT is valid for secure targets too.
+    for (const key of ['HTTP_PROXY', 'http_proxy']) if (env[key]?.trim()) candidates.push(env[key]!.trim());
   } else {
     for (const key of ['HTTP_PROXY', 'http_proxy']) if (env[key]?.trim()) candidates.push(env[key]!.trim());
   }
   for (const key of ['ALL_PROXY', 'all_proxy']) if (env[key]?.trim()) candidates.push(env[key]!.trim());
-  if (candidates.length === 0 && input.vscodeProxy && vscodeSupportOff === false) {
-    // Already covered above; kept for clarity.
-  }
+  if (input.systemProxy) candidates.push(input.systemProxy);
 
   for (const candidate of candidates) {
     const parsed = parseProxyUrl(candidate);

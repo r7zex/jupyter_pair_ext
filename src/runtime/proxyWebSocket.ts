@@ -4,8 +4,8 @@
  * Trystero constructs `new WebSocket(url)` against the global WebSocket. In
  * Node that global is normally `ws`, which ignores every form of proxy
  * configuration. This factory installs a subclass that resolves a proxy for
- * the target URL at construction time (VS Code setting first, then the
- * standard environment variables) and attaches the matching agent, so Nostr
+ * the target URL at construction time (Pair Notebook/VS Code settings,
+ * environment variables, then the Windows system proxy) and attaches the matching agent, so Nostr
  * discovery keeps working on proxy-only networks.
  *
  * Credentials are passed only to the agent; they are never logged and never
@@ -20,9 +20,13 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 import { describeProxy, parseProxyUrl, resolveProxy, type ProxyDescriptor } from './proxy';
 
 export interface ProxyWebSocketRuntimeOptions {
-  /** VS Code `http.proxy` value; env vars are used when omitted or empty. */
+  /** Pair Notebook override; useful for local Karing HTTP/SOCKS listeners. */
+  explicitProxy?: string | undefined;
   vscodeProxy?: string | undefined;
   vscodeProxySupport?: string | undefined;
+  vscodeNoProxy?: readonly string[] | undefined;
+  systemProxy?: string | undefined;
+  systemNoProxy?: string | undefined;
   env?: Record<string, string | undefined>;
 }
 
@@ -68,14 +72,19 @@ let activeProxyRuntimeOptions: ProxyWebSocketRuntimeOptions = {};
  * Trystero signalling. Keeping one resolver prevents two divergent proxy
  * implementations; credentials only ever reach the agent.
  */
-export function createProxiedNodeWebSocket(url: string): NodeWebSocket {
+export function createProxiedNodeWebSocket(
+  url: string,
+  protocols?: string | string[],
+): NodeWebSocket {
   let agent: Agent | undefined;
   try {
     agent = createProxyAgent(url, activeProxyRuntimeOptions)?.agent;
   } catch {
     agent = undefined;
   }
-  const socket = new NodeWebSocket(url, agent ? { agent } : undefined);
+  const socket = protocols === undefined
+    ? new NodeWebSocket(url, agent ? { agent } : undefined)
+    : new NodeWebSocket(url, protocols, agent ? { agent } : undefined);
   // Same crash-safety rationale as ProxyAwareWebSocket above.
   socket.on('error', () => { /* handled via close/reconnect */ });
   return socket;

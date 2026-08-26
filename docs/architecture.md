@@ -1,4 +1,4 @@
-# Pair Notebook 0.3.1 architecture
+# Pair Notebook architecture
 
 ## Responsibilities
 
@@ -20,7 +20,7 @@ VS Code edit
   -> Yjs transaction
   -> authenticated Pair Notebook frame
   -> Trystero action
-  -> encrypted WebRTC data channel
+  -> encrypted WebRTC data channel or encrypted Nostr emergency relay
   -> remote Yjs transaction
   -> minimal VS Code workspace edit
 
@@ -34,7 +34,7 @@ Join bootstrap
   -> isolated participant working copy
 ```
 
-The discovery medium never carries project payloads. It carries encrypted session descriptions needed to establish peer-to-peer WebRTC connections.
+The discovery medium normally carries only encrypted session descriptions needed to establish peer-to-peer WebRTC connections. If ICE is impossible, a separate emergency protocol chunks authenticated AES-256-GCM ciphertext over a redundant subset of the same public Nostr relays; relay operators never receive the session token or plaintext project frames.
 
 ## Working and backing copies
 
@@ -50,5 +50,6 @@ The VSIX targets VS Code 1.95. Trystero runs in the extension host with bundled 
 
 - `werift` provides `RTCPeerConnection`.
 - `ws` provides `WebSocket` when the VS Code Node runtime has no global implementation.
+- `proxy.ts` resolves Pair Notebook/VS Code settings, environment variables, and the Windows system proxy for every WSS signalling and emergency-relay socket.
 
 Both are bundled by esbuild into `out/extension.js`; `node_modules` is excluded from the VSIX.

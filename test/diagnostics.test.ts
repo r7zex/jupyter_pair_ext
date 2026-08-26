@@ -89,12 +89,12 @@ describe('passive diagnostics', () => {
   it('reports DNS failures only when an injected resolver actually fails', async () => {
     const report = await buildNetworkDiagnostics({
       resolveDns: async (host) => {
-        if (host === 'relay.damus.io') throw new Error('ENOTFOUND');
+        if (host === 'nostr.data.haus') throw new Error('ENOTFOUND');
         return { address: '1.2.3.4' };
       },
-      dnsHosts: ['nos.lol', 'relay.damus.io'],
+      dnsHosts: ['nos.lol', 'nostr.data.haus'],
     });
-    assert.deepEqual(report.dnsFailures, ['relay.damus.io']);
+    assert.deepEqual(report.dnsFailures, ['nostr.data.haus']);
     const dnsObservation = report.observations.find((item) => item.observation.includes('DNS resolution failed'));
     assert.ok(dnsObservation);
     assert.equal(dnsObservation.confidence, 'confirmed');
