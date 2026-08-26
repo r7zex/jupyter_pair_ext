@@ -193,7 +193,14 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
     failure now leaves UDP unknown instead of claiming it is blocked.
   - Settings/README and 16 focused TURN/diagnostic regressions cover the honest
     behavior without exposing credentials.
-- [ ] Repair and run the network probe script.
+- [x] Repair and run the network probe script.
+  - Replaced invalid TypeScript syntax with JavaScript, made timers/socket
+    completion idempotent, and guaranteed TURN client cleanup.
+  - Removed hard-coded dead TURN credentials/endpoints. Trusted TURN is probed
+    only when `TURN_URLS` is explicitly supplied; otherwise the output says
+    `SKIPPED`.
+  - `node --check` passed. A live narrowed run passed DNS/TCP/TLS/WSS for
+    `wss://nos.lol`, all three STUN bindings, and the unconfigured TURN path.
 - [ ] Run the complete automated, live-network, package, and installed-artifact
   validation matrix.
 

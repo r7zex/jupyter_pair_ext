@@ -7,7 +7,11 @@
  *
  * Checks per Nostr relay: DNS resolution, TCP connect, TLS handshake,
  * WebSocket upgrade. Also performs a real STUN Binding over UDP against
- * Google/Cloudflare and a real TURN Allocate over UDP/TCP/TLS.
+ * Google/Cloudflare. When TURN_URLS is explicitly configured, it also runs a
+ * real TURN Allocate over the requested UDP/TCP/TLS endpoints, for example:
+ *
+ *   TURN_URLS=turn:relay.example.com:3478,turns:relay.example.com:5349 \
+ *   TURN_USERNAME=user TURN_PASSWORD=secret node scripts/network-probe.mjs
  * Results are printed per endpoint; never report a category as working
  * because one endpoint responded.
  */
@@ -31,13 +35,12 @@ const RELAYS = process.env.PAIR_NOTEBOOK_RELAYS?.split(',') ?? [
   'wss://offchain.pub',
 ];
 
-const TURN_USERNAME = process.env.TURN_USERNAME ?? 'openrelayproject';
-const TURN_PASSWORD = process.env.TURN_PASSWORD ?? 'openrelayproject';
-const TURN_ENDPOINTS = [
-  { label: 'TURN-UDP-80', host: 'openrelay.metered.ca', port: 80, transport: 'udp' },
-  { label: 'TURN-TCP-443', host: 'openrelay.metered.ca', port: 443, transport: 'tcp' },
-  { label: 'TURN-TLS-443', host: 'openrelay.metered.ca', port: 443, transport: 'tls' },
-];
+const TURN_USERNAME = process.env.TURN_USERNAME ?? '';
+const TURN_PASSWORD = process.env.TURN_PASSWORD ?? '';
+const TURN_ENDPOINTS = (process.env.TURN_URLS ?? '')
+  .split(',')
+  .map((value) => parseTurnEndpoint(value))
+  .filter(Boolean);
 const STUN_SERVERS = [
   { label: 'Google STUN 1', host: 'stun.l.google.com', port: 19302 },
   { label: 'Google STUN 2', host: 'stun1.l.google.com', port: 19302 },
@@ -49,18 +52,41 @@ const TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS ?? 8000);
 // werift's TURN client can surface socket resets as library-internal
 // unhandled rejections when a relay is unreachable; report them, don't crash.
 process.on('unhandledRejection', (reason) => {
-  console.log(`BACKGROUND-ERROR ${(reason as Error)?.stack ?? String(reason)}`);
+  const detail = reason instanceof Error ? reason.stack ?? reason.message : String(reason);
+  console.log(`BACKGROUND-ERROR ${detail}`);
 });
 
 function withTimeout(promise, ms, label) {
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => {
-      // Prevent an unhandled rejection if the underlying op settles later.
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
       promise.catch(() => {});
       reject(new Error(`${label}: timeout after ${ms}ms`));
     }, ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
   });
-  return Promise.race([promise, timeoutPromise]);
+}
+
+function parseTurnEndpoint(rawValue) {
+  const raw = rawValue.trim();
+  if (!raw) return undefined;
+  const match = /^(turn|turns):(?:\/\/)?(\[[^\]]+\]|[^:/?#]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(raw);
+  if (!match) throw new Error(`Invalid TURN_URLS endpoint: ${raw}`);
+  const scheme = match[1].toLowerCase();
+  const host = match[2].replace(/^\[|\]$/g, '');
+  const port = match[3] ? Number(match[3]) : scheme === 'turns' ? 5349 : 3478;
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Invalid TURN_URLS port: ${raw}`);
+  }
+  const transport = scheme === 'turns' ? 'tls' : (match[4]?.toLowerCase() ?? 'udp');
+  return {
+    label: `TURN-${transport.toUpperCase()}-${port}`,
+    host,
+    port,
+    transport,
+  };
 }
 
 async function checkDns(host) {
@@ -79,7 +105,10 @@ function checkTcp(host, port) {
   return new Promise((resolve) => {
     const started = performance.now();
     const socket = net.connect({ host, port });
+    let settled = false;
     const finish = (ok, error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
       resolve({ ok, error, ms: Math.round(performance.now() - started) });
     };
@@ -94,7 +123,10 @@ function checkTls(host, port, servername) {
   return new Promise((resolve) => {
     const started = performance.now();
     const socket = tls.connect({ host, port, servername: servername ?? host, rejectUnauthorized: true });
+    let settled = false;
     const finish = (ok, error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
       resolve({ ok, error, ms: Math.round(performance.now() - started) });
     };
@@ -125,6 +157,7 @@ function checkStunBinding(host, port) {
   return new Promise((resolve) => {
     const started = performance.now();
     const socket = dgram.createSocket('udp4');
+    let settled = false;
     // STUN Binding Request: type 0x0001, length 0, magic cookie, 12-byte id.
     const transactionId = crypto.randomBytes(12);
     const message = Buffer.concat([
@@ -133,6 +166,8 @@ function checkStunBinding(host, port) {
       transactionId,
     ]);
     const finish = (ok, detail) => {
+      if (settled) return;
+      settled = true;
       socket.close();
       resolve({ ok, detail, ms: Math.round(performance.now() - started) });
     };
@@ -151,22 +186,24 @@ function checkStunBinding(host, port) {
 }
 
 async function checkTurnAllocate({ label, host, port, transport }) {
+  let client;
   try {
     const { createTurnClient } = await import('werift');
     const started = performance.now();
     await withTimeout((async () => {
-      const client = await createTurnClient(
+      client = await createTurnClient(
         { address: [host, port], username: TURN_USERNAME, password: TURN_PASSWORD },
         { transport, lifetime: 600 },
       );
       await client.connectionMade();
       if (!client.relayedAddress) throw new Error('no relayed address');
-      await client.close();
     })(), TIMEOUT_MS, label);
     return { label, ok: true, detail: 'Allocate + auth OK', ms: Math.round(performance.now() - started) };
   } catch (error) {
     const code = error?.code ? ` [${error.code}]` : '';
     return { label, ok: false, detail: `${error?.name ?? 'Error'}${code}: ${error?.message ?? String(error)}` };
+  } finally {
+    try { await client?.close(); } catch { /* best-effort cleanup */ }
   }
 }
 
@@ -195,7 +232,11 @@ for (const stun of STUN_SERVERS) {
   const result = await checkStunBinding(stun.host, stun.port);
   console.log(`STUN ${stun.label} ${stun.host}:${stun.port}: ${result.ok ? 'OK' : 'FAIL'} ${result.detail ?? result.error ?? ''} (${result.ms}ms)`);
 }
-for (const endpoint of TURN_ENDPOINTS) {
-  const result = await checkTurnAllocate(endpoint);
-  console.log(`${result.label} ${endpoint.host}:${endpoint.port}: ${result.ok ? 'OK' : 'FAIL'} ${result.detail}${result.ms ? ` (${result.ms}ms)` : ''}`);
+if (TURN_ENDPOINTS.length === 0) {
+  console.log('TURN: SKIPPED (not configured; set TURN_URLS and credentials to probe a trusted service)');
+} else {
+  for (const endpoint of TURN_ENDPOINTS) {
+    const result = await checkTurnAllocate(endpoint);
+    console.log(`${result.label} ${endpoint.host}:${endpoint.port}: ${result.ok ? 'OK' : 'FAIL'} ${result.detail}${result.ms ? ` (${result.ms}ms)` : ''}`);
+  }
 }
