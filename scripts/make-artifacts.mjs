@@ -172,7 +172,7 @@ async function main() {
     'pair-notebook/package.json',
     'pair-notebook/out/extension.js',
     'pair-notebook/media/jupyter_kernel_bridge.py',
-    'pair-notebook/docs/acceptance-report.md',
+    'pair-notebook/docs/network-compatibility-audit.md',
     'pair-notebook/src/extension.ts',
     'pair-notebook/test/audit.regression.test.ts',
   ]) {

@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { describe, it, before, after } from 'mocha';
+
+class FakeRelaySocket extends EventEmitter {
+  public readonly sent: string[] = [];
+  public closeCalls = 0;
+
+  public send(data: string): void {
+    this.sent.push(data);
+  }
+
+  public close(): void {
+    this.closeCalls += 1;
+  }
+}
 
 describe('emergency Nostr data relay', function () {
   this.timeout(20_000);
@@ -108,5 +122,92 @@ describe('emergency Nostr data relay', function () {
     assert.equal(received.length, 0);
     a.stop();
     b.stop();
+  });
+
+  it('tracks dialing sockets so repeated start calls cannot create duplicates', () => {
+    const sockets: FakeRelaySocket[] = [];
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'dial-dedupe',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => {
+        const socket = new FakeRelaySocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    relay.start();
+    relay.start();
+    assert.equal(sockets.length, 1);
+    assert.equal(relay.connectedRelayCount, 0);
+    sockets[0]!.emit('open');
+    assert.equal(relay.connectedRelayCount, 1);
+    relay.stop();
+  });
+
+  it('closes a still-dialing socket and refuses a late open after stop', () => {
+    const socket = new FakeRelaySocket();
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'stop-dial',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => socket,
+    });
+    relay.start();
+    relay.stop();
+    assert.equal(socket.closeCalls, 1);
+    socket.emit('open');
+    assert.equal(relay.connectedRelayCount, 0);
+    assert.equal(socket.sent.length, 0);
+  });
+
+  it('does not let a stale close remove a replacement relay socket', () => {
+    const sockets: FakeRelaySocket[] = [];
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'stale-close',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => {
+        const socket = new FakeRelaySocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    relay.start();
+    sockets[0]!.emit('open');
+    sockets[0]!.emit('close');
+    relay.start();
+    sockets[1]!.emit('open');
+    sockets[0]!.emit('close');
+    relay.start();
+    assert.equal(sockets.length, 2);
+    assert.equal(relay.connectedRelayCount, 1);
+    relay.stop();
+  });
+
+  it('rejects unbounded and malformed public-relay chunk metadata', () => {
+    const socket = new FakeRelaySocket();
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'invalid-chunks',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => socket,
+    });
+    let frames = 0;
+    relay.onFrame = () => { frames += 1; };
+    relay.start();
+    socket.emit('open');
+    const publish = (content: unknown): void => {
+      socket.emit('message', JSON.stringify(['EVENT', 'sub', { content: JSON.stringify(content) }]));
+    };
+    publish({ t: 'd', f: 'peer-b', p: 'a'.repeat(24), s: 1, i: 0, n: 999_999, d: 'AAAA' });
+    publish({ t: 'd', f: 'peer-b', p: 'b'.repeat(24), s: 1, i: 0, n: 1, d: 'not-base64!' });
+    publish({ t: 'a', f: '../not-a-peer' });
+    assert.equal(frames, 0);
+    relay.stop();
   });
 });

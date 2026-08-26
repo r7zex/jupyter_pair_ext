@@ -24,20 +24,30 @@
 
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto';
 import { schnorr } from '@noble/secp256k1';
+import { MAX_WIRE_FRAME_BYTES } from '../core/wire';
 import { createProxiedNodeWebSocket } from './proxyWebSocket';
 
 /** Relays used for the fallback channel; a subset of the discovery list. */
 export const RELAY_DATA_URLS = [
   'wss://nos.lol',
-  'wss://relay.damus.io',
-  'wss://nostr.mom',
   'wss://relay.sigit.io',
+  'wss://nostr.mom',
+  'wss://nostr.data.haus',
 ];
 
 const CHUNK_TARGET_BYTES = 32 * 1024;
 const IV_BYTES = 12;
 const REORDER_WINDOW_MS = 1_000;
 const PACKET_TTL_MS = 120_000;
+const MAX_RELAY_CHUNKS = Math.ceil((MAX_WIRE_FRAME_BYTES + IV_BYTES + 16) / CHUNK_TARGET_BYTES);
+const MAX_RELAY_CHUNK_BASE64_CHARS = Math.ceil(CHUNK_TARGET_BYTES * 4 / 3) + 4;
+const MAX_PENDING_PACKETS = 256;
+const MAX_PENDING_PACKET_BYTES = 128 * 1024 * 1024;
+const MAX_OUTBOX_MESSAGES = 8_192;
+const MAX_OUTBOX_BYTES = 256 * 1024 * 1024;
+const MAX_SEEN_PACKET_IDS = 32_768;
+const PEER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const PACKET_ID_PATTERN = /^[a-f0-9]{24}$/;
 
 export type RelaySocketLike = {
   send(data: string): void;
@@ -61,6 +71,12 @@ interface PendingPacket {
   total: number;
   seq: number;
   firstSeenAt: number;
+  bytes: number;
+}
+
+interface QueuedPayload {
+  payload: unknown;
+  bytes: number;
 }
 export function deriveRelayTopic(sessionId: string, token: string): string {
   return createHash('sha256').update(`pair-notebook-relay-v1|${sessionId}|${token}`).digest('hex');
@@ -132,7 +148,9 @@ interface InboundMessage {
 }
 
 export class NostrFrameRelay {
+  /** Includes both dialing and open sockets so start() cannot duplicate dials. */
   private readonly sockets = new Map<string, RelaySocketLike>();
+  private readonly openSockets = new Set<RelaySocketLike>();
   private readonly key: Buffer;
   private readonly privateKey: Uint8Array;
   private readonly kind: number;
@@ -142,7 +160,9 @@ export class NostrFrameRelay {
   private readonly seenPacketIds = new Map<string, number>();
   private nextSeq = 1;
   private housekeepingTimer: NodeJS.Timeout | undefined;
-  private readonly outbox: Array<() => Promise<void>> = [];
+  private readonly outbox: QueuedPayload[] = [];
+  private outboxBytes = 0;
+  private pendingPacketBytes = 0;
   private stopped = false;
   private announced = false;
 
@@ -157,7 +177,7 @@ export class NostrFrameRelay {
   }
 
   get connectedRelayCount(): number {
-    return this.sockets.size;
+    return this.openSockets.size;
   }
 
   /** Connects to the relays and subscribes to the session's data topic. */
@@ -172,10 +192,19 @@ export class NostrFrameRelay {
       } catch {
         continue;
       }
+      this.sockets.set(url, socket);
       socket.on('open', () => {
-        if (this.stopped) return;
-        this.sockets.set(url, socket);
-        socket.send(JSON.stringify(['REQ', 'sub', { kinds: [this.kind], '#x': [this.topic], since: Math.floor(Date.now() / 1000) - 30 }]));
+        if (this.stopped || this.sockets.get(url) !== socket) {
+          try { socket.close(); } catch { /* already gone */ }
+          return;
+        }
+        this.openSockets.add(socket);
+        try {
+          socket.send(JSON.stringify(['REQ', 'sub', { kinds: [this.kind], '#x': [this.topic], since: Math.floor(Date.now() / 1000) - 30 }]));
+        } catch {
+          try { socket.close(); } catch { /* close/reconnect owns recovery */ }
+          return;
+        }
         if (this.announced) this.sendAnnounce();
         this.flushOutbox();
       });
@@ -184,8 +213,12 @@ export class NostrFrameRelay {
       });
       socket.on('error', () => { /* close follows */ });
       socket.on('close', () => {
+        this.openSockets.delete(socket);
+        if (this.sockets.get(url) !== socket) return;
         this.sockets.delete(url);
-        if (!this.stopped) setTimeout(() => this.start(), 2_000 + Math.floor(Math.random() * 2_000)).unref?.();
+        if (!this.stopped) {
+          setTimeout(() => this.start(), 2_000 + Math.floor(Math.random() * 2_000)).unref?.();
+        }
       });
     }
     this.housekeepingTimer ??= setInterval(() => this.housekeeping(), 5_000);
@@ -200,8 +233,12 @@ export class NostrFrameRelay {
       try { socket.close(); } catch { /* already gone */ }
     }
     this.sockets.clear();
+    this.openSockets.clear();
     this.pendingPackets.clear();
+    this.pendingPacketBytes = 0;
     this.seenPacketIds.clear();
+    this.outbox.splice(0);
+    this.outboxBytes = 0;
   }
 
   /** Publishes an announce so other session members can discover this peer via relay. */
@@ -212,6 +249,9 @@ export class NostrFrameRelay {
 
   /** Sends one frame to a peer (or broadcasts when toPeerId is undefined). */
   send(bytes: Buffer, toPeerId?: string): void {
+    if (bytes.byteLength > MAX_WIRE_FRAME_BYTES) {
+      throw new Error('Relay frame exceeds the Pair Notebook wire size limit.');
+    }
     const packetId = randomBytes(12).toString('hex');
     const encrypted = encryptPacket(this.key, bytes);
     const total = Math.max(1, Math.ceil(encrypted.length / CHUNK_TARGET_BYTES));
@@ -219,15 +259,13 @@ export class NostrFrameRelay {
     this.nextSeq += 1;
     const base: InboundMessage = { t: 'd', f: this.options.localPeerId, s: seq, p: packetId };
     if (toPeerId !== undefined) (base as { to?: string }).to = toPeerId;
-    const tasks: Array<() => Promise<void>> = [];
+    const payloads: unknown[] = [];
     for (let index = 0; index < total; index += 1) {
       const slice = encrypted.subarray(index * CHUNK_TARGET_BYTES, Math.min((index + 1) * CHUNK_TARGET_BYTES, encrypted.length));
       const payload = { ...base, i: index, n: total, d: slice.toString('base64') };
-      tasks.push(() => this.publish(payload));
+      payloads.push(payload);
     }
-    // Remember our own packet ids so an echoed copy is not delivered back.
-    this.seenPacketIds.set(packetId, Date.now());
-    this.executeOrQueue(tasks);
+    this.executeOrQueue(payloads);
   }
 
   /**
@@ -235,26 +273,37 @@ export class NostrFrameRelay {
    * (that race silently dropped the very messages needed to connect).
    * Queue such sends and flush them the moment the first relay opens.
    */
-  private executeOrQueue(tasks: Array<() => Promise<void>>): void {
+  private executeOrQueue(payloads: unknown[]): void {
     if (this.stopped) return;
-    if (this.sockets.size === 0) {
-      this.outbox.push(...tasks);
+    if (this.openSockets.size === 0) {
+      const queued = payloads.map((payload) => ({
+        payload,
+        bytes: Buffer.byteLength(JSON.stringify(payload), 'utf8'),
+      }));
+      const addedBytes = queued.reduce((total, entry) => total + entry.bytes, 0);
+      if (this.outbox.length + queued.length > MAX_OUTBOX_MESSAGES
+        || this.outboxBytes + addedBytes > MAX_OUTBOX_BYTES) {
+        throw new Error('Relay connection queue is full; wait for a relay to reconnect and retry.');
+      }
+      this.outbox.push(...queued);
+      this.outboxBytes += addedBytes;
       return;
     }
-    for (const task of tasks) void task();
+    for (const payload of payloads) void this.publish(payload);
   }
 
   private flushOutbox(): void {
     if (this.outbox.length === 0) return;
     const queued = this.outbox.splice(0);
-    for (const task of queued) void task();
+    this.outboxBytes = 0;
+    for (const entry of queued) void this.publish(entry.payload);
   }
 
   private async publish(payload: unknown): Promise<void> {
-    if (this.stopped || this.sockets.size === 0) return;
+    if (this.stopped || this.openSockets.size === 0) return;
     const event = await buildEvent(payload, { topic: this.topic, kind: this.kind }, this.privateKey);
     const wire = JSON.stringify(['EVENT', event]);
-    for (const socket of this.sockets.values()) {
+    for (const socket of this.openSockets) {
       try { socket.send(wire); } catch { /* reconnect logic handles it */ }
     }
   }
@@ -268,6 +317,7 @@ export class NostrFrameRelay {
     if (!event?.content) return;
     let parsed: InboundMessage;
     try { parsed = JSON.parse(event.content) as InboundMessage; } catch { return; }
+    if (typeof parsed.f !== 'string' || !PEER_ID_PATTERN.test(parsed.f)) return;
     if (parsed.f === this.options.localPeerId) return; // our own echo
     const addressedTo = (parsed as { to?: string }).to;
     if (addressedTo !== undefined && addressedTo !== this.options.localPeerId) return;
@@ -275,26 +325,36 @@ export class NostrFrameRelay {
       this.onPeerAnnounce(parsed.f);
       return;
     }
-    if (parsed.t !== 'd' || typeof parsed.p !== 'string' || typeof parsed.d !== 'string'
-      || typeof parsed.i !== 'number' || typeof parsed.n !== 'number' || typeof parsed.s !== 'number') return;
+    if (parsed.t !== 'd' || typeof parsed.p !== 'string' || !PACKET_ID_PATTERN.test(parsed.p)
+      || typeof parsed.d !== 'string' || parsed.d.length > MAX_RELAY_CHUNK_BASE64_CHARS
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(parsed.d) || parsed.d.length % 4 !== 0
+      || !Number.isSafeInteger(parsed.i) || !Number.isSafeInteger(parsed.n) || !Number.isSafeInteger(parsed.s)
+      || parsed.i! < 0 || parsed.n! < 1 || parsed.n! > MAX_RELAY_CHUNKS || parsed.i! >= parsed.n! || parsed.s! < 1) return;
     this.acceptChunk(parsed);
   }
 
   private acceptChunk(message: InboundMessage): void {
     const packetKey = `${message.f}:${message.p}`;
     if (this.seenPacketIds.has(packetKey)) return;
+    const chunk = Buffer.from(message.d!, 'base64');
+    if (chunk.byteLength === 0 || chunk.byteLength > CHUNK_TARGET_BYTES) return;
     let pending = this.pendingPackets.get(packetKey);
     if (!pending) {
-      if ((message.n ?? 1) < 1 || (message.i ?? 0) >= (message.n ?? 1)) return;
-      pending = { chunks: new Map(), total: message.n!, seq: message.s!, firstSeenAt: Date.now() };
+      if (this.pendingPackets.size >= MAX_PENDING_PACKETS) return;
+      pending = { chunks: new Map(), total: message.n!, seq: message.s!, firstSeenAt: Date.now(), bytes: 0 };
       this.pendingPackets.set(packetKey, pending);
     }
+    if (pending.total !== message.n || pending.seq !== message.s) return;
     if (pending.chunks.has(message.i!)) return;
+    if (this.pendingPacketBytes + chunk.byteLength > MAX_PENDING_PACKET_BYTES) return;
     // Chunks are slices of one GCM packet: reassemble first, decrypt once.
-    pending.chunks.set(message.i!, Buffer.from(message.d!, 'base64'));
+    pending.chunks.set(message.i!, chunk);
+    pending.bytes += chunk.byteLength;
+    this.pendingPacketBytes += chunk.byteLength;
     if (pending.chunks.size < pending.total) return;
     this.pendingPackets.delete(packetKey);
-    this.seenPacketIds.set(packetKey, Date.now());
+    this.pendingPacketBytes -= pending.bytes;
+    this.rememberSeen(packetKey);
     const assembledEncrypted = Buffer.concat([...pending.chunks.entries()]
       .sort((left, right) => left[0] - right[0])
       .map(([, chunk]) => chunk));
@@ -322,7 +382,20 @@ export class NostrFrameRelay {
       if (now - timestamp > PACKET_TTL_MS) this.seenPacketIds.delete(id);
     }
     for (const [id, pending] of this.pendingPackets) {
-      if (now - pending.firstSeenAt > REORDER_WINDOW_MS * 30) this.pendingPackets.delete(id);
+      if (now - pending.firstSeenAt > REORDER_WINDOW_MS * 30) {
+        this.pendingPackets.delete(id);
+        this.pendingPacketBytes -= pending.bytes;
+      }
+    }
+  }
+
+  private rememberSeen(packetKey: string): void {
+    this.seenPacketIds.delete(packetKey);
+    this.seenPacketIds.set(packetKey, Date.now());
+    while (this.seenPacketIds.size > MAX_SEEN_PACKET_IDS) {
+      const oldest = this.seenPacketIds.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.seenPacketIds.delete(oldest);
     }
   }
 }

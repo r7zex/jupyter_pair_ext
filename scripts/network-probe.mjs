@@ -26,7 +26,6 @@ const RELAYS = process.env.PAIR_NOTEBOOK_RELAYS?.split(',') ?? [
   'wss://nos.lol',
   'wss://relay.sigit.io',
   'wss://nostr.mom',
-  'wss://relay.damus.io',
   'wss://nostr.data.haus',
   'wss://nostr.sathoarder.com',
   'wss://relay.primal.net',

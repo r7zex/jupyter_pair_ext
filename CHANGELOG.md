@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 - 2026-08-26 (Windows VPN/proxy compatibility and relay lifecycle)
+
+- Detects the current Windows WinINet proxy before activation, Start, Join and Reconnect, covering Karing's system-proxy mode without requiring a duplicated VS Code setting. `pairNotebook.proxyUrl` remains an explicit HTTP(S)/SOCKS fallback for PAC-only or non-Windows clients.
+- Routes MQTT.js through the same proxy resolver. The secondary Trystero family previously created its own `ws` socket and silently bypassed Karing/VS Code proxy settings even while Nostr worked.
+- Fixes `http://` proxy URLs without a port resolving to 1080 instead of 80, adds secure-target `HTTP_PROXY` fallback, and honours VS Code/Windows bypass lists with ports and wildcards.
+- Removes an observed HTTP 503 Nostr endpoint from discovery and emergency-relay lists; the replacement passed DNS, TCP, TLS and WebSocket upgrade probes on the release network.
+- Prevents duplicate emergency-relay dials, closes sockets that are still connecting during shutdown, keeps stale close events from deleting replacements, and bounds malformed chunk metadata, reassembly memory and the pre-connect outbox.
+- Adds a 21-pair integration matrix for direct, Flowseal/zapret, Karing TUN, Karing system proxy, explicit HTTP proxy and environment proxy paths with WebRTC/UDP unavailable, plus independent-process public Nostr and MQTT WebRTC smokes.
+- Removes obsolete 0.3.1 reports, the completed repair prompt, a broken debug script and the superseded 0.5.0 VSIX from the current repository tree.
+
 ## 0.5.0 - 2026-08-24 (secondary signalling family, route policy, network-change recovery)
 
 - **Secondary signalling family (MQTT)**: Pair Notebook now joins a concurrent MQTT-signalling room (`@trystero-p2p/mqtt`, public WSS brokers) in addition to Nostr. Failure of one signalling family no longer kills discovery: peers met through the surviving family connect with the full signed identity handshake. The same logical participant discovered through BOTH families appears exactly once — a provably-alive incumbent transport wins deterministically, the duplicate is closed, and zombie/lost-leave retirement semantics are unchanged. After the winning route dies, the peer is re-discovered through the surviving family. Failures of the secondary family are fully contained and never affect the primary.

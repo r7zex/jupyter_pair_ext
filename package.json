@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "pair-notebook",
   "license": "MIT",
   "engines": {
@@ -283,6 +283,12 @@
           "default": "",
           "scope": "application",
           "description": "Username for the custom TURN servers. Store the password with 'Pair Notebook: Set TURN Password' so it never appears in settings or logs."
+        },
+        "pairNotebook.proxyUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional HTTP(S), SOCKS4 or SOCKS5 proxy URL for signalling and encrypted relay fallback (for example http://127.0.0.1:10809). Pair Notebook otherwise uses VS Code, environment and Windows system proxy settings automatically."
         }
       }
     }
@@ -299,9 +305,10 @@
   },
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",
-    "@trystero-p2p/mqtt": "^0.25.3",
+    "@trystero-p2p/core": "^0.25.3",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
+    "mqtt": "^5.15.2",
     "socks-proxy-agent": "^8.0.5",
     "trystero": "^0.25.3",
     "werift": "^0.24.4",

@@ -126,7 +126,7 @@ export interface NetworkDiagnosticsReport {
   dnsFailures: string[];
 }
 
-const DEFAULT_DNS_HOSTS = ['nos.lol', 'relay.damus.io'];
+const DEFAULT_DNS_HOSTS = ['nos.lol', 'nostr.data.haus'];
 
 /**
  * Builds the full passive report. DNS checks are bounded and optional; when

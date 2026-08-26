@@ -22,6 +22,12 @@ import {
   resolveProxy,
 } from '../src/runtime/proxy';
 import { createProxyAgent } from '../src/runtime/proxyWebSocket';
+import { proxyAwareMqttOptions } from '../src/runtime/mqttProxy';
+import {
+  parseWindowsSystemProxyOutput,
+  proxyUrlFromWindowsValue,
+  readWindowsSystemProxy,
+} from '../src/runtime/systemProxy';
 
 describe('TURN endpoint configuration', () => {
   it('parses turn and turns URLs with explicit transports', () => {
@@ -154,6 +160,12 @@ describe('proxy resolution', () => {
     assert.equal(parseProxyUrl('not a url'), undefined);
   });
 
+  it('uses protocol-correct default proxy ports', () => {
+    assert.equal(parseProxyUrl('http://proxy.local')?.port, 80);
+    assert.equal(parseProxyUrl('https://proxy.local')?.port, 443);
+    assert.equal(parseProxyUrl('socks5://proxy.local')?.port, 1080);
+  });
+
   it('redacts credentials from proxy URLs', () => {
     const redacted = redactProxyUrl('http://user:hunter2@proxy.local:3128');
     assert.ok(!redacted.includes('hunter2'));
@@ -168,19 +180,56 @@ describe('proxy resolution', () => {
     assert.equal(resolveProxy('wss://nos.lol', { env: { ALL_PROXY: 'socks5h://env-all:1080' } })?.kind, 'socks5h');
   });
 
+  it('supports an explicit local VPN proxy and Windows system-proxy fallback', () => {
+    const env = { HTTPS_PROXY: 'http://env:8443' };
+    assert.equal(resolveProxy('wss://nos.lol', {
+      explicitProxy: 'socks5h://karing:10808',
+      vscodeProxy: 'http://vscode:3128',
+      systemProxy: 'http://system:10809',
+      env,
+    })?.host, 'karing');
+    assert.equal(resolveProxy('wss://nos.lol', { systemProxy: 'http://system:10809', env: {} })?.host, 'system');
+    assert.equal(resolveProxy('wss://nos.lol', { systemProxy: 'http://system:10809', env })?.host, 'env');
+  });
+
+  it('uses HTTP_PROXY for secure CONNECT when HTTPS_PROXY is absent', () => {
+    assert.equal(resolveProxy('wss://nos.lol', {
+      env: { HTTP_PROXY: 'http://karing:10809' },
+    })?.host, 'karing');
+  });
+
   it('honours http.proxySupport=off for the VS Code proxy only', () => {
     const env = { HTTPS_PROXY: 'http://env-https:8443' };
     assert.equal(
       resolveProxy('wss://nos.lol', { vscodeProxy: 'http://vscode:3128', vscodeProxySupport: 'off', env })?.host,
       'env-https',
     );
+    assert.equal(resolveProxy('wss://nos.lol', {
+      systemProxy: 'http://system:10809', vscodeProxySupport: 'off', env: {},
+    })?.host, 'system');
   });
 
   it('honours NO_PROXY exclusions', () => {
     const env = { HTTPS_PROXY: 'http://env-https:8443', NO_PROXY: 'nos.lol,.internal' };
     assert.equal(resolveProxy('wss://nos.lol', { env }), undefined);
     assert.equal(resolveProxy('wss://box.internal', { env }), undefined);
-    assert.equal(resolveProxy('wss://relay.damus.io', { env })?.host, 'env-https');
+    assert.equal(resolveProxy('wss://nostr.data.haus', { env })?.host, 'env-https');
+  });
+
+  it('honours port-qualified, VS Code and Windows bypass lists', () => {
+    assert.equal(isHostExcluded('nos.lol', 'nos.lol:443', '443'), true);
+    assert.equal(isHostExcluded('nos.lol', 'nos.lol:80', '443'), false);
+    assert.equal(isHostExcluded('127.0.0.1', 'localhost;127.*;<local>', '443'), true);
+    assert.equal(resolveProxy('wss://nos.lol', {
+      systemProxy: 'http://system:10809',
+      systemNoProxy: 'nos.lol;localhost',
+      env: {},
+    }), undefined);
+    assert.equal(resolveProxy('wss://box.internal', {
+      vscodeProxy: 'http://vscode:3128',
+      vscodeNoProxy: ['.internal'],
+      env: {},
+    }), undefined);
   });
 
   it('never matches a NO_PROXY suffix without a dot boundary', () => {
@@ -270,6 +319,69 @@ describe('proxy resolution', () => {
         proxyServer.close((error) => error ? reject(error) : resolve());
       });
     }
+  });
+});
+
+describe('MQTT proxy integration', () => {
+  it('injects a proxy-aware WebSocket hook into MQTT.js options', () => {
+    const calls: Array<{ url: string; protocols: string[] }> = [];
+    const expectedSocket = {};
+    const options = proxyAwareMqttOptions({}, (url, protocols) => {
+      calls.push({ url, protocols });
+      return expectedSocket;
+    });
+    const created = options.createWebsocket?.('wss://broker.example/mqtt', ['mqtt'], options);
+    assert.equal(created, expectedSocket);
+    assert.deepEqual(calls, [{ url: 'wss://broker.example/mqtt', protocols: ['mqtt'] }]);
+  });
+
+  it('preserves an explicit MQTT WebSocket hook', () => {
+    const explicit = (): object => ({ explicit: true });
+    const options = proxyAwareMqttOptions({ createWebsocket: explicit });
+    assert.equal(options.createWebsocket, explicit);
+  });
+});
+
+describe('Windows system proxy discovery', () => {
+  it('normalizes single and per-protocol WinINet ProxyServer values', () => {
+    assert.equal(proxyUrlFromWindowsValue('127.0.0.1:10809'), 'http://127.0.0.1:10809');
+    assert.equal(
+      proxyUrlFromWindowsValue('http=127.0.0.1:8080;https=127.0.0.1:10809;socks=127.0.0.1:10808'),
+      'http://127.0.0.1:10809',
+    );
+    assert.equal(proxyUrlFromWindowsValue('socks=127.0.0.1:10808'), 'socks5://127.0.0.1:10808');
+  });
+
+  it('parses enabled WinINet registry settings and bypasses', () => {
+    const parsed = parseWindowsSystemProxyOutput(`
+      ProxyEnable    REG_DWORD    0x1
+      ProxyServer    REG_SZ       127.0.0.1:10809
+      ProxyOverride  REG_SZ       localhost;*.internal;<local>
+    `);
+    assert.equal(parsed?.proxyUrl, 'http://127.0.0.1:10809');
+    assert.equal(parsed?.noProxy, 'localhost,*.internal,<local>');
+  });
+
+  it('does not use a disabled manual proxy and reports PAC-only configuration', () => {
+    assert.equal(parseWindowsSystemProxyOutput(`
+      ProxyEnable    REG_DWORD    0x0
+      ProxyServer    REG_SZ       127.0.0.1:10809
+    `), undefined);
+    assert.equal(parseWindowsSystemProxyOutput(`
+      ProxyEnable    REG_DWORD    0x0
+      AutoConfigURL  REG_SZ       http://127.0.0.1/proxy.pac
+    `)?.autoConfigUrl, 'http://127.0.0.1/proxy.pac');
+  });
+
+  it('is read-only, Windows-only and accepts an injected registry query', async () => {
+    assert.equal(await readWindowsSystemProxy({ platform: 'linux', queryRegistry: async () => {
+      throw new Error('must not run');
+    } }), undefined);
+    const parsed = await readWindowsSystemProxy({
+      platform: 'win32',
+      queryRegistry: async () => 'ProxyEnable REG_DWORD 0x1\nProxyServer REG_SZ 127.0.0.1:10809',
+    });
+    assert.equal(parsed?.proxyUrl, 'http://127.0.0.1:10809');
   });
 });
 

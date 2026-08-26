@@ -8,7 +8,7 @@ import {
   type NostrRoomConfig,
   type Room,
 } from 'trystero';
-import { joinRoom as joinMqttRoom } from '@trystero-p2p/mqtt';
+import { joinRoom as joinMqttRoom } from './mqttRoom';
 import {
   generateIdentityCredentials,
   newIdentityNonce,
@@ -60,7 +60,6 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://nos.lol',
   'wss://relay.sigit.io',
   'wss://nostr.mom',
-  'wss://relay.damus.io',
   'wss://nostr.data.haus',
   'wss://nostr.sathoarder.com',
   'wss://relay.primal.net',
@@ -183,6 +182,10 @@ export function configureMeshNetwork(config: MeshNetworkConfig): void {
   meshNetworkConfig.proxy = config.proxy;
   meshNetworkConfig.disableRelayFallback = config.disableRelayFallback;
   meshNetworkConfig.relayFactory = config.relayFactory;
+  // Trystero and the emergency relay create replacement sockets during
+  // recovery. Refresh the global constructor now so those reconnects see a
+  // newly enabled VPN or proxy without restarting the extension host.
+  installProxyAwareWebSocket(config.proxy ?? {});
 }
 
 const RELAY_REDUNDANCY = 8;
