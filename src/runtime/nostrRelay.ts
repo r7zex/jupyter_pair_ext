@@ -22,10 +22,12 @@
  * per sender by sequence number with a small gap buffer.
  */
 
-import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { schnorr } from '@noble/secp256k1';
 import { MAX_WIRE_FRAME_BYTES } from '../core/wire';
+import { type FrameRelay } from './frameRelay';
 import { createProxiedNodeWebSocket } from './proxyWebSocket';
+import { decryptRelayPacket, deriveRelayFrameKey, encryptRelayPacket } from './relayCrypto';
 
 /** Relays used for the fallback channel; a subset of the discovery list. */
 export const RELAY_DATA_URLS = [
@@ -36,10 +38,9 @@ export const RELAY_DATA_URLS = [
 ];
 
 const CHUNK_TARGET_BYTES = 32 * 1024;
-const IV_BYTES = 12;
 const REORDER_WINDOW_MS = 1_000;
 const PACKET_TTL_MS = 120_000;
-const MAX_RELAY_CHUNKS = Math.ceil((MAX_WIRE_FRAME_BYTES + IV_BYTES + 16) / CHUNK_TARGET_BYTES);
+const MAX_RELAY_CHUNKS = Math.ceil((MAX_WIRE_FRAME_BYTES + 12 + 16) / CHUNK_TARGET_BYTES);
 const MAX_RELAY_CHUNK_BASE64_CHARS = Math.ceil(CHUNK_TARGET_BYTES * 4 / 3) + 4;
 const MAX_PENDING_PACKETS = 256;
 const MAX_PENDING_PACKET_BYTES = 128 * 1024 * 1024;
@@ -91,26 +92,6 @@ function deriveKind(topic: string): number {
   return 20_000 + Math.abs(hash) % 10_000;
 }
 
-function deriveFrameKey(token: string, sessionId: string): Buffer {
-  return Buffer.from(hkdfSync('sha256', Buffer.from(token, 'utf8'), Buffer.from(sessionId, 'utf8'), 'pair-notebook-frame-key', 32));
-}
-
-function encryptPacket(key: Buffer, plaintext: Buffer): Buffer {
-  const iv = randomBytes(IV_BYTES);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
-}
-
-function decryptPacket(key: Buffer, packet: Buffer): Buffer {
-  if (packet.length < IV_BYTES + 16) throw new Error('Relay packet is truncated.');
-  const iv = packet.subarray(0, IV_BYTES);
-  const tag = packet.subarray(IV_BYTES, IV_BYTES + 16);
-  const decipher = createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(packet.subarray(IV_BYTES + 16)), decipher.final()]);
-}
-
 async function buildEvent(
   payload: unknown,
   options: { topic: string; kind: number },
@@ -147,7 +128,7 @@ interface InboundMessage {
   d?: string;
 }
 
-export class NostrFrameRelay {
+export class NostrFrameRelay implements FrameRelay {
   /** Includes both dialing and open sockets so start() cannot duplicate dials. */
   private readonly sockets = new Map<string, RelaySocketLike>();
   private readonly openSockets = new Set<RelaySocketLike>();
@@ -172,12 +153,22 @@ export class NostrFrameRelay {
   constructor(private readonly options: NostrFrameRelayOptions) {
     this.topic = deriveRelayTopic(options.sessionId, options.token);
     this.kind = deriveKind(this.topic);
-    this.key = deriveFrameKey(options.token, options.sessionId);
+    this.key = deriveRelayFrameKey(options.token, options.sessionId);
     this.privateKey = randomBytes(32);
   }
 
   get connectedRelayCount(): number {
     return this.openSockets.size;
+  }
+
+  async waitUntilReady(timeoutMs = 15_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.stopped && this.connectedRelayCount === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (this.connectedRelayCount === 0) {
+      throw new Error('No Nostr emergency relay completed a WebSocket connection.');
+    }
   }
 
   /** Connects to the relays and subscribes to the session's data topic. */
@@ -198,13 +189,13 @@ export class NostrFrameRelay {
           try { socket.close(); } catch { /* already gone */ }
           return;
         }
-        this.openSockets.add(socket);
         try {
           socket.send(JSON.stringify(['REQ', 'sub', { kinds: [this.kind], '#x': [this.topic], since: Math.floor(Date.now() / 1000) - 30 }]));
         } catch {
           try { socket.close(); } catch { /* close/reconnect owns recovery */ }
           return;
         }
+        this.openSockets.add(socket);
         if (this.announced) this.sendAnnounce();
         this.flushOutbox();
       });
@@ -253,7 +244,7 @@ export class NostrFrameRelay {
       throw new Error('Relay frame exceeds the Pair Notebook wire size limit.');
     }
     const packetId = randomBytes(12).toString('hex');
-    const encrypted = encryptPacket(this.key, bytes);
+    const encrypted = encryptRelayPacket(this.key, bytes);
     const total = Math.max(1, Math.ceil(encrypted.length / CHUNK_TARGET_BYTES));
     const seq = this.nextSeq;
     this.nextSeq += 1;
@@ -360,7 +351,7 @@ export class NostrFrameRelay {
       .map(([, chunk]) => chunk));
     let assembled: Buffer;
     try {
-      assembled = decryptPacket(this.key, assembledEncrypted);
+      assembled = decryptRelayPacket(this.key, assembledEncrypted);
     } catch {
       // Wrong key or corrupted packet: drop silently; the sender retry owns recovery.
       return;

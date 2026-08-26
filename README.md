@@ -1,13 +1,13 @@
-# Pair Notebook 0.5.1
+# Pair Notebook 0.5.2
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.5.1.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.5.2.vsix` from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.5.1.vsix --force
+code --install-extension .\pair-notebook-0.5.2.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
@@ -20,9 +20,11 @@ Pair Notebook tries several independent ways to reach the other participant and 
 
 1. **Direct P2P** — encrypted WebRTC over ICE (STUN-assisted). Near-ping latency; this is the normal path.
 2. **Optional custom TURN relay** — when you configure `pairNotebook.turnUrls`, WebRTC can relay through that service; UDP, TCP and TLS transports are probed and reachable ones are preferred. Pair Notebook does not ship anonymous TURN credentials or claim a dead public demo as a fallback.
-3. **Encrypted emergency relay** — if ICE cannot build any path (cross-VPN setups, UDP blocked), session frames tunnel as AES-256-GCM ciphertext through public Nostr relays. The session token never reaches the relays.
+3. **Redundant encrypted emergency relay** — if ICE cannot build any path (cross-VPN setups, UDP blocked), every session frame is sent as AES-256-GCM ciphertext through independent Nostr and MQTT infrastructures. Either family can carry the complete session; the token and plaintext never reach relay operators.
 
 Signalling runs over TWO independent families concurrently — multiple health-checked public Nostr relays plus a public MQTT broker set — so the failure of one family or relay no longer stalls discovery; a participant discovered through both families still appears exactly once. All WebSocket-based channels honour `pairNotebook.proxyUrl`, `http.proxy` from VS Code, the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, and the current Windows system proxy. HTTP(S), SOCKS4, SOCKS5 and SOCKS5h are supported; proxy credentials are never logged or displayed.
+
+Start and Join include a strict relay-readiness barrier: Pair Notebook requires at least one subscribed full-data emergency family (Nostr or MQTT) before it declares the local transport ready. It attempts both, but does not reject a usable session merely because one independent public infrastructure is temporarily unavailable. Join is reported as connected only after the two computers complete the signed end-to-end handshake. With working outbound WSS from both computers, Flowseal/zapret and Karing therefore retain independently tested full-data paths even when WebRTC and TURN are unavailable.
 
 On Windows, Karing TUN needs no special setup because it transparently routes application traffic. Karing's **Auto Set System Proxy** mode is detected from the current user's WinINet settings; Pair Notebook refreshes that value before Start, Join and Reconnect. If another client uses PAC only or does not register its listener as the Windows system proxy, set `pairNotebook.proxyUrl` to its local HTTP/SOCKS URL, for example `http://127.0.0.1:10809`.
 
@@ -90,13 +92,13 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 ## Network and security
 
-Trystero uses public Nostr relays for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, the emergency channel sends only AES-256-GCM ciphertext through a redundant subset of the Nostr relays. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
+Trystero uses public Nostr and MQTT services for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, both emergency families send only AES-256-GCM ciphertext through Nostr relays and MQTT brokers. Duplicate deliveries are removed before the signed participant handshake. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
 Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Version 0.3.3 requires a fresh authenticated invite and intentionally does not resume legacy token-only sessions.
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
-Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook can use a custom TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate or trust one) and independently falls back to the built-in encrypted emergency relay over public Nostr, which needs nothing from the user. There is no built-in TURN service: the former Open Relay demo is not sent to Trystero, probed, or advertised because it is no longer operational anonymously. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
+Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook can use a custom TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate or trust one) and independently falls back to the built-in encrypted Nostr + MQTT emergency route, which needs nothing from the user. There is no built-in TURN service: the former Open Relay demo is not sent to Trystero, probed, or advertised because it is no longer operational anonymously. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
 
 ## Development
 
@@ -108,11 +110,11 @@ npm run test:live
 npm run artifacts
 ```
 
-`npm test` uses an in-memory Trystero room to make transport and failover tests deterministic. `npm run test:live` additionally launches two independent Node processes and verifies public Nostr discovery plus a real WebRTC data-channel exchange.
+`npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport and failover tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies 64 KiB direct-to-system-proxy round trips over Nostr only, MQTT only, and both emergency families together.
 
 The final artifacts are:
 
-- `pair-notebook-0.5.1.vsix` — installable extension.
-- `pair-notebook-complete-0.5.1.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.5.2.vsix` — installable extension.
+- `pair-notebook-complete-0.5.2.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and the [network compatibility audit](docs/network-compatibility-audit.md) for implementation details.

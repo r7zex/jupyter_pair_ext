@@ -430,6 +430,45 @@ describe('mesh network configuration', () => {
 describe('mesh relay fallback integration', function () {
   this.timeout(30_000);
 
+  it('refuses to advertise a session when the guaranteed relay readiness barrier fails', async () => {
+    const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
+    const deadRoom = {
+      makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+      onPeerJoin: () => undefined,
+      onPeerLeave: () => undefined,
+      ping: async () => -1,
+      leave: async () => undefined,
+    };
+    configureMeshNetwork({
+      relayFactory: () => ({
+        connectedRelayCount: 0,
+        onFrame: () => undefined,
+        onPeerAnnounce: () => undefined,
+        start: () => undefined,
+        stop: () => undefined,
+        waitUntilReady: async () => { throw new Error('no common WSS path'); },
+        sendAnnounce: () => undefined,
+        send: () => undefined,
+      }),
+    });
+    const transport = new MeshTransport({
+      sessionId: 'relay-readiness', token: 'relay-readiness-token-that-is-long-enough',
+      localPeer: { peerId: 'ready-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'ready-host' }),
+      isHost: () => true,
+      roomFactory: () => deadRoom as never,
+    });
+    try {
+      await assert.rejects(
+        transport.start(),
+        /Guaranteed emergency relay readiness failed: no common WSS path/,
+      );
+    } finally {
+      await transport.stop();
+      configureMeshNetwork({});
+    }
+  });
+
   it('derives complementary relay roles regardless of which side receives first', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
@@ -559,6 +598,65 @@ describe('mesh relay fallback integration', function () {
       assert.ok(retry);
       assert.notEqual(retry.localHs.nonce, failedNonce);
       assert.ok(sends >= 3);
+    } finally {
+      await local.stop();
+      await remote.stop();
+    }
+  });
+
+  it('ignores a delayed proof from an older relay transcript without rejecting the peer', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const local = new MeshTransport({
+      sessionId: 'relay-stale-proof', token: 'relay-stale-proof-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    const remote = new MeshTransport({
+      sessionId: 'relay-stale-proof', token: 'relay-stale-proof-token-that-is-long-enough',
+      localPeer: { peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false,
+    });
+    type Negotiation = { localHs: { nonce: string }; remoteProof?: unknown; timeout: NodeJS.Timeout };
+    type RelayInternals = {
+      relay: unknown;
+      localHandshake: () => unknown;
+      handleRelayData: (peerId: string, bytes: Buffer) => void;
+      relayNegotiations: Map<string, Negotiation>;
+    };
+    const localInternals = local as unknown as RelayInternals;
+    const remoteInternals = remote as unknown as RelayInternals;
+    localInternals.relay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: () => undefined,
+    };
+    local.connect({ peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 });
+    const errors: Error[] = [];
+    local.on('connectionError', (_peer, error: Error) => errors.push(error));
+
+    try {
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+        k: 'hs', hs: remoteInternals.localHandshake(),
+      })));
+      const negotiation = localInternals.relayNegotiations.get('z-guest');
+      assert.ok(negotiation);
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+        k: 'pr',
+        pr: {
+          version: 2,
+          signature: Buffer.alloc(64).toString('base64'),
+          transcriptId: '0'.repeat(64),
+        },
+      })));
+
+      assert.equal(errors.length, 0);
+      assert.equal(localInternals.relayNegotiations.get('z-guest'), negotiation);
+      assert.equal(negotiation.remoteProof, undefined);
     } finally {
       await local.stop();
       await remote.stop();
