@@ -6,7 +6,6 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import NodeWebSocket from 'ws';
 
 import {
-  DEFAULT_TURN_URLS,
   orderTurnEndpoints,
   parseTurnEndpoint,
   parseTurnEndpoints,
@@ -73,7 +72,11 @@ describe('TURN endpoint configuration', () => {
   });
 
   it('orders UDP before TCP before TLS regardless of input order', () => {
-    const endpoints = parseTurnEndpoints(DEFAULT_TURN_URLS);
+    const endpoints = parseTurnEndpoints([
+      'turns:relay.example.com:443',
+      'turn:relay.example.com:443?transport=tcp',
+      'turn:relay.example.com:3478',
+    ]);
     const ordered = orderTurnEndpoints(endpoints);
     assert.deepEqual(ordered.map((endpoint) => endpoint.transport), ['udp', 'tcp', 'tls']);
   });
@@ -302,10 +305,11 @@ describe('mesh network configuration', () => {
       assert.ok(!diagnostics.includes('custom-secret-password'));
       assert.ok(diagnostics.includes(TRYSTERO_RELAY_URLS[0]));
       assert.ok(diagnostics.includes('cotton.example.com'));
+      assert.equal((transport.networkDiagnostics() as { turnStatus?: string }).turnStatus, 'configured');
     } finally {
       await transport.stop();
       resetInMemoryTrystero();
-      // Restore defaults so unrelated tests keep using the public fallback.
+      // Restore the unconfigured default so unrelated tests do not inherit credentials.
       configureMeshNetwork({});
     }
   });

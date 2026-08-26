@@ -68,28 +68,12 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://relay.orangepill.dev',
   'wss://offchain.pub',
 ];
-/**
- * Default TURN relay endpoints, used as a last-resort connectivity fallback.
- *
- * Trystero's default STUN servers cannot traverse symmetric NATs or
- * restrictive firewalls, which made joins stall for a long time and then
- * fail with "could not connect to peer ... configure TURN servers".
- * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is
- * what the werift ICE stack actually uses (it consumes only one TURN URL),
- * so MeshTransport probes reachability and reorders this list in place,
- * always keeping direct peer-to-peer ICE preferred over relaying.
- * The list must stay compatible on every participant because ICE needs both
- * sides to attempt usable relays. The Open Relay (Metered) demo credentials
- * are publicly published by that provider for free-tier testing; they are
- * overridden via `pairNotebook.turnUrls` + secret storage in production.
- */
-export const TRYSTERO_TURN_SERVERS = [
-  {
-    urls: [...DEFAULT_TURN_URLS],
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-];
+/** @deprecated Pair Notebook no longer advertises a dead built-in TURN service. */
+export const TRYSTERO_TURN_SERVERS: ReadonlyArray<{
+  urls: string[];
+  username: string;
+  credential: string;
+}> = [];
 
 export interface MeshNetworkConfig {
   /** Overrides the default TURN endpoint URL list. */
@@ -354,6 +338,7 @@ export class MeshTransport extends EventEmitter {
   private pingInFlight = false;
   private turnEndpoints: TurnEndpoint[] | undefined;
   private turnProbes: TurnProbeResult[] | undefined;
+  private turnStatus: 'not-configured' | 'invalid' | 'configured' = 'not-configured';
   private relay: NostrFrameRelay | undefined;
   private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
@@ -599,11 +584,14 @@ export class MeshTransport extends EventEmitter {
    * preferred by ordinary candidate priority regardless of TURN ordering.
    */
   private buildTurnConfig(): NostrRoomConfig['turnConfig'] {
-    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : DEFAULT_TURN_URLS;
-    const username = meshNetworkConfig.turnUsername || TRYSTERO_TURN_SERVERS[0].username;
-    const password = meshNetworkConfig.turnPassword || TRYSTERO_TURN_SERVERS[0].credential;
+    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : [...DEFAULT_TURN_URLS];
     const endpoints = parseTurnEndpoints(urls);
+    this.turnEndpoints = undefined;
+    this.turnProbes = undefined;
+    this.turnStatus = urls.length === 0 ? 'not-configured' : endpoints.length === 0 ? 'invalid' : 'configured';
     if (endpoints.length === 0) return undefined;
+    const username = meshNetworkConfig.turnUsername ?? '';
+    const password = meshNetworkConfig.turnPassword ?? '';
     const ordered = orderTurnEndpoints(endpoints);
     const entry = {
       urls: ordered.map((endpoint) => endpoint.url),
@@ -659,6 +647,7 @@ export class MeshTransport extends EventEmitter {
     return {
       relays: [...TRYSTERO_RELAY_URLS],
       relayRedundancy: RELAY_REDUNDANCY,
+      turnStatus: this.turnStatus,
       turnEndpoints: (this.turnEndpoints ?? []).map((endpoint) => ({ ...endpoint })),
       turnProbes: (this.turnProbes ?? []).map((probe) => ({
         url: probe.endpoint.url,

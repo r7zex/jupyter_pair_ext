@@ -185,7 +185,14 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
     host directory/admission messages.
   - The concurrent Nostr/MQTT regression passes with canonical order 7 and no
     order-mismatch error; the different-key negative regression also passes.
-- [ ] Remove misleading built-in TURN fallback and correct diagnostics/docs.
+- [x] Remove misleading built-in TURN fallback and correct diagnostics/docs.
+  - Empty settings no longer pass or probe the dead Metered demo. Valid custom
+    TURN URLs and secret-stored credentials still build the ordered config.
+  - Diagnostics distinguish not configured, invalid, configured unreachable,
+    and UDP unavailable with a successful TCP/TLS control path. Total TURN
+    failure now leaves UDP unknown instead of claiming it is blocked.
+  - Settings/README and 16 focused TURN/diagnostic regressions cover the honest
+    behavior without exposing credentials.
 - [ ] Repair and run the network probe script.
 - [ ] Run the complete automated, live-network, package, and installed-artifact
   validation matrix.
