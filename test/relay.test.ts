@@ -54,7 +54,7 @@ describe('emergency Nostr data relay', function () {
     a.send(payload, 'peer-b');
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(receivedAtB.length, 1);
-    assert.ok(receivedAtB[0].equals(payload));
+    assert.ok(receivedAtB[0]!.equals(payload));
     a.stop();
     b.stop();
   });
@@ -71,7 +71,7 @@ describe('emergency Nostr data relay', function () {
     a.send(payload);
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert.equal(received.length, 1);
-    assert.ok(received[0].equals(payload));
+    assert.ok(received[0]!.equals(payload));
     a.stop();
     b.stop();
   });

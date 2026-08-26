@@ -18,23 +18,23 @@ const BRIDGE_MESSAGE_TYPES = new Set([
 export interface JupyterKernelEvent {
   type: 'accepted' | 'iopub' | 'shell' | 'inputRequest' | 'complete' | 'commandResult'
     | 'completionResult' | 'kernelInfoResult' | 'channelError' | 'commandError';
-  requestId?: string;
-  messageType?: string;
-  content?: Record<string, any>;
-  metadata?: Record<string, any>;
-  buffersBase64?: string[];
-  success?: boolean;
-  executionCount?: number | null;
-  command?: string;
-  channel?: string;
-  message?: string;
-  traceback?: string;
+  requestId?: string | undefined;
+  messageType?: string | undefined;
+  content?: Record<string, any> | undefined;
+  metadata?: Record<string, any> | undefined;
+  buffersBase64?: string[] | undefined;
+  success?: boolean | undefined;
+  executionCount?: number | null | undefined;
+  command?: string | undefined;
+  channel?: string | undefined;
+  message?: string | undefined;
+  traceback?: string | undefined;
 }
 
 export interface JupyterExecutionResult {
   requestId: string;
   success: boolean;
-  executionCount?: number | null;
+  executionCount?: number | null | undefined;
   content: Record<string, any>;
 }
 

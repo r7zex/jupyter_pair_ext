@@ -383,7 +383,7 @@ describe('production SessionRuntime integration', () => {
     const extensionRoot = path.join(root, 'extension');
     const folders = [path.join(root, 'host'), path.join(root, 'peer-b'), path.join(root, 'peer-c')];
     await Promise.all([...folders.map((folder) => mkdir(folder, { recursive: true })), mkdir(path.join(extensionRoot, 'media'), { recursive: true })]);
-    await writeFile(path.join(folders[0], 'work.ipynb'), JSON.stringify({
+    await writeFile(path.join(folders[0]!, 'work.ipynb'), JSON.stringify({
       cells: [{ cell_type: 'code', id: 'a', metadata: {}, source: ['value = 1'], execution_count: null, outputs: [] }],
       metadata: { language_info: { name: 'python' } }, nbformat: 4, nbformat_minor: 5,
     }), 'utf8');
@@ -391,7 +391,7 @@ describe('production SessionRuntime integration', () => {
     const token = 'failover-integration-token-that-is-long-enough';
     const sessionId = `failover-${Date.now()}`;
     const host = new SessionRuntime(descriptor({
-      sessionId, role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: folders[0],
+      sessionId, role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: folders[0]!,
       pythonPath: process.execPath,
     }), token, context(extensionRoot), logger());
     let peerB: any;
@@ -399,12 +399,12 @@ describe('production SessionRuntime integration', () => {
     try {
       await host.start();
       peerB = new SessionRuntime(descriptor({
-        sessionId, role: 'peer', peerId: 'peer-b', hostPeerId: 'host', workingFolder: folders[1],
+        sessionId, role: 'peer', peerId: 'peer-b', hostPeerId: 'host', workingFolder: folders[1]!,
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       await peerB.start();
       peerC = new SessionRuntime(descriptor({
-        sessionId, role: 'peer', peerId: 'peer-c', hostPeerId: 'host', workingFolder: folders[2],
+        sessionId, role: 'peer', peerId: 'peer-c', hostPeerId: 'host', workingFolder: folders[2]!,
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       await peerC.start();
@@ -1456,7 +1456,7 @@ describe('standard VS Code NotebookController production path', () => {
     await productionController.interruptHandler(notebookA);
     assert.equal(calls.at(-1), 'A:interrupt');
 
-    runtime.executeCell = async (key: string, id: string, _code: string, onEvent: (event: any) => void) => {
+    runtime.executeCell = async (_key: string, id: string, _code: string, onEvent: (event: any) => void) => {
       onEvent({ type: 'inputRequest', requestId: id, content: { prompt: 'Name:' } });
       return { requestId: id, success: true, content: { status: 'ok' } };
     };

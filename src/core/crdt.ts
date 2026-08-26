@@ -18,13 +18,13 @@ export interface OutputItemSnapshot {
 
 export interface OutputSnapshot {
   items: OutputItemSnapshot[];
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> | undefined;
 }
 
 export interface CellExecutionSnapshot {
-  executionOrder?: number;
-  success?: boolean;
-  timing?: { startTime: number; endTime: number };
+  executionOrder?: number | undefined;
+  success?: boolean | undefined;
+  timing?: { startTime: number; endTime: number } | undefined;
 }
 
 export interface CellSnapshot {
@@ -34,7 +34,7 @@ export interface CellSnapshot {
   source: string;
   metadata: Record<string, unknown>;
   outputs: OutputSnapshot[];
-  execution?: CellExecutionSnapshot;
+  execution?: CellExecutionSnapshot | undefined;
 }
 
 export interface NotebookSnapshot {
@@ -65,7 +65,7 @@ export interface ProjectUpdate {
   kind: DocumentKind;
   update: Uint8Array;
   origin: unknown;
-  scope?: { type: 'cellText' | 'cellOutputs' | 'cellMetadata' | 'cellExecution' | 'notebookMetadata' | 'structure'; cellId?: string };
+  scope?: { type: 'cellText' | 'cellOutputs' | 'cellMetadata' | 'cellExecution' | 'notebookMetadata' | 'structure'; cellId?: string } | undefined;
 }
 
 /**
@@ -281,6 +281,7 @@ export class CollaborativeProject extends EventEmitter {
       }
       for (let index = 0; index < desiredIds.length; index += 1) {
         const id = desiredIds[index];
+        if (id === undefined) continue;
         if (order.get(index) === id) continue;
         const current = order.toArray().indexOf(id, index + 1);
         if (current >= 0) order.delete(current, 1);

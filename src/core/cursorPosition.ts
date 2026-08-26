@@ -7,8 +7,8 @@ export interface SharedCursorPosition {
   anchor: number;
   active: number;
   /** Base64-encoded Yjs relative positions used by peers that understand them. */
-  relativeAnchor?: string;
-  relativeActive?: string;
+  relativeAnchor?: string | undefined;
+  relativeActive?: string | undefined;
 }
 
 export interface ResolvedCursorPosition {

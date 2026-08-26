@@ -128,15 +128,15 @@ describe('TURN reachability selection', () => {
       allocate: fakeAllocate({ udp: 30, tcp: 10, tls: 5 }),
       timeoutMs: 100,
     });
-    assert.equal(selectTurnEndpoints(endpoints, probes).ordered[0].transport, 'udp');
+    assert.equal(selectTurnEndpoints(endpoints, probes).ordered[0]?.transport, 'udp');
   });
 
   it('reports probe failures without leaking credentials', async () => {
-    const probes = await probeTurnEndpoints([endpoints[0]], {
+    const probes = await probeTurnEndpoints([endpoints[0]!], {
       allocate: async () => { throw new Error('password=hunter2 rejected'); },
       timeoutMs: 100,
     });
-    assert.match(probes[0].error ?? '', /\[redacted\]/);
+    assert.match(probes[0]?.error ?? '', /\[redacted\]/);
   });
 });
 
@@ -303,7 +303,7 @@ describe('mesh network configuration', () => {
 
       const diagnostics = JSON.stringify(transport.networkDiagnostics());
       assert.ok(!diagnostics.includes('custom-secret-password'));
-      assert.ok(diagnostics.includes(TRYSTERO_RELAY_URLS[0]));
+      assert.ok(diagnostics.includes(TRYSTERO_RELAY_URLS[0] ?? ''));
       assert.ok(diagnostics.includes('cotton.example.com'));
       assert.equal((transport.networkDiagnostics() as { turnStatus?: string }).turnStatus, 'configured');
     } finally {

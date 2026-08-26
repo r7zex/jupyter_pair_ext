@@ -76,7 +76,9 @@ export async function discoverPythonEnvironments(workspaceRoot: string, configur
       const index = nextIndex;
       nextIndex += 1;
       if (index >= entries.length) return;
-      const [executable, source] = entries[index];
+      const entry = entries[index];
+      if (!entry) return;
+      const [executable, source] = entry;
       inspected[index] = await inspectEnvironment(executable, source);
     }
   }));

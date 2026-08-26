@@ -77,22 +77,22 @@ export const TRYSTERO_TURN_SERVERS: ReadonlyArray<{
 
 export interface MeshNetworkConfig {
   /** Overrides the default TURN endpoint URL list. */
-  turnUrls?: readonly string[];
-  turnUsername?: string;
+  turnUrls?: readonly string[] | undefined;
+  turnUsername?: string | undefined;
   /** TURN credential; supplied from VS Code secret storage, never logged. */
-  turnPassword?: string;
+  turnPassword?: string | undefined;
   /** Disables the live TURN Allocate probe when true. */
   disableTurnProbe?: boolean;
   /** Proxy options applied to signalling WebSockets. */
-  proxy?: ProxyWebSocketRuntimeOptions;
+  proxy?: ProxyWebSocketRuntimeOptions | undefined;
   /** Disables the emergency Nostr data relay (default: enabled). */
-  disableRelayFallback?: boolean;
+  disableRelayFallback?: boolean | undefined;
   /** Test hook: builds the relay channel instead of the real one. */
-  relayFactory?: (options: {
+  relayFactory?: ((options: {
     token: string;
     sessionId: string;
     localPeerId: string;
-  }) => NostrFrameRelay;
+  }) => NostrFrameRelay) | undefined;
 }
 
 const RELAY_TRANSPORT_PREFIX = 'relay:';
@@ -146,13 +146,13 @@ interface RouteUpgrade {
   role: 'initiator' | 'responder';
   status: RouteUpgradeStatus;
   startedAt: number;
-  candidateTransportId?: string;
-  candidateRawId?: string;
-  connectedAt?: number;
+  candidateTransportId?: string | undefined;
+  candidateRawId?: string | undefined;
+  connectedAt?: number | undefined;
   verifiedPings: number;
-  lastError?: string;
-  deadlineTimer?: NodeJS.Timeout;
-  verifyTimer?: NodeJS.Timeout;
+  lastError?: string | undefined;
+  deadlineTimer?: NodeJS.Timeout | undefined;
+  verifyTimer?: NodeJS.Timeout | undefined;
 }
 
 interface RelayNegotiation {
@@ -160,8 +160,8 @@ interface RelayNegotiation {
   localHs: HandshakeMessage;
   sentLocalHs: boolean;
   sentProof: boolean;
-  remoteHs?: HandshakeMessage;
-  remoteProof?: string;
+  remoteHs?: HandshakeMessage | undefined;
+  remoteProof?: string | undefined;
   timeout: NodeJS.Timeout;
 }
 
@@ -228,13 +228,13 @@ export interface MeshOptions {
   isHost: () => boolean;
   hostReady?: () => boolean;
   purpose?: PeerConnectionPurpose;
-  roomFactory?: TrysteroRoomFactory;
+  roomFactory?: TrysteroRoomFactory | undefined;
   /** Test hook: builds the SECONDARY (MQTT) signalling room. */
-  secondaryRoomFactory?: TrysteroRoomFactory;
+  secondaryRoomFactory?: TrysteroRoomFactory | undefined;
   /** Disables the concurrent MQTT signalling family (default: enabled). */
-  disableSecondarySignalling?: boolean;
+  disableSecondarySignalling?: boolean | undefined;
   /** Required by production callers; omitted tests receive an ephemeral key. */
-  identityPrivateKey?: string;
+  identityPrivateKey?: string | undefined;
 }
 
 export type TrysteroRoomFactory = (
@@ -420,6 +420,7 @@ export class MeshTransport extends EventEmitter {
       },
       onJoinError: (details) => this.onJoinError(details),
     };
+    const turnConfig = this.buildTurnConfig();
     const config: NostrRoomConfig = {
       appId: TRYSTERO_APP_ID,
       password: this.options.token,
@@ -429,7 +430,7 @@ export class MeshTransport extends EventEmitter {
         redundancy: RELAY_REDUNDANCY,
         warnOnRelayFailure: false,
       },
-      turnConfig: this.buildTurnConfig(),
+      ...(turnConfig !== undefined ? { turnConfig } : {}),
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
     try {
@@ -470,19 +471,20 @@ export class MeshTransport extends EventEmitter {
    * contained: the primary Nostr room is never affected.
    */
   private startSecondarySignalling(): void {
-    if (this.mqttRoom || this.stopped || this.options.disableSecondarySignalling) return;
+    if (this.mqttRoom || this.mqttJoining || this.stopped || this.options.disableSecondarySignalling) return;
     const testFactory = this.options.roomFactory || MeshTransport.testingRoomFactory;
     const factory = this.options.secondaryRoomFactory ?? (testFactory ? undefined : joinMqttRoom);
     if (!factory) return;
     this.mqttJoining = true;
     try {
+      const turnConfig = this.buildTurnConfig();
       const config: NostrRoomConfig = {
         appId: TRYSTERO_APP_ID,
         password: this.options.token,
         rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
-        turnConfig: this.buildTurnConfig(),
+        ...(turnConfig !== undefined ? { turnConfig } : {}),
       };
-      this.mqttRoom = factory(config, `${this.options.sessionId}`, {
+      const room = factory(config, `${this.options.sessionId}`, {
         handshakeTimeoutMs: 15_000,
         onPeerHandshake: async (rawId, send, receive, isInitiator) => {
           try {
@@ -504,11 +506,12 @@ export class MeshTransport extends EventEmitter {
         },
         onJoinError: () => undefined,
       });
-      this.mqttAction = this.mqttRoom.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
+      this.mqttRoom = room;
+      this.mqttAction = room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
       this.mqttAction.onMessage = (data, { peerId }) =>
         this.handleAction(data, MQTT_TRANSPORT_PREFIX + peerId);
-      this.mqttRoom.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
-      this.mqttRoom.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
+      room.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
+      room.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
     } catch {
       this.mqttRoom = undefined;
       this.mqttAction = undefined;

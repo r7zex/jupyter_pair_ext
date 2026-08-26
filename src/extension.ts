@@ -245,8 +245,8 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
         const completedDelta = Math.max(0, state.completedFiles - lastCompletedFiles);
         lastCompletedFiles = state.completedFiles;
         progress.report({
-          message: state.currentFile,
-          increment: state.totalFiles ? completedDelta * 100 / state.totalFiles : undefined,
+          ...(state.currentFile !== undefined ? { message: state.currentFile } : {}),
+          ...(state.totalFiles ? { increment: completedDelta * 100 / state.totalFiles } : {}),
         });
       }, undefined, identity.privateKey));
       break;
@@ -734,9 +734,11 @@ async function showDiagnostics(advanced = false): Promise<void> {
       ok: probe.ok,
       ...(probe.latencyMs !== undefined ? { latencyMs: probe.latencyMs } : {}),
     })),
-    turnStatus: network?.turnStatus,
-    relayFallbackEnabled: network?.relayFallback?.enabled,
-    connectedRelayCount: network?.relayFallback?.connectedRelays,
+    ...(network?.turnStatus !== undefined ? { turnStatus: network.turnStatus } : {}),
+    ...(network?.relayFallback?.enabled !== undefined
+      ? { relayFallbackEnabled: network.relayFallback.enabled } : {}),
+    ...(network?.relayFallback?.connectedRelays !== undefined
+      ? { connectedRelayCount: network.relayFallback.connectedRelays } : {}),
     resolveDns: async (host) => (await lookup(host)),
   });
 

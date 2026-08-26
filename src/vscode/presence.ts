@@ -155,15 +155,17 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
         const option: vscode.DecorationOptions = {
           range: new vscode.Range(start, end),
           hoverMessage: showName ? `${state.peer.displayName} is editing here` : 'A collaborator is editing here',
-          renderOptions: showName ? {
-            after: {
-              contentText: ` ${state.peer.displayName} `,
-              color: '#ffffff',
-              backgroundColor: color,
-              fontWeight: '600',
-              margin: '0 0 0 2px',
+          ...(showName ? {
+            renderOptions: {
+              after: {
+                contentText: ` ${state.peer.displayName} `,
+                color: '#ffffff',
+                backgroundColor: color,
+                fontWeight: '600',
+                margin: '0 0 0 2px',
+              },
             },
-          } : undefined,
+          } : {}),
         };
         editor.setDecorations(decoration, [option]);
       }

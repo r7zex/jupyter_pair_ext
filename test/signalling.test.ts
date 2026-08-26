@@ -70,6 +70,7 @@ describe('secondary signalling family (MQTT)', function () {
       // The connection must come from the SECONDARY family: the primary room
       // is a dead stub that can never admit peers.
       const mapped = [...(host as unknown as { identityToTransport: Map<string, string> }).identityToTransport.values()][0];
+      assert.ok(mapped, 'peer should be mapped through the secondary signalling family');
       assert.ok(mapped.startsWith('mqtt:'), `expected an mqtt-family transport, got ${mapped}`);
       assert.ok(host.activeSignallingFamilies().includes('mqtt'));
       const got = new Promise<string>((resolve) => {
