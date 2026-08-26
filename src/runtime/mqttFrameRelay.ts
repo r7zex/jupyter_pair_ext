@@ -13,7 +13,13 @@ import { MAX_WIRE_FRAME_BYTES } from '../core/wire';
 import { type FrameRelay } from './frameRelay';
 import { defaultRelayUrls } from './mqttRoom';
 import { proxyAwareMqttOptions } from './mqttProxy';
-import { decryptRelayPacket, deriveRelayFrameKey, encryptRelayPacket } from './relayCrypto';
+import {
+  decryptRelayPacket,
+  deriveRelayFrameKey,
+  encryptRelayPacket,
+  encryptRelayReadinessProbe,
+  verifyRelayReadinessProbe,
+} from './relayCrypto';
 
 const CHUNK_TARGET_BYTES = 32 * 1024;
 const PACKET_TTL_MS = 120_000;
@@ -24,6 +30,9 @@ const MAX_PENDING_PACKET_BYTES = 128 * 1024 * 1024;
 const MAX_OUTBOX_MESSAGES = 8_192;
 const MAX_OUTBOX_BYTES = 256 * 1024 * 1024;
 const MAX_SEEN_PACKET_IDS = 32_768;
+const DEFAULT_READINESS_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_READINESS_RECHECK_MS = 45_000;
+const DEFAULT_READINESS_RETRY_MS = 5_000;
 const PEER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const PACKET_ID_PATTERN = /^[a-f0-9]{24}$/;
 const QOS_ONE: IClientPublishOptions = { qos: 1 };
@@ -34,10 +43,20 @@ export interface MqttRelayClient {
   subscribe(
     topic: string,
     options: { qos: 1 },
-    callback: (error?: Error | null) => void,
+    callback: (error?: Error | null, granted?: readonly MqttSubscriptionGrant[]) => void,
   ): unknown;
-  publish(topic: string, payload: string, options: IClientPublishOptions): unknown;
+  publish(
+    topic: string,
+    payload: string,
+    options: IClientPublishOptions,
+    callback?: (error?: Error | null) => void,
+  ): unknown;
   end(force?: boolean): unknown;
+}
+
+export interface MqttSubscriptionGrant {
+  topic: string;
+  qos: number;
 }
 
 export interface MqttFrameRelayOptions {
@@ -46,11 +65,15 @@ export interface MqttFrameRelayOptions {
   localPeerId: string;
   brokers?: readonly string[];
   clientFactory?: (url: string, options: IClientOptions) => MqttRelayClient;
+  /** Test hooks; production uses conservative network-scale defaults. */
+  readinessProbeTimeoutMs?: number;
+  readinessRecheckMs?: number;
+  readinessRetryMs?: number;
 }
 
 interface RelayMessage {
   v: 1;
-  t: 'a' | 'd';
+  t: 'a' | 'd' | 'r';
   f: string;
   to?: string;
   p?: string;
@@ -71,6 +94,11 @@ interface QueuedMessage {
   bytes: number;
 }
 
+interface PendingReadinessProbe {
+  nonce: string;
+  timer: NodeJS.Timeout;
+}
+
 export function deriveMqttRelayTopic(sessionId: string, token: string): string {
   const digest = createHash('sha256')
     .update(`pair-notebook-mqtt-data-v1|${sessionId}|${token}`)
@@ -81,6 +109,9 @@ export function deriveMqttRelayTopic(sessionId: string, token: string): string {
 export class MqttFrameRelay implements FrameRelay {
   private readonly clients = new Map<string, MqttRelayClient>();
   private readonly readyClients = new Set<MqttRelayClient>();
+  private readonly pendingReadiness = new Map<MqttRelayClient, PendingReadinessProbe>();
+  private readonly lastVerifiedAt = new Map<MqttRelayClient, number>();
+  private readonly readinessRetryTimers = new Map<MqttRelayClient, NodeJS.Timeout>();
   private readonly key: Buffer;
   private readonly topic: string;
   private readonly pendingPackets = new Map<string, PendingPacket>();
@@ -110,7 +141,7 @@ export class MqttFrameRelay implements FrameRelay {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (this.connectedRelayCount === 0) {
-      throw new Error('No MQTT emergency broker completed a subscribed connection.');
+      throw new Error('No MQTT emergency broker completed a verified data-path check.');
     }
   }
 
@@ -125,6 +156,7 @@ export class MqttFrameRelay implements FrameRelay {
           clean: true,
           connectTimeout: 10_000,
           reconnectPeriod: 2_000,
+          reconnectOnConnackError: true,
           resubscribe: true,
         }));
       } catch {
@@ -135,10 +167,10 @@ export class MqttFrameRelay implements FrameRelay {
       client.on('message', (topic: unknown, payload: unknown) => {
         if (topic !== this.topic) return;
         const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8');
-        this.handleMessage(bytes);
+        this.handleMessage(bytes, client);
       });
-      client.on('offline', () => this.readyClients.delete(client));
-      client.on('close', () => this.readyClients.delete(client));
+      client.on('offline', () => this.clearClientReadiness(client));
+      client.on('close', () => this.clearClientReadiness(client));
       client.on('error', () => undefined);
       if (client.connected) this.subscribeClient(client);
     }
@@ -155,6 +187,10 @@ export class MqttFrameRelay implements FrameRelay {
     }
     this.clients.clear();
     this.readyClients.clear();
+    for (const client of this.pendingReadiness.keys()) this.clearPendingReadiness(client);
+    this.lastVerifiedAt.clear();
+    for (const timer of this.readinessRetryTimers.values()) clearTimeout(timer);
+    this.readinessRetryTimers.clear();
     this.pendingPackets.clear();
     this.seenPacketIds.clear();
     this.outbox.splice(0);
@@ -196,19 +232,21 @@ export class MqttFrameRelay implements FrameRelay {
 
   private subscribeClient(client: MqttRelayClient): void {
     if (this.stopped) return;
+    this.clearReadinessRetry(client);
     try {
-      client.subscribe(this.topic, { qos: 1 }, (error) => {
-        if (this.stopped || error) return;
-        this.readyClients.add(client);
-        if (this.announced) this.publishWire(client, JSON.stringify({
-          v: 1,
-          t: 'a',
-          f: this.options.localPeerId,
-        } satisfies RelayMessage));
-        this.flushOutbox();
+      client.subscribe(this.topic, { qos: 1 }, (error, granted) => {
+        if (this.stopped || error || !granted?.some((entry) => (
+          entry.topic === this.topic && entry.qos === 1
+        ))) {
+          this.dropClientReadiness(client);
+          this.scheduleReadinessRetry(client);
+          return;
+        }
+        this.beginReadinessProbe(client);
       });
     } catch {
-      this.readyClients.delete(client);
+      this.dropClientReadiness(client);
+      this.scheduleReadinessRetry(client);
     }
   }
 
@@ -243,15 +281,71 @@ export class MqttFrameRelay implements FrameRelay {
   }
 
   private publishWire(client: MqttRelayClient, wire: string): void {
-    try { client.publish(this.topic, wire, QOS_ONE); } catch { /* MQTT reconnect owns recovery */ }
+    try {
+      client.publish(this.topic, wire, QOS_ONE, (error) => {
+        if (!error) return;
+        this.dropClientReadiness(client);
+        this.scheduleReadinessRetry(client);
+      });
+    } catch {
+      this.dropClientReadiness(client);
+      this.scheduleReadinessRetry(client);
+    }
   }
 
-  private handleMessage(bytes: Buffer): void {
+  private beginReadinessProbe(client: MqttRelayClient): void {
+    if (this.pendingReadiness.has(client)) return;
+    const nonce = randomBytes(12).toString('hex');
+    const timer = setTimeout(() => {
+      const pending = this.pendingReadiness.get(client);
+      if (pending?.nonce !== nonce) return;
+      this.dropClientReadiness(client);
+      this.scheduleReadinessRetry(client);
+    }, this.options.readinessProbeTimeoutMs ?? DEFAULT_READINESS_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingReadiness.set(client, { nonce, timer });
+    const wire = JSON.stringify({
+      v: 1,
+      t: 'r',
+      f: this.options.localPeerId,
+      p: nonce,
+      d: encryptRelayReadinessProbe(this.key, nonce),
+    } satisfies RelayMessage);
+    try {
+      client.publish(this.topic, wire, QOS_ONE, (error) => {
+        if (error) {
+          this.dropClientReadiness(client);
+          this.scheduleReadinessRetry(client);
+        }
+      });
+    } catch {
+      this.dropClientReadiness(client);
+      this.scheduleReadinessRetry(client);
+    }
+  }
+
+  private handleMessage(bytes: Buffer, client: MqttRelayClient): void {
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_RELAY_CHUNK_BASE64_CHARS + 1_024) return;
     let message: RelayMessage;
     try { message = JSON.parse(bytes.toString('utf8')) as RelayMessage; } catch { return; }
-    if (message.v !== 1 || typeof message.f !== 'string'
-      || !PEER_ID_PATTERN.test(message.f) || message.f === this.options.localPeerId) return;
+    if (message.v !== 1 || typeof message.f !== 'string' || !PEER_ID_PATTERN.test(message.f)) return;
+    if (message.t === 'r') {
+      const pending = this.pendingReadiness.get(client);
+      if (!pending || message.f !== this.options.localPeerId || message.p !== pending.nonce
+        || typeof message.d !== 'string' || message.d.length > 512
+        || !verifyRelayReadinessProbe(this.key, pending.nonce, message.d)) return;
+      this.clearPendingReadiness(client);
+      this.readyClients.add(client);
+      this.lastVerifiedAt.set(client, Date.now());
+      if (this.announced) this.publishWire(client, JSON.stringify({
+        v: 1,
+        t: 'a',
+        f: this.options.localPeerId,
+      } satisfies RelayMessage));
+      this.flushOutbox();
+      return;
+    }
+    if (message.f === this.options.localPeerId) return;
     if (message.to !== undefined && message.to !== this.options.localPeerId) return;
     if (message.t === 'a') {
       this.onPeerAnnounce(message.f);
@@ -263,6 +357,12 @@ export class MqttFrameRelay implements FrameRelay {
       || !Number.isSafeInteger(message.i) || !Number.isSafeInteger(message.n)
       || message.i! < 0 || message.n! < 1 || message.n! > MAX_RELAY_CHUNKS || message.i! >= message.n!) return;
     this.acceptChunk(message);
+  }
+
+  private dropClientReadiness(client: MqttRelayClient): void {
+    this.readyClients.delete(client);
+    this.clearPendingReadiness(client);
+    this.lastVerifiedAt.delete(client);
   }
 
   private acceptChunk(message: RelayMessage): void {
@@ -305,6 +405,40 @@ export class MqttFrameRelay implements FrameRelay {
       this.pendingPackets.delete(id);
       this.pendingPacketBytes -= pending.bytes;
     }
+    const recheckMs = this.options.readinessRecheckMs ?? DEFAULT_READINESS_RECHECK_MS;
+    for (const client of this.readyClients) {
+      if (!this.pendingReadiness.has(client)
+        && now - (this.lastVerifiedAt.get(client) ?? 0) >= recheckMs) {
+        this.beginReadinessProbe(client);
+      }
+    }
+  }
+
+  private clearClientReadiness(client: MqttRelayClient): void {
+    this.dropClientReadiness(client);
+    this.clearReadinessRetry(client);
+  }
+
+  private clearPendingReadiness(client: MqttRelayClient): void {
+    const pending = this.pendingReadiness.get(client);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingReadiness.delete(client);
+  }
+
+  private scheduleReadinessRetry(client: MqttRelayClient): void {
+    if (this.stopped || !client.connected || this.readinessRetryTimers.has(client)) return;
+    const timer = setTimeout(() => {
+      this.readinessRetryTimers.delete(client);
+      if (!this.stopped && client.connected) this.subscribeClient(client);
+    }, this.options.readinessRetryMs ?? DEFAULT_READINESS_RETRY_MS);
+    timer.unref?.();
+    this.readinessRetryTimers.set(client, timer);
+  }
+
+  private clearReadinessRetry(client: MqttRelayClient): void {
+    const timer = this.readinessRetryTimers.get(client);
+    if (timer) clearTimeout(timer);
+    this.readinessRetryTimers.delete(client);
   }
 
   private rememberSeen(packetKey: string): void {

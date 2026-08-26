@@ -1,13 +1,13 @@
-# Pair Notebook 0.5.2
+# Pair Notebook 0.5.3
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.5.2.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.5.3.vsix` from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.5.2.vsix --force
+code --install-extension .\pair-notebook-0.5.3.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
@@ -24,7 +24,7 @@ Pair Notebook tries several independent ways to reach the other participant and 
 
 Signalling runs over TWO independent families concurrently — multiple health-checked public Nostr relays plus a public MQTT broker set — so the failure of one family or relay no longer stalls discovery; a participant discovered through both families still appears exactly once. All WebSocket-based channels honour `pairNotebook.proxyUrl`, `http.proxy` from VS Code, the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, and the current Windows system proxy. HTTP(S), SOCKS4, SOCKS5 and SOCKS5h are supported; proxy credentials are never logged or displayed.
 
-Start and Join include a strict relay-readiness barrier: Pair Notebook requires at least one subscribed full-data emergency family (Nostr or MQTT) before it declares the local transport ready. It attempts both, but does not reject a usable session merely because one independent public infrastructure is temporarily unavailable. Join is reported as connected only after the two computers complete the signed end-to-end handshake. With working outbound WSS from both computers, Flowseal/zapret and Karing therefore retain independently tested full-data paths even when WebRTC and TURN are unavailable.
+Start and Join include a strict relay-readiness barrier: Pair Notebook requires an encrypted publish-to-receive self-check through at least one complete emergency family (Nostr or MQTT) before it declares the local transport ready. A merely open WebSocket, rejected subscription, or write-only relay cannot pass. Both families are attempted, established paths are periodically revalidated, and a later publication rejection retires that path and triggers recovery. Join is reported as connected only after the two computers complete the signed end-to-end handshake. With a common working outbound WSS route, Flowseal/zapret and Karing therefore retain independently tested full-data paths even when WebRTC and TURN are unavailable.
 
 On Windows, Karing TUN needs no special setup because it transparently routes application traffic. Karing's **Auto Set System Proxy** mode is detected from the current user's WinINet settings; Pair Notebook refreshes that value before Start, Join and Reconnect. If another client uses PAC only or does not register its listener as the Windows system proxy, set `pairNotebook.proxyUrl` to its local HTTP/SOCKS URL, for example `http://127.0.0.1:10809`.
 
@@ -110,11 +110,11 @@ npm run test:live
 npm run artifacts
 ```
 
-`npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport and failover tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies 64 KiB direct-to-system-proxy round trips over Nostr only, MQTT only, and both emergency families together.
+`npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport and failover tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies eight-by-64-KiB direct-to-system-proxy bursts across all seven compatible ordered Nostr-only, MQTT-only, and redundant-family combinations.
 
 The final artifacts are:
 
-- `pair-notebook-0.5.2.vsix` — installable extension.
-- `pair-notebook-complete-0.5.2.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.5.3.vsix` — installable extension.
+- `pair-notebook-complete-0.5.3.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and the [network compatibility audit](docs/network-compatibility-audit.md) for implementation details.

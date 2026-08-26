@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
 
 const IV_BYTES = 12;
+const READINESS_PREFIX = 'pair-notebook-relay-readiness-v1:';
 
 export function deriveRelayFrameKey(token: string, sessionId: string): Buffer {
   return Buffer.from(hkdfSync(
@@ -26,4 +27,18 @@ export function decryptRelayPacket(key: Buffer, packet: Buffer): Buffer {
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(packet.subarray(IV_BYTES + 16)), decipher.final()]);
+}
+
+/** Builds an opaque self-check that proves a relay can publish and deliver ciphertext. */
+export function encryptRelayReadinessProbe(key: Buffer, nonce: string): string {
+  return encryptRelayPacket(key, Buffer.from(`${READINESS_PREFIX}${nonce}`, 'utf8')).toString('base64');
+}
+
+export function verifyRelayReadinessProbe(key: Buffer, nonce: string, encoded: string): boolean {
+  try {
+    const plaintext = decryptRelayPacket(key, Buffer.from(encoded, 'base64'));
+    return plaintext.equals(Buffer.from(`${READINESS_PREFIX}${nonce}`, 'utf8'));
+  } catch {
+    return false;
+  }
 }

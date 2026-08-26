@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3 - 2026-08-26 (verified relay data paths and recovery)
+
+- Fixes false emergency readiness after a protocol-defined Nostr `CLOSED`/negative `OK` response or a rejected/downgraded MQTT SUBACK. These states previously counted as connected even though they could not provide the required delivery semantics.
+- Requires an invite-key-encrypted publish-to-receive self-check before either Nostr or MQTT can satisfy Start/Join readiness. Opening a WebSocket or writing a subscription request is no longer accepted as proof.
+- Times out lost self-checks, reconnects or resubscribes, periodically revalidates established paths, and immediately retires a path after a later Nostr publication rejection or MQTT QoS failure.
+- Enables MQTT reconnection after transient CONNACK rejection for both signalling and emergency data clients.
+- Expands the public forced-relay acceptance test to seven compatible ordered Nostr/MQTT/redundant combinations and an eight-by-64-KiB bidirectional burst per scenario through direct/winws and Windows system-proxy/xray routes.
+- 262 deterministic tests plus public Nostr/WebRTC, MQTT/WebRTC, endpoint, STUN, and forced emergency-relay checks pass.
+
 ## 0.5.2 - 2026-08-26 (redundant full-data fallback and readiness contract)
 
 - Adds a second complete emergency data path over proxy-aware MQTT/WSS. Nostr and MQTT now both carry encrypted Pair Notebook wire frames when WebRTC/TURN is unavailable; either family can sustain the session independently.

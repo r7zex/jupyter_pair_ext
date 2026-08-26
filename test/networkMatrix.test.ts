@@ -73,7 +73,7 @@ describe('Russia-oriented network compatibility matrix', function () {
         const message = JSON.parse(String(raw)) as unknown[];
         if (message[0] !== 'EVENT') return;
         for (const client of relayHub.clients) {
-          if (client !== socket && client.readyState === NodeWebSocket.OPEN) client.send(JSON.stringify(message));
+          if (client.readyState === NodeWebSocket.OPEN) client.send(JSON.stringify(['EVENT', 'sub', message[1]]));
         }
       });
     });

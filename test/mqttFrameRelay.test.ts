@@ -13,6 +13,8 @@ class FakeMqttHub {
   public readonly clients = new Set<FakeMqttClient>();
   public readonly published: Array<{ topic: string; payload: string }> = [];
 
+  constructor(public deliverMessages = true) {}
+
   client(): FakeMqttClient {
     const client = new FakeMqttClient(this);
     this.clients.add(client);
@@ -21,6 +23,7 @@ class FakeMqttHub {
 
   publish(topic: string, payload: string): void {
     this.published.push({ topic, payload });
+    if (!this.deliverMessages) return;
     for (const client of this.clients) {
       if (client.subscriptions.has(topic)) client.emit('message', topic, Buffer.from(payload, 'utf8'));
     }
@@ -35,13 +38,23 @@ class FakeMqttClient extends EventEmitter implements MqttRelayClient {
     super();
   }
 
-  public subscribe(topic: string, _options: { qos: 1 }, callback: (error?: Error | null) => void): void {
+  public subscribe(
+    topic: string,
+    _options: { qos: 1 },
+    callback: (error?: Error | null, granted?: readonly { topic: string; qos: number }[]) => void,
+  ): void {
     this.subscriptions.add(topic);
-    callback();
+    callback(undefined, [{ topic, qos: 1 }]);
   }
 
-  public publish(topic: string, payload: string): void {
+  public publish(
+    topic: string,
+    payload: string,
+    _options?: unknown,
+    callback?: (error?: Error | null) => void,
+  ): void {
     this.hub.publish(topic, payload);
+    callback?.();
   }
 
   public end(): void {
@@ -91,6 +104,70 @@ describe('emergency MQTT data relay', () => {
       }).waitUntilReady(),
       /No emergency relay family became ready/,
     );
+  });
+
+  it('does not report an MQTT broker ready when SUBACK rejects or downgrades QoS 1', async () => {
+    for (const grantedQos of [0, 128]) {
+      const rejectedClient = new FakeMqttClient(new FakeMqttHub());
+      rejectedClient.subscribe = (topic, _options, callback): void => {
+        (callback as (...args: unknown[]) => void)(undefined, [{ topic, qos: grantedQos }]);
+      };
+      const relay = new MqttFrameRelay({
+        token: 'mqtt-rejected-subscription-token',
+        sessionId: `mqtt-rejected-subscription-${grantedQos}`,
+        localPeerId: 'mqtt-rejected-local',
+        brokers: ['wss://rejecting-broker/mqtt'],
+        clientFactory: () => rejectedClient,
+      });
+      relay.start();
+      await assert.rejects(
+        relay.waitUntilReady(50),
+        /No MQTT emergency broker completed a verified data-path check/,
+      );
+      relay.stop();
+    }
+  });
+
+  it('does not report an MQTT broker ready when its publish path drops data', async () => {
+    const hub = new FakeMqttHub(false);
+    const relay = new MqttFrameRelay({
+      token: 'mqtt-frame-token-that-is-long-enough',
+      sessionId: 'mqtt-frame-session',
+      localPeerId: 'mqtt-dropped-readiness',
+      brokers: ['wss://fake-broker/mqtt'],
+      clientFactory: () => hub.client(),
+      readinessProbeTimeoutMs: 20,
+      readinessRetryMs: 5,
+    });
+    relay.start();
+    await assert.rejects(
+      relay.waitUntilReady(30),
+      /No MQTT emergency broker completed a verified data-path check/,
+    );
+    hub.deliverMessages = true;
+    await relay.waitUntilReady(100);
+    assert.equal(relay.connectedRelayCount, 1);
+    relay.stop();
+  });
+
+  it('retires a verified MQTT path when QoS delivery later fails', () => {
+    const hub = new FakeMqttHub();
+    const client = hub.client();
+    const relay = new MqttFrameRelay({
+      token: 'mqtt-later-failure-token',
+      sessionId: 'mqtt-later-failure',
+      localPeerId: 'mqtt-later-local',
+      brokers: ['wss://fake-broker/mqtt'],
+      clientFactory: () => client,
+    });
+    relay.start();
+    assert.equal(relay.connectedRelayCount, 1);
+    client.publish = (_topic, _payload, _options, callback): void => {
+      callback?.(new Error('PUBACK failed'));
+    };
+    relay.send(Buffer.from('later-data-failure'));
+    assert.equal(relay.connectedRelayCount, 0);
+    relay.stop();
   });
 
   it('announces peers and exchanges encrypted frames without WebRTC or Nostr', () => {
