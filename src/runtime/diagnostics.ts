@@ -80,8 +80,9 @@ export function classifyAdapters(
 /**
  * Infers local UDP reachability from live TURN Allocate probes. All UDP
  * probes failing while at least one TCP/TLS probe succeeds is strong
- * evidence of filtered UDP; anything else stays "unknown" rather than
- * guessed.
+ * evidence of filtered UDP. If every transport fails, the probe cannot
+ * distinguish UDP filtering from DNS, credentials, server, or routing
+ * failures, so availability stays unknown.
  */
 export function assessUdpAvailability(probes: readonly TurnProbeResult[]): UdpAvailability {
   const udp = probes.filter((probe) => probe.endpoint.transport === 'udp');
@@ -97,11 +98,16 @@ export function assessUdpAvailability(probes: readonly TurnProbeResult[]): UdpAv
       detail: 'All UDP TURN probes failed while TCP/TLS paths succeeded.',
     };
   }
-  return { state: 'unavailable', confidence: 'medium', detail: 'All TURN transports failed, including UDP.' };
+  return {
+    state: 'unknown',
+    confidence: 'low',
+    detail: 'All configured TURN transports failed; UDP availability cannot be determined.',
+  };
 }
 
 export interface DiagnosticsInput {
   turnProbes?: readonly TurnProbeResult[];
+  turnStatus?: 'not-configured' | 'invalid' | 'configured';
   relayFallbackEnabled?: boolean;
   connectedRelayCount?: number;
   /** Hosts to check for DNS resolution; failures are reported per host. */
@@ -120,7 +126,7 @@ export interface NetworkDiagnosticsReport {
   dnsFailures: string[];
 }
 
-const DEFAULT_DNS_HOSTS = ['nos.lol', 'relay.damus.io', 'openrelay.metered.ca'];
+const DEFAULT_DNS_HOSTS = ['nos.lol', 'relay.damus.io'];
 
 /**
  * Builds the full passive report. DNS checks are bounded and optional; when
@@ -139,6 +145,28 @@ export async function buildNetworkDiagnostics(input: DiagnosticsInput = {}): Pro
       impact: 'UDP appears unavailable on the current network path; WebRTC falls back to TCP/TLS relaying.',
       confidence: udp.confidence,
       possibleCauses: ['VPN routing', 'Firewall', 'ISP filtering', 'Packet-filter configuration'],
+    });
+  }
+  if (input.turnStatus === 'not-configured') {
+    observations.push({
+      observation: 'Custom TURN is not configured.',
+      impact: 'Direct ICE remains available; if it fails, Pair Notebook uses the encrypted Nostr emergency relay.',
+      confidence: 'confirmed',
+      suggestion: 'Configure pairNotebook.turnUrls only if you operate or trust a TURN service.',
+    });
+  } else if (input.turnStatus === 'invalid') {
+    observations.push({
+      observation: 'Configured TURN URLs contain no valid turn: or turns: endpoint.',
+      impact: 'No TURN relay was passed to WebRTC.',
+      confidence: 'confirmed',
+      suggestion: 'Correct pairNotebook.turnUrls or clear it to use direct ICE plus the emergency relay.',
+    });
+  } else if ((input.turnProbes?.length ?? 0) > 0 && input.turnProbes?.every((probe) => !probe.ok)) {
+    observations.push({
+      observation: 'All configured TURN endpoint probes failed.',
+      impact: 'The configured TURN service is unreachable or rejected the credentials; this does not prove UDP is blocked.',
+      confidence: 'confirmed',
+      possibleCauses: ['TURN DNS or service outage', 'Invalid TURN credentials', 'VPN routing', 'Firewall or ISP filtering'],
     });
   }
 
@@ -181,8 +209,7 @@ export async function buildNetworkDiagnostics(input: DiagnosticsInput = {}): Pro
     }
   }
 
-  if (input.relayFallbackEnabled && (input.connectedRelayCount ?? 0) === 0 && (input.turnProbes?.length ?? 0) > 0) {
-    // Only meaningful once probes have actually been attempted.
+  if (input.relayFallbackEnabled && (input.connectedRelayCount ?? 0) === 0) {
     observations.push({
       observation: 'No emergency-relay socket is currently connected.',
       impact: 'The last-resort encrypted Nostr transport is not available right now.',

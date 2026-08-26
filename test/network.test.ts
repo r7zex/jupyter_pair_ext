@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { describe, it } from 'mocha';
+import { HttpProxyAgent } from 'http-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import NodeWebSocket from 'ws';
 
 import {
-  DEFAULT_TURN_URLS,
   orderTurnEndpoints,
   parseTurnEndpoint,
   parseTurnEndpoints,
@@ -69,7 +72,11 @@ describe('TURN endpoint configuration', () => {
   });
 
   it('orders UDP before TCP before TLS regardless of input order', () => {
-    const endpoints = parseTurnEndpoints(DEFAULT_TURN_URLS);
+    const endpoints = parseTurnEndpoints([
+      'turns:relay.example.com:443',
+      'turn:relay.example.com:443?transport=tcp',
+      'turn:relay.example.com:3478',
+    ]);
     const ordered = orderTurnEndpoints(endpoints);
     assert.deepEqual(ordered.map((endpoint) => endpoint.transport), ['udp', 'tcp', 'tls']);
   });
@@ -194,7 +201,28 @@ describe('proxy resolution', () => {
       env: { HTTPS_PROXY: 'http://corporate:3128' },
     });
     assert.equal(httpsThroughHttp?.proxy.kind, 'http');
-    assert.ok(httpsThroughHttp?.agent);
+    assert.ok(httpsThroughHttp?.agent instanceof HttpsProxyAgent);
+    assert.equal(httpsThroughHttp.agent.proxy.protocol, 'http:');
+
+    const httpsThroughHttps = createProxyAgent('wss://nos.lol', {
+      env: { HTTPS_PROXY: 'https://user:p%40ss@corporate:8443' },
+    });
+    assert.ok(httpsThroughHttps?.agent instanceof HttpsProxyAgent);
+    assert.equal(httpsThroughHttps.agent.proxy.protocol, 'https:');
+    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.username), 'user');
+    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.password), 'p@ss');
+
+    const wsThroughHttp = createProxyAgent('ws://relay.example.com', {
+      env: { HTTP_PROXY: 'http://corporate:3128' },
+    });
+    assert.ok(wsThroughHttp?.agent instanceof HttpProxyAgent);
+    assert.equal(wsThroughHttp.agent.proxy.protocol, 'http:');
+
+    const wsThroughHttps = createProxyAgent('ws://relay.example.com', {
+      env: { HTTP_PROXY: 'https://corporate:8443' },
+    });
+    assert.ok(wsThroughHttps?.agent instanceof HttpProxyAgent);
+    assert.equal(wsThroughHttps.agent.proxy.protocol, 'https:');
 
     const socks = createProxyAgent('wss://nos.lol', {
       env: { ALL_PROXY: 'socks5h://torified:9050' },
@@ -202,6 +230,46 @@ describe('proxy resolution', () => {
     assert.equal(socks?.proxy.kind, 'socks5h');
 
     assert.equal(createProxyAgent('wss://nos.lol', { env: { NO_PROXY: 'nos.lol' } }), undefined);
+  });
+
+  it('uses HTTP CONNECT for a secure WebSocket through an HTTP proxy', async () => {
+    const connectTargets: string[] = [];
+    let forwardedRequestCount = 0;
+    const proxyServer = createServer((_request, response) => {
+      forwardedRequestCount += 1;
+      response.writeHead(400).end();
+    });
+    proxyServer.on('connect', (request, socket) => {
+      connectTargets.push(request.url ?? '');
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    });
+    await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const proxyAddress = proxyServer.address();
+      assert.ok(proxyAddress && typeof proxyAddress !== 'string');
+      const resolved = createProxyAgent('wss://127.0.0.1:65534', {
+        vscodeProxy: `http://127.0.0.1:${proxyAddress.port}`,
+        env: {},
+      });
+      assert.ok(resolved);
+
+      const socket = new NodeWebSocket('wss://127.0.0.1:65534', { agent: resolved.agent });
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('proxy request timed out')), 2_000);
+        socket.once('error', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
+
+      assert.deepEqual(connectTargets, ['127.0.0.1:65534']);
+      assert.equal(forwardedRequestCount, 0);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        proxyServer.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 });
 
@@ -237,10 +305,11 @@ describe('mesh network configuration', () => {
       assert.ok(!diagnostics.includes('custom-secret-password'));
       assert.ok(diagnostics.includes(TRYSTERO_RELAY_URLS[0]));
       assert.ok(diagnostics.includes('cotton.example.com'));
+      assert.equal((transport.networkDiagnostics() as { turnStatus?: string }).turnStatus, 'configured');
     } finally {
       await transport.stop();
       resetInMemoryTrystero();
-      // Restore defaults so unrelated tests keep using the public fallback.
+      // Restore the unconfigured default so unrelated tests do not inherit credentials.
       configureMeshNetwork({});
     }
   });
@@ -249,7 +318,142 @@ describe('mesh network configuration', () => {
 describe('mesh relay fallback integration', function () {
   this.timeout(30_000);
 
-  it('joins a peer through the Nostr relay when WebRTC never connects', async () => {
+  it('derives complementary relay roles regardless of which side receives first', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const host = new MeshTransport({
+      sessionId: 'relay-roles', token: 'relay-role-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    const guest = new MeshTransport({
+      sessionId: 'relay-roles', token: 'relay-role-token-that-is-long-enough',
+      localPeer: { peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false,
+    });
+    type RelayInternals = {
+      localHandshake: () => unknown;
+      advanceRelayHandshake: (peerId: string, kind: 'hs', hs: unknown, proof: unknown) => void;
+      relayNegotiations: Map<string, { role: 'initiator' | 'responder' }>;
+    };
+    const hostInternals = host as unknown as RelayInternals;
+    const guestInternals = guest as unknown as RelayInternals;
+
+    try {
+      hostInternals.advanceRelayHandshake('z-guest', 'hs', guestInternals.localHandshake(), undefined);
+      guestInternals.advanceRelayHandshake('a-host', 'hs', hostInternals.localHandshake(), undefined);
+      assert.equal(hostInternals.relayNegotiations.get('z-guest')?.role, 'initiator');
+      assert.equal(guestInternals.relayNegotiations.get('a-host')?.role, 'responder');
+    } finally {
+      await host.stop();
+      await guest.stop();
+    }
+  });
+
+  it('expires stale relay state after a lost handshake or proof and retries with a fresh nonce', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const transport = new MeshTransport({
+      sessionId: 'relay-retry', token: 'relay-retry-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    type Negotiation = { localHs: { nonce: string }; timeout: NodeJS.Timeout };
+    type RelayInternals = {
+      relay: unknown;
+      relayNegotiations: Map<string, Negotiation>;
+      considerRelayFallback: (peerId: string) => void;
+      expireRelayNegotiation: (peerId: string, negotiation: Negotiation) => void;
+    };
+    const internals = transport as unknown as RelayInternals;
+    let sends = 0;
+    internals.relay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: () => { sends += 1; },
+    };
+    transport.connect({ peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 });
+    const errors: Error[] = [];
+    transport.on('connectionError', (_peer, error: Error) => errors.push(error));
+
+    try {
+      internals.considerRelayFallback('z-guest');
+      const first = internals.relayNegotiations.get('z-guest');
+      assert.ok(first);
+      internals.expireRelayNegotiation('z-guest', first);
+      const second = internals.relayNegotiations.get('z-guest');
+      assert.ok(second);
+      assert.notEqual(second.localHs.nonce, first.localHs.nonce);
+      assert.equal(sends, 2);
+      assert.match(errors[0]?.message ?? '', /timed out; retrying/);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('surfaces a bad relay proof, releases the negotiation, and retries', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const local = new MeshTransport({
+      sessionId: 'relay-proof', token: 'relay-proof-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    const remote = new MeshTransport({
+      sessionId: 'relay-proof', token: 'relay-proof-token-that-is-long-enough',
+      localPeer: { peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false,
+    });
+    type Negotiation = { localHs: { nonce: string }; timeout: NodeJS.Timeout };
+    type RelayInternals = {
+      relay: unknown;
+      localHandshake: () => unknown;
+      handleRelayData: (peerId: string, bytes: Buffer) => void;
+      relayNegotiations: Map<string, Negotiation>;
+    };
+    const localInternals = local as unknown as RelayInternals;
+    const remoteInternals = remote as unknown as RelayInternals;
+    let sends = 0;
+    localInternals.relay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: () => { sends += 1; },
+    };
+    local.connect({ peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 });
+    const errors: Error[] = [];
+    local.on('connectionError', (_peer, error: Error) => errors.push(error));
+
+    try {
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+        k: 'hs', hs: remoteInternals.localHandshake(),
+      })));
+      const failedNonce = localInternals.relayNegotiations.get('z-guest')?.localHs.nonce;
+      assert.ok(failedNonce);
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+        k: 'pr', pr: { version: 2, signature: Buffer.alloc(64).toString('base64') },
+      })));
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      assert.match(errors[0]?.message ?? '', /failed the identity proof/);
+      const retry = localInternals.relayNegotiations.get('z-guest');
+      assert.ok(retry);
+      assert.notEqual(retry.localHs.nonce, failedNonce);
+      assert.ok(sends >= 3);
+    } finally {
+      await local.stop();
+      await remote.stop();
+    }
+  });
+
+  it('joins when only the lexically higher peer starts Nostr relay fallback', async () => {
     const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
     const { NostrFrameRelay: RelayCtor } = await import('../src/runtime/nostrRelay.js');
     const { WebSocketServer } = await import('ws');
@@ -287,9 +491,14 @@ describe('mesh relay fallback integration', function () {
       }),
     });
 
-    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host-r' };
-    const identityA = { peerId: 'host-r', displayName: 'Host R', joinOrder: 0 };
-    const identityB = { peerId: 'guest-r', displayName: 'Guest R', joinOrder: 1 };
+    // These are the exact lexical ordering seen in the failing production
+    // session: the guest id is higher, so the old inbound-is-responder rule
+    // made both sides responders when only the guest started fallback.
+    const hostId = '39b992fb-3700-464d-90e3-e07203ec6691';
+    const guestId = '836285ae-de7f-4e84-afd5-4f93cd4fb4f5';
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId };
+    const identityA = { peerId: hostId, displayName: 'Host R', joinOrder: 0 };
+    const identityB = { peerId: guestId, displayName: 'Guest R', joinOrder: 1 };
 
     const commonToken = 'relay-mesh-token-that-is-long-enough';
     const host = new MeshTransport({
@@ -310,10 +519,10 @@ describe('mesh relay fallback integration', function () {
         new Promise<void>((resolve) => host.once('peerConnected', resolve)),
         new Promise<void>((resolve) => guest.once('peerConnected', resolve)),
       ]);
-      // Nudge both sides like an ICE failure / announce would.
-      (guest as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('host-r');
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      (host as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('guest-r');
+      // Only the lexically higher guest starts. The host must derive its role
+      // from both IDs when that inbound handshake is its first relay state.
+      (guest as unknown as { considerRelayFallback: (id: string) => void })
+        .considerRelayFallback(hostId);
       await connected;
 
       const gotFrame = new Promise<Buffer>((resolve) => {
@@ -321,9 +530,9 @@ describe('mesh relay fallback integration', function () {
           if (frame.type === 'probePing') resolve(Buffer.from(frame.payload));
         });
       });
-      guest.sendTo('host-r', 'probePing', {}, Buffer.from('via-relay'));
+      guest.sendTo(hostId, 'probePing', {}, Buffer.from('via-relay'));
       assert.equal((await gotFrame).toString('utf8'), 'via-relay');
-      const route = host.peerRuntime().find((peer) => peer.peerId === 'guest-r')?.route;
+      const route = host.peerRuntime().find((peer) => peer.peerId === guestId)?.route;
       assert.equal(route, 'Relay');
     } finally {
       await host.stop();

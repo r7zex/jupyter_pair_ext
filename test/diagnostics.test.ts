@@ -24,8 +24,8 @@ describe('passive diagnostics', () => {
     assert.equal(udpBlocked.confidence, 'high');
 
     const everythingDown = assessUdpAvailability([probe('udp', false), probe('tls', false)]);
-    assert.equal(everythingDown.state, 'unavailable');
-    assert.equal(everythingDown.confidence, 'medium', 'must not overclaim when nothing works');
+    assert.equal(everythingDown.state, 'unknown');
+    assert.equal(everythingDown.confidence, 'low', 'must not infer UDP blocking when nothing works');
 
     const udpFine = assessUdpAvailability([probe('udp', true)]);
     assert.equal(udpFine.state, 'available');
@@ -98,5 +98,30 @@ describe('passive diagnostics', () => {
     const dnsObservation = report.observations.find((item) => item.observation.includes('DNS resolution failed'));
     assert.ok(dnsObservation);
     assert.equal(dnsObservation.confidence, 'confirmed');
+  });
+
+  it('distinguishes absent, invalid, and unreachable custom TURN configuration', async () => {
+    const absent = await buildNetworkDiagnostics({
+      turnStatus: 'not-configured', adapters: [], relayFallbackEnabled: false,
+    });
+    assert.ok(absent.observations.some((item) => item.observation === 'Custom TURN is not configured.'));
+    assert.equal(absent.udp.state, 'unknown');
+
+    const invalid = await buildNetworkDiagnostics({
+      turnStatus: 'invalid', adapters: [], relayFallbackEnabled: false,
+    });
+    assert.ok(invalid.observations.some((item) => item.observation.includes('no valid turn: or turns:')));
+
+    const unreachable = await buildNetworkDiagnostics({
+      turnStatus: 'configured',
+      turnProbes: [probe('udp', false), probe('tcp', false), probe('tls', false)],
+      adapters: [],
+      relayFallbackEnabled: false,
+    });
+    assert.equal(unreachable.udp.state, 'unknown');
+    assert.ok(unreachable.observations.some((item) =>
+      item.observation === 'All configured TURN endpoint probes failed.'));
+    assert.ok(unreachable.observations.some((item) =>
+      item.impact.includes('does not prove UDP is blocked')));
   });
 });
