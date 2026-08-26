@@ -137,6 +137,8 @@ export const ROUTE_UPGRADE_TIMEOUT_MS = 45_000;
 export const ROUTE_UPGRADE_REQUIRED_PINGS = 3;
 /** Minimum time the candidate must stay alive before promotion. */
 export const ROUTE_UPGRADE_STABILITY_WINDOW_MS = 3_000;
+/** Maximum time a relay identity handshake may retain retry-blocking state. */
+export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
 
 export type RouteUpgradeStatus =
   | 'requesting'
@@ -167,6 +169,16 @@ interface RouteUpgrade {
   lastError?: string;
   deadlineTimer?: NodeJS.Timeout;
   verifyTimer?: NodeJS.Timeout;
+}
+
+interface RelayNegotiation {
+  role: 'initiator' | 'responder';
+  localHs: HandshakeMessage;
+  sentLocalHs: boolean;
+  sentProof: boolean;
+  remoteHs?: HandshakeMessage;
+  remoteProof?: string;
+  timeout: NodeJS.Timeout;
 }
 
 
@@ -343,14 +355,7 @@ export class MeshTransport extends EventEmitter {
   private turnEndpoints: TurnEndpoint[] | undefined;
   private turnProbes: TurnProbeResult[] | undefined;
   private relay: NostrFrameRelay | undefined;
-  private readonly relayNegotiations = new Map<string, {
-    role: 'initiator' | 'responder';
-    localHs: HandshakeMessage;
-    sentLocalHs: boolean;
-    sentProof: boolean;
-    remoteHs?: HandshakeMessage;
-    remoteProof?: string;
-  }>();
+  private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
   /** Make-before-break improvement attempts, keyed by logical peer id. */
   private readonly routeUpgrades = new Map<string, RouteUpgrade>();
@@ -1358,18 +1363,54 @@ public improvablePeerIds(): string[] {
 
   private sendRelayHandshake(peerId: string): void {
     const existing = this.relayNegotiations.get(peerId);
-    const negotiation = existing ?? {
+    const negotiation = existing ?? this.createRelayNegotiation(peerId);
+    if (!negotiation.sentLocalHs) {
+      negotiation.sentLocalHs = true;
+      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+    }
+  }
+
+  private createRelayNegotiation(peerId: string): RelayNegotiation {
+    const negotiation = {
       role: (this.options.localPeer.peerId < peerId ? 'initiator' : 'responder') as 'initiator' | 'responder',
       localHs: this.localHandshake(),
       sentLocalHs: false,
       sentProof: false,
-      remoteHs: undefined as HandshakeMessage | undefined,
-      remoteProof: undefined as string | undefined,
-    };
+      remoteHs: undefined,
+      remoteProof: undefined,
+      timeout: undefined as unknown as NodeJS.Timeout,
+    } satisfies RelayNegotiation;
+    negotiation.timeout = setTimeout(
+      () => this.expireRelayNegotiation(peerId, negotiation),
+      RELAY_NEGOTIATION_TIMEOUT_MS,
+    );
+    negotiation.timeout.unref?.();
     this.relayNegotiations.set(peerId, negotiation);
-    if (!negotiation.sentLocalHs) {
-      negotiation.sentLocalHs = true;
-      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+    return negotiation;
+  }
+
+  private expireRelayNegotiation(peerId: string, negotiation: RelayNegotiation): void {
+    if (this.relayNegotiations.get(peerId) !== negotiation) return;
+    this.relayNegotiations.delete(peerId);
+    clearTimeout(negotiation.timeout);
+    if (this.stopped || this.identityToTransport.has(peerId)) return;
+    const error = new Error(`Emergency relay handshake with ${peerId} timed out; retrying.`);
+    const peer = this.directory.get(peerId);
+    if (peer) this.emit('connectionError', peer, error);
+    else this.emit('protocolError', error);
+    this.considerRelayFallback(peerId);
+  }
+
+  private failRelayNegotiation(peerId: string, error: unknown): void {
+    const negotiation = this.relayNegotiations.get(peerId);
+    if (negotiation) clearTimeout(negotiation.timeout);
+    this.relayNegotiations.delete(peerId);
+    const failure = error instanceof Error ? error : new Error(String(error));
+    const peer = this.directory.get(peerId);
+    if (peer) this.emit('connectionError', peer, failure);
+    else this.emit('protocolError', failure);
+    if (!this.stopped && !this.identityToTransport.has(peerId)) {
+      queueMicrotask(() => this.considerRelayFallback(peerId));
     }
   }
 
@@ -1391,7 +1432,15 @@ public improvablePeerIds(): string[] {
       return;
     }
     if (envelope.k === 'hs' || envelope.k === 'pr') {
-      this.advanceRelayHandshake(fromPeerId, envelope.k, envelope.hs, envelope.pr);
+      try {
+        this.advanceRelayHandshake(fromPeerId, envelope.k, envelope.hs, envelope.pr);
+      } catch (error) {
+        // NostrFrameRelay intentionally isolates malformed public-relay input.
+        // Convert authenticated Pair Notebook handshake failures into an
+        // observable error here, and release the state that otherwise blocks
+        // every later fallback attempt.
+        this.failRelayNegotiation(fromPeerId, error);
+      }
       return;
     }
     if (envelope.k === 'fr' && typeof envelope.d === 'string') {
@@ -1414,15 +1463,10 @@ public improvablePeerIds(): string[] {
         return;
       }
       // An inbound hs IS the announcement of a new relay-only peer.
-      negotiation = {
-        role: 'responder',
-        localHs: this.localHandshake(),
-        sentLocalHs: false,
-        sentProof: false,
-        remoteHs: undefined,
-        remoteProof: undefined,
-      };
-      this.relayNegotiations.set(fromPeerId, negotiation);
+      // Role is derived from stable peer IDs on both sides. Treating every
+      // inbound handshake as the responder makes two responders whenever the
+      // lexically higher peer is the only side that starts fallback.
+      negotiation = this.createRelayNegotiation(fromPeerId);
     }
     if (kind === 'hs') {
       const parsed = this.parseHandshake(rawHs);
@@ -1470,7 +1514,9 @@ public improvablePeerIds(): string[] {
       peer: negotiation.remoteHs.peer,
       nonce: negotiation.remoteHs.nonce,
     });
+    clearTimeout(negotiation.timeout);
     this.relayNegotiations.delete(fromPeerId);
+    this.relayAttempts.delete(fromPeerId);
     this.onPeerJoin(transportPeerId);
     this.routes.set(fromPeerId, 'Relay');
   }
@@ -1537,6 +1583,7 @@ public improvablePeerIds(): string[] {
     if (room) await room.leave();
     this.relay?.stop();
     this.relay = undefined;
+    for (const negotiation of this.relayNegotiations.values()) clearTimeout(negotiation.timeout);
     this.relayNegotiations.clear();
     this.relayAttempts.clear();
     for (const upgrade of [...this.routeUpgrades.values()]) {

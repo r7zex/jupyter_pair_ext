@@ -169,7 +169,15 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
   - Focused proxy tests: 9 passing, including a local HTTP proxy that asserts
     the actual CONNECT request. Full suite: 210 passing and one unrelated
     route-optimization timing failure; its isolated rerun passed.
-- [ ] Repair emergency relay role symmetry, cleanup, retry, and tests.
+- [x] Repair emergency relay role symmetry, cleanup, retry, and tests.
+  - Both inbound and outbound creation paths derive roles from the same peer-ID
+    ordering. The production host/guest IDs now connect when only the higher
+    guest starts fallback.
+  - Relay negotiations expire after 12 seconds, retry with a fresh nonce, and
+    reset their attempt budget after successful authentication. Invalid proofs
+    are reported and cannot leave retry-blocking state behind.
+  - Focused relay integration tests: 4 passing (role symmetry, lost-message
+    expiry/retry, invalid-proof recovery, and one-sided higher-peer join).
 - [ ] Repair host-assigned `joinOrder` concurrency race and tests.
 - [ ] Remove misleading built-in TURN fallback and correct diagnostics/docs.
 - [ ] Repair and run the network probe script.
