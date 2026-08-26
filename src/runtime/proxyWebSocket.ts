@@ -36,19 +36,26 @@ export function createProxyAgent(
     ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password ?? '')}@`
     : '';
   const authority = `${proxy.host}:${proxy.port}`;
+  const proxyUrl = `${proxy.kind}://${credentials}${authority}`;
   switch (proxy.kind) {
     case 'socks4':
-      return { agent: new SocksProxyAgent(`socks4://${credentials}${authority}`), proxy };
+      return { agent: new SocksProxyAgent(proxyUrl), proxy };
     case 'socks5':
     case 'socks5h':
-      return {
-        agent: new SocksProxyAgent(`socks5${proxy.kind === 'socks5h' ? 'h' : ''}://${credentials}${authority}`),
-        proxy,
-      };
+      return { agent: new SocksProxyAgent(proxyUrl), proxy };
     case 'https':
-      return { agent: new HttpsProxyAgent(`http://${credentials}${authority}`), proxy };
-    default:
-      return { agent: new HttpProxyAgent(`http://${credentials}${authority}`), proxy };
+    case 'http': {
+      const targetProtocol = new URL(targetUrl).protocol;
+      // Secure WebSocket requests need a CONNECT tunnel even when the proxy
+      // itself speaks plain HTTP. HttpProxyAgent forwards the request instead,
+      // which makes ordinary HTTP proxies reject the WebSocket upgrade with
+      // HTTP 400. HttpsProxyAgent supports both HTTP and HTTPS proxy transports
+      // and upgrades the established tunnel to target TLS for `wss:`.
+      const agent = targetProtocol === 'wss:' || targetProtocol === 'https:'
+        ? new HttpsProxyAgent(proxyUrl)
+        : new HttpProxyAgent(proxyUrl);
+      return { agent, proxy };
+    }
   }
 }
 

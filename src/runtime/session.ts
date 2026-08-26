@@ -657,15 +657,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const selfId = this.descriptor.localPeer.peerId;
     return this.transport.peerRuntime()
       .filter((peer) => peer.peerId !== selfId)
-      .map((peer) => ({
-        peerId: peer.peerId,
-        displayName: peer.displayName,
-        routeType: peer.route === 'Relay' ? 'relay' as const : 'direct' as const,
-        latencyMs: peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
-        ...(upgrades.has(peer.peerId) ? { upgradeStatus: upgrades.get(peer.peerId) } : {}),
-        ...(this.transport.getRemoteRouteStatus(peer.peerId)
-          ? { remoteStatus: this.transport.getRemoteRouteStatus(peer.peerId) } : {}),
-      }));
+      .map((peer) => {
+        const upgradeStatus = upgrades.get(peer.peerId);
+        const remoteStatus = this.transport.getRemoteRouteStatus(peer.peerId);
+        return {
+          peerId: peer.peerId,
+          displayName: peer.displayName,
+          routeType: peer.route === 'Relay' ? 'relay' as const : 'direct' as const,
+          latencyMs: peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
+          ...(upgradeStatus !== undefined ? { upgradeStatus } : {}),
+          ...(remoteStatus !== undefined ? { remoteStatus } : {}),
+        };
+      });
   }
 
   /**

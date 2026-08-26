@@ -39,28 +39,12 @@ export interface TurnProbeResult {
 const TRANSPORT_PRIORITY: Record<TurnTransport, number> = { udp: 0, tcp: 1, tls: 2 };
 
 /**
- * Default public relay endpoints, used as a last-resort connectivity fallback.
- *
- * STATUS (verified live 2026-08-24): the Metered Open Relay demo endpoint
- * no longer resolves publicly, and its CURRENT documentation gates TURN
- * credentials behind a free account/API key, so these built-in endpoints are
- * effectively NON-OPERATIONAL today. They are kept only as a stable ordering
- * skeleton for deployments that override `pairNotebook.turnUrls`; Pair
- * Notebook does NOT depend on them: when all TURN transports fail, direct ICE
- * still works on normal networks and the encrypted Nostr emergency relay
- * covers the rest without any registration. There is currently NO trustworthy
- * anonymous, registration-free, production-grade public TURN provider that
- * could be shipped as a built-in default.
- * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is what
- * the werift ICE stack actually uses (it consumes only one TURN URL), so
- * MeshTransport probes reachability and reorders this list in place, always
- * keeping direct peer-to-peer ICE preferred over relaying.
+ * There is no built-in TURN service. The former anonymous Metered demo no
+ * longer resolves publicly and must not be advertised as a working fallback.
+ * Keep this empty export for source compatibility; production endpoints come
+ * only from the explicit `pairNotebook.turnUrls` setting.
  */
-export const DEFAULT_TURN_URLS = [
-  'turn:openrelay.metered.ca:80',
-  'turn:openrelay.metered.ca:443?transport=tcp',
-  'turns:openrelay.metered.ca:443',
-];
+export const DEFAULT_TURN_URLS: readonly string[] = [];
 
 /**
  * Parses and normalizes a single TURN URL. Rejects anything that is not a
@@ -75,11 +59,11 @@ export function parseTurnEndpoint(rawUrl: string): TurnEndpoint | undefined {
   if (!rawScheme || hostPort === undefined) return undefined;
   const scheme = rawScheme.toLowerCase() as 'turn' | 'turns';
   // Strip IPv6 brackets for the host value while keeping the canonical form.
-  const bracketed = /^\[([^\]]+)\](:((\d+)))?$/.exec(hostPort);
+  const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(hostPort);
   let port: number;
   let host: string;
   const bracketedHost = bracketed?.[1];
-  const bracketedPort = bracketed?.[3];
+  const bracketedPort = bracketed?.[2];
   if (bracketed && bracketedHost !== undefined) {
     host = `[${bracketedHost}]`;
     if (bracketedPort === undefined) {

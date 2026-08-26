@@ -188,7 +188,7 @@ describe('audit regressions', () => {
         await client.start();
         await connected;
         await impostor.start();
-        await waitFor(() => errors.some((error) => /different identity key|already connected|already connecting/i.test(error.message)), 1000);
+        await waitFor(() => errors.some((error) => /different identity key/i.test(error.message)), 1000);
         assert.equal(host.peerRuntime().find((entry) => entry.peerId === 'client')?.online, true);
         assert.equal(host.peerRuntime().filter((entry) => entry.peerId === 'client').length, 1);
       } finally {

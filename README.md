@@ -19,7 +19,7 @@ VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`
 Pair Notebook tries several independent ways to reach the other participant and always shows which one is currently in use:
 
 1. **Direct P2P** — encrypted WebRTC over ICE (STUN-assisted). Near-ping latency; this is the normal path.
-2. **TURN relay** — when direct paths fail (symmetric NAT, restrictive firewall), WebRTC is relayed through TURN; UDP, TCP and TLS transports are probed at startup and the reachable ones are preferred.
+2. **Optional custom TURN relay** — when you configure `pairNotebook.turnUrls`, WebRTC can relay through that service; UDP, TCP and TLS transports are probed and reachable ones are preferred. Pair Notebook does not ship anonymous TURN credentials or claim a dead public demo as a fallback.
 3. **Encrypted emergency relay** — if ICE cannot build any path (cross-VPN setups, UDP blocked), session frames tunnel as AES-256-GCM ciphertext through public Nostr relays. The session token never reaches the relays.
 
 Signalling runs over TWO independent families concurrently — multiple health-checked public Nostr relays plus a public MQTT broker set — so the failure of one family or relay no longer stalls discovery; a participant discovered through both families still appears exactly once. All WebSocket-based channels honour `http.proxy` from VS Code and the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, including SOCKS4/SOCKS5/SOCKS5h proxies. Proxy credentials are never logged or displayed.
@@ -45,7 +45,7 @@ The button never modifies VPN/DNS/zapret/firewall/router settings and never requ
 
 ## Diagnostics
 
-Passive diagnostics run automatically with ordinary user permissions: adapter classification (VPN/TUN detection), configured-proxy detection, DNS resolution checks of signalling hosts, and TURN probe results that reveal whether UDP appears unavailable on the path. Every conclusion carries an explicit confidence level (confirmed/high/medium/low); filtering software such as zapret/Flowseal is never named as a confirmed cause without direct evidence — correlated symptoms are listed as possible causes instead. Nothing is ever changed on the system by diagnostics.
+Passive diagnostics run automatically with ordinary user permissions: adapter classification (VPN/TUN detection), configured-proxy detection, DNS resolution checks of signalling hosts, and custom TURN probes when configured. UDP is reported unavailable only when UDP probes fail while a TCP/TLS control path succeeds; if every TURN path fails, UDP remains unknown because DNS, credentials, the TURN service, routing, or filtering can produce the same result. Every conclusion carries an explicit confidence level (confirmed/high/medium/low); filtering software such as zapret/Flowseal is never named as a confirmed cause without direct evidence — correlated symptoms are listed as possible causes instead. Nothing is ever changed on the system by diagnostics.
 
 
 VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are only required on a computer selected to execute notebook cells; text and notebook collaboration itself does not require them.
@@ -97,7 +97,7 @@ Each participant also owns an Ed25519 identity key. The private key remains in V
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
-Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook relies on two independent fallbacks: a configured TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate their own TURN), and the built-in encrypted emergency relay over public Nostr, which needs nothing from the user. Note: the previously bundled free public TURN demo (Open Relay by Metered) is no longer operational without an account and is therefore treated as non-functional by the built-in configuration; the emergency relay keeps joins working where TURN is unavailable. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
+Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook can use a custom TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate or trust one) and independently falls back to the built-in encrypted emergency relay over public Nostr, which needs nothing from the user. There is no built-in TURN service: the former Open Relay demo is not sent to Trystero, probed, or advertised because it is no longer operational anonymously. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
 
 ## Development
 

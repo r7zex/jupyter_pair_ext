@@ -607,10 +607,11 @@ function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
   result.metadata = { ...cell.metadata, pairNotebookCellId: cell.id };
   result.outputs = cell.outputs.map(toNotebookOutput);
   if (cell.execution !== undefined) {
-    const { executionOrder, success } = cell.execution;
+    const { executionOrder, success, timing } = cell.execution;
     result.executionSummary = {
       ...(executionOrder !== undefined ? { executionOrder } : {}),
       ...(success !== undefined ? { success } : {}),
+      ...(timing !== undefined ? { timing: { ...timing } } : {}),
     };
   }
   return result;

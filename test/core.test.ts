@@ -1313,7 +1313,7 @@ describe('real transport and compute', () => {
     }
   });
 
-  it('passes curated Nostr relays and a public TURN fallback to Trystero', async () => {
+  it('passes curated Nostr relays without advertising dead built-in TURN', async () => {
     const capturedConfigs: unknown[] = [];
     const inMemoryFactory = createInMemoryTrysteroFactory();
     const transport = new MeshTransport({
@@ -1336,15 +1336,16 @@ describe('real transport and compute', () => {
       };
       assert.deepEqual(config.relayConfig?.urls, TRYSTERO_RELAY_URLS);
       assert.ok((config.relayConfig?.redundancy ?? 0) >= 2);
-      assert.equal(config.turnConfig?.length, TRYSTERO_TURN_SERVERS.length);
-      for (const server of config.turnConfig ?? []) {
-        assert.ok(Array.isArray(server.urls) && server.urls.length >= 3);
-        // UDP first (preferred TURN transport), then TCP, then TLS.
-        assert.match(server.urls[0] ?? '', /^turn:openrelay\.metered\.ca:80$/);
-        assert.match(server.urls[1] ?? '', /^turn:openrelay\.metered\.ca:443\?transport=tcp$/);
-        assert.match(server.urls[2] ?? '', /^turns:openrelay\.metered\.ca:443$/);
-        assert.ok(server.username && server.credential);
-      }
+      assert.equal(TRYSTERO_TURN_SERVERS.length, 0);
+      assert.equal(config.turnConfig, undefined);
+      const diagnostics = transport.networkDiagnostics() as {
+        turnStatus?: string;
+        turnEndpoints?: unknown[];
+        udpAvailability?: { state?: string };
+      };
+      assert.equal(diagnostics.turnStatus, 'not-configured');
+      assert.deepEqual(diagnostics.turnEndpoints, []);
+      assert.equal(diagnostics.udpAvailability?.state, 'unknown');
     } finally {
       await transport.stop();
       resetInMemoryTrystero();

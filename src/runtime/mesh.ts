@@ -68,28 +68,12 @@ export const TRYSTERO_RELAY_URLS = [
   'wss://relay.orangepill.dev',
   'wss://offchain.pub',
 ];
-/**
- * Default TURN relay endpoints, used as a last-resort connectivity fallback.
- *
- * Trystero's default STUN servers cannot traverse symmetric NATs or
- * restrictive firewalls, which made joins stall for a long time and then
- * fail with "could not connect to peer ... configure TURN servers".
- * Endpoints are ordered UDP -> TCP -> TLS; at runtime the first entry is
- * what the werift ICE stack actually uses (it consumes only one TURN URL),
- * so MeshTransport probes reachability and reorders this list in place,
- * always keeping direct peer-to-peer ICE preferred over relaying.
- * The list must stay compatible on every participant because ICE needs both
- * sides to attempt usable relays. The Open Relay (Metered) demo credentials
- * are publicly published by that provider for free-tier testing; they are
- * overridden via `pairNotebook.turnUrls` + secret storage in production.
- */
-export const TRYSTERO_TURN_SERVERS = [
-  {
-    urls: [...DEFAULT_TURN_URLS],
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-];
+/** @deprecated Pair Notebook no longer advertises a dead built-in TURN service. */
+export const TRYSTERO_TURN_SERVERS: ReadonlyArray<{
+  urls: string[];
+  username: string;
+  credential: string;
+}> = [];
 
 export interface MeshNetworkConfig {
   /** Overrides the default TURN endpoint URL list. */
@@ -137,6 +121,8 @@ export const ROUTE_UPGRADE_TIMEOUT_MS = 45_000;
 export const ROUTE_UPGRADE_REQUIRED_PINGS = 3;
 /** Minimum time the candidate must stay alive before promotion. */
 export const ROUTE_UPGRADE_STABILITY_WINDOW_MS = 3_000;
+/** Maximum time a relay identity handshake may retain retry-blocking state. */
+export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
 
 export type RouteUpgradeStatus =
   | 'requesting'
@@ -160,13 +146,23 @@ interface RouteUpgrade {
   role: 'initiator' | 'responder';
   status: RouteUpgradeStatus;
   startedAt: number;
-  candidateTransportId?: string;
-  candidateRawId?: string;
-  connectedAt?: number;
+  candidateTransportId?: string | undefined;
+  candidateRawId?: string | undefined;
+  connectedAt?: number | undefined;
   verifiedPings: number;
-  lastError?: string;
-  deadlineTimer?: NodeJS.Timeout;
-  verifyTimer?: NodeJS.Timeout;
+  lastError?: string | undefined;
+  deadlineTimer?: NodeJS.Timeout | undefined;
+  verifyTimer?: NodeJS.Timeout | undefined;
+}
+
+interface RelayNegotiation {
+  role: 'initiator' | 'responder';
+  localHs: HandshakeMessage;
+  sentLocalHs: boolean;
+  sentProof: boolean;
+  remoteHs?: HandshakeMessage | undefined;
+  remoteProof?: string | undefined;
+  timeout: NodeJS.Timeout;
 }
 
 
@@ -233,6 +229,10 @@ export interface MeshOptions {
   hostReady?: () => boolean;
   purpose?: PeerConnectionPurpose;
   roomFactory?: TrysteroRoomFactory | undefined;
+  /** Test hook: builds the SECONDARY (MQTT) signalling room. */
+  secondaryRoomFactory?: TrysteroRoomFactory | undefined;
+  /** Disables the concurrent MQTT signalling family (default: enabled). */
+  disableSecondarySignalling?: boolean | undefined;
   /** Required by production callers; omitted tests receive an ephemeral key. */
   identityPrivateKey?: string | undefined;
 }
@@ -338,15 +338,9 @@ export class MeshTransport extends EventEmitter {
   private pingInFlight = false;
   private turnEndpoints: TurnEndpoint[] | undefined;
   private turnProbes: TurnProbeResult[] | undefined;
+  private turnStatus: 'not-configured' | 'invalid' | 'configured' = 'not-configured';
   private relay: NostrFrameRelay | undefined;
-  private readonly relayNegotiations = new Map<string, {
-    role: 'initiator' | 'responder';
-    localHs: HandshakeMessage;
-    sentLocalHs: boolean;
-    sentProof: boolean;
-    remoteHs?: HandshakeMessage | undefined;
-    remoteProof?: string | undefined;
-  }>();
+  private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
   /** Make-before-break improvement attempts, keyed by logical peer id. */
   private readonly routeUpgrades = new Map<string, RouteUpgrade>();
@@ -477,19 +471,20 @@ export class MeshTransport extends EventEmitter {
    * contained: the primary Nostr room is never affected.
    */
   private startSecondarySignalling(): void {
-    if (this.mqttRoom || this.stopped || this.options.disableSecondarySignalling) return;
+    if (this.mqttRoom || this.mqttJoining || this.stopped || this.options.disableSecondarySignalling) return;
     const testFactory = this.options.roomFactory || MeshTransport.testingRoomFactory;
     const factory = this.options.secondaryRoomFactory ?? (testFactory ? undefined : joinMqttRoom);
     if (!factory) return;
     this.mqttJoining = true;
     try {
+      const turnConfig = this.buildTurnConfig();
       const config: NostrRoomConfig = {
         appId: TRYSTERO_APP_ID,
         password: this.options.token,
         rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
-        turnConfig: this.buildTurnConfig(),
+        ...(turnConfig !== undefined ? { turnConfig } : {}),
       };
-      this.mqttRoom = factory(config, `${this.options.sessionId}`, {
+      const room = factory(config, `${this.options.sessionId}`, {
         handshakeTimeoutMs: 15_000,
         onPeerHandshake: async (rawId, send, receive, isInitiator) => {
           try {
@@ -511,11 +506,12 @@ export class MeshTransport extends EventEmitter {
         },
         onJoinError: () => undefined,
       });
-      this.mqttAction = this.mqttRoom.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
+      this.mqttRoom = room;
+      this.mqttAction = room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
       this.mqttAction.onMessage = (data, { peerId }) =>
         this.handleAction(data, MQTT_TRANSPORT_PREFIX + peerId);
-      this.mqttRoom.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
-      this.mqttRoom.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
+      room.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
+      room.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
     } catch {
       this.mqttRoom = undefined;
       this.mqttAction = undefined;
@@ -591,12 +587,14 @@ export class MeshTransport extends EventEmitter {
    * preferred by ordinary candidate priority regardless of TURN ordering.
    */
   private buildTurnConfig(): NostrRoomConfig['turnConfig'] {
-    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : DEFAULT_TURN_URLS;
-    const fallbackTurn = TRYSTERO_TURN_SERVERS[0];
-    const username = meshNetworkConfig.turnUsername || fallbackTurn?.username || '';
-    const password = meshNetworkConfig.turnPassword || fallbackTurn?.credential || '';
+    const urls = meshNetworkConfig.turnUrls?.length ? [...meshNetworkConfig.turnUrls] : [...DEFAULT_TURN_URLS];
     const endpoints = parseTurnEndpoints(urls);
+    this.turnEndpoints = undefined;
+    this.turnProbes = undefined;
+    this.turnStatus = urls.length === 0 ? 'not-configured' : endpoints.length === 0 ? 'invalid' : 'configured';
     if (endpoints.length === 0) return undefined;
+    const username = meshNetworkConfig.turnUsername ?? '';
+    const password = meshNetworkConfig.turnPassword ?? '';
     const ordered = orderTurnEndpoints(endpoints);
     const entry = {
       urls: ordered.map((endpoint) => endpoint.url),
@@ -652,6 +650,7 @@ export class MeshTransport extends EventEmitter {
     return {
       relays: [...TRYSTERO_RELAY_URLS],
       relayRedundancy: RELAY_REDUNDANCY,
+      turnStatus: this.turnStatus,
       turnEndpoints: (this.turnEndpoints ?? []).map((endpoint) => ({ ...endpoint })),
       turnProbes: (this.turnProbes ?? []).map((probe) => ({
         url: probe.endpoint.url,
@@ -901,8 +900,8 @@ export class MeshTransport extends EventEmitter {
     }
     // During an explicit upgrade the working route must survive the candidate
     // handshake, so assertPeerCanJoin defers retirement for prefixed keys.
-    this.assertPeerCanJoin(remote.peer, transportKey);
-    this.pendingHandshakes.set(transportKey, { ...remote, admittedAt: Date.now() });
+    const admittedPeer = this.assertPeerCanJoin(remote.peer, transportKey);
+    this.pendingHandshakes.set(transportKey, { ...remote, peer: admittedPeer, admittedAt: Date.now() });
   }
 
   /**
@@ -1356,18 +1355,54 @@ public improvablePeerIds(): string[] {
 
   private sendRelayHandshake(peerId: string): void {
     const existing = this.relayNegotiations.get(peerId);
-    const negotiation = existing ?? {
+    const negotiation = existing ?? this.createRelayNegotiation(peerId);
+    if (!negotiation.sentLocalHs) {
+      negotiation.sentLocalHs = true;
+      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+    }
+  }
+
+  private createRelayNegotiation(peerId: string): RelayNegotiation {
+    const negotiation = {
       role: (this.options.localPeer.peerId < peerId ? 'initiator' : 'responder') as 'initiator' | 'responder',
       localHs: this.localHandshake(),
       sentLocalHs: false,
       sentProof: false,
-      remoteHs: undefined as HandshakeMessage | undefined,
-      remoteProof: undefined as string | undefined,
-    };
+      remoteHs: undefined,
+      remoteProof: undefined,
+      timeout: undefined as unknown as NodeJS.Timeout,
+    } satisfies RelayNegotiation;
+    negotiation.timeout = setTimeout(
+      () => this.expireRelayNegotiation(peerId, negotiation),
+      RELAY_NEGOTIATION_TIMEOUT_MS,
+    );
+    negotiation.timeout.unref?.();
     this.relayNegotiations.set(peerId, negotiation);
-    if (!negotiation.sentLocalHs) {
-      negotiation.sentLocalHs = true;
-      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+    return negotiation;
+  }
+
+  private expireRelayNegotiation(peerId: string, negotiation: RelayNegotiation): void {
+    if (this.relayNegotiations.get(peerId) !== negotiation) return;
+    this.relayNegotiations.delete(peerId);
+    clearTimeout(negotiation.timeout);
+    if (this.stopped || this.identityToTransport.has(peerId)) return;
+    const error = new Error(`Emergency relay handshake with ${peerId} timed out; retrying.`);
+    const peer = this.directory.get(peerId);
+    if (peer) this.emit('connectionError', peer, error);
+    else this.emit('protocolError', error);
+    this.considerRelayFallback(peerId);
+  }
+
+  private failRelayNegotiation(peerId: string, error: unknown): void {
+    const negotiation = this.relayNegotiations.get(peerId);
+    if (negotiation) clearTimeout(negotiation.timeout);
+    this.relayNegotiations.delete(peerId);
+    const failure = error instanceof Error ? error : new Error(String(error));
+    const peer = this.directory.get(peerId);
+    if (peer) this.emit('connectionError', peer, failure);
+    else this.emit('protocolError', failure);
+    if (!this.stopped && !this.identityToTransport.has(peerId)) {
+      queueMicrotask(() => this.considerRelayFallback(peerId));
     }
   }
 
@@ -1389,7 +1424,15 @@ public improvablePeerIds(): string[] {
       return;
     }
     if (envelope.k === 'hs' || envelope.k === 'pr') {
-      this.advanceRelayHandshake(fromPeerId, envelope.k, envelope.hs, envelope.pr);
+      try {
+        this.advanceRelayHandshake(fromPeerId, envelope.k, envelope.hs, envelope.pr);
+      } catch (error) {
+        // NostrFrameRelay intentionally isolates malformed public-relay input.
+        // Convert authenticated Pair Notebook handshake failures into an
+        // observable error here, and release the state that otherwise blocks
+        // every later fallback attempt.
+        this.failRelayNegotiation(fromPeerId, error);
+      }
       return;
     }
     if (envelope.k === 'fr' && typeof envelope.d === 'string') {
@@ -1412,15 +1455,10 @@ public improvablePeerIds(): string[] {
         return;
       }
       // An inbound hs IS the announcement of a new relay-only peer.
-      negotiation = {
-        role: 'responder',
-        localHs: this.localHandshake(),
-        sentLocalHs: false,
-        sentProof: false,
-        remoteHs: undefined,
-        remoteProof: undefined,
-      };
-      this.relayNegotiations.set(fromPeerId, negotiation);
+      // Role is derived from stable peer IDs on both sides. Treating every
+      // inbound handshake as the responder makes two responders whenever the
+      // lexically higher peer is the only side that starts fallback.
+      negotiation = this.createRelayNegotiation(fromPeerId);
     }
     if (kind === 'hs') {
       const parsed = this.parseHandshake(rawHs);
@@ -1460,15 +1498,17 @@ public improvablePeerIds(): string[] {
       throw new Error(`Relay peer ${fromPeerId} failed the identity proof.`);
     }
     const transportPeerId = RELAY_TRANSPORT_PREFIX + fromPeerId;
-    this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
+    const admittedPeer = this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
     this.pendingHandshakes.set(transportPeerId, {
       version: HANDSHAKE_VERSION,
       sessionId: negotiation.remoteHs.sessionId,
       purpose: negotiation.remoteHs.purpose,
-      peer: negotiation.remoteHs.peer,
+      peer: admittedPeer,
       nonce: negotiation.remoteHs.nonce,
     });
+    clearTimeout(negotiation.timeout);
     this.relayNegotiations.delete(fromPeerId);
+    this.relayAttempts.delete(fromPeerId);
     this.onPeerJoin(transportPeerId);
     this.routes.set(fromPeerId, 'Relay');
   }
@@ -1535,6 +1575,7 @@ public improvablePeerIds(): string[] {
     if (room) await room.leave();
     this.relay?.stop();
     this.relay = undefined;
+    for (const negotiation of this.relayNegotiations.values()) clearTimeout(negotiation.timeout);
     this.relayNegotiations.clear();
     this.relayAttempts.clear();
     for (const upgrade of [...this.routeUpgrades.values()]) {
@@ -1603,7 +1644,7 @@ public improvablePeerIds(): string[] {
     return { version: HANDSHAKE_VERSION, signature: proof.signature };
   }
 
-  private assertPeerCanJoin(identity: PeerIdentity, transportPeerId: string): void {
+  private assertPeerCanJoin(identity: PeerIdentity, transportPeerId: string): PeerIdentity {
     if (this.connections.size + this.pendingHandshakes.size >= MAX_DIRECTORY_PEERS) {
       throw new Error(`Pair Notebook supports at most ${MAX_DIRECTORY_PEERS} connected peers.`);
     }
@@ -1618,7 +1659,16 @@ public improvablePeerIds(): string[] {
       throw new Error(`Peer identity ${identity.peerId} presented a different identity key.`);
     }
     if (remembered?.identityKey && remembered.joinOrder !== identity.joinOrder) {
-      throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
+      if (!this.options.isHost()) {
+        throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
+      }
+      // The current host owns canonical failover order. Parallel Nostr/MQTT
+      // handshakes can both be signed before the first admitted route delivers
+      // peerAdmission, leaving the second route with the guest's provisional
+      // order. The already-pinned key proves this is the same identity; use the
+      // host directory's value before duplicate-route handling. Key mismatch
+      // is deliberately rejected above and can never reach this normalization.
+      identity = { ...identity, joinOrder: remembered.joinOrder };
     }
     const activeTransport = this.identityToTransport.get(identity.peerId);
     const isUpgradeCandidate = transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
@@ -1653,6 +1703,7 @@ public improvablePeerIds(): string[] {
     if (conflictingPeer) {
       throw new Error(`Display name is already in use: ${conflictingPeer.displayName}.`);
     }
+    return identity;
   }
 
   /**

@@ -85,12 +85,23 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
         metadata: { outputType: 'display_data' },
         items: [{ mime: 'text/html', dataBase64: Buffer.from('<b>PAIR</b>').toString('base64') }],
       }]);
+      remote.setCellExecution('work.ipynb', 'b', {
+        executionOrder: 7,
+        success: true,
+        timing: { startTime: 100, endTime: 200 },
+      });
       applyUpdates(local, updates.splice(0));
       await waitFor(() => notebook.cells[2].document.getText().includes('REMOTE')
         && notebook.cells[2].metadata.owner === 'remote'
-        && notebook.cells[2].outputs.length === 1, 1500, 'remote cell fields');
+        && notebook.cells[2].outputs.length === 1
+        && notebook.cells[2].executionSummary?.timing?.endTime === 200, 1500, 'remote cell fields');
       assert.equal(notebook.cells[2].metadata.pairNotebookCellId, 'b');
       assert.equal(Buffer.from(notebook.cells[2].outputs[0].items[0].data).toString('utf8'), '<b>PAIR</b>');
+      assert.deepEqual(notebook.cells[2].executionSummary, {
+        executionOrder: 7,
+        success: true,
+        timing: { startTime: 100, endTime: 200 },
+      });
     } finally {
       synchronizer.dispose();
       local.destroy();

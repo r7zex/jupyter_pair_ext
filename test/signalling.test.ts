@@ -70,6 +70,7 @@ describe('secondary signalling family (MQTT)', function () {
       // The connection must come from the SECONDARY family: the primary room
       // is a dead stub that can never admit peers.
       const mapped = [...(host as unknown as { identityToTransport: Map<string, string> }).identityToTransport.values()][0];
+      assert.ok(mapped, 'peer should be mapped through the secondary signalling family');
       assert.ok(mapped.startsWith('mqtt:'), `expected an mqtt-family transport, got ${mapped}`);
       assert.ok(host.activeSignallingFamilies().includes('mqtt'));
       const got = new Promise<string>((resolve) => {
@@ -89,7 +90,7 @@ describe('secondary signalling family (MQTT)', function () {
     }
   });
 
-  it('deduplicates a participant discovered through both signalling families', async () => {
+  it('normalizes a stale provisional join order across concurrent signalling families', async () => {
     const inMemory = supportModule.createInMemoryTrysteroFactory();
     const mqttFactory = (config: never, roomId: string, callbacks: never) =>
       inMemory(config, `mqttD#${roomId}`, callbacks);
@@ -109,6 +110,17 @@ describe('secondary signalling family (MQTT)', function () {
       roomFactory: inMemory as never,
       secondaryRoomFactory: mqttFactory as never,
     });
+    const errors: Error[] = [];
+    let assignedCanonicalOrder = false;
+    host.on('connectionError', (_peer, error: Error) => errors.push(error));
+    host.on('peerConnected', (peer: { peerId: string }) => {
+      if (assignedCanonicalOrder) return;
+      assignedCanonicalOrder = true;
+      // Both primary and secondary handshakes have already captured the
+      // guest's provisional order by the time the first route is admitted.
+      // This makes the second, still-valid signed route present stale order 1.
+      host.setPeerJoinOrder(peer.peerId, 7);
+    });
 
     try {
       const connected = Promise.all([
@@ -124,6 +136,8 @@ describe('secondary signalling family (MQTT)', function () {
       // One logical participant each side despite two signalling families.
       assert.equal(host.peerRuntime().filter((peer) => peer.peerId === 'guest-dup').length, 1);
       assert.equal(guest.peerRuntime().filter((peer) => peer.peerId === 'host-dup').length, 1);
+      assert.equal(host.peerRuntime().find((peer) => peer.peerId === 'guest-dup')?.joinOrder, 7);
+      assert.ok(!errors.some((error) => /different host-assigned order/i.test(error.message)));
 
       // Frames flow exactly once.
       const received: string[] = [];

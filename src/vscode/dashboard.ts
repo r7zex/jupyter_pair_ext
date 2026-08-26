@@ -188,6 +188,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
     ? compute?.hardware?.gpus.find((gpu) => gpu.index === gpuIndex)
     : undefined;
   const configuredColor = vscode.workspace.getConfiguration('pairNotebook').get<string>('myCursorColor', '#4FC3F7');
+  const connection = buildConnectionView(snapshot);
   return {
     live: true,
     isHost: snapshot.isHost,
@@ -249,7 +250,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
     runtimeState: snapshot.runtimeState,
     runtimeDetail: snapshot.runtimeDetail,
     waitingForHostFolder: snapshot.waitingForHostFolder,
-    connection: buildConnectionView(snapshot),
+    ...(connection !== undefined ? { connection } : {}),
   };
 }
 

@@ -719,6 +719,7 @@ async function showDiagnostics(advanced = false): Promise<void> {
     try { return runtime?.networkDiagnostics(); } catch { return undefined; }
   })() as {
     relays?: string[];
+    turnStatus?: 'not-configured' | 'invalid' | 'configured';
     turnEndpoints?: Array<{ url: string; transport: string }>;
     turnProbes?: Array<{ url: string; transport: string; ok: boolean; latencyMs?: number }>;
     proxy?: string;
@@ -733,8 +734,11 @@ async function showDiagnostics(advanced = false): Promise<void> {
       ok: probe.ok,
       ...(probe.latencyMs !== undefined ? { latencyMs: probe.latencyMs } : {}),
     })),
-    relayFallbackEnabled: network?.relayFallback?.enabled,
-    connectedRelayCount: network?.relayFallback?.connectedRelays,
+    ...(network?.turnStatus !== undefined ? { turnStatus: network.turnStatus } : {}),
+    ...(network?.relayFallback?.enabled !== undefined
+      ? { relayFallbackEnabled: network.relayFallback.enabled } : {}),
+    ...(network?.relayFallback?.connectedRelays !== undefined
+      ? { connectedRelayCount: network.relayFallback.connectedRelays } : {}),
     resolveDns: async (host) => (await lookup(host)),
   });
 
@@ -757,12 +761,16 @@ async function showDiagnostics(advanced = false): Promise<void> {
       '',
       'Discovery (Nostr relays):',
       ...(network.relays ?? []).map((relay, index) => `  ${index + 1}. ${relay}`),
-      'TURN fallback order:',
-      ...(network.turnEndpoints ?? []).map((endpoint, index) => {
+      network.turnStatus === 'not-configured'
+        ? 'TURN: not configured (direct ICE + encrypted emergency relay remain enabled)'
+        : network.turnStatus === 'invalid'
+          ? 'TURN: configured URLs are invalid; no TURN service is active'
+          : 'TURN fallback order:',
+      ...(network.turnStatus === 'configured' ? (network.turnEndpoints ?? []).map((endpoint, index) => {
         const probe = (network.turnProbes ?? []).find((item) => item.url === endpoint.url);
         const state = !probe ? 'not probed yet' : probe.ok ? `reachable (${probe.latencyMs} ms)` : 'unreachable';
         return `  ${index + 1}. [${endpoint.transport.toUpperCase()}] ${endpoint.url} — ${state}`;
-      }),
+      }) : []),
       `Proxy for signalling: ${network.proxy ?? 'Direct'}`,
       `UDP availability: ${network.udpAvailability?.state ?? 'unknown'} (${network.udpAvailability?.confidence ?? 'low'} confidence)`,
       '',

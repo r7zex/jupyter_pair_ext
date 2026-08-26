@@ -276,7 +276,7 @@
           },
           "default": [],
           "scope": "application",
-          "description": "Custom TURN relay URLs (turn:/turns:), tried in order UDP, TCP, TLS before the built-in public fallback. Use your own TURN deployment for restricted networks."
+          "description": "Optional custom TURN relay URLs (turn:/turns:), tried in order UDP, TCP, TLS. Pair Notebook has no built-in TURN service; direct ICE and the encrypted emergency relay remain available when this is empty."
         },
         "pairNotebook.turnUsername": {
           "type": "string",
