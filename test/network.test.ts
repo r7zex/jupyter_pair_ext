@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { describe, it } from 'mocha';
+import { HttpProxyAgent } from 'http-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import NodeWebSocket from 'ws';
 
 import {
   DEFAULT_TURN_URLS,
@@ -194,7 +198,28 @@ describe('proxy resolution', () => {
       env: { HTTPS_PROXY: 'http://corporate:3128' },
     });
     assert.equal(httpsThroughHttp?.proxy.kind, 'http');
-    assert.ok(httpsThroughHttp?.agent);
+    assert.ok(httpsThroughHttp?.agent instanceof HttpsProxyAgent);
+    assert.equal(httpsThroughHttp.agent.proxy.protocol, 'http:');
+
+    const httpsThroughHttps = createProxyAgent('wss://nos.lol', {
+      env: { HTTPS_PROXY: 'https://user:p%40ss@corporate:8443' },
+    });
+    assert.ok(httpsThroughHttps?.agent instanceof HttpsProxyAgent);
+    assert.equal(httpsThroughHttps.agent.proxy.protocol, 'https:');
+    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.username), 'user');
+    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.password), 'p@ss');
+
+    const wsThroughHttp = createProxyAgent('ws://relay.example.com', {
+      env: { HTTP_PROXY: 'http://corporate:3128' },
+    });
+    assert.ok(wsThroughHttp?.agent instanceof HttpProxyAgent);
+    assert.equal(wsThroughHttp.agent.proxy.protocol, 'http:');
+
+    const wsThroughHttps = createProxyAgent('ws://relay.example.com', {
+      env: { HTTP_PROXY: 'https://corporate:8443' },
+    });
+    assert.ok(wsThroughHttps?.agent instanceof HttpProxyAgent);
+    assert.equal(wsThroughHttps.agent.proxy.protocol, 'https:');
 
     const socks = createProxyAgent('wss://nos.lol', {
       env: { ALL_PROXY: 'socks5h://torified:9050' },
@@ -202,6 +227,46 @@ describe('proxy resolution', () => {
     assert.equal(socks?.proxy.kind, 'socks5h');
 
     assert.equal(createProxyAgent('wss://nos.lol', { env: { NO_PROXY: 'nos.lol' } }), undefined);
+  });
+
+  it('uses HTTP CONNECT for a secure WebSocket through an HTTP proxy', async () => {
+    const connectTargets: string[] = [];
+    let forwardedRequestCount = 0;
+    const proxyServer = createServer((_request, response) => {
+      forwardedRequestCount += 1;
+      response.writeHead(400).end();
+    });
+    proxyServer.on('connect', (request, socket) => {
+      connectTargets.push(request.url ?? '');
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    });
+    await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const proxyAddress = proxyServer.address();
+      assert.ok(proxyAddress && typeof proxyAddress !== 'string');
+      const resolved = createProxyAgent('wss://127.0.0.1:65534', {
+        vscodeProxy: `http://127.0.0.1:${proxyAddress.port}`,
+        env: {},
+      });
+      assert.ok(resolved);
+
+      const socket = new NodeWebSocket('wss://127.0.0.1:65534', { agent: resolved.agent });
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('proxy request timed out')), 2_000);
+        socket.once('error', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
+
+      assert.deepEqual(connectTargets, ['127.0.0.1:65534']);
+      assert.equal(forwardedRequestCount, 0);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        proxyServer.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 });
 

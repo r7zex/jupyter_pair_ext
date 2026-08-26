@@ -162,7 +162,13 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
 ## Progress on `codex/fix-network-relay-reliability`
 
 - [x] Confirmed and documented all five reproducible defects and their evidence.
-- [ ] Repair WSS proxy agent selection and add regressions.
+- [x] Repair WSS proxy agent selection and add regressions.
+  - Secure WebSockets now use an HTTP CONNECT tunnelling agent through both
+    HTTP and HTTPS proxies; the configured proxy scheme and credentials are
+    preserved. Plain WebSockets retain forward-proxy behavior.
+  - Focused proxy tests: 9 passing, including a local HTTP proxy that asserts
+    the actual CONNECT request. Full suite: 210 passing and one unrelated
+    route-optimization timing failure; its isolated rerun passed.
 - [ ] Repair emergency relay role symmetry, cleanup, retry, and tests.
 - [ ] Repair host-assigned `joinOrder` concurrency race and tests.
 - [ ] Remove misleading built-in TURN fallback and correct diagnostics/docs.
