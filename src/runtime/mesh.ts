@@ -908,8 +908,8 @@ export class MeshTransport extends EventEmitter {
     }
     // During an explicit upgrade the working route must survive the candidate
     // handshake, so assertPeerCanJoin defers retirement for prefixed keys.
-    this.assertPeerCanJoin(remote.peer, transportKey);
-    this.pendingHandshakes.set(transportKey, { ...remote, admittedAt: Date.now() });
+    const admittedPeer = this.assertPeerCanJoin(remote.peer, transportKey);
+    this.pendingHandshakes.set(transportKey, { ...remote, peer: admittedPeer, admittedAt: Date.now() });
   }
 
   /**
@@ -1506,12 +1506,12 @@ public improvablePeerIds(): string[] {
       throw new Error(`Relay peer ${fromPeerId} failed the identity proof.`);
     }
     const transportPeerId = RELAY_TRANSPORT_PREFIX + fromPeerId;
-    this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
+    const admittedPeer = this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
     this.pendingHandshakes.set(transportPeerId, {
       version: HANDSHAKE_VERSION,
       sessionId: negotiation.remoteHs.sessionId,
       purpose: negotiation.remoteHs.purpose,
-      peer: negotiation.remoteHs.peer,
+      peer: admittedPeer,
       nonce: negotiation.remoteHs.nonce,
     });
     clearTimeout(negotiation.timeout);
@@ -1652,7 +1652,7 @@ public improvablePeerIds(): string[] {
     return { version: HANDSHAKE_VERSION, signature: proof.signature };
   }
 
-  private assertPeerCanJoin(identity: PeerIdentity, transportPeerId: string): void {
+  private assertPeerCanJoin(identity: PeerIdentity, transportPeerId: string): PeerIdentity {
     if (this.connections.size + this.pendingHandshakes.size >= MAX_DIRECTORY_PEERS) {
       throw new Error(`Pair Notebook supports at most ${MAX_DIRECTORY_PEERS} connected peers.`);
     }
@@ -1667,7 +1667,16 @@ public improvablePeerIds(): string[] {
       throw new Error(`Peer identity ${identity.peerId} presented a different identity key.`);
     }
     if (remembered?.identityKey && remembered.joinOrder !== identity.joinOrder) {
-      throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
+      if (!this.options.isHost()) {
+        throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
+      }
+      // The current host owns canonical failover order. Parallel Nostr/MQTT
+      // handshakes can both be signed before the first admitted route delivers
+      // peerAdmission, leaving the second route with the guest's provisional
+      // order. The already-pinned key proves this is the same identity; use the
+      // host directory's value before duplicate-route handling. Key mismatch
+      // is deliberately rejected above and can never reach this normalization.
+      identity = { ...identity, joinOrder: remembered.joinOrder };
     }
     const activeTransport = this.identityToTransport.get(identity.peerId);
     const isUpgradeCandidate = transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
@@ -1702,6 +1711,7 @@ public improvablePeerIds(): string[] {
     if (conflictingPeer) {
       throw new Error(`Display name is already in use: ${conflictingPeer.displayName}.`);
     }
+    return identity;
   }
 
   /**

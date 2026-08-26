@@ -178,7 +178,13 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
     are reported and cannot leave retry-blocking state behind.
   - Focused relay integration tests: 4 passing (role symmetry, lost-message
     expiry/retry, invalid-proof recovery, and one-sided higher-peer join).
-- [ ] Repair host-assigned `joinOrder` concurrency race and tests.
+- [x] Repair host-assigned `joinOrder` concurrency race and tests.
+  - After identity-key verification, the current host normalizes a stale
+    provisional order to its canonical directory value before duplicate-route
+    handling. Non-host peers still reject order changes outside authenticated
+    host directory/admission messages.
+  - The concurrent Nostr/MQTT regression passes with canonical order 7 and no
+    order-mismatch error; the different-key negative regression also passes.
 - [ ] Remove misleading built-in TURN fallback and correct diagnostics/docs.
 - [ ] Repair and run the network probe script.
 - [ ] Run the complete automated, live-network, package, and installed-artifact
