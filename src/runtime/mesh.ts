@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
 import {
   joinRoom,
@@ -40,7 +41,8 @@ import {
 } from './turn';
 import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
 import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
-import { NostrFrameRelay } from './nostrRelay';
+import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
+import { RedundantFrameRelay } from './redundantFrameRelay';
 import { assessUdpAvailability } from './diagnostics';
 import { shouldMigrateRoute } from './routeScoring';
 import { NetworkChangeWatcher } from './netWatch';
@@ -84,14 +86,10 @@ export interface MeshNetworkConfig {
   disableTurnProbe?: boolean;
   /** Proxy options applied to signalling WebSockets. */
   proxy?: ProxyWebSocketRuntimeOptions | undefined;
-  /** Disables the emergency Nostr data relay (default: enabled). */
+  /** Disables the redundant Nostr + MQTT emergency data relay (default: enabled). */
   disableRelayFallback?: boolean | undefined;
   /** Test hook: builds the relay channel instead of the real one. */
-  relayFactory?: ((options: {
-    token: string;
-    sessionId: string;
-    localPeerId: string;
-  }) => NostrFrameRelay) | undefined;
+  relayFactory?: ((options: FrameRelayOptions) => FrameRelay) | undefined;
 }
 
 const RELAY_TRANSPORT_PREFIX = 'relay:';
@@ -160,7 +158,7 @@ interface RelayNegotiation {
   sentLocalHs: boolean;
   sentProof: boolean;
   remoteHs?: HandshakeMessage | undefined;
-  remoteProof?: string | undefined;
+  remoteProof?: HandshakeProof | undefined;
   timeout: NodeJS.Timeout;
 }
 
@@ -258,6 +256,8 @@ interface HandshakeMessage {
 interface HandshakeProof {
   version: number;
   signature: string;
+  /** Binds delayed relay proofs to the exact pair of handshake nonces. */
+  transcriptId?: string | undefined;
 }
 
 interface ConnectedPeer {
@@ -342,7 +342,7 @@ export class MeshTransport extends EventEmitter {
   private turnEndpoints: TurnEndpoint[] | undefined;
   private turnProbes: TurnProbeResult[] | undefined;
   private turnStatus: 'not-configured' | 'invalid' | 'configured' = 'not-configured';
-  private relay: NostrFrameRelay | undefined;
+  private relay: FrameRelay | undefined;
   private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
   /** Make-before-break improvement attempts, keyed by logical peer id. */
@@ -448,7 +448,7 @@ export class MeshTransport extends EventEmitter {
       throw new Error(`Could not start Trystero: ${formatError(error)}`, { cause: error });
     }
     this.hasStarted = true;
-    this.startRelayFallback();
+    await this.startRelayFallback();
     this.timers = [
       setInterval(() => this.heartbeatTick(), 500),
       setInterval(() => void this.pingTick(), 1000),
@@ -822,8 +822,8 @@ export class MeshTransport extends EventEmitter {
     }
   }
 
-  /** Starts the emergency Nostr data relay unless disabled by configuration. */
-  private startRelayFallback(): void {
+  /** Starts independent Nostr and MQTT emergency data relays unless disabled. */
+  private async startRelayFallback(): Promise<void> {
     if (this.relay || meshNetworkConfig.disableRelayFallback || this.stopped) return;
     // Tests inject a custom room factory (options or the testing hook) to run
     // in-memory transports; a relay there would dial real public Nostr relays
@@ -836,20 +836,27 @@ export class MeshTransport extends EventEmitter {
         token: this.options.token,
         sessionId: this.options.sessionId,
         localPeerId: this.options.localPeer.peerId,
-      }) ?? new NostrFrameRelay({
+      }) ?? new RedundantFrameRelay({
         token: this.options.token,
         sessionId: this.options.sessionId,
         localPeerId: this.options.localPeer.peerId,
       });
-    } catch {
+    } catch (error) {
       this.relay = undefined;
-      return;
+      throw new Error(`Guaranteed emergency relay construction failed: ${formatError(error)}`, { cause: error });
     }
     this.relay.onPeerAnnounce = (peerId) => {
       if (!this.identityToTransport.has(peerId)) this.considerRelayFallback(peerId);
     };
     this.relay.onFrame = (fromPeerId, bytes) => this.handleRelayData(fromPeerId, bytes);
     this.relay.start();
+    try {
+      await this.relay.waitUntilReady?.(15_000);
+    } catch (error) {
+      this.relay.stop();
+      this.relay = undefined;
+      throw new Error(`Guaranteed emergency relay readiness failed: ${formatError(error)}`, { cause: error });
+    }
     // Announce presence a few times so peers joining via WebRTC-less paths
     // find each other even if some early publishes race the socket open.
     for (const delayMs of [500, 4_000, 12_000]) {
@@ -888,6 +895,7 @@ export class MeshTransport extends EventEmitter {
     const localProof: HandshakeProof = {
       version: HANDSHAKE_VERSION,
       signature: signIdentityTranscript(this.identityPrivateKey, transcript),
+      transcriptId: handshakeTranscriptId(transcript),
     };
     let incomingProof: { data: unknown };
     if (isInitiator) {
@@ -898,6 +906,9 @@ export class MeshTransport extends EventEmitter {
       await send(localProof);
     }
     const remoteProof = this.parseHandshakeProof(incomingProof.data);
+    if (remoteProof.transcriptId && remoteProof.transcriptId !== handshakeTranscriptId(transcript)) {
+      throw new Error('Peer identity proof belongs to a different handshake attempt.');
+    }
     if (!verifyIdentityTranscript(remote.peer.identityKey!, transcript, remoteProof.signature)) {
       throw new Error(`Peer ${remote.peer.peerId} did not prove ownership of its identity key.`);
     }
@@ -1466,6 +1477,10 @@ public improvablePeerIds(): string[] {
     if (kind === 'hs') {
       const parsed = this.parseHandshake(rawHs);
       if (parsed.sessionId !== this.options.sessionId || parsed.peer.peerId !== fromPeerId) return;
+      // Do not replace a handshake while its proof is in flight. Public
+      // relays can deliver a newer retry before an older proof; mixing those
+      // two transcripts caused false identity failures on healthy sessions.
+      if (negotiation.remoteHs && negotiation.remoteHs.nonce !== parsed.nonce) return;
       negotiation.remoteHs = parsed;
       // Always re-answer with our own handshake: both sides may start the
       // negotiation simultaneously and the first copy can arrive before the
@@ -1473,8 +1488,7 @@ public improvablePeerIds(): string[] {
       negotiation.sentLocalHs = true;
       this.sendRelayEnvelope(fromPeerId, { k: 'hs', hs: negotiation.localHs });
     } else if (typeof rawPr === 'object' && rawPr !== null) {
-      const proof = rawPr as HandshakeProof;
-      if (typeof proof.signature === 'string') negotiation.remoteProof = proof.signature;
+      negotiation.remoteProof = this.parseHandshakeProof(rawPr);
     } else {
       return;
     }
@@ -1488,16 +1502,26 @@ public improvablePeerIds(): string[] {
       const responder = negotiation.role === 'initiator' ? negotiation.remoteHs : negotiation.localHs;
       const transcript = handshakeTranscript(initiator, responder);
       const signature = signIdentityTranscript(this.identityPrivateKey, transcript);
-      this.sendRelayEnvelope(fromPeerId, { k: 'pr', pr: { version: HANDSHAKE_VERSION, signature } });
+      this.sendRelayEnvelope(fromPeerId, {
+        k: 'pr',
+        pr: { version: HANDSHAKE_VERSION, signature, transcriptId: handshakeTranscriptId(transcript) },
+      });
     }
     // Finalize when the remote proof has also arrived.
-    if (typeof negotiation.remoteProof !== 'string') return;
+    if (!negotiation.remoteProof) return;
     const initiator = negotiation.role === 'initiator' ? negotiation.localHs : negotiation.remoteHs;
     const responder = negotiation.role === 'initiator' ? negotiation.remoteHs : negotiation.localHs;
     const transcript = handshakeTranscript(initiator, responder);
+    if (negotiation.remoteProof.transcriptId
+      && negotiation.remoteProof.transcriptId !== handshakeTranscriptId(transcript)) {
+      // This proof belongs to a delayed attempt. Ignore it without consuming
+      // the bounded retry budget or reporting a forged-identity error.
+      negotiation.remoteProof = undefined;
+      return;
+    }
     const identityKey = negotiation.remoteHs.peer.identityKey;
     if (!identityKey
-      || !verifyIdentityTranscript(identityKey, transcript, negotiation.remoteProof)) {
+      || !verifyIdentityTranscript(identityKey, transcript, negotiation.remoteProof.signature)) {
       throw new Error(`Relay peer ${fromPeerId} failed the identity proof.`);
     }
     const transportPeerId = RELAY_TRANSPORT_PREFIX + fromPeerId;
@@ -1641,10 +1665,16 @@ public improvablePeerIds(): string[] {
     }
     const proof = value as Partial<HandshakeProof>;
     if (proof.version !== HANDSHAKE_VERSION || typeof proof.signature !== 'string'
-      || proof.signature.length > 128) {
+      || proof.signature.length > 128
+      || (proof.transcriptId !== undefined
+        && (typeof proof.transcriptId !== 'string' || !/^[a-f0-9]{64}$/.test(proof.transcriptId)))) {
       throw new Error('Peer sent an invalid identity proof.');
     }
-    return { version: HANDSHAKE_VERSION, signature: proof.signature };
+    return {
+      version: HANDSHAKE_VERSION,
+      signature: proof.signature,
+      ...(proof.transcriptId ? { transcriptId: proof.transcriptId } : {}),
+    };
   }
 
   private assertPeerCanJoin(identity: PeerIdentity, transportPeerId: string): PeerIdentity {
@@ -2357,6 +2387,10 @@ function handshakeTranscript(initiator: HandshakeMessage, responder: HandshakeMe
     initiator: transcriptIdentity(initiator),
     responder: transcriptIdentity(responder),
   }), 'utf8');
+}
+
+function handshakeTranscriptId(transcript: Buffer): string {
+  return createHash('sha256').update(transcript).digest('hex');
 }
 
 function transcriptIdentity(handshake: HandshakeMessage): Record<string, unknown> {

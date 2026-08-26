@@ -2,7 +2,7 @@
 
 Date: 2026-08-26
 
-Release: 0.5.1
+Release: 0.5.2
 
 Primary platform: Windows, VS Code 1.95+
 
@@ -13,9 +13,18 @@ The release has an application path for the requested Flowseal/zapret ↔ Karing
 - Flowseal/zapret is transparent packet interception, so Pair Notebook opens ordinary direct TCP/UDP sockets and the preset handles them below the application.
 - Karing TUN is also transparent to the application and needs no Pair Notebook setting.
 - Karing system-proxy mode now works because Pair Notebook reads the current user's Windows proxy before every connection attempt and routes Nostr/MQTT signalling plus the encrypted emergency channel through it.
-- If WebRTC cannot cross the resulting NAT, VPN boundary or UDP policy, both peers can still authenticate and exchange encrypted frames through the public Nostr emergency channel. A custom TURN service remains optional.
+- If WebRTC cannot cross the resulting NAT, VPN boundary or UDP policy, both peers can still authenticate and exchange encrypted frames through either the public Nostr or the independent public MQTT emergency channel. A custom TURN service remains optional.
+- Start and Join do not declare the local transport ready until at least one complete emergency family has completed its WSS subscription. Both Nostr and MQTT are attempted; failure is explicit only when neither independent full-data path is reachable.
 
-This is not a claim that every Russian ISP, VPN node or third-party relay will be online forever. The exact two physical computers were not available to this audit. The code paths were validated deterministically, against the active local Karing proxy, and against current public endpoints as described below.
+The connectivity contract is exact: with working outbound WSS on both computers, Pair Notebook 0.5.2 proves a subscribed local full-data fallback before Start/Join continues, and reports Join as connected only after the two peers complete the signed end-to-end handshake. This remains true when WebRTC, UDP and TURN are unavailable. No networked program can operate during a total loss of outbound connectivity. The exact two physical computers were not available to this audit; the release was exercised with active `winws` plus a live xray/Karing-style system proxy as described below.
+
+## Additional 0.5.2 defects corrected
+
+| Defect in 0.5.1 | Concrete failure | 0.5.2 correction |
+| --- | --- | --- |
+| Emergency project data used Nostr only | MQTT could discover a peer while failed ICE plus unavailable Nostr left no complete data path | Independent encrypted MQTT data relay; Nostr and MQTT each carry the full wire protocol |
+| Relay proofs were not bound to one retry transcript | A delayed proof mixed with a newer handshake and reproducibly emitted `failed the identity proof` during a successful connection | SHA-256 transcript binding; delayed proofs are ignored without consuming the retry budget |
+| Start/Join returned before fallback connectivity was proven | The UI could advertise a session before any full-data relay subscribed | Fail-closed readiness barrier: either complete family may pass; both failing produces an actionable error |
 
 ## Confirmed defects corrected
 
@@ -46,12 +55,14 @@ All 21 combinations open their independently routed relay sockets and exchange o
 
 ## Release evidence
 
-- `npm test`: PASS, 250 tests.
+- `npm test`: PASS, 256 tests.
 - `npm run lint`: PASS.
 - Active Windows proxy read: `ProxyEnable=1`, `ProxyServer=127.0.0.1:10809`.
 - Real WSS through that detected local system proxy: PASS to `wss://nos.lol`, with target TLS validation enabled.
 - Independent-process public Nostr/WebRTC smoke: PASS.
 - Independent-process public MQTT/WebRTC smoke with primary signalling and emergency relay disabled: PASS through the detected system proxy.
+- Forced no-WebRTC/no-signalling emergency relay, direct host to Windows/Karing system-proxy peer, 64 KiB round trip: PASS over Nostr only, MQTT only, and both families together.
+- The forced redundant test rejects any `failed the identity proof` diagnostic; none occurred after transcript binding.
 - Public endpoint probe: 9/10 pre-fix Nostr WSS candidates passed DNS, TCP, TLS and WebSocket upgrade; `relay.damus.io` returned HTTP 503 and was removed. The resulting 9/9 release list then passed the same probe.
 - UDP STUN binding: PASS for both configured Google endpoints and Cloudflare from the release network.
 - Custom TURN Allocate: NOT RUN because no user-owned TURN credentials were configured.
@@ -61,7 +72,7 @@ All 21 combinations open their independently routed relay sockets and exchange o
 
 Use Karing TUN when possible. For Karing system-proxy mode, enable **Auto Set System Proxy** before pressing Join; Pair Notebook refreshes it at that moment. If diagnostics still show `Direct`, set `pairNotebook.proxyUrl` to the local listener shown by Karing (commonly an HTTP/mixed port such as `http://127.0.0.1:10809`) and run **Pair Notebook: Reconnect**.
 
-Flowseal/zapret presets require no Pair Notebook address or port. If a custom preset excludes or damages all configured public WSS hosts, the preset itself must be changed; an extension cannot make an unreachable third-party endpoint reachable. Multiple Nostr relays, MQTT discovery, optional TURN and the encrypted emergency path reduce that external dependency but cannot eliminate it.
+Flowseal/zapret presets require no Pair Notebook address or port. Pair Notebook now attempts both emergency WSS families and requires at least one complete path before Start/Join continues; if both are blocked it produces an immediate readiness error rather than a false working state. Total loss of outbound WSS remains a physical absence of network connectivity, not an application transport state.
 
 ## Primary sources
 

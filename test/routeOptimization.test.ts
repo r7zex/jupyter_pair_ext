@@ -54,6 +54,7 @@ describe('make-before-break route optimization', function () {
   });
 
   after(async () => {
+    meshModule.configureMeshNetwork({});
     await new Promise<void>((resolve) => hubFixture.hub.close(() => resolve()));
   });
 

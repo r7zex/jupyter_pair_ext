@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 - 2026-08-26 (redundant full-data fallback and readiness contract)
+
+- Adds a second complete emergency data path over proxy-aware MQTT/WSS. Nostr and MQTT now both carry encrypted Pair Notebook wire frames when WebRTC/TURN is unavailable; either family can sustain the session independently.
+- Encrypts MQTT fallback packets with the same session-bound AES-256-GCM design, chunks standard snapshot frames, uses QoS 1, bounds broker input/queues, and deduplicates broker and cross-family delivery.
+- Makes Start and Join wait for at least one subscribed full-data emergency family. Both Nostr and MQTT are attempted; either can satisfy readiness independently, and the session fails with a concrete error only when neither is reachable.
+- Binds every identity proof to the exact handshake transcript and ignores delayed proofs from an older retry. This removes the reproducible false `failed the identity proof` errors from healthy redundant relay sessions.
+- Adds a public forced-relay acceptance command that disables WebRTC and normal signalling, routes one peer directly and the other through the detected Windows/Karing proxy, and verifies a 64 KiB round trip over Nostr-only, MQTT-only, and redundant modes.
+- 256 deterministic tests plus public Nostr/WebRTC, MQTT/WebRTC, and forced emergency-relay smokes pass.
+
 ## 0.5.1 - 2026-08-26 (Windows VPN/proxy compatibility and relay lifecycle)
 
 - Detects the current Windows WinINet proxy before activation, Start, Join and Reconnect, covering Karing's system-proxy mode without requiring a duplicated VS Code setting. `pairNotebook.proxyUrl` remains an explicit HTTP(S)/SOCKS fallback for PAC-only or non-Windows clients.

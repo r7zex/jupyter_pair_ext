@@ -6,7 +6,7 @@
 | --- | --- |
 | `extension.ts` | VS Code commands, name/invite prompts, folder selection, session restore, and UI lifecycle |
 | `DashboardProvider` | Non-empty startup fallback, command bridge, state rendering, and host-pause controls |
-| `MeshTransport` | Trystero/Nostr discovery, authenticated handshakes, WebRTC actions, queues, RTT, and metrics |
+| `MeshTransport` | Nostr/MQTT discovery, authenticated handshakes, WebRTC actions, redundant emergency relays, queues, RTT, and metrics |
 | `SessionRuntime` | CRDT/filesystem synchronization, host election, execution barriers, persistence ownership, and pause/resume |
 | `downloadProjectSnapshot` | Folderless join bootstrap with streamed files, hashes, atomic publish, and final reconciliation |
 | `CollaborativeProject` | Bounded Yjs text/notebook state and stable notebook-cell identity |
@@ -20,7 +20,7 @@ VS Code edit
   -> Yjs transaction
   -> authenticated Pair Notebook frame
   -> Trystero action
-  -> encrypted WebRTC data channel or encrypted Nostr emergency relay
+  -> encrypted WebRTC data channel or redundant encrypted Nostr + MQTT emergency relay
   -> remote Yjs transaction
   -> minimal VS Code workspace edit
 
@@ -34,7 +34,7 @@ Join bootstrap
   -> isolated participant working copy
 ```
 
-The discovery medium normally carries only encrypted session descriptions needed to establish peer-to-peer WebRTC connections. If ICE is impossible, a separate emergency protocol chunks authenticated AES-256-GCM ciphertext over a redundant subset of the same public Nostr relays; relay operators never receive the session token or plaintext project frames.
+The discovery media normally carry only encrypted session descriptions needed to establish peer-to-peer WebRTC connections. If ICE is impossible, a separate emergency protocol chunks authenticated AES-256-GCM ciphertext over independent public Nostr relays and MQTT brokers. Either family can carry complete project frames; duplicate cross-family delivery is removed before the signed identity handshake. Relay operators never receive the session token or plaintext project frames. Start/Join attempts both families and waits until at least one complete family is subscribed; a temporary outage in one infrastructure does not disable the healthy independent path.
 
 ## Working and backing copies
 
