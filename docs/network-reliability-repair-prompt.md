@@ -203,6 +203,21 @@ invite secrets, proxy passwords, private keys, or full session identifiers.
     `wss://nos.lol`, all three STUN bindings, and the unconfigured TURN path.
 - [ ] Run the complete automated, live-network, package, and installed-artifact
   validation matrix.
+  - PASS: `npm ci`, lint, 215-test full suite, and public two-process
+    Trystero/Nostr/WebRTC smoke.
+  - PASS: exact local Karing/Xray path at `http://127.0.0.1:10809`: WSS opened
+    and two public `NostrFrameRelay` instances delivered an encrypted frame.
+  - PASS: full network probe reached 9/10 configured WSS relays and all three
+    STUN servers. `relay.damus.io` returned HTTP 503; TURN was correctly
+    skipped because no trusted custom service was configured.
+  - PASS: VSIX built at commit `5486f21` (SHA-256
+    `77AFA7EFAD83A12A76406E813CB7BF6E187969B827166127DCE476A69994CDA7`).
+    The bundled, source-built, and isolated-installed `extension.js` hashes
+    all equal `374833458525DF22968AF42DD00D9EE776902493FE61469AE05E405899F54832`;
+    VS Code listed `pair-notebook.pair-notebook@0.5.0`.
+  - NOT RUN: a real join between two physical computers with Flowseal/zapret
+    on one and Karing VPN on the other. This requires the second machine and
+    cannot be replaced by a same-machine claim.
 
 After every phase, update this checklist and the pull request body with the
 commit SHA, exact tests run, results, remaining failures, and anything that was
