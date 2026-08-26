@@ -31,7 +31,9 @@ export type MqttRoomConfig = JoinRoomConfig;
 
 export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
   init: (config) => getRelays(config, defaultRelayUrls, DEFAULT_REDUNDANCY).map((url) => {
-    const client = relayManager.register(url, () => mqtt.connect(url, proxyAwareMqttOptions()));
+    const client = relayManager.register(url, () => mqtt.connect(url, proxyAwareMqttOptions({
+      reconnectOnConnackError: true,
+    })));
     const handlers = messageHandlers.forRelay(client);
     if (client.listenerCount('message') === 0) {
       client

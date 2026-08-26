@@ -34,7 +34,7 @@ Join bootstrap
   -> isolated participant working copy
 ```
 
-The discovery media normally carry only encrypted session descriptions needed to establish peer-to-peer WebRTC connections. If ICE is impossible, a separate emergency protocol chunks authenticated AES-256-GCM ciphertext over independent public Nostr relays and MQTT brokers. Either family can carry complete project frames; duplicate cross-family delivery is removed before the signed identity handshake. Relay operators never receive the session token or plaintext project frames. Start/Join attempts both families and waits until at least one complete family is subscribed; a temporary outage in one infrastructure does not disable the healthy independent path.
+The discovery media normally carry only encrypted session descriptions needed to establish peer-to-peer WebRTC connections. If ICE is impossible, a separate emergency protocol chunks authenticated AES-256-GCM ciphertext over independent public Nostr relays and MQTT brokers. Either family can carry complete project frames; duplicate cross-family delivery is removed before the signed identity handshake. Relay operators never receive the session token or plaintext project frames. Start/Join attempts both families and requires an invite-key-encrypted publish-to-receive self-check through at least one family. Lost probes are retried, verified paths are rechecked periodically, and explicit Nostr/MQTT publication failure retires the affected path without disabling a healthy independent family.
 
 ## Working and backing copies
 

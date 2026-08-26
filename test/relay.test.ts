@@ -16,6 +16,20 @@ class FakeRelaySocket extends EventEmitter {
   }
 }
 
+async function completeFakeReadiness(socket: FakeRelaySocket): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  let event: unknown;
+  while (Date.now() < deadline && event === undefined) {
+    for (const wire of socket.sent) {
+      const message = JSON.parse(wire) as unknown[];
+      if (message[0] === 'EVENT') event = message[1];
+    }
+    if (event === undefined) await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(event, 'readiness EVENT was not published');
+  socket.emit('message', JSON.stringify(['EVENT', 'sub', event]));
+}
+
 describe('emergency Nostr data relay', function () {
   this.timeout(20_000);
 
@@ -36,7 +50,7 @@ describe('emergency Nostr data relay', function () {
         if (message[0] === 'EVENT') {
           seenEvents.push(message);
           for (const client of hub.clients) {
-            if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
+            if (client.readyState === 1) client.send(JSON.stringify(['EVENT', 'sub', message[1]]));
           }
         }
       });
@@ -124,7 +138,7 @@ describe('emergency Nostr data relay', function () {
     b.stop();
   });
 
-  it('tracks dialing sockets so repeated start calls cannot create duplicates', () => {
+  it('tracks dialing sockets so repeated start calls cannot create duplicates', async () => {
     const sockets: FakeRelaySocket[] = [];
     const relay = new NostrFrameRelayCtor({
       token: 'shared-token-that-is-long-enough',
@@ -142,6 +156,7 @@ describe('emergency Nostr data relay', function () {
     assert.equal(sockets.length, 1);
     assert.equal(relay.connectedRelayCount, 0);
     sockets[0]!.emit('open');
+    await completeFakeReadiness(sockets[0]!);
     assert.equal(relay.connectedRelayCount, 1);
     relay.stop();
   });
@@ -163,7 +178,80 @@ describe('emergency Nostr data relay', function () {
     assert.equal(socket.sent.length, 0);
   });
 
-  it('does not let a stale close remove a replacement relay socket', () => {
+  it('does not report a Nostr relay ready after it closes the subscription', async () => {
+    const socket = new FakeRelaySocket();
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'closed-subscription',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => socket,
+    });
+    relay.start();
+    socket.emit('open');
+    socket.emit('message', JSON.stringify(['CLOSED', 'sub', 'restricted: subscription rejected']));
+    await assert.rejects(
+      relay.waitUntilReady(50),
+      /No Nostr emergency relay completed a verified data-path check/,
+    );
+    relay.stop();
+  });
+
+  it('reconnects and revalidates Nostr after a readiness probe is lost', async () => {
+    const sockets: FakeRelaySocket[] = [];
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'readiness-recovery',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => {
+        const socket = new FakeRelaySocket();
+        sockets.push(socket);
+        return socket;
+      },
+      readinessProbeTimeoutMs: 20,
+      reconnectDelayMs: 5,
+    });
+    relay.start();
+    sockets[0]!.emit('open');
+    await assert.rejects(relay.waitUntilReady(30));
+    const deadline = Date.now() + 200;
+    while (sockets.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(sockets.length, 2);
+    sockets[1]!.emit('open');
+    await completeFakeReadiness(sockets[1]!);
+    await relay.waitUntilReady(100);
+    assert.equal(relay.connectedRelayCount, 1);
+    relay.stop();
+  });
+
+  it('retires a verified Nostr path when the relay rejects later data', async () => {
+    const socket = new FakeRelaySocket();
+    const relay = new NostrFrameRelayCtor({
+      token: 'shared-token-that-is-long-enough',
+      sessionId: 'later-rejection',
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => socket,
+    });
+    relay.start();
+    socket.emit('open');
+    await completeFakeReadiness(socket);
+    assert.equal(relay.connectedRelayCount, 1);
+    socket.emit('message', JSON.stringify([
+      'OK',
+      'f'.repeat(64),
+      false,
+      'rate-limited: retry later',
+    ]));
+    assert.equal(relay.connectedRelayCount, 0);
+    assert.equal(socket.closeCalls, 1);
+    relay.stop();
+  });
+
+  it('does not let a stale close remove a replacement relay socket', async () => {
     const sockets: FakeRelaySocket[] = [];
     const relay = new NostrFrameRelayCtor({
       token: 'shared-token-that-is-long-enough',
@@ -178,9 +266,11 @@ describe('emergency Nostr data relay', function () {
     });
     relay.start();
     sockets[0]!.emit('open');
+    await completeFakeReadiness(sockets[0]!);
     sockets[0]!.emit('close');
     relay.start();
     sockets[1]!.emit('open');
+    await completeFakeReadiness(sockets[1]!);
     sockets[0]!.emit('close');
     relay.start();
     assert.equal(sockets.length, 2);

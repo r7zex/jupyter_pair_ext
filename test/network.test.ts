@@ -676,7 +676,7 @@ describe('mesh relay fallback integration', function () {
         const message = JSON.parse(String(raw)) as unknown[];
         if (message[0] === 'EVENT') {
           for (const client of hub.clients) {
-            if (client !== socket && client.readyState === 1) client.send(JSON.stringify(message));
+            if (client.readyState === 1) client.send(JSON.stringify(['EVENT', 'sub', message[1]]));
           }
         }
       });

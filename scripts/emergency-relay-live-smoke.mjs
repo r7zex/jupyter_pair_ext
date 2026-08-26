@@ -11,7 +11,17 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const currentFile = fileURLToPath(import.meta.url);
-const modes = ['nostr', 'mqtt', 'redundant'];
+const relayModes = ['nostr', 'mqtt', 'redundant'];
+const scenarios = [
+  { label: 'nostr-only', hostMode: 'nostr', peerMode: 'nostr' },
+  { label: 'mqtt-only', hostMode: 'mqtt', peerMode: 'mqtt' },
+  { label: 'redundant', hostMode: 'redundant', peerMode: 'redundant' },
+  { label: 'nostr-to-redundant', hostMode: 'nostr', peerMode: 'redundant' },
+  { label: 'redundant-to-nostr', hostMode: 'redundant', peerMode: 'nostr' },
+  { label: 'mqtt-to-redundant', hostMode: 'mqtt', peerMode: 'redundant' },
+  { label: 'redundant-to-mqtt', hostMode: 'redundant', peerMode: 'mqtt' },
+];
+const frameCount = 8;
 
 function deadRoom() {
   return {
@@ -34,7 +44,7 @@ if (process.argv.includes('--worker')) {
   const mode = process.env.PAIR_NOTEBOOK_RELAY_MODE;
   const sessionId = process.env.PAIR_NOTEBOOK_RELAY_SESSION;
   const token = process.env.PAIR_NOTEBOOK_RELAY_TOKEN;
-  if (!role || !modes.includes(mode) || !sessionId || !token) {
+  if (!role || !relayModes.includes(mode) || !sessionId || !token) {
     throw new Error('Emergency relay smoke worker environment is incomplete.');
   }
   const isHost = role === 'host';
@@ -62,7 +72,7 @@ if (process.argv.includes('--worker')) {
     roomFactory: () => deadRoom(),
     disableSecondarySignalling: true,
   });
-  const payload = Buffer.alloc(64 * 1024, 0x5a);
+  const receivedFrames = new Set();
   const finish = async (label) => {
     process.stdout.write(`${label}\n`);
     await transport.stop().catch(() => undefined);
@@ -71,15 +81,33 @@ if (process.argv.includes('--worker')) {
   transport.on('connectionError', (_peer, error) => process.stderr.write(`connection: ${error.message}\n`));
   transport.on('protocolError', (error) => process.stderr.write(`protocol: ${error.message}\n`));
   transport.on('message', (frame, sourceId) => {
-    if (isHost && frame.type === 'relayLiveProbe' && Buffer.from(frame.payload).equals(payload)) {
-      transport.sendTo(sourceId, 'relayLiveAck', {}, frame.payload);
-      setTimeout(() => void finish('PAIR_NOTEBOOK_RELAY_HOST_OK'), 500);
-    } else if (!isHost && frame.type === 'relayLiveAck' && Buffer.from(frame.payload).equals(payload)) {
-      void finish('PAIR_NOTEBOOK_RELAY_PEER_OK');
+    const index = Number(frame.meta.index);
+    const expected = Number.isInteger(index) && index >= 0 && index < frameCount
+      ? Buffer.alloc(64 * 1024, index + 1)
+      : undefined;
+    if (!expected || !Buffer.from(frame.payload).equals(expected)) return;
+    if (isHost && frame.type === 'relayLiveProbe') {
+      receivedFrames.add(index);
+      transport.sendTo(sourceId, 'relayLiveAck', { index }, frame.payload);
+      if (receivedFrames.size === frameCount) {
+        setTimeout(() => void finish('PAIR_NOTEBOOK_RELAY_HOST_OK'), 500);
+      }
+    } else if (!isHost && frame.type === 'relayLiveAck') {
+      receivedFrames.add(index);
+      if (receivedFrames.size === frameCount) void finish('PAIR_NOTEBOOK_RELAY_PEER_OK');
     }
   });
   transport.on('peerConnected', () => {
-    if (!isHost) transport.sendTo('relay-live-host', 'relayLiveProbe', {}, payload);
+    if (!isHost) {
+      for (let index = 0; index < frameCount; index += 1) {
+        transport.sendTo(
+          'relay-live-host',
+          'relayLiveProbe',
+          { index },
+          Buffer.alloc(64 * 1024, index + 1),
+        );
+      }
+    }
   });
   await transport.start();
   setTimeout(() => {
@@ -87,17 +115,20 @@ if (process.argv.includes('--worker')) {
     process.exit(2);
   }, 75_000).unref();
 } else {
-  for (const mode of modes) {
-    const sessionId = `relay-${mode}-${randomBytes(12).toString('hex')}`;
+  for (const scenario of scenarios) {
+    const sessionId = `relay-${scenario.label}-${randomBytes(12).toString('hex')}`;
     const token = randomBytes(32).toString('base64url');
     const baseEnvironment = {
       ...process.env,
-      PAIR_NOTEBOOK_RELAY_MODE: mode,
       PAIR_NOTEBOOK_RELAY_SESSION: sessionId,
       PAIR_NOTEBOOK_RELAY_TOKEN: token,
     };
     const start = (role) => spawn(process.execPath, [currentFile, '--worker'], {
-      env: { ...baseEnvironment, PAIR_NOTEBOOK_RELAY_ROLE: role },
+      env: {
+        ...baseEnvironment,
+        PAIR_NOTEBOOK_RELAY_ROLE: role,
+        PAIR_NOTEBOOK_RELAY_MODE: role === 'host' ? scenario.hostMode : scenario.peerMode,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const host = start('host');
@@ -120,8 +151,8 @@ if (process.argv.includes('--worker')) {
     const completed = output.includes('PAIR_NOTEBOOK_RELAY_HOST_OK')
       && output.includes('PAIR_NOTEBOOK_RELAY_PEER_OK');
     if (!completed || /failed the identity proof/i.test(diagnostics)) {
-      throw new Error(`Public ${mode} emergency relay smoke failed. ${diagnostics.trim()}`);
+      throw new Error(`Public ${scenario.label} emergency relay smoke failed. ${diagnostics.trim()}`);
     }
-    process.stdout.write(`Public ${mode} emergency relay 64 KiB round-trip passed (direct -> system proxy).\n`);
+    process.stdout.write(`Public ${scenario.label} emergency relay ${frameCount} x 64 KiB burst passed (direct -> system proxy).\n`);
   }
 }

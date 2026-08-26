@@ -27,7 +27,13 @@ import { schnorr } from '@noble/secp256k1';
 import { MAX_WIRE_FRAME_BYTES } from '../core/wire';
 import { type FrameRelay } from './frameRelay';
 import { createProxiedNodeWebSocket } from './proxyWebSocket';
-import { decryptRelayPacket, deriveRelayFrameKey, encryptRelayPacket } from './relayCrypto';
+import {
+  decryptRelayPacket,
+  deriveRelayFrameKey,
+  encryptRelayPacket,
+  encryptRelayReadinessProbe,
+  verifyRelayReadinessProbe,
+} from './relayCrypto';
 
 /** Relays used for the fallback channel; a subset of the discovery list. */
 export const RELAY_DATA_URLS = [
@@ -47,6 +53,8 @@ const MAX_PENDING_PACKET_BYTES = 128 * 1024 * 1024;
 const MAX_OUTBOX_MESSAGES = 8_192;
 const MAX_OUTBOX_BYTES = 256 * 1024 * 1024;
 const MAX_SEEN_PACKET_IDS = 32_768;
+const DEFAULT_READINESS_PROBE_TIMEOUT_MS = 10_000;
+const DEFAULT_READINESS_RECHECK_MS = 45_000;
 const PEER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const PACKET_ID_PATTERN = /^[a-f0-9]{24}$/;
 
@@ -65,6 +73,10 @@ export interface NostrFrameRelayOptions {
   localPeerId: string;
   relays?: readonly string[];
   socketFactory?: RelaySocketFactory;
+  /** Test hooks; production uses conservative network-scale defaults. */
+  readinessProbeTimeoutMs?: number;
+  readinessRecheckMs?: number;
+  reconnectDelayMs?: number;
 }
 
 interface PendingPacket {
@@ -78,6 +90,12 @@ interface PendingPacket {
 interface QueuedPayload {
   payload: unknown;
   bytes: number;
+}
+
+interface PendingReadinessProbe {
+  nonce: string;
+  eventId: string;
+  timer: NodeJS.Timeout;
 }
 export function deriveRelayTopic(sessionId: string, token: string): string {
   return createHash('sha256').update(`pair-notebook-relay-v1|${sessionId}|${token}`).digest('hex');
@@ -119,7 +137,7 @@ type FrameHandler = (fromPeerId: string, bytes: Buffer) => void;
 type AnnounceHandler = (peerId: string) => void;
 
 interface InboundMessage {
-  t: 'd' | 'a';
+  t: 'd' | 'a' | 'r';
   f: string;
   s?: number;
   p?: string;
@@ -132,6 +150,8 @@ export class NostrFrameRelay implements FrameRelay {
   /** Includes both dialing and open sockets so start() cannot duplicate dials. */
   private readonly sockets = new Map<string, RelaySocketLike>();
   private readonly openSockets = new Set<RelaySocketLike>();
+  private readonly pendingReadiness = new Map<RelaySocketLike, PendingReadinessProbe>();
+  private readonly lastVerifiedAt = new Map<RelaySocketLike, number>();
   private readonly key: Buffer;
   private readonly privateKey: Uint8Array;
   private readonly kind: number;
@@ -167,7 +187,7 @@ export class NostrFrameRelay implements FrameRelay {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (this.connectedRelayCount === 0) {
-      throw new Error('No Nostr emergency relay completed a WebSocket connection.');
+      throw new Error('No Nostr emergency relay completed a verified data-path check.');
     }
   }
 
@@ -195,21 +215,19 @@ export class NostrFrameRelay implements FrameRelay {
           try { socket.close(); } catch { /* close/reconnect owns recovery */ }
           return;
         }
-        this.openSockets.add(socket);
-        if (this.announced) this.sendAnnounce();
-        this.flushOutbox();
+        void this.beginReadinessProbe(url, socket);
       });
       socket.on('message', (raw: unknown) => {
-        try { this.handleRelayMessage(String(raw)); } catch { /* malformed input from a stranger */ }
+        try { this.handleRelayMessage(String(raw), socket); } catch { /* malformed input from a stranger */ }
       });
       socket.on('error', () => { /* close follows */ });
       socket.on('close', () => {
         this.openSockets.delete(socket);
+        this.clearPendingReadiness(socket);
+        this.lastVerifiedAt.delete(socket);
         if (this.sockets.get(url) !== socket) return;
         this.sockets.delete(url);
-        if (!this.stopped) {
-          setTimeout(() => this.start(), 2_000 + Math.floor(Math.random() * 2_000)).unref?.();
-        }
+        this.scheduleReconnect();
       });
     }
     this.housekeepingTimer ??= setInterval(() => this.housekeeping(), 5_000);
@@ -225,6 +243,8 @@ export class NostrFrameRelay implements FrameRelay {
     }
     this.sockets.clear();
     this.openSockets.clear();
+    for (const socket of this.pendingReadiness.keys()) this.clearPendingReadiness(socket);
+    this.lastVerifiedAt.clear();
     this.pendingPackets.clear();
     this.pendingPacketBytes = 0;
     this.seenPacketIds.clear();
@@ -299,9 +319,48 @@ export class NostrFrameRelay implements FrameRelay {
     }
   }
 
-  private handleRelayMessage(raw: string): void {
+  private async beginReadinessProbe(url: string, socket: RelaySocketLike): Promise<void> {
+    if (this.pendingReadiness.has(socket)) return;
+    const nonce = randomBytes(12).toString('hex');
+    try {
+      const event = await buildEvent({
+        t: 'r',
+        f: this.options.localPeerId,
+        p: nonce,
+        d: encryptRelayReadinessProbe(this.key, nonce),
+      } satisfies InboundMessage, { topic: this.topic, kind: this.kind }, this.privateKey);
+      if (this.stopped || this.sockets.get(url) !== socket) return;
+      const timer = setTimeout(() => {
+        const pending = this.pendingReadiness.get(socket);
+        if (pending?.nonce === nonce) this.rejectSocket(socket);
+      }, this.options.readinessProbeTimeoutMs ?? DEFAULT_READINESS_PROBE_TIMEOUT_MS);
+      timer.unref?.();
+      this.pendingReadiness.set(socket, { nonce, eventId: String(event.id), timer });
+      socket.send(JSON.stringify(['EVENT', event]));
+    } catch {
+      this.rejectSocket(socket);
+    }
+  }
+
+  private handleRelayMessage(raw: string, socket: RelaySocketLike): void {
     const message = JSON.parse(raw) as unknown[];
-    if (!Array.isArray(message) || message[0] !== 'EVENT') return;
+    if (!Array.isArray(message)) return;
+    if (message[0] === 'CLOSED' && message[1] === 'sub') {
+      this.rejectSocket(socket);
+      return;
+    }
+    if (message[0] === 'OK') {
+      const pending = this.pendingReadiness.get(socket);
+      if (message[2] !== true && !String(message[3] ?? '').startsWith('duplicate:')) {
+        // A relay that rejects any valid Pair Notebook event is no longer a
+        // usable data path, even if its WebSocket remains open.
+        if (!pending || message[1] === pending.eventId || this.openSockets.has(socket)) {
+          this.rejectSocket(socket);
+        }
+      }
+      return;
+    }
+    if (message[0] !== 'EVENT') return;
     // Client->relay publishes are ["EVENT", event]; relay->client deliveries
     // are ["EVENT", <subId>, event].
     const event = (message[2] ?? message[1]) as { content?: string } | undefined;
@@ -309,7 +368,19 @@ export class NostrFrameRelay implements FrameRelay {
     let parsed: InboundMessage;
     try { parsed = JSON.parse(event.content) as InboundMessage; } catch { return; }
     if (typeof parsed.f !== 'string' || !PEER_ID_PATTERN.test(parsed.f)) return;
-    if (parsed.f === this.options.localPeerId) return; // our own echo
+    if (parsed.t === 'r') {
+      const pending = this.pendingReadiness.get(socket);
+      if (!pending || parsed.f !== this.options.localPeerId || parsed.p !== pending.nonce
+        || typeof parsed.d !== 'string' || parsed.d.length > 512
+        || !verifyRelayReadinessProbe(this.key, pending.nonce, parsed.d)) return;
+      this.clearPendingReadiness(socket);
+      this.openSockets.add(socket);
+      this.lastVerifiedAt.set(socket, Date.now());
+      if (this.announced) this.sendAnnounce();
+      this.flushOutbox();
+      return;
+    }
+    if (parsed.f === this.options.localPeerId) return; // our own data/announce echo
     const addressedTo = (parsed as { to?: string }).to;
     if (addressedTo !== undefined && addressedTo !== this.options.localPeerId) return;
     if (parsed.t === 'a') {
@@ -322,6 +393,19 @@ export class NostrFrameRelay implements FrameRelay {
       || !Number.isSafeInteger(parsed.i) || !Number.isSafeInteger(parsed.n) || !Number.isSafeInteger(parsed.s)
       || parsed.i! < 0 || parsed.n! < 1 || parsed.n! > MAX_RELAY_CHUNKS || parsed.i! >= parsed.n! || parsed.s! < 1) return;
     this.acceptChunk(parsed);
+  }
+
+  private rejectSocket(socket: RelaySocketLike): void {
+    this.openSockets.delete(socket);
+    this.clearPendingReadiness(socket);
+    this.lastVerifiedAt.delete(socket);
+    for (const [url, candidate] of this.sockets) {
+      if (candidate !== socket) continue;
+      this.sockets.delete(url);
+      this.scheduleReconnect();
+      break;
+    }
+    try { socket.close(); } catch { /* close/reconnect owns recovery */ }
   }
 
   private acceptChunk(message: InboundMessage): void {
@@ -378,6 +462,25 @@ export class NostrFrameRelay implements FrameRelay {
         this.pendingPacketBytes -= pending.bytes;
       }
     }
+    const recheckMs = this.options.readinessRecheckMs ?? DEFAULT_READINESS_RECHECK_MS;
+    for (const [url, socket] of this.sockets) {
+      if (!this.openSockets.has(socket) || this.pendingReadiness.has(socket)) continue;
+      if (now - (this.lastVerifiedAt.get(socket) ?? 0) >= recheckMs) {
+        void this.beginReadinessProbe(url, socket);
+      }
+    }
+  }
+
+  private clearPendingReadiness(socket: RelaySocketLike): void {
+    const pending = this.pendingReadiness.get(socket);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingReadiness.delete(socket);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped) return;
+    const delayMs = this.options.reconnectDelayMs ?? (2_000 + Math.floor(Math.random() * 2_000));
+    setTimeout(() => this.start(), delayMs).unref?.();
   }
 
   private rememberSeen(packetKey: string): void {
