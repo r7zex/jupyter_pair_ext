@@ -138,18 +138,20 @@ function checkTls(host, port, servername) {
 }
 
 async function checkWebSocketUpgrade(url) {
+  let ws;
   try {
     const { WebSocket } = await import('ws');
     const started = performance.now();
-    const ws = new WebSocket(url);
+    ws = new WebSocket(url);
     const result = await withTimeout(new Promise((resolve) => {
       ws.once('open', () => resolve({ ok: true }));
       ws.once('error', (error) => resolve({ ok: false, error: error.message }));
     }), TIMEOUT_MS, 'websocket');
-    ws.close();
     return { ...result, ms: Math.round(performance.now() - started) };
   } catch (error) {
     return { ok: false, error: error.message };
+  } finally {
+    try { ws?.terminate(); } catch { /* already closed */ }
   }
 }
 
@@ -186,24 +188,27 @@ function checkStunBinding(host, port) {
 }
 
 async function checkTurnAllocate({ label, host, port, transport }) {
-  let client;
   try {
     const { createTurnClient } = await import('werift');
     const started = performance.now();
     await withTimeout((async () => {
-      client = await createTurnClient(
+      const client = await createTurnClient(
         { address: [host, port], username: TURN_USERNAME, password: TURN_PASSWORD },
         { transport, lifetime: 600 },
       );
-      await client.connectionMade();
-      if (!client.relayedAddress) throw new Error('no relayed address');
+      try {
+        await client.connectionMade();
+        if (!client.relayedAddress) throw new Error('no relayed address');
+      } finally {
+        // This finally belongs to the underlying operation, so it also runs
+        // when create/connect settles after the outer reporting timeout.
+        try { await client.close(); } catch { /* best-effort cleanup */ }
+      }
     })(), TIMEOUT_MS, label);
     return { label, ok: true, detail: 'Allocate + auth OK', ms: Math.round(performance.now() - started) };
   } catch (error) {
     const code = error?.code ? ` [${error.code}]` : '';
     return { label, ok: false, detail: `${error?.name ?? 'Error'}${code}: ${error?.message ?? String(error)}` };
-  } finally {
-    try { await client?.close(); } catch { /* best-effort cleanup */ }
   }
 }
 
