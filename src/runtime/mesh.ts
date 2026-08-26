@@ -120,6 +120,12 @@ export const ROUTE_UPGRADE_REQUIRED_PINGS = 3;
 export const ROUTE_UPGRADE_STABILITY_WINDOW_MS = 3_000;
 /** Maximum time a relay identity handshake may retain retry-blocking state. */
 export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
+/**
+ * A physical Trystero route is not the logical participant. Keep the identity
+ * alive long enough to replace a failed route before SessionCoordinator may
+ * interpret it as a host loss.
+ */
+export const LOGICAL_PEER_RECOVERY_MS = 30_000;
 
 export type RouteUpgradeStatus =
   | 'requesting'
@@ -236,6 +242,8 @@ export interface MeshOptions {
   disableSecondarySignalling?: boolean | undefined;
   /** Required by production callers; omitted tests receive an ephemeral key. */
   identityPrivateKey?: string | undefined;
+  /** Test hook; production uses the bounded logical recovery lease above. */
+  logicalPeerRecoveryMs?: number | undefined;
 }
 
 export type TrysteroRoomFactory = (
@@ -267,6 +275,12 @@ interface ConnectedPeer {
   connectedAt: number;
   lastSeen: number;
   snapshotRequested: boolean;
+}
+
+interface RecoveringPeer {
+  identity: PeerIdentity;
+  startedAt: number;
+  timer: NodeJS.Timeout;
 }
 
 interface QueuedFrame {
@@ -319,6 +333,7 @@ export class MeshTransport extends EventEmitter {
   private action: MessageAction<ArrayBuffer> | undefined;
   private readonly connections = new Map<string, ConnectedPeer>();
   private readonly identityToTransport = new Map<string, string>();
+  private readonly recoveringPeers = new Map<string, RecoveringPeer>();
   private readonly pendingHandshakes = new Map<string, HandshakeMessage>();
   private readonly pendingInboundFrames = new Map<string, PendingInboundFrames>();
   private totalPendingInboundBytes = 0;
@@ -685,6 +700,28 @@ export class MeshTransport extends EventEmitter {
     if (error) throw new Error(`Cannot remember an invalid peer: ${error}`);
     this.rememberPeer(normalizedPeerIdentity(peer));
     if (this.identityToTransport.has(peer.peerId)) this.sendHelloAck(peer.peerId);
+  }
+
+  public hasRoute(peerId: string): boolean {
+    const transportPeerId = this.identityToTransport.get(peerId);
+    return Boolean(transportPeerId && this.connections.has(transportPeerId));
+  }
+
+  public isPeerRecovering(peerId: string): boolean {
+    return this.recoveringPeers.has(peerId);
+  }
+
+  /** Waits for an authenticated replacement route without changing host state. */
+  public async waitForRoute(peerId: string, timeoutMs = LOGICAL_PEER_RECOVERY_MS): Promise<void> {
+    if (this.hasRoute(peerId)) return;
+    const remembered = this.directory.get(peerId);
+    if (remembered && peerId !== this.options.localPeer.peerId) this.beginLogicalRecovery(remembered);
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    while (!this.stopped && Date.now() < deadline) {
+      if (this.hasRoute(peerId)) return;
+      await delay(50);
+    }
+    throw new Error(`No authenticated route to peer ${peerId} after route recovery.`);
   }
 
   public updateLocalPeer(identity: PeerIdentity): void {
@@ -1551,20 +1588,25 @@ public improvablePeerIds(): string[] {
         .map((connection) => connection.identity.peerId),
     );
     return [...this.directory.values()]
-      .filter((peer) => peer.peerId === this.options.localPeer.peerId || activeRuntimeIds.has(peer.peerId))
+      .filter((peer) => peer.peerId === this.options.localPeer.peerId
+        || activeRuntimeIds.has(peer.peerId) || this.recoveringPeers.has(peer.peerId))
       .map((peer) => {
         const transportPeerId = this.identityToTransport.get(peer.peerId);
         const connection = transportPeerId ? this.connections.get(transportPeerId) : undefined;
         const latency = this.latency.get(peer.peerId);
         const local = peer.peerId === this.options.localPeer.peerId;
+        const recovering = this.recoveringPeers.has(peer.peerId);
         return {
           ...peer,
           latency: latency?.current ?? (local ? 0 : -1),
           latencyEma: latency?.ema ?? (local ? 0 : -1),
-          lastHeartbeat: connection?.lastSeen ?? (local ? Date.now() : 0),
+          // SessionCoordinator polls this projection. Refreshing the logical
+          // lease while route recovery is bounded prevents its much shorter
+          // heartbeat lease from racing the replacement route.
+          lastHeartbeat: connection?.lastSeen ?? (local || recovering ? Date.now() : 0),
           missedHeartbeats: 0,
           route: local ? 'Direct' : this.routes.get(peer.peerId) ?? 'Direct',
-          online: local || Boolean(connection),
+          online: local || Boolean(connection) || recovering,
         };
       });
   }
@@ -1593,6 +1635,8 @@ public improvablePeerIds(): string[] {
     this.action = undefined;
     this.connections.clear();
     this.identityToTransport.clear();
+    for (const recovery of this.recoveringPeers.values()) clearTimeout(recovery.timer);
+    this.recoveringPeers.clear();
     this.pendingHandshakes.clear();
     this.pendingInboundFrames.clear();
     this.totalPendingInboundBytes = 0;
@@ -1794,6 +1838,7 @@ public improvablePeerIds(): string[] {
     };
     this.connections.set(transportPeerId, connection);
     this.identityToTransport.set(handshake.peer.peerId, transportPeerId);
+    this.finishLogicalRecovery(handshake.peer.peerId);
     this.rememberPeer(handshake.peer);
     this.routes.set(handshake.peer.peerId, 'Direct');
     if (handshake.purpose === 'runtime') {
@@ -1825,6 +1870,7 @@ public improvablePeerIds(): string[] {
     this.takePendingInboundFrames(transportPeerId);
     const connection = this.connections.get(transportPeerId);
     if (!connection) return;
+    const wasActiveIdentityRoute = this.identityToTransport.get(connection.identity.peerId) === transportPeerId;
     const queue = this.outboundQueues.get(transportPeerId);
     if (queue) {
       queue.realtimeFrames.length = 0;
@@ -1836,15 +1882,45 @@ public improvablePeerIds(): string[] {
     this.inboundWindows.delete(transportPeerId);
     this.seenIds.delete(connection.identity.peerId);
     this.latency.delete(connection.identity.peerId);
-    if (this.identityToTransport.get(connection.identity.peerId) === transportPeerId) {
+    if (wasActiveIdentityRoute) {
       this.identityToTransport.delete(connection.identity.peerId);
     }
-    if (!this.stopped) {
-      this.emit(
-        connection.purpose === 'runtime' ? 'peerDisconnected' : 'bootstrapDisconnected',
-        connection.identity,
-      );
+    if (!this.stopped && wasActiveIdentityRoute) {
+      if (connection.purpose === 'runtime') this.beginLogicalRecovery(connection.identity);
+      else this.emit('bootstrapDisconnected', connection.identity);
     }
+  }
+
+  private beginLogicalRecovery(identity: PeerIdentity): void {
+    if (this.stopped || this.hasRoute(identity.peerId) || this.recoveringPeers.has(identity.peerId)) return;
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      const recovery = this.recoveringPeers.get(identity.peerId);
+      if (!recovery || recovery.startedAt !== startedAt) return;
+      if (this.hasRoute(identity.peerId)) {
+        this.finishLogicalRecovery(identity.peerId);
+        return;
+      }
+      this.recoveringPeers.delete(identity.peerId);
+      this.emit('peerDisconnected', recovery.identity);
+    }, this.options.logicalPeerRecoveryMs ?? LOGICAL_PEER_RECOVERY_MS);
+    timer.unref?.();
+    this.recoveringPeers.set(identity.peerId, { identity: { ...identity }, startedAt, timer });
+    this.emit('peerRecovering', { ...identity });
+
+    // Do not wait for the periodic 20-second sweep. The already-verified full
+    // data relay is the fastest safe replacement for a failed direct route.
+    this.relayAttempts.delete(identity.peerId);
+    this.relay?.sendAnnounce();
+    this.considerRelayFallback(identity.peerId);
+  }
+
+  private finishLogicalRecovery(peerId: string): void {
+    const recovery = this.recoveringPeers.get(peerId);
+    if (!recovery) return;
+    clearTimeout(recovery.timer);
+    this.recoveringPeers.delete(peerId);
+    this.emit('peerRecovered', { ...recovery.identity });
   }
 
   private onJoinError(details: JoinError): void {
