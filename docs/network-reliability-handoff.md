@@ -68,4 +68,3 @@ git diff --check
 ```
 
 Expected tracked artifact: `pair-notebook-0.5.2.vsix` only.
-
