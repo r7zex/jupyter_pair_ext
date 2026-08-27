@@ -40,7 +40,7 @@ The discovery media normally carry only encrypted session descriptions needed to
 
 Every participant identity has a separate extension-managed working copy, including two participants opened in separate VS Code windows on one computer. Only the elected host has a backing root. Joining descriptors deliberately store an empty `backingFolder`, so a local or synchronized path from another machine can never be reused accidentally.
 
-When host identity changes, every runtime disables its backing writer and enters `waiting-for-host-folder`. The promoted runtime clears inherited paths, asks for a local folder, materializes all authoritative documents/binaries/directories, and then broadcasts `hostStorageReady`.
+When host identity changes, every runtime disables its backing writer and enters `waiting-for-host-folder`. The promoted runtime clears inherited paths and exposes a persistent retry action. It can materialize all authoritative documents/binaries/directories into a verified empty folder, or hash-check and bind an exact existing synchronized copy without rewriting it. A mismatch needs an explicit destructive confirmation and cancellation leaves the pause/retry state intact. Only then does the host broadcast `hostStorageReady`.
 
 The host writes the durable backing root before updating an open working-copy editor. Open editors remain dirty during ordinary debounced persistence; explicit execution, final save, and host transfer use VS Code's save API as filesystem barriers. Local recovery snapshots are staged under a verified non-symlink session directory and rotated independently of the backing root.
 
@@ -53,3 +53,7 @@ The VSIX targets VS Code 1.95. Trystero runs in the extension host with bundled 
 - `proxy.ts` resolves Pair Notebook/VS Code settings, environment variables, and the Windows system proxy for every WSS signalling and emergency-relay socket.
 
 Both are bundled by esbuild into `out/extension.js`; `node_modules` is excluded from the VSIX.
+
+## Execution recovery
+
+Remote execution is a request/accept/result state machine above the route layer. File barriers and unaccepted requests retry against `waitForRoute`; the executor deduplicates by request ID and caches acknowledged results. Ordered kernel events and results use binary frame payloads, are retained within bounded replay budgets, and are replayed after an authenticated replacement route appears. Stdin uses an event-sequence/digest acknowledgement so a retry cannot write duplicate input. Transport protocol v3 makes these framing guarantees an admission boundary: mixed 0.5.3 and 0.5.4 participants do not enter one session.

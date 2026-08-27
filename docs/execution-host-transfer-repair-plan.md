@@ -8,6 +8,8 @@ Incident scope: a two-participant Windows session connected successfully, but re
 
 This document is the implementation contract for the repair. Changes are delivered as small pushed commits so every completed phase remains available on GitHub.
 
+Status: implementation checkpoints A-F are complete on PR #11 for release 0.5.4. The exact two reported physical computers remain the only external acceptance item that cannot be executed in this development environment.
+
 ## Evidence from the reported incident
 
 The screenshot records all of the following at the same time:
@@ -99,8 +101,8 @@ The current prompt offers only `Replace folder contents`. Materialization writes
   - **Save current session to an empty folder** — require an empty directory, then materialize the authoritative session.
   - **Use an existing synchronized project folder** — scan and compare it against the authoritative manifest without modifying it first.
 - When the existing folder matches, bind it without destructive replacement. Ignored local files may remain.
-- When tracked contents differ, show a bounded conflict summary and require an explicit follow-up choice: use current session contents, import the existing folder as a new authoritative revision, or choose another folder. Never infer a winner from timestamps.
-- Before an explicit import, create a recoverable local snapshot; then apply versioned document/file changes, converge peers, materialize, and resume.
+- When tracked contents differ, show a bounded conflict summary and require an explicit follow-up choice: write the current authoritative session or choose another folder. Never infer a winner from timestamps.
+- Deliberately do not import a conflicting directory into the live session during host promotion. That would replace already-merged CRDT authority while peers are paused and cannot be made equivalent to the user's requested “use the same Dropbox copy” operation. Exact copies attach without writes; mismatches require an explicit session-to-folder replacement or another folder.
 
 ### Checkpoint F — release and installed-artifact acceptance
 
@@ -136,3 +138,12 @@ The current prompt offers only `Replace folder contents`. Materialization writes
 ## Explicit limitations
 
 The exact two computers from the report and their Dropbox contents are unavailable in the development environment. The implementation must therefore use deterministic fault-injection tests plus final user-side acceptance. No test result may be represented as a passed physical two-computer check until that check is actually performed.
+
+## Completed checkpoints
+
+- `aab46a6`: logical route recovery lease and immediate replacement-route search.
+- `c41c76f`, `4bfec3e`: idempotent request/result delivery and retryable file barriers.
+- `991661a`: full content request for newly discovered CRDT documents.
+- `b5d58eb`: persistent folder retry, empty-folder mode, and exact shared-folder binding.
+- `cbbf60e`, `7f0f7a7`, `bf09842`: ordered output replay, bounded large rich output, reliable stdin/control delivery, and protocol-v3 compatibility boundary.
+- Release acceptance: `npm run artifacts` passed lint, compilation, 272 deterministic tests, VSIX packaging, and archive validation; VS Code CLI then installed `pair-notebook.pair-notebook@0.5.4` successfully. The installed JavaScript bundle and Python bridge hashes match the packaged build. VSIX SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
