@@ -53,7 +53,10 @@ class CorrelationTests(unittest.TestCase):
             MODULE.wait_for_parent_message(getter, "wanted", 0.01, "kernel_info_reply")
 
     def test_serialization_bounds_large_kernel_output(self) -> None:
-        value = MODULE.serializable({"text": "x" * 1_000_000, "many": list(range(1000))})
+        value = MODULE.serializable({
+            "text": "x" * (MODULE.MAX_SERIALIZED_CHARACTERS + 1),
+            "many": list(range(1000)),
+        })
         encoded = MODULE.json.dumps(value).encode("utf-8")
         self.assertLess(len(encoded), MODULE.MAX_EMIT_BYTES)
         self.assertIn("truncated", value["text"].lower())

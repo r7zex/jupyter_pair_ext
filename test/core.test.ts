@@ -1048,10 +1048,10 @@ describe('compute launch and recent projects', () => {
   it('terminates a bridge that emits an oversized protocol line', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bridge-limit-'));
     const bridge = path.join(root, 'oversized-bridge.js');
-    await writeFile(bridge, "process.stdout.write('x'.repeat(1024 * 1024 + 1)); setTimeout(() => {}, 30000);\n", 'utf8');
+    await writeFile(bridge, "process.stdout.write('x'.repeat(32 * 1024 * 1024 + 1)); setTimeout(() => {}, 30000);\n", 'utf8');
     const kernel = new PythonKernel(process.execPath, bridge, root, undefined);
     try {
-      await assert.rejects(kernel.start(), /1 MiB safety limit/i);
+      await assert.rejects(kernel.start(), /32 MiB safety limit/i);
     } finally {
       kernel.stop();
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1464,14 +1464,21 @@ describe('real transport and compute', () => {
       assert.equal(await realpath(ready.pythonExecutable), await realpath(expectedPython));
       const first = await kernel.execute('one', 'import os\nprint("PAIR_TEST")\nprint("CUDA=" + str(os.environ.get("CUDA_VISIBLE_DEVICES")))\n2 + 3');
       const second = await kernel.execute('two', 'from IPython.display import HTML\nHTML("<b>PAIR</b>")');
+      const largeRich = await kernel.execute(
+        'large-rich',
+        'from IPython.display import display\ndisplay({"text/plain": "x" * (1024 * 1024 + 256)}, raw=True)',
+      );
       assert.equal(first.success, true);
       assert.equal(second.success, true);
+      assert.equal(largeRich.success, true);
       assert.ok(events.some((event) => event.requestId === 'one' && event.messageType === 'stream' && String(event.content?.text).includes('PAIR_TEST')));
       assert.ok(events.some((event) => event.requestId === 'one' && event.messageType === 'stream' && String(event.content?.text).includes('CUDA=3')));
       assert.ok(events.some((event) => event.requestId === 'one' && event.messageType === 'execute_result'
         && String((event.content?.data as Record<string, unknown> | undefined)?.['text/plain']).trim() === '5'));
       assert.ok(events.some((event) => event.requestId === 'two' && event.messageType === 'execute_result'
         && String((event.content?.data as Record<string, unknown> | undefined)?.['text/html']).includes('<b>PAIR</b>')));
+      assert.ok(events.some((event) => event.requestId === 'large-rich' && event.messageType === 'display_data'
+        && String((event.content?.data as Record<string, unknown> | undefined)?.['text/plain']).length > 1024 * 1024));
 
       const inputRequest = onceKernelEvent(kernel, (event) => event.type === 'inputRequest' && event.requestId === 'stdin');
       const stdinExecution = kernel.execute('stdin', 'name = input("Name: ")\nprint(name)');

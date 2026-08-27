@@ -174,7 +174,7 @@ const MAX_COMPLETED_REMOTE_EXECUTIONS = 256;
 /** Match the controller's bounded render queue so reconnect replay cannot grow without limit. */
 const MAX_REPLAYED_EXECUTION_EVENTS = 2_048;
 const MAX_REPLAYED_EXECUTION_EVENT_BYTES = 32 * 1024 * 1024;
-const MAX_COMPLETED_EXECUTION_EVENT_BYTES = 64 * 1024 * 1024;
+const MAX_RETAINED_REMOTE_EXECUTION_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_JUPYTER_BUFFER_BASE64_CHARACTERS = Math.ceil(16 * 1024 * 1024 * 4 / 3) + 4;
 const EXECUTION_BARRIER_REPLY_TIMEOUT_MS = 60_000;
 const MAX_LIVE_KERNELS = 8;
@@ -245,9 +245,9 @@ interface ExecutionOwner {
 interface CompletedRemoteExecution {
   sourceId: string;
   requestDigest: string;
-  result: JupyterExecutionResult;
+  resultPayload: Uint8Array<ArrayBufferLike>;
   events: RemoteExecutionEventRecord[];
-  retainedEventBytes: number;
+  retainedBytes: number;
   expiryTimer: NodeJS.Timeout;
   retryTimer: NodeJS.Timeout | undefined;
 }
@@ -426,7 +426,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingKernelCommands = new Map<string, PendingKernelCommand>();
   private readonly pendingExecutions = new Map<string, PendingExecution>();
   private readonly completedRemoteExecutions = new Map<string, CompletedRemoteExecution>();
-  private completedRemoteExecutionEventBytes = 0;
+  private completedRemoteExecutionBytes = 0;
   private readonly completedExecutionReceipts = new Map<string, CompletedExecutionReceipt>();
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
@@ -1621,7 +1621,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (completed.retryTimer) clearTimeout(completed.retryTimer);
     }
     this.completedRemoteExecutions.clear();
-    this.completedRemoteExecutionEventBytes = 0;
+    this.completedRemoteExecutionBytes = 0;
     for (const receipt of this.completedExecutionReceipts.values()) clearTimeout(receipt.timer);
     this.completedExecutionReceipts.clear();
     for (const pending of this.pendingTransfers.values()) {
@@ -2425,7 +2425,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const requestId = String(frame.meta.requestId ?? '');
           const pending = this.pendingExecutions.get(requestId);
           if (pending && pending.executorId === sourceId) {
-            const result = normalizeRemoteExecutionResult(frame.meta.result, requestId);
+            const result = decodeRemoteExecutionResult(frame, requestId);
             if (result) {
               const rawEventCount = frame.meta.eventCount;
               const eventCount = rawEventCount === undefined
@@ -4444,9 +4444,24 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     events: RemoteExecutionEventRecord[] = [],
   ): void {
     this.dropCompletedRemoteExecution(requestId);
-    const retainedEventBytes = events.reduce((total, event) => total + event.payload.byteLength, 0);
+    let resultPayload: Uint8Array<ArrayBufferLike>;
+    try {
+      resultPayload = encodeRemoteExecutionResult(result);
+    } catch (error) {
+      resultPayload = encodeRemoteExecutionResult({
+        requestId,
+        success: false,
+        content: {
+          status: 'error',
+          ename: 'OutputReplayLimit',
+          evalue: formatError(error),
+        },
+      });
+    }
+    const retainedBytes = resultPayload.byteLength
+      + events.reduce((total, event) => total + event.payload.byteLength, 0);
     while (this.completedRemoteExecutions.size >= MAX_COMPLETED_REMOTE_EXECUTIONS
-      || this.completedRemoteExecutionEventBytes + retainedEventBytes > MAX_COMPLETED_EXECUTION_EVENT_BYTES) {
+      || this.completedRemoteExecutionBytes + retainedBytes > MAX_RETAINED_REMOTE_EXECUTION_BYTES) {
       const oldest = this.completedRemoteExecutions.keys().next().value as string | undefined;
       if (!oldest) break;
       this.dropCompletedRemoteExecution(oldest);
@@ -4458,13 +4473,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.completedRemoteExecutions.set(requestId, {
       sourceId,
       requestDigest,
-      result,
+      resultPayload,
       events,
-      retainedEventBytes,
+      retainedBytes,
       expiryTimer,
       retryTimer: undefined,
     });
-    this.completedRemoteExecutionEventBytes += retainedEventBytes;
+    this.completedRemoteExecutionBytes += retainedBytes;
     this.deliverCompletedRemoteExecution(requestId);
   }
 
@@ -4479,9 +4494,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.sendRemoteExecutionEvents(completed.sourceId, requestId, completed.events);
       this.transport.sendTo(completed.sourceId, 'executeResult', {
         requestId,
-        result: completed.result,
         eventCount: completed.events.length,
-      });
+      }, completed.resultPayload);
     } catch (error) {
       this.log.appendLine(`[debug] Execution result ${requestId} awaits route recovery: ${formatError(error)}`);
     }
@@ -4489,7 +4503,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     completed.retryTimer = setTimeout(() => {
       completed.retryTimer = undefined;
       this.deliverCompletedRemoteExecution(requestId);
-    }, executionDeliveryRetryMs(completed.retainedEventBytes));
+    }, executionDeliveryRetryMs(completed.retainedBytes));
   }
 
   private dropCompletedRemoteExecution(requestId: string): void {
@@ -4498,9 +4512,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     clearTimeout(completed.expiryTimer);
     if (completed.retryTimer) clearTimeout(completed.retryTimer);
     this.completedRemoteExecutions.delete(requestId);
-    this.completedRemoteExecutionEventBytes = Math.max(
+    this.completedRemoteExecutionBytes = Math.max(
       0,
-      this.completedRemoteExecutionEventBytes - completed.retainedEventBytes,
+      this.completedRemoteExecutionBytes - completed.retainedBytes,
     );
   }
 
@@ -4536,14 +4550,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const rejectRequest = (ename: string, evalue: string): void => {
       if (!TRANSFER_ID_PATTERN.test(requestId)) return;
       try {
+        const result = {
+          requestId,
+          success: false,
+          content: { status: 'error', ename, evalue },
+        } satisfies JupyterExecutionResult;
         this.transport.sendTo(sourceId, 'executeResult', {
           requestId,
-          result: {
-            requestId,
-            success: false,
-            content: { status: 'error', ename, evalue },
-          } satisfies JupyterExecutionResult,
-        });
+          eventCount: 0,
+        }, encodeRemoteExecutionResult(result));
       } catch (error) {
         this.log.appendLine(`[debug] Could not reject execution ${requestId}: ${formatError(error)}`);
       }
@@ -5609,6 +5624,35 @@ function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string):
     message: boundedString(value.message, 64 * 1024),
     traceback: boundedString(value.traceback, 256 * 1024),
   };
+}
+
+function encodeRemoteExecutionResult(result: JupyterExecutionResult): Uint8Array<ArrayBufferLike> {
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(result), 'utf8');
+  } catch (error) {
+    throw new Error(`Could not serialize the remote execution result: ${formatError(error)}`);
+  }
+  if (payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+    throw new Error('The remote execution result exceeded the replay byte limit.');
+  }
+  return payload;
+}
+
+function decodeRemoteExecutionResult(frame: WireFrame, expectedRequestId: string): JupyterExecutionResult | undefined {
+  let value: unknown;
+  if (frame.payload.byteLength) {
+    if (frame.payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+    try {
+      value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frame.payload));
+    } catch {
+      return undefined;
+    }
+  } else {
+    // Compatibility with version 0.5.3, which put the result in frame metadata.
+    value = frame.meta.result;
+  }
+  return normalizeRemoteExecutionResult(value, expectedRequestId);
 }
 
 function normalizeRemoteExecutionResult(value: unknown, expectedRequestId: string): JupyterExecutionResult | undefined {

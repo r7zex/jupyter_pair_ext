@@ -1056,7 +1056,12 @@ describe('compute and lifecycle regression coverage', () => {
     (runtime as any).updatePresence();
     const sent: any[] = [];
     (runtime as any).transport = {
-      sendTo: (peerId: string, type: string, meta: any) => sent.push({ peerId, type, meta }),
+      sendTo: (
+        peerId: string,
+        type: string,
+        meta: any,
+        payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+      ) => sent.push({ peerId, type, meta, payload }),
       stop: async () => undefined,
     };
     try {
@@ -1071,8 +1076,9 @@ describe('compute and lifecycle regression coverage', () => {
       }, 'peer-z');
       assert.equal(sent.length, 1);
       assert.equal(sent[0].type, 'executeResult');
-      assert.equal(sent[0].meta.result.success, false);
-      assert.equal(sent[0].meta.result.content.ename, 'RemoteComputeDisabled');
+      const rejectedResult = JSON.parse(Buffer.from(sent[0].payload).toString('utf8'));
+      assert.equal(rejectedResult.success, false);
+      assert.equal(rejectedResult.content.ename, 'RemoteComputeDisabled');
 
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
@@ -1095,7 +1101,7 @@ describe('compute and lifecycle regression coverage', () => {
         },
       }, 'peer-z');
       assert.equal(sent.length, 1);
-      assert.equal(sent[0].meta.result.content.ename, 'ComputeTargetChanged');
+      assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'ComputeTargetChanged');
 
       // Turning off an advertised device must be enforced on the executor,
       // even if a peer still holds a previously selected target.
@@ -1109,7 +1115,7 @@ describe('compute and lifecycle regression coverage', () => {
           documentManifest: {}, binaryManifest: {}, directoryManifest: [],
         },
       }, 'peer-z');
-      assert.equal(sent[0].meta.result.content.ename, 'CpuComputeDisabled');
+      assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'CpuComputeDisabled');
 
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
@@ -1357,6 +1363,10 @@ describe('compute and lifecycle regression coverage', () => {
       finishExecution!({ requestId, success: true, content: { status: 'ok' } });
       await first;
       assert.equal(sent.filter((item) => item.type === 'executeResult').length, 1);
+      const completedResult = sent.find((item) => item.type === 'executeResult');
+      assert.ok(completedResult);
+      assert.equal(completedResult.meta.result, undefined);
+      assert.equal(JSON.parse(Buffer.from(completedResult.payload).toString('utf8')).success, true);
       assert.equal(sent.filter((item) => item.type === 'executionEvent').length, 2,
         'terminal delivery replays output before the result');
 
@@ -1419,10 +1429,11 @@ describe('compute and lifecycle regression coverage', () => {
       await (runtime as any).onMessage(eventFrame(1, 'second', [largeBuffer]), 'peer-z');
       assert.deepEqual(seen, [], 'a gap must be buffered instead of rendering out of order');
       await (runtime as any).onMessage({
-        type: 'executeResult', payload: new Uint8Array(), meta: {
+        type: 'executeResult', payload: Buffer.from(JSON.stringify({
+          requestId, success: true, content: { status: 'ok' },
+        }), 'utf8'), meta: {
           requestId,
           eventCount: 2,
-          result: { requestId, success: true, content: { status: 'ok' } },
         },
       }, 'peer-z');
       assert.equal(resolved, undefined, 'the result must wait for all preceding events');
