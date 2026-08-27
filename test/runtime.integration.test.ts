@@ -1083,6 +1083,129 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('retries one idempotent execution request after a route replacement and acknowledges its result', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-route-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-route-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-route-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let attempts = 0;
+    let routeWaits = 0;
+    const sentTypes: string[] = [];
+    try {
+      runtime.descriptor.notebookCompute = {
+        'work.ipynb': { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
+      };
+      (runtime as any).synchronizeExecutionFiles = async () => ({ documents: {}, binaries: {}, directories: [] });
+      (runtime as any).transport = {
+        waitForRoute: async () => { routeWaits += 1; },
+        sendTo: (_peerId: string, type: string, meta: any) => {
+          sentTypes.push(type);
+          if (type !== 'executeRequest') return;
+          attempts += 1;
+          if (attempts === 1) throw new Error('No route to peer peer-z.');
+          queueMicrotask(() => {
+            void (runtime as any).onMessage({
+              type: 'executeAccepted', payload: new Uint8Array(), meta: { requestId: meta.requestId },
+            }, 'peer-z');
+            void (runtime as any).onMessage({
+              type: 'executeResult', payload: new Uint8Array(), meta: {
+                requestId: meta.requestId,
+                result: { requestId: meta.requestId, success: true, content: { status: 'ok' } },
+              },
+            }, 'peer-z');
+          });
+        },
+        stop: async () => undefined,
+      };
+      const result = await runtime.executeCell('work.ipynb', 'cell-a', '1+1', () => undefined);
+      assert.equal(result.success, true);
+      assert.equal(attempts, 2, 'the same request is retried after the route disappears');
+      assert.ok(routeWaits >= 2);
+      assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
+      assert.equal((runtime as any).pendingExecutions.size, 0);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('executes a repeated remote request exactly once and replays the terminal result until acknowledged', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-idempotent-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-idempotent', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-idempotent-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any }> = [];
+    (runtime as any).transport = {
+      sendTo: (_peerId: string, type: string, meta: any) => sent.push({ type, meta }),
+      peerRuntime: () => [],
+      stop: async () => undefined,
+    };
+    let finishExecution: ((value: any) => void) | undefined;
+    let executionCount = 0;
+    try {
+      fakeVscode.__config.allowRemoteCompute = true;
+      fakeVscode.__config.allowCpu = true;
+      runtime.project.ensureNotebook('work.ipynb');
+      (runtime as any).updatePresence();
+      const target = runtime.computeForNotebook('work.ipynb');
+      const manifest = (runtime as any).executionManifest();
+      const requestId = 'idempotent-request';
+      await (runtime as any).handleExecutionBarrierCheck({
+        type: 'executionBarrierCheck', payload: new Uint8Array(),
+        meta: { requestId, notebookKey: 'work.ipynb', target, manifest },
+      }, 'peer-z');
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: { requestId, notebookKey: 'work.ipynb', target, manifest },
+      }, 'peer-z');
+      sent.length = 0;
+      (runtime as any).executeLocally = async () => {
+        executionCount += 1;
+        return new Promise((resolve) => { finishExecution = resolve; });
+      };
+      const frame = {
+        type: 'executeRequest', payload: Buffer.from('1+1'),
+        meta: {
+          requestId, notebookKey: 'work.ipynb', target,
+          documentManifest: manifest.documents,
+          binaryManifest: manifest.binaries,
+          directoryManifest: manifest.directories,
+        },
+      };
+      const first = (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      assert.equal(executionCount, 1, 'an active duplicate must not launch a second kernel request');
+      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 2);
+
+      assert.ok(finishExecution);
+      finishExecution!({ requestId, success: true, content: { status: 'ok' } });
+      await first;
+      assert.equal(sent.filter((item) => item.type === 'executeResult').length, 1);
+
+      await (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      assert.equal(executionCount, 1, 'a completed duplicate must replay the cached result');
+      assert.equal(sent.filter((item) => item.type === 'executeResult').length, 2);
+      await (runtime as any).onMessage({
+        type: 'executeResultAck', payload: new Uint8Array(), meta: { requestId },
+      }, 'peer-z');
+      assert.equal((runtime as any).completedRemoteExecutions.size, 0);
+    } finally {
+      delete fakeVscode.__config.allowRemoteCompute;
+      delete fakeVscode.__config.allowCpu;
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects pending remote executions when the session closes', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-dispose-exec-'));
     const extensionRoot = path.join(root, 'extension');
@@ -1100,6 +1223,7 @@ describe('compute and lifecycle regression coverage', () => {
       executorId: 'peer-z',
       notebookKey: 'work.ipynb',
       timer: setTimeout(() => undefined, 60_000),
+      accepted: true,
     });
     try {
       await (runtime as any).disposeAsync();
