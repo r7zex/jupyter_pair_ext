@@ -241,7 +241,7 @@ describe('audit regressions', () => {
     it('refuses an invite holder impersonating a known offline peer', async () => {
       const roomFactory = createInMemoryTrysteroFactory();
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
-      const host = transport(identity('host'), true, roomFactory, clock, sessionId, token);
+      const host = transport(identity('host'), true, roomFactory, clock, sessionId, token, 25);
       const clientIdentity = identity('client');
       const client = transport(clientIdentity, false, roomFactory, clock, sessionId, token);
       const errors: Error[] = [];
@@ -740,6 +740,7 @@ function transport(
   clock: HostClock,
   sessionId: string,
   token: string,
+  logicalPeerRecoveryMs?: number,
 ): MeshTransport {
   return new MeshTransport({
     sessionId,
@@ -748,6 +749,7 @@ function transport(
     hostClock: () => clock,
     isHost: () => isHost,
     roomFactory,
+    ...(logicalPeerRecoveryMs === undefined ? {} : { logicalPeerRecoveryMs }),
   });
 }
 

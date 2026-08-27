@@ -3502,14 +3502,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const manifest = this.executionManifest();
       const statusPromise = this.waitForBarrierReply(requestId, 'status', executorId);
-      try {
-        await this.sendToWithRouteRecovery(executorId, 'executionBarrierCheck', {
-          requestId, notebookKey, target, manifest,
-        });
-      } catch (error) {
-        this.dropBarrierReply(requestId, 'status');
-        throw error;
-      }
+      void this.dispatchExecutionBarrierFrame(
+        executorId,
+        requestId,
+        'status',
+        'executionBarrierCheck',
+        { requestId, notebookKey, target, manifest },
+      );
       const status = await statusPromise;
       if (status.success !== true) {
         throw new Error(`File synchronization was refused by the executor: ${String(status.message ?? 'invalid barrier request')}`);
@@ -3531,14 +3530,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         await this.synchronizeBinaryVersion(executorId, relativePath, version);
       }));
       const ackPromise = this.waitForBarrierReply(requestId, 'ack', executorId);
-      try {
-        await this.sendToWithRouteRecovery(executorId, 'executionBarrierCommit', {
-          requestId, notebookKey, target, manifest,
-        });
-      } catch (error) {
-        this.dropBarrierReply(requestId, 'ack');
-        throw error;
-      }
+      void this.dispatchExecutionBarrierFrame(
+        executorId,
+        requestId,
+        'ack',
+        'executionBarrierCommit',
+        { requestId, notebookKey, target, manifest },
+      );
       const ack = await ackPromise;
       if (ack.success === true) return manifest;
       lastError = String(ack.message ?? 'remote hash verification failed');
@@ -3643,6 +3641,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const authorizationKey = barrierAuthorizationKey(sourceId, requestId);
     const pending = this.pendingBarrierAuthorizations.get(authorizationKey);
     const manifestDigest = manifest ? executionManifestDigest(manifest) : '';
+    const completed = this.completedExecutionBarriers.get(authorizationKey);
+    if (completed && notebookKey && target && manifest
+      && completed.sourceId === sourceId
+      && completed.notebookKey === notebookKey
+      && sameComputeTarget(completed.target, target)
+      && completed.manifestDigest === manifestDigest) {
+      this.transport.sendTo(sourceId, 'executionBarrierAck', { requestId, success: true, message: '' });
+      return;
+    }
     const authorized = Boolean(pending && notebookKey && target && manifest
       && pending.sourceId === sourceId
       && pending.notebookKey === notebookKey
@@ -3676,6 +3683,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const success = !badDocuments.length && !badBinaries.length && !badDirectories.length
       && !extraDocuments.length && !extraBinaries.length && !extraDirectories.length;
     if (success) {
+      const previous = this.completedExecutionBarriers.get(authorizationKey);
+      if (previous) clearTimeout(previous.timer);
       const timer = setTimeout(() => this.completedExecutionBarriers.delete(authorizationKey), COMPLETED_BARRIER_TIMEOUT_MS);
       this.completedExecutionBarriers.set(authorizationKey, {
         sourceId, notebookKey, target, manifestDigest, timer,
@@ -3890,12 +3899,32 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
   }
 
-  private dropBarrierReply(requestId: string, phase: 'status' | 'ack'): void {
+  private async dispatchExecutionBarrierFrame(
+    executorId: string,
+    requestId: string,
+    phase: 'status' | 'ack',
+    type: 'executionBarrierCheck' | 'executionBarrierCommit',
+    meta: Record<string, unknown>,
+  ): Promise<void> {
     const key = `${requestId}:${phase}`;
-    const pending = this.pendingBarrierReplies.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingBarrierReplies.delete(key);
+    const deadline = Date.now() + EXECUTION_BARRIER_REPLY_TIMEOUT_MS;
+    while (!this.closed && Date.now() < deadline) {
+      const pending = this.pendingBarrierReplies.get(key);
+      if (!pending || pending.executorId !== executorId) return;
+      try {
+        await this.waitForTransportRoute(executorId, Math.min(5_000, Math.max(1, deadline - Date.now())));
+        if (this.pendingBarrierReplies.get(key) !== pending) return;
+        this.transport.sendTo(executorId, type, meta);
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) {
+          clearTimeout(pending.timer);
+          this.pendingBarrierReplies.delete(key);
+          pending.reject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+      }
+      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+    }
   }
 
   private resolveBarrierReply(
@@ -4700,8 +4729,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async inspectBackingFolder(folder: string): Promise<BackingFolderInspection> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can inspect a shared backing folder.');
-    if (!this.storage) throw new Error('Session storage is not ready.');
     const resolved = await this.validateBackingFolder(folder);
+    if (!this.storage) throw new Error('Session storage is not ready.');
     const snapshot = await this.collectMaterialization();
     return this.storage.inspectMaterializedFolder(
       resolved,
@@ -4713,8 +4742,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async setBackingFolder(folder: string, mode: BackingFolderMode = 'replace'): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the shared backing folder.');
-    if (!this.storage) throw new Error('Session storage is not ready.');
     const resolved = await this.validateBackingFolder(folder);
+    if (!this.storage) throw new Error('Session storage is not ready.');
     const previous = this.descriptor.backingFolder;
     if (mode === 'reuse-existing') {
       const snapshot = await this.collectMaterialization();

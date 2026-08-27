@@ -1389,8 +1389,14 @@ describe('real transport and compute', () => {
     const hostPeer: PeerIdentity = { peerId: 'host', displayName: 'Host', joinOrder: 0 };
     const peer: PeerIdentity = { peerId: 'peer-z', displayName: 'Peer', joinOrder: 1 };
     const strangerPeer: PeerIdentity = { peerId: 'stranger', displayName: 'Stranger', joinOrder: 2 };
-    const host = new MeshTransport({ sessionId: 'room-security', token, localPeer: hostPeer, hostClock: () => clock, isHost: () => true, roomFactory });
-    const client = new MeshTransport({ sessionId: 'room-security', token, localPeer: peer, hostClock: () => clock, isHost: () => false, roomFactory });
+    const host = new MeshTransport({
+      sessionId: 'room-security', token, localPeer: hostPeer, hostClock: () => clock,
+      isHost: () => true, roomFactory, logicalPeerRecoveryMs: 25,
+    });
+    const client = new MeshTransport({
+      sessionId: 'room-security', token, localPeer: peer, hostClock: () => clock,
+      isHost: () => false, roomFactory, logicalPeerRecoveryMs: 25,
+    });
     const stranger = new MeshTransport({
       sessionId: 'room-security', token: 'different-password-that-is-long-enough-123', localPeer: strangerPeer,
       hostClock: () => clock, isHost: () => false, roomFactory,

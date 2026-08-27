@@ -306,6 +306,7 @@ describe('production SessionRuntime integration', () => {
       sharedController.dispose();
 
       await waitFor(() => fileExists(path.join(peerFolder, 'notes.txt')), 3000, 'peer receives notes before disconnect');
+      useFastLogicalRecovery(host, peer);
       const hostDisconnected = onceEvent(host, 'peerDisconnected');
       const peerDisconnected = onceEvent(peer, 'peerDisconnected');
       partitionInMemoryTrystero();
@@ -314,6 +315,9 @@ describe('production SessionRuntime integration', () => {
 
       peer.project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 5, deleteCount: 0, insertText: ' # peer offline' }]);
       host.project.applyCellTextChanges('work.ipynb', 'b', [{ offset: 5, deleteCount: 0, insertText: ' # host online' }]);
+      const peerCreatedOffline = path.join(peerFolder, 'peer-created-offline.py');
+      await writeFile(peerCreatedOffline, 'print("created while disconnected")\n', 'utf8');
+      await peer.onLocalFile(fakeVscode.Uri.file(peerCreatedOffline), 'create');
 
       await rm(path.join(hostFolder, 'notes.txt'));
       await host.onLocalDelete(fakeVscode.Uri.file(path.join(hostFolder, 'notes.txt')));
@@ -333,6 +337,9 @@ describe('production SessionRuntime integration', () => {
           && a.cells[1].source.includes('host online');
       }, 5000, 'bidirectional reconnect convergence');
       await waitFor(() => host.snapshot().awareness.some((state: any) => state.peer.peerId === 'peer-z'), 3000, 'presence restoration');
+      await waitFor(() => host.project.has('peer-created-offline.py')
+        && host.project.text('peer-created-offline.py').toString() === 'print("created while disconnected")\n',
+      5000, 'participant-created file reconciliation');
       await waitFor(async () => !peer.project.has('notes.txt')
         && !await fileExists(path.join(peerFolder, 'notes.txt')), 5000, 'offline delete tombstone reconciliation');
       await waitFor(async () => await readFile(path.join(peerFolder, 'model.bin'), 'utf8') === 'OFFLINE_NEW_MODEL', 5000, 'offline binary revision reconciliation');
@@ -408,6 +415,7 @@ describe('production SessionRuntime integration', () => {
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       await peerC.start();
+      useFastLogicalRecovery(peerB, peerC);
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
       await waitFor(() => peerB.descriptor.localPeer.joinOrder === 1
         && peerC.descriptor.localPeer.joinOrder === 2, 2000, 'monotonic host-assigned participant order');
@@ -480,6 +488,7 @@ describe('production SessionRuntime integration', () => {
       await alpha.start();
       await beta.start();
       await waitFor(() => alpha.snapshot().peers.some((peer: any) => peer.peerId === 'beta' && peer.online), 5000, 'full mesh before partition');
+      useFastLogicalRecovery(alpha, beta);
 
       partitionInMemoryTrystero();
       host.descriptor.mode = 'host-only';
@@ -879,6 +888,38 @@ describe('runtime repair invariants', () => {
       assert.equal(sent.at(-1)?.meta.success, false);
 
       (runtime as any).remoteComputeTargetError = () => undefined;
+      const repeatableTarget = { executorId: 'host', device: 'cpu', epoch: 0, author: 'peer-a' };
+      const repeatableManifest = {
+        documents: { 'keep.txt': (runtime as any).projectDocumentHash('keep.txt') },
+        binaries: {},
+        directories: [],
+      };
+      await (runtime as any).handleExecutionBarrierCheck({
+        type: 'executionBarrierCheck', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      assert.equal(sent.at(-1)?.meta.success, true);
+      sent.length = 0;
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      assert.equal(sent.at(-1)?.type, 'executionBarrierAck');
+      assert.equal(sent.at(-1)?.meta.success, true, 'a lost acknowledgement can be requested again safely');
+
       await (runtime as any).handleExecutionBarrierCheck({
         type: 'executionBarrierCheck', payload: new Uint8Array(),
         meta: {
@@ -1176,6 +1217,50 @@ describe('compute and lifecycle regression coverage', () => {
       assert.ok(routeWaits >= 2);
       assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
       assert.equal((runtime as any).pendingExecutions.size, 0);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retries an execution barrier commit when its acknowledgement is lost', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-barrier-ack-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'barrier-ack-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'barrier-ack-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let commits = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb');
+      const target = { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' };
+      (runtime as any).transport = {
+        waitForRoute: async () => undefined,
+        sendTo: (_peerId: string, type: string, meta: any) => {
+          if (type === 'executionBarrierCheck') {
+            queueMicrotask(() => (runtime as any).resolveBarrierReply(
+              meta.requestId, 'status', 'peer-z',
+              { success: true, missingDocuments: [], missingBinaries: [] },
+            ));
+          } else if (type === 'executionBarrierCommit') {
+            commits += 1;
+            if (commits >= 2) {
+              queueMicrotask(() => (runtime as any).resolveBarrierReply(
+                meta.requestId, 'ack', 'peer-z', { success: true },
+              ));
+            }
+          }
+        },
+        stop: async () => undefined,
+      };
+      const manifest = await (runtime as any).synchronizeExecutionFiles(
+        'peer-z', 'barrier-ack-retry-request', 'work.ipynb', target,
+      );
+      assert.ok(manifest.documents['work.ipynb']);
+      assert.equal(commits, 2);
+      assert.equal((runtime as any).pendingBarrierReplies.size, 0);
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
@@ -2202,6 +2287,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   }
 });
 `;
+}
+
+function useFastLogicalRecovery(...runtimes: any[]): void {
+  for (const runtime of runtimes) {
+    (runtime as any).transport.options.logicalPeerRecoveryMs = 25;
+  }
 }
 
 function onceEvent(emitter: NodeJS.EventEmitter, event: string): Promise<void> {
