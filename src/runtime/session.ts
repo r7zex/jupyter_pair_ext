@@ -171,6 +171,11 @@ const EXECUTION_RESULT_RETRY_MS = 1_500;
 /** Keep terminal results long enough to replay them after a route replacement. */
 const COMPLETED_REMOTE_EXECUTION_TIMEOUT_MS = 5 * 60_000;
 const MAX_COMPLETED_REMOTE_EXECUTIONS = 256;
+/** Match the controller's bounded render queue so reconnect replay cannot grow without limit. */
+const MAX_REPLAYED_EXECUTION_EVENTS = 2_048;
+const MAX_REPLAYED_EXECUTION_EVENT_BYTES = 32 * 1024 * 1024;
+const MAX_COMPLETED_EXECUTION_EVENT_BYTES = 64 * 1024 * 1024;
+const MAX_REMOTE_JUPYTER_BUFFER_BASE64_CHARACTERS = Math.ceil(16 * 1024 * 1024 * 4 / 3) + 4;
 const EXECUTION_BARRIER_REPLY_TIMEOUT_MS = 60_000;
 const MAX_LIVE_KERNELS = 8;
 const MAX_SNAPSHOT_PROJECT_BYTES = 8 * 1024 * 1024 * 1024;
@@ -215,12 +220,34 @@ interface PendingExecution {
   notebookKey: string;
   timer: NodeJS.Timeout;
   accepted: boolean;
+  nextEventSequence: number;
+  bufferedEvents: Map<number, { event: JupyterKernelEvent; byteLength: number }>;
+  bufferedEventBytes: number;
+  deferredResult?: JupyterExecutionResult | undefined;
+  expectedEventCount?: number | undefined;
+}
+
+interface RemoteExecutionEventRecord {
+  sequence: number;
+  payload: Uint8Array<ArrayBufferLike>;
+}
+
+interface ExecutionOwner {
+  peerId: string;
+  notebookKey: string;
+  requestDigest?: string | undefined;
+  events?: RemoteExecutionEventRecord[] | undefined;
+  eventBytes?: number | undefined;
+  eventOverflow?: Error | undefined;
+  replayTimer?: NodeJS.Timeout | undefined;
 }
 
 interface CompletedRemoteExecution {
   sourceId: string;
   requestDigest: string;
   result: JupyterExecutionResult;
+  events: RemoteExecutionEventRecord[];
+  retainedEventBytes: number;
   expiryTimer: NodeJS.Timeout;
   retryTimer: NodeJS.Timeout | undefined;
 }
@@ -399,6 +426,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingKernelCommands = new Map<string, PendingKernelCommand>();
   private readonly pendingExecutions = new Map<string, PendingExecution>();
   private readonly completedRemoteExecutions = new Map<string, CompletedRemoteExecution>();
+  private completedRemoteExecutionEventBytes = 0;
   private readonly completedExecutionReceipts = new Map<string, CompletedExecutionReceipt>();
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
@@ -413,11 +441,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private readonly kernels = new Map<string, JupyterKernel>();
   private readonly kernelLastUsed = new Map<string, number>();
-  private readonly executionOwners = new Map<string, {
-    peerId: string;
-    notebookKey: string;
-    requestDigest?: string | undefined;
-  }>();
+  private readonly executionOwners = new Map<string, ExecutionOwner>();
   private hardware: HardwareInfo | undefined;
   private environments: PythonEnvironment[] = [];
   private resources: ResourceSample | undefined;
@@ -938,7 +962,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         ));
       }, EXECUTION_ACCEPT_TIMEOUT_MS);
       this.pendingExecutions.set(requestId, {
-        resolve, reject, onEvent, executorId, notebookKey, timer, accepted: false,
+        resolve,
+        reject,
+        onEvent,
+        executorId,
+        notebookKey,
+        timer,
+        accepted: false,
+        nextEventSequence: 0,
+        bufferedEvents: new Map(),
+        bufferedEventBytes: 0,
       });
       void this.dispatchRemoteExecutionRequest(
         executorId,
@@ -996,6 +1029,66 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.pendingExecutions.delete(requestId);
       pending.reject(new Error('Remote compute timed out after four hours.'));
     }, REMOTE_EXECUTION_TIMEOUT_MS);
+  }
+
+  private acceptRemoteExecutionEvent(
+    requestId: string,
+    pending: PendingExecution,
+    sequence: number,
+    event: JupyterKernelEvent,
+    byteLength: number,
+  ): void {
+    if (sequence < pending.nextEventSequence) return;
+    if (sequence > pending.nextEventSequence) {
+      if (pending.bufferedEvents.has(sequence)) return;
+      if (pending.bufferedEvents.size >= MAX_REPLAYED_EXECUTION_EVENTS
+        || pending.bufferedEventBytes + byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+        throw new Error('Remote Jupyter event replay exceeded its bounded receive queue.');
+      }
+      pending.bufferedEvents.set(sequence, { event, byteLength });
+      pending.bufferedEventBytes += byteLength;
+      return;
+    }
+    pending.onEvent(event);
+    pending.nextEventSequence += 1;
+    while (true) {
+      const buffered = pending.bufferedEvents.get(pending.nextEventSequence);
+      if (!buffered) break;
+      pending.bufferedEvents.delete(pending.nextEventSequence);
+      pending.bufferedEventBytes = Math.max(0, pending.bufferedEventBytes - buffered.byteLength);
+      pending.onEvent(buffered.event);
+      pending.nextEventSequence += 1;
+    }
+    if (pending.deferredResult !== undefined
+      && pending.expectedEventCount === pending.nextEventSequence) {
+      this.resolvePendingRemoteExecution(
+        requestId,
+        pending,
+        pending.executorId,
+        pending.deferredResult,
+      );
+    }
+  }
+
+  private rejectPendingRemoteExecution(requestId: string, pending: PendingExecution, message: string): void {
+    if (this.pendingExecutions.get(requestId) !== pending) return;
+    clearTimeout(pending.timer);
+    this.pendingExecutions.delete(requestId);
+    pending.reject(new Error(message));
+  }
+
+  private resolvePendingRemoteExecution(
+    requestId: string,
+    pending: PendingExecution,
+    executorId: string,
+    result: JupyterExecutionResult,
+  ): void {
+    if (this.pendingExecutions.get(requestId) !== pending) return;
+    clearTimeout(pending.timer);
+    this.pendingExecutions.delete(requestId);
+    this.rememberCompletedExecutionReceipt(requestId, executorId);
+    this.acknowledgeExecutionResult(requestId, executorId);
+    pending.resolve(result);
   }
 
   private async waitForTransportRoute(peerId: string, timeoutMs: number): Promise<void> {
@@ -1528,6 +1621,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (completed.retryTimer) clearTimeout(completed.retryTimer);
     }
     this.completedRemoteExecutions.clear();
+    this.completedRemoteExecutionEventBytes = 0;
     for (const receipt of this.completedExecutionReceipts.values()) clearTimeout(receipt.timer);
     this.completedExecutionReceipts.clear();
     for (const pending of this.pendingTransfers.values()) {
@@ -1547,6 +1641,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       clearTimeout(this.pendingSessionEndFence.timer);
       this.pendingSessionEndFence.resolve();
       this.pendingSessionEndFence = undefined;
+    }
+    for (const owner of this.executionOwners.values()) {
+      if (owner.replayTimer) clearTimeout(owner.replayTimer);
     }
     this.executionOwners.clear();
     this.kernelCommandWindows.clear();
@@ -1633,6 +1730,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (this.awareness.getLocalState()) {
           this.transport.sendTo(peer.peerId, 'awareness', {}, encodeAwarenessUpdate(this.awareness, [this.awareness.clientID]));
         }
+        this.replayRemoteExecutionsForPeer(peer.peerId);
       } catch (error) {
         this.log.appendLine(`[error] Failed to initialize peer ${peer.displayName}: ${formatError(error)}`);
       }
@@ -1695,6 +1793,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       for (const [requestId, owner] of [...this.executionOwners]) {
         if (owner.peerId !== peer.peerId) continue;
         void this.kernels.get(owner.notebookKey)?.interrupt().catch(() => undefined);
+        if (owner.replayTimer) clearTimeout(owner.replayTimer);
         this.executionOwners.delete(requestId);
       }
       for (const [requestId, completed] of [...this.completedRemoteExecutions]) {
@@ -2298,9 +2397,27 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const pending = this.pendingExecutions.get(requestId);
           if (pending && pending.executorId === sourceId) {
             this.markRemoteExecutionAccepted(requestId, sourceId);
-            const event = normalizeRemoteJupyterEvent(frame.meta.event, requestId);
-            if (!event) throw new Error('Remote executor sent a malformed Jupyter event.');
-            pending.onEvent(event);
+            const decoded = decodeRemoteExecutionEvent(frame, requestId);
+            if (!decoded) {
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent a malformed Jupyter event.');
+              break;
+            }
+            const rawSequence = frame.meta.eventSequence;
+            if (rawSequence === undefined) {
+              // Compatibility with pre-sequencing peers. Those events cannot be replayed.
+              pending.onEvent(decoded.event);
+              break;
+            }
+            const sequence = boundedNumber(rawSequence, 0, Number.MAX_SAFE_INTEGER, true);
+            if (sequence === undefined) {
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an invalid Jupyter event sequence.');
+              break;
+            }
+            try {
+              this.acceptRemoteExecutionEvent(requestId, pending, sequence, decoded.event, decoded.byteLength);
+            } catch (error) {
+              this.rejectPendingRemoteExecution(requestId, pending, formatError(error));
+            }
           }
           break;
         }
@@ -2308,15 +2425,24 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const requestId = String(frame.meta.requestId ?? '');
           const pending = this.pendingExecutions.get(requestId);
           if (pending && pending.executorId === sourceId) {
-            clearTimeout(pending.timer);
-            this.pendingExecutions.delete(requestId);
             const result = normalizeRemoteExecutionResult(frame.meta.result, requestId);
             if (result) {
-              this.rememberCompletedExecutionReceipt(requestId, sourceId);
-              this.acknowledgeExecutionResult(requestId, sourceId);
-              pending.resolve(result);
+              const rawEventCount = frame.meta.eventCount;
+              const eventCount = rawEventCount === undefined
+                ? undefined
+                : boundedNumber(rawEventCount, 0, MAX_REPLAYED_EXECUTION_EVENTS, true);
+              if (rawEventCount !== undefined && eventCount === undefined) {
+                this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an invalid event count.');
+              } else if (eventCount !== undefined && pending.nextEventSequence < eventCount) {
+                pending.deferredResult = result;
+                pending.expectedEventCount = eventCount;
+              } else if (eventCount !== undefined && pending.nextEventSequence > eventCount) {
+                this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an inconsistent event count.');
+              } else {
+                this.resolvePendingRemoteExecution(requestId, pending, sourceId, result);
+              }
             } else {
-              pending.reject(new Error('Remote executor sent a malformed execution result.'));
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent a malformed execution result.');
             }
           } else {
             const receipt = this.completedExecutionReceipts.get(requestId);
@@ -4270,14 +4396,57 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private sendRemoteExecutionEvents(peerId: string, requestId: string, events: RemoteExecutionEventRecord[]): void {
+    for (const event of events) {
+      this.transport.sendTo(peerId, 'executionEvent', {
+        requestId,
+        eventSequence: event.sequence,
+      }, event.payload);
+    }
+  }
+
+  private deliverActiveRemoteExecution(requestId: string): void {
+    const owner = this.executionOwners.get(requestId);
+    if (!owner || !owner.events || this.closed) return;
+    if (owner.replayTimer) {
+      clearTimeout(owner.replayTimer);
+      owner.replayTimer = undefined;
+    }
+    this.sendExecutionAccepted(owner.peerId, requestId);
+    try {
+      this.sendRemoteExecutionEvents(owner.peerId, requestId, owner.events);
+      return;
+    } catch (error) {
+      this.log.appendLine(`[debug] Execution events ${requestId} await route recovery: ${formatError(error)}`);
+    }
+    if (this.executionOwners.get(requestId) !== owner) return;
+    owner.replayTimer = setTimeout(() => {
+      owner.replayTimer = undefined;
+      this.deliverActiveRemoteExecution(requestId);
+    }, executionDeliveryRetryMs(owner.eventBytes ?? 0));
+  }
+
+  private replayRemoteExecutionsForPeer(peerId: string): void {
+    for (const [requestId, owner] of this.executionOwners) {
+      if (owner.peerId !== peerId || !owner.events) continue;
+      this.deliverActiveRemoteExecution(requestId);
+    }
+    for (const [requestId, completed] of this.completedRemoteExecutions) {
+      if (completed.sourceId === peerId) this.deliverCompletedRemoteExecution(requestId);
+    }
+  }
+
   private rememberCompletedRemoteExecution(
     sourceId: string,
     requestId: string,
     requestDigest: string,
     result: JupyterExecutionResult,
+    events: RemoteExecutionEventRecord[] = [],
   ): void {
     this.dropCompletedRemoteExecution(requestId);
-    while (this.completedRemoteExecutions.size >= MAX_COMPLETED_REMOTE_EXECUTIONS) {
+    const retainedEventBytes = events.reduce((total, event) => total + event.payload.byteLength, 0);
+    while (this.completedRemoteExecutions.size >= MAX_COMPLETED_REMOTE_EXECUTIONS
+      || this.completedRemoteExecutionEventBytes + retainedEventBytes > MAX_COMPLETED_EXECUTION_EVENT_BYTES) {
       const oldest = this.completedRemoteExecutions.keys().next().value as string | undefined;
       if (!oldest) break;
       this.dropCompletedRemoteExecution(oldest);
@@ -4290,9 +4459,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       sourceId,
       requestDigest,
       result,
+      events,
+      retainedEventBytes,
       expiryTimer,
       retryTimer: undefined,
     });
+    this.completedRemoteExecutionEventBytes += retainedEventBytes;
     this.deliverCompletedRemoteExecution(requestId);
   }
 
@@ -4304,9 +4476,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       completed.retryTimer = undefined;
     }
     try {
+      this.sendRemoteExecutionEvents(completed.sourceId, requestId, completed.events);
       this.transport.sendTo(completed.sourceId, 'executeResult', {
         requestId,
         result: completed.result,
+        eventCount: completed.events.length,
       });
     } catch (error) {
       this.log.appendLine(`[debug] Execution result ${requestId} awaits route recovery: ${formatError(error)}`);
@@ -4315,7 +4489,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     completed.retryTimer = setTimeout(() => {
       completed.retryTimer = undefined;
       this.deliverCompletedRemoteExecution(requestId);
-    }, EXECUTION_RESULT_RETRY_MS);
+    }, executionDeliveryRetryMs(completed.retainedEventBytes));
   }
 
   private dropCompletedRemoteExecution(requestId: string): void {
@@ -4324,6 +4498,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     clearTimeout(completed.expiryTimer);
     if (completed.retryTimer) clearTimeout(completed.retryTimer);
     this.completedRemoteExecutions.delete(requestId);
+    this.completedRemoteExecutionEventBytes = Math.max(
+      0,
+      this.completedRemoteExecutionEventBytes - completed.retainedEventBytes,
+    );
   }
 
   private rememberCompletedExecutionReceipt(requestId: string, executorId: string): void {
@@ -4394,7 +4572,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const activeOwner = this.executionOwners.get(requestId);
     if (activeOwner) {
       if (activeOwner.peerId === sourceId && activeOwner.requestDigest === requestDigest) {
-        this.sendExecutionAccepted(sourceId, requestId);
+        this.deliverActiveRemoteExecution(requestId);
       } else {
         rejectRequest('ExecutionBusy', 'The execution request id is already active.');
       }
@@ -4474,7 +4652,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       });
       return;
     }
-    this.executionOwners.set(requestId, { peerId: sourceId, notebookKey, requestDigest });
+    const executionOwner: ExecutionOwner = {
+      peerId: sourceId,
+      notebookKey,
+      requestDigest,
+      events: [],
+      eventBytes: 0,
+    };
+    this.executionOwners.set(requestId, executionOwner);
     this.sendExecutionAccepted(sourceId, requestId);
     let timeout: NodeJS.Timeout | undefined;
     let result: JupyterExecutionResult;
@@ -4485,10 +4670,37 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         requestId,
         code,
         (event) => {
+          if (executionOwner.eventOverflow) return;
+          let payload: Uint8Array<ArrayBufferLike>;
           try {
-            this.transport.sendTo(sourceId, 'executionEvent', { requestId, event });
+            payload = encodeRemoteExecutionEvent(event);
           } catch (error) {
-            this.log.appendLine(`[error] Could not forward Jupyter event to ${sourceId}: ${formatError(error)}`);
+            executionOwner.eventOverflow = error instanceof Error ? error : new Error(String(error));
+            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            return;
+          }
+          const events = executionOwner.events ?? [];
+          const nextBytes = (executionOwner.eventBytes ?? 0) + payload.byteLength;
+          if (events.length >= MAX_REPLAYED_EXECUTION_EVENTS
+            || nextBytes > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+            executionOwner.eventOverflow = new Error(
+              'Remote Jupyter output exceeded the bounded reconnect replay queue.',
+            );
+            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            return;
+          }
+          const record = { sequence: events.length, payload } satisfies RemoteExecutionEventRecord;
+          events.push(record);
+          executionOwner.events = events;
+          executionOwner.eventBytes = nextBytes;
+          try {
+            this.transport.sendTo(sourceId, 'executionEvent', {
+              requestId,
+              eventSequence: record.sequence,
+            }, record.payload);
+          } catch (error) {
+            this.log.appendLine(`[debug] Jupyter event ${record.sequence} awaits route recovery: ${formatError(error)}`);
+            this.deliverActiveRemoteExecution(requestId);
           }
         },
       );
@@ -4507,9 +4719,27 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       };
     } finally {
       if (timeout) clearTimeout(timeout);
+      if (executionOwner.replayTimer) clearTimeout(executionOwner.replayTimer);
       this.executionOwners.delete(requestId);
     }
-    this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, result);
+    if (executionOwner.eventOverflow) {
+      result = {
+        requestId,
+        success: false,
+        content: {
+          status: 'error',
+          ename: 'OutputReplayLimit',
+          evalue: executionOwner.eventOverflow.message,
+        },
+      };
+    }
+    this.rememberCompletedRemoteExecution(
+      sourceId,
+      requestId,
+      requestDigest,
+      result,
+      executionOwner.events ?? [],
+    );
   }
 
   private async handleKernelCommand(frame: WireFrame, sourceId: string): Promise<void> {
@@ -4943,6 +5173,11 @@ function runtimeDelay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function executionDeliveryRetryMs(retainedBytes: number): number {
+  const estimatedTransferMs = Math.ceil(Math.max(0, retainedBytes) / (512 * 1024)) * 1_000;
+  return Math.max(EXECUTION_RESULT_RETRY_MS, Math.min(60_000, estimatedTransferMs));
+}
+
 function isRouteUnavailableError(error: unknown): boolean {
   return /no (?:authenticated )?route to peer|peer .+ disconnected during transfer/i.test(formatError(error));
 }
@@ -5300,6 +5535,47 @@ function normalizeExecutionManifest(value: unknown, fallbackAuthor: string): Exe
   return { documents, binaries, directories };
 }
 
+function encodeRemoteExecutionEvent(event: JupyterKernelEvent): Uint8Array<ArrayBufferLike> {
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(event), 'utf8');
+  } catch (error) {
+    throw new Error(`Could not serialize the remote Jupyter event: ${formatError(error)}`);
+  }
+  if (payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+    throw new Error('A remote Jupyter event exceeded the reconnect replay byte limit.');
+  }
+  return payload;
+}
+
+function decodeRemoteExecutionEvent(
+  frame: WireFrame,
+  expectedRequestId: string,
+): { event: JupyterKernelEvent; byteLength: number } | undefined {
+  let value: unknown;
+  let byteLength: number;
+  if (frame.payload.byteLength) {
+    if (frame.payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+    try {
+      value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frame.payload));
+    } catch {
+      return undefined;
+    }
+    byteLength = frame.payload.byteLength;
+  } else {
+    // Compatibility with version 0.5.3, which put the event in frame metadata.
+    value = frame.meta.event;
+    try {
+      byteLength = Buffer.byteLength(JSON.stringify(value), 'utf8');
+    } catch {
+      return undefined;
+    }
+    if (byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+  }
+  const event = normalizeRemoteJupyterEvent(value, expectedRequestId);
+  return event ? { event, byteLength } : undefined;
+}
+
 function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string): JupyterKernelEvent | undefined {
   if (!isPlainRecord(value) || value.requestId !== expectedRequestId
     || typeof value.type !== 'string' || !REMOTE_JUPYTER_EVENT_TYPES.has(value.type)) return undefined;
@@ -5310,7 +5586,7 @@ function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string):
     if (!Array.isArray(value.buffersBase64) || value.buffersBase64.length > 16) return undefined;
     buffersBase64 = [];
     for (const item of value.buffersBase64) {
-      if (typeof item !== 'string' || item.length > 768 * 1024
+      if (typeof item !== 'string' || item.length > MAX_REMOTE_JUPYTER_BUFFER_BASE64_CHARACTERS
         || item.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(item)) return undefined;
       buffersBase64.push(item);
     }

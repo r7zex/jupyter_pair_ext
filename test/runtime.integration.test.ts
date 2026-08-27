@@ -8,6 +8,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { MeshTransport } from '../src/runtime/mesh';
+import { encodeFrame } from '../src/core/wire';
 import {
   createInMemoryTrysteroFactory,
   healInMemoryTrystero,
@@ -1276,9 +1277,18 @@ describe('compute and lifecycle regression coverage', () => {
       sessionId: 'exec-idempotent', role: 'host', peerId: 'host', hostPeerId: 'host',
       workingFolder: folder, pythonPath: process.execPath,
     }), 'exec-idempotent-token-that-is-long-enough', context(extensionRoot), logger());
-    const sent: Array<{ type: string; meta: any }> = [];
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let eventRouteAvailable = false;
     (runtime as any).transport = {
-      sendTo: (_peerId: string, type: string, meta: any) => sent.push({ type, meta }),
+      sendTo: (
+        _peerId: string,
+        type: string,
+        meta: any,
+        payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+      ) => {
+        if (type === 'executionEvent' && !eventRouteAvailable) throw new Error('No route to peer peer-z.');
+        sent.push({ type, meta, payload });
+      },
       peerRuntime: () => [],
       stop: async () => undefined,
     };
@@ -1301,8 +1311,21 @@ describe('compute and lifecycle regression coverage', () => {
         meta: { requestId, notebookKey: 'work.ipynb', target, manifest },
       }, 'peer-z');
       sent.length = 0;
-      (runtime as any).executeLocally = async () => {
+      const largeOutput = 'x'.repeat(1024 * 1024 + 64);
+      (runtime as any).executeLocally = async (
+        _notebookKey: string,
+        _target: unknown,
+        activeRequestId: string,
+        _code: string,
+        onEvent: (event: unknown) => void,
+      ) => {
         executionCount += 1;
+        onEvent({
+          type: 'iopub',
+          requestId: activeRequestId,
+          messageType: 'stream',
+          content: { name: 'stdout', text: largeOutput },
+        });
         return new Promise((resolve) => { finishExecution = resolve; });
       };
       const frame = {
@@ -1318,12 +1341,24 @@ describe('compute and lifecycle regression coverage', () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       await (runtime as any).handleExecutionRequest(frame, 'peer-z');
       assert.equal(executionCount, 1, 'an active duplicate must not launch a second kernel request');
-      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 2);
+      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 3);
+      assert.equal(sent.filter((item) => item.type === 'executionEvent').length, 0);
+
+      eventRouteAvailable = true;
+      (runtime as any).replayRemoteExecutionsForPeer('peer-z');
+      const activeEvent = sent.find((item) => item.type === 'executionEvent');
+      assert.ok(activeEvent, 'the cached active event must replay when the route returns');
+      assert.equal(activeEvent.meta.event, undefined, 'large event data must not use the 1 MiB frame header');
+      assert.equal(activeEvent.meta.eventSequence, 0);
+      assert.ok(activeEvent.payload.byteLength > 1024 * 1024);
+      assert.doesNotThrow(() => encodeFrame('executionEvent', activeEvent.meta, activeEvent.payload));
 
       assert.ok(finishExecution);
       finishExecution!({ requestId, success: true, content: { status: 'ok' } });
       await first;
       assert.equal(sent.filter((item) => item.type === 'executeResult').length, 1);
+      assert.equal(sent.filter((item) => item.type === 'executionEvent').length, 2,
+        'terminal delivery replays output before the result');
 
       await (runtime as any).handleExecutionRequest(frame, 'peer-z');
       assert.equal(executionCount, 1, 'a completed duplicate must replay the cached result');
@@ -1335,6 +1370,70 @@ describe('compute and lifecycle regression coverage', () => {
     } finally {
       delete fakeVscode.__config.allowRemoteCompute;
       delete fakeVscode.__config.allowCpu;
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('orders and deduplicates replayed execution events before resolving the result', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-event-order-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-event-order', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-event-order-token-that-is-long-enough', context(extensionRoot), logger());
+    const requestId = 'event-order-request';
+    const seen: string[] = [];
+    const sentTypes: string[] = [];
+    let resolved: any;
+    const resultPromise = new Promise<void>((resolve, reject) => {
+      (runtime as any).pendingExecutions.set(requestId, {
+        resolve: (result: any) => { resolved = result; resolve(); },
+        reject,
+        onEvent: (event: any) => seen.push(String(event.content.text)),
+        executorId: 'peer-z',
+        notebookKey: 'work.ipynb',
+        timer: setTimeout(() => reject(new Error('test timed out')), 10_000),
+        accepted: false,
+        nextEventSequence: 0,
+        bufferedEvents: new Map(),
+        bufferedEventBytes: 0,
+      });
+    });
+    (runtime as any).transport = {
+      sendTo: (_peerId: string, type: string) => sentTypes.push(type),
+      stop: async () => undefined,
+    };
+    const largeBuffer = Buffer.alloc(1024 * 1024, 7).toString('base64');
+    const eventFrame = (sequence: number, text: string, buffersBase64?: string[]) => ({
+      type: 'executionEvent',
+      meta: { requestId, eventSequence: sequence },
+      payload: Buffer.from(JSON.stringify({
+        type: 'iopub', requestId, messageType: 'stream', content: { name: 'stdout', text },
+        ...(buffersBase64 ? { buffersBase64 } : {}),
+      }), 'utf8'),
+    });
+    try {
+      await (runtime as any).onMessage(eventFrame(1, 'second', [largeBuffer]), 'peer-z');
+      assert.deepEqual(seen, [], 'a gap must be buffered instead of rendering out of order');
+      await (runtime as any).onMessage({
+        type: 'executeResult', payload: new Uint8Array(), meta: {
+          requestId,
+          eventCount: 2,
+          result: { requestId, success: true, content: { status: 'ok' } },
+        },
+      }, 'peer-z');
+      assert.equal(resolved, undefined, 'the result must wait for all preceding events');
+      await (runtime as any).onMessage(eventFrame(1, 'second', [largeBuffer]), 'peer-z');
+      await (runtime as any).onMessage(eventFrame(0, 'first'), 'peer-z');
+      await resultPromise;
+      await (runtime as any).onMessage(eventFrame(0, 'first'), 'peer-z');
+      assert.deepEqual(seen, ['first', 'second']);
+      assert.equal((resolved as { success: boolean } | undefined)?.success, true);
+      assert.ok(sentTypes.includes('executeResultAck'));
+    } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
