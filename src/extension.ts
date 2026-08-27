@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, rm } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,7 +14,6 @@ import {
 } from './core/identity';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
 import { copyProject } from './core/projectFiles';
-import { filesystemPathComparisonKey } from './core/projectPath';
 import {
   accessibleRecentProjects,
   normalizeRecentProjects,
@@ -38,7 +37,7 @@ import {
 } from './core/types';
 import { SnapshotBootstrapError, downloadProjectSnapshot } from './runtime/bootstrap';
 import { configureMeshNetwork } from './runtime/mesh';
-import { SessionRuntime } from './runtime/session';
+import { BackingFolderMismatchError, SessionRuntime } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
@@ -533,17 +532,7 @@ async function transferHost(): Promise<void> {
 async function selectBackingFolder(): Promise<void> {
   const active = requireRuntime();
   if (!active.coordinator.isCurrentHost()) throw new Error('Только текущий хост может выбрать папку проекта.');
-  const chosen = await vscode.window.showOpenDialog({
-    title: 'Выберите папку, где хост будет сохранять проект',
-    canSelectFolders: true,
-    canSelectFiles: false,
-    canSelectMany: false,
-    openLabel: 'Использовать как папку хоста',
-  });
-  if (!chosen?.[0]) return;
-  if (!await confirmBackingFolderReplacement(chosen[0].fsPath, active.descriptor.backingFolder)) return;
-  await active.setBackingFolder(chosen[0].fsPath);
-  void vscode.window.showInformationMessage(`Pair Notebook: проект хоста сохраняется в ${chosen[0].fsPath}.`);
+  await chooseHostFolder(active);
 }
 
 async function promptForNewHostFolder(active: SessionRuntime): Promise<void> {
@@ -553,50 +542,103 @@ async function promptForNewHostFolder(active: SessionRuntime): Promise<void> {
   hostFolderPromptOpen = true;
   try {
     const action = await vscode.window.showWarningMessage(
-      'Вы стали новым хостом. Сессия поставлена на паузу: выберите папку на этом компьютере, куда будет записано полное текущее состояние проекта.',
+      'Вы стали новым хостом. Сессия поставлена на паузу. Можно записать текущее состояние в пустую папку или безопасно подключить уже синхронизированную общую папку.',
       { modal: true },
-      'Выбрать папку',
+      'Настроить папку',
     );
-    if (action !== 'Выбрать папку' || runtime !== active) return;
-    const chosen = await vscode.window.showOpenDialog({
-      title: 'Новая папка хоста Pair Notebook',
-      canSelectFolders: true,
-      canSelectFiles: false,
-      canSelectMany: false,
-      openLabel: 'Сохранить проект и продолжить',
-    });
-    if (!chosen?.[0] || runtime !== active) return;
-    if (!await confirmBackingFolderReplacement(chosen[0].fsPath, active.descriptor.backingFolder)) return;
-    await active.setBackingFolder(chosen[0].fsPath);
-    void vscode.window.showInformationMessage(
-      `Pair Notebook: полное состояние сохранено в ${chosen[0].fsPath}; сессия продолжена.`,
-    );
+    if (action !== 'Настроить папку' || runtime !== active) return;
+    await chooseHostFolder(active);
   } finally {
     hostFolderPromptOpen = false;
   }
 }
 
-async function confirmBackingFolderReplacement(folder: string, currentFolder: string): Promise<boolean> {
-  const resolved = path.resolve(folder);
-  if (currentFolder && sameFilesystemPath(resolved, path.resolve(currentFolder))) return true;
-  let entries: string[];
-  try {
-    entries = await readdir(resolved);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw error;
-  }
-  if (!entries.length) return true;
-  const choice = await vscode.window.showWarningMessage(
-    'Выбранная папка не пуста. Pair Notebook запишет в неё полное состояние сессии, заменит конфликтующие файлы и удалит лишние отслеживаемые файлы. Выберите отдельную пустую папку, если эти данные нужно сохранить.',
-    { modal: true },
-    'Заменить содержимое папки',
-  );
-  return choice === 'Заменить содержимое папки';
-}
+async function chooseHostFolder(active: SessionRuntime): Promise<void> {
+  const choice = await vscode.window.showQuickPick([
+    {
+      label: '$(new-folder) Пустая папка',
+      description: 'Записать в неё полное текущее состояние сессии',
+      detail: 'Непустая папка будет отклонена без изменения её файлов.',
+      mode: 'empty' as const,
+    },
+    {
+      label: '$(cloud) Существующая общая папка',
+      description: 'Подключить уже синхронизированную копию, например Dropbox',
+      detail: 'Сначала выполняется проверка всех файлов; совпадающая папка не перезаписывается.',
+      mode: 'existing' as const,
+    },
+  ], {
+    title: 'Папка нового хоста Pair Notebook',
+    placeHolder: 'Выберите безопасный способ продолжить сессию',
+  });
+  if (!choice || runtime !== active) return;
 
-function sameFilesystemPath(left: string, right: string): boolean {
-  return filesystemPathComparisonKey(left) === filesystemPathComparisonKey(right);
+  for (;;) {
+    const chosen = await vscode.window.showOpenDialog({
+      title: choice.mode === 'empty' ? 'Выберите пустую папку хоста' : 'Выберите существующую общую папку',
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: choice.mode === 'empty' ? 'Проверить пустую папку' : 'Проверить общую папку',
+    });
+    if (!chosen?.[0] || runtime !== active) return;
+    const folder = chosen[0].fsPath;
+    let inspection = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: 'Pair Notebook: проверка папки хоста',
+      cancellable: false,
+    }, () => active.inspectBackingFolder(folder));
+    if (runtime !== active) return;
+
+    if (choice.mode === 'empty') {
+      if (!inspection.empty) {
+        const retry = await vscode.window.showWarningMessage(
+          'Эта папка не пуста. Ничего не было изменено. Выберите другую пустую папку.',
+          { modal: true },
+          'Выбрать другую папку',
+        );
+        if (retry === 'Выбрать другую папку') continue;
+        return;
+      }
+      await active.setBackingFolder(folder, 'replace');
+      void vscode.window.showInformationMessage(`Pair Notebook: текущее состояние записано в ${folder}; сессия продолжена.`);
+      return;
+    }
+
+    if (inspection.empty) {
+      const retry = await vscode.window.showWarningMessage(
+        'В выбранной папке нет файлов общей копии. Выберите папку Dropbox с проектом или используйте режим пустой папки.',
+        { modal: true },
+        'Выбрать другую папку',
+      );
+      if (retry === 'Выбрать другую папку') continue;
+      return;
+    }
+    if (inspection.matches) {
+      try {
+        await active.setBackingFolder(folder, 'reuse-existing');
+        void vscode.window.showInformationMessage(`Pair Notebook: общая папка ${folder} проверена и подключена без перезаписи; сессия продолжена.`);
+        return;
+      } catch (error) {
+        if (!(error instanceof BackingFolderMismatchError)) throw error;
+        inspection = error.inspection;
+      }
+    }
+
+    const mismatchCount = inspection.missing.length + inspection.different.length + inspection.extra.length;
+    const decision = await vscode.window.showWarningMessage(
+      `Общая папка отличается от текущей сессии (${mismatchCount} несовпадений: отсутствуют ${inspection.missing.length}, изменены ${inspection.different.length}, лишние ${inspection.extra.length}). `
+      + 'Она не была изменена. Можно явно записать в неё состояние сессии: конфликтующие файлы будут заменены, а лишние отслеживаемые файлы удалены.',
+      { modal: true },
+      'Записать текущую сессию',
+      'Выбрать другую папку',
+    );
+    if (decision === 'Выбрать другую папку') continue;
+    if (decision !== 'Записать текущую сессию') return;
+    await active.setBackingFolder(folder, 'replace');
+    void vscode.window.showInformationMessage(`Pair Notebook: состояние сессии записано в ${folder}; сессия продолжена.`);
+    return;
+  }
 }
 
 async function selectAutosaveFolder(): Promise<void> {

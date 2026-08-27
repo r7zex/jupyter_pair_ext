@@ -50,7 +50,12 @@ import {
   shouldTrackProjectPath,
 } from '../core/projectFiles';
 import { metadataCellId, StableCellIdRegistry } from '../core/notebookIdentity';
-import { StorageAdapter, safeProjectTarget, safeRelativePath } from '../core/persistence';
+import {
+  MaterializedFolderInspection,
+  StorageAdapter,
+  safeProjectTarget,
+  safeRelativePath,
+} from '../core/persistence';
 import {
   filesystemPathComparisonKey,
   portablePathComparisonKey,
@@ -352,6 +357,16 @@ export interface PeerConnectionView {
 export type RuntimeState = 'connecting' | 'connected' | 'syncing' | 'ready' | 'executing'
   | 'waiting-for-stdin' | 'reconnecting' | 'host-unavailable' | 'executor-unavailable'
   | 'waiting-for-host-folder' | 'kernel-starting' | 'kernel-failed' | 'file-synchronization-failed';
+
+export type BackingFolderMode = 'replace' | 'reuse-existing';
+export type BackingFolderInspection = MaterializedFolderInspection;
+
+export class BackingFolderMismatchError extends Error {
+  public constructor(public readonly inspection: BackingFolderInspection) {
+    super('The selected existing folder no longer matches the authoritative session state.');
+    this.name = 'BackingFolderMismatchError';
+  }
+}
 
 export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public readonly project = new CollaborativeProject();
@@ -4683,8 +4698,50 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.emit('state', state, detail);
   }
 
-  public async setBackingFolder(folder: string): Promise<void> {
+  public async inspectBackingFolder(folder: string): Promise<BackingFolderInspection> {
+    if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can inspect a shared backing folder.');
+    if (!this.storage) throw new Error('Session storage is not ready.');
+    const resolved = await this.validateBackingFolder(folder);
+    const snapshot = await this.collectMaterialization();
+    return this.storage.inspectMaterializedFolder(
+      resolved,
+      snapshot.documents,
+      snapshot.binaries,
+      snapshot.directories,
+    );
+  }
+
+  public async setBackingFolder(folder: string, mode: BackingFolderMode = 'replace'): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the shared backing folder.');
+    if (!this.storage) throw new Error('Session storage is not ready.');
+    const resolved = await this.validateBackingFolder(folder);
+    const previous = this.descriptor.backingFolder;
+    if (mode === 'reuse-existing') {
+      const snapshot = await this.collectMaterialization();
+      const inspection = await this.storage.bindExistingBacking(
+        resolved,
+        snapshot.documents,
+        snapshot.binaries,
+        snapshot.directories,
+      );
+      if (!inspection.matches) throw new BackingFolderMismatchError(inspection);
+    } else {
+      this.storage.setBackingRoot(resolved);
+    }
+    this.descriptor.backingFolder = resolved;
+    try {
+      if (mode === 'replace') await this.materializeBackingFolder();
+      await this.persistDescriptor();
+      await this.onHostStorageReady(this.descriptor.localPeer.peerId);
+      this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
+    } catch (error) {
+      this.descriptor.backingFolder = previous;
+      this.storage.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
+      throw error;
+    }
+  }
+
+  private async validateBackingFolder(folder: string): Promise<string> {
     const [resolved, workingFolder, autosaveFolder] = await Promise.all([
       canonicalFolderPath(folder),
       canonicalFolderPath(this.descriptor.workingFolder),
@@ -4696,19 +4753,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (pathsOverlap(resolved, autosaveFolder)) {
       throw new Error('The shared backing folder must be separate from the local autosave folder.');
     }
-    const previous = this.descriptor.backingFolder;
-    this.descriptor.backingFolder = resolved;
-    this.storage?.setBackingRoot(resolved);
-    try {
-      await this.materializeBackingFolder();
-      await this.persistDescriptor();
-      await this.onHostStorageReady(this.descriptor.localPeer.peerId);
-      this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
-    } catch (error) {
-      this.descriptor.backingFolder = previous;
-      this.storage?.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
-      throw error;
-    }
+    return resolved;
   }
 
   private async normalizeRestoredBackingFolder(): Promise<void> {

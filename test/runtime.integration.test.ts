@@ -1360,10 +1360,13 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(host.snapshot().runtimeState, 'waiting-for-host-folder');
       assert.equal(peer.snapshot().runtimeState, 'waiting-for-host-folder');
       assert.equal(await readFile(path.join(oldHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
-      const newHostBacking = path.join(root, 'new-host-backing');
-      await peer.setBackingFolder(newHostBacking);
+      const inspection = await peer.inspectBackingFolder(oldHostBacking);
+      assert.equal(inspection.empty, false);
+      assert.equal(inspection.matches, true, 'the Dropbox-style shared copy matches the transferred CRDT state');
+      await peer.setBackingFolder(oldHostBacking, 'reuse-existing');
       await waitFor(() => !host.snapshot().waitingForHostFolder && !peer.snapshot().waitingForHostFolder, 3000, 'manual host-transfer resume');
-      assert.equal(await readFile(path.join(newHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
+      assert.equal(await readFile(path.join(oldHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
+      assert.equal(peer.descriptor.backingFolder, oldHostBacking);
       assert.equal((host as any).pendingTransfers.size, 0);
       assert.equal((peer as any).preparedHostTransfers.size, 0);
     } finally {
