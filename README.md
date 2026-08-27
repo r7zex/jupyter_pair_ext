@@ -1,13 +1,13 @@
-# Pair Notebook 0.5.3
+# Pair Notebook 0.5.4
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.5.3.vsix` from **Extensions: Install from VSIX...**, or run:
+Install `pair-notebook-0.5.4.vsix` on **both computers** from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.5.3.vsix --force
+code --install-extension .\pair-notebook-0.5.4.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
@@ -25,6 +25,8 @@ Pair Notebook tries several independent ways to reach the other participant and 
 Signalling runs over TWO independent families concurrently — multiple health-checked public Nostr relays plus a public MQTT broker set — so the failure of one family or relay no longer stalls discovery; a participant discovered through both families still appears exactly once. All WebSocket-based channels honour `pairNotebook.proxyUrl`, `http.proxy` from VS Code, the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables, and the current Windows system proxy. HTTP(S), SOCKS4, SOCKS5 and SOCKS5h are supported; proxy credentials are never logged or displayed.
 
 Start and Join include a strict relay-readiness barrier: Pair Notebook requires an encrypted publish-to-receive self-check through at least one complete emergency family (Nostr or MQTT) before it declares the local transport ready. A merely open WebSocket, rejected subscription, or write-only relay cannot pass. Both families are attempted, established paths are periodically revalidated, and a later publication rejection retires that path and triggers recovery. Join is reported as connected only after the two computers complete the signed end-to-end handshake. With a common working outbound WSS route, Flowseal/zapret and Karing therefore retain independently tested full-data paths even when WebRTC and TURN are unavailable.
+
+A lost physical route now enters a bounded logical recovery lease instead of immediately removing the participant or electing a new host. Cell requests, file-version barriers, ordered Jupyter events, terminal results, stdin replies, Interrupt, and Restart all wait for or reconcile across the replacement authenticated route. An accepted cell is keyed by one idempotent request ID, so recovery cannot execute it twice.
 
 On Windows, Karing TUN needs no special setup because it transparently routes application traffic. Karing's **Auto Set System Proxy** mode is detected from the current user's WinINet settings; Pair Notebook refreshes that value before Start, Join and Reconnect. If another client uses PAC only or does not register its listener as the Windows system proxy, set `pairNotebook.proxyUrl` to its local HTTP/SOCKS URL, for example `http://127.0.0.1:10809`.
 
@@ -77,7 +79,8 @@ Every new session is resilient:
 - An abrupt departure is covered by continuous atomic host persistence, which uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
 - The earliest eligible connected participant becomes the new host deterministically.
 - Every participant sees a paused state. Persistence, invitations, host transfer, session ending, and notebook execution remain disabled during the pause.
-- The new host must select a folder on their own computer. Pair Notebook materializes the complete current project into that folder before broadcasting resume.
+- The new host has a persistent **Choose host folder** action even after cancelling a dialog. They explicitly choose either an empty folder that receives the current session, or an existing synchronized folder (for example Dropbox) that is fully hash-checked and attached without rewriting when it matches.
+- A non-empty mismatched folder is never changed implicitly. The new host must explicitly write the current session into it or choose another folder; cancelling keeps the session paused and the retry action visible.
 - The previous host folder is not deleted or moved. If it is synchronized by Dropbox or another provider, its last completed host writes remain available there.
 
 Editing state remains in the CRDT during the short folder-selection pause, so an accidental keystroke is not discarded. The new host materializes the current merged state before the session resumes.
@@ -94,7 +97,7 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 Trystero uses public Nostr and MQTT services for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, both emergency families send only AES-256-GCM ciphertext through Nostr relays and MQTT brokers. Duplicate deliveries are removed before the signed participant handshake. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
-Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Version 0.3.3 requires a fresh authenticated invite and intentionally does not resume legacy token-only sessions.
+Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Release 0.5.4 uses execution protocol v3 and intentionally rejects 0.5.3 peers, so both participants must install the same new VSIX instead of entering a partially compatible session.
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
@@ -114,7 +117,7 @@ npm run artifacts
 
 The final artifacts are:
 
-- `pair-notebook-0.5.3.vsix` — installable extension.
-- `pair-notebook-complete-0.5.3.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook-0.5.4.vsix` — installable extension.
+- `pair-notebook-complete-0.5.4.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and the [network compatibility audit](docs/network-compatibility-audit.md) for implementation details.

@@ -243,6 +243,48 @@ describe('.ipynb round-trip fidelity', () => {
 });
 
 describe('host promotion persistence barrier', () => {
+  it('binds an exact shared folder without rewriting it and refuses a mismatched copy', async () => {
+    const working = await temporaryDirectory('pair-notebook-existing-working-');
+    const exact = await temporaryDirectory('pair-notebook-existing-exact-');
+    const stale = await temporaryDirectory('pair-notebook-existing-stale-');
+    let current = 'print("shared")\n';
+    try {
+      await Promise.all([
+        writeFile(path.join(exact, 'main.py'), current, 'utf8'),
+        writeFile(path.join(stale, 'main.py'), 'print("stale")\n', 'utf8'),
+        mkdir(path.join(exact, 'empty')),
+        mkdir(path.join(stale, 'empty')),
+      ]);
+      const storage = new StorageAdapter({
+        workingRoot: working,
+        debounceMs: 10,
+        serialize: async () => Buffer.from(current, 'utf8'),
+      });
+      const manifest = [{ relativePath: 'main.py', bytes: Buffer.from(current, 'utf8') }];
+
+      const exactInspection = await storage.bindExistingBacking(exact, manifest, [], ['empty']);
+      assert.equal(exactInspection.matches, true);
+      assert.equal(await readFile(path.join(exact, 'main.py'), 'utf8'), current);
+
+      const staleInspection = await storage.bindExistingBacking(stale, manifest, [], ['empty']);
+      assert.equal(staleInspection.matches, false);
+      assert.deepEqual(staleInspection.different, ['main.py']);
+
+      current = 'print("after bind")\n';
+      storage.schedule('main.py');
+      await storage.flush();
+      assert.equal(await readFile(path.join(exact, 'main.py'), 'utf8'), current, 'the verified folder becomes the durable root');
+      assert.equal(await readFile(path.join(stale, 'main.py'), 'utf8'), 'print("stale")\n', 'a mismatched folder is never bound');
+      await storage.stop(false);
+    } finally {
+      await Promise.all([
+        rm(working, { recursive: true, force: true }),
+        rm(exact, { recursive: true, force: true }),
+        rm(stale, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
   it('makes a stale backing folder equal to the authoritative project state', async () => {
     const working = await temporaryDirectory('pair-notebook-working-');
     const backing = await temporaryDirectory('pair-notebook-backing-');

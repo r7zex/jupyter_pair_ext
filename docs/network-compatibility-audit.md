@@ -1,8 +1,8 @@
 # Network compatibility audit
 
-Date: 2026-08-26
+Date: 2026-08-27
 
-Release: 0.5.3
+Release: 0.5.4
 
 Primary platform: Windows, VS Code 1.95+
 
@@ -16,7 +16,19 @@ The release has an application path for the requested Flowseal/zapret ↔ Karing
 - If WebRTC cannot cross the resulting NAT, VPN boundary or UDP policy, both peers can still authenticate and exchange encrypted frames through either the public Nostr or the independent public MQTT emergency channel. A custom TURN service remains optional.
 - Start and Join do not declare the local transport ready until at least one complete emergency family has returned its own invite-key-encrypted publish-to-receive probe. Both Nostr and MQTT are attempted; failure is explicit only when neither independent full-data path is verified.
 
-The connectivity contract is exact: with a common working outbound WSS infrastructure on both computers, Pair Notebook 0.5.3 proves a bidirectional encrypted local full-data fallback before Start/Join continues, and reports Join as connected only after the two peers complete the signed end-to-end handshake. This remains true when WebRTC, UDP and TURN are unavailable. No networked program can operate during a total loss of outbound connectivity or when the peers have no common reachable infrastructure. The exact two physical computers were not available to this audit; the release was exercised with active `winws` plus a live xray/Karing-style system proxy as described below.
+The connectivity contract is exact: with a common working outbound WSS infrastructure on both computers, Pair Notebook 0.5.4 proves a bidirectional encrypted local full-data fallback before Start/Join continues, and reports Join as connected only after the two peers complete the signed end-to-end handshake. This remains true when WebRTC, UDP and TURN are unavailable. No networked program can operate during a total loss of outbound connectivity or when the peers have no common reachable infrastructure. The exact two physical computers were not available to this audit; the release was exercised with direct/winws-style routing plus a live Windows/Karing-style system proxy as described below.
+
+## Additional 0.5.4 defects corrected
+
+| Defect in 0.5.3 | Concrete failure | 0.5.4 correction |
+| --- | --- | --- |
+| Physical `onPeerLeave` immediately became logical disconnect | A recoverable route flap could elect a new host before the emergency route completed negotiation | 30-second authenticated logical-peer lease plus immediate relay/direct recovery |
+| Barrier/request/result frames assumed the current route remained present | `No route to peer` escaped from `synchronizeExecutionFiles`; accepted cells could remain running for four hours after a lost result | Route-aware barrier retries, bounded acceptance, idempotent request IDs, retained result replay and acknowledgements |
+| Newly learned file state was accepted before testing whether the document existed | The existence test was permanently false after `acceptFileState` created an empty CRDT document; participant-created files appeared empty or absent | Capture pre-acceptance existence and request the full state for every newly discovered live document |
+| Jupyter events/results lived in the 1 MiB metadata header and the bridge emitted at most 512 KiB | Large PNG/HTML output deterministically failed before or during transport, and route-gap events disappeared | Bounded 32 MiB bridge/Mesh payload pipeline, ordered replay, deduplication and terminal event-count barrier |
+| Stdin and kernel controls were one-shot route sends | A route flap after an `input()` prompt could strand the remote kernel indefinitely | Digest-bound exactly-once stdin acknowledgement plus route-aware Interrupt/Restart delivery |
+| New-host folder cancellation was a one-shot prompt | Cancelling the non-empty warning left the session paused with no visible way to retry | Persistent pause-card action, empty-folder mode, and exact existing/Dropbox-folder verification |
+| 0.5.3 and 0.5.4 shared a handshake despite incompatible execution frames | A mixed pair could connect and then reject payload-only results | Protocol-v3 admission rejects mixed versions immediately |
 
 ## Additional 0.5.3 defects corrected
 
@@ -64,15 +76,19 @@ All 21 combinations open their independently routed relay sockets and exchange o
 
 ## Release evidence
 
-- `npm test`: PASS, 262 tests.
+- `npm test`: PASS, 272 tests.
 - `npm run lint`: PASS.
+- `npm audit`: PASS, 0 vulnerabilities.
+- `npm run artifacts`: PASS; the VSIX contains only 14 required release entries and the complete ZIP contains 86 entries under one top-level directory.
+- VS Code CLI install: PASS as `pair-notebook.pair-notebook@0.5.4`; installed bundle and Python bridge hashes match the release build.
+- `pair-notebook-0.5.4.vsix` SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
 - Active Windows proxy read: `ProxyEnable=1`, `ProxyServer=127.0.0.1:10809`.
 - Real WSS through that detected local system proxy: PASS to `wss://nos.lol`, with target TLS validation enabled.
 - Independent-process public Nostr/WebRTC smoke: PASS.
 - Independent-process public MQTT/WebRTC smoke with primary signalling and emergency relay disabled: PASS through the detected system proxy.
 - Forced no-WebRTC/no-signalling emergency relay, direct/winws host to Windows/Karing system-proxy peer: PASS for all seven compatible ordered Nostr-only, MQTT-only and redundant combinations, with eight 64 KiB frames sent and acknowledged per scenario.
 - The forced redundant test rejects any `failed the identity proof` diagnostic; none occurred after transcript binding.
-- Public endpoint probe: 9/10 pre-fix Nostr WSS candidates passed DNS, TCP, TLS and WebSocket upgrade; `relay.damus.io` returned HTTP 503 and was removed. The resulting 9/9 release list then passed the same probe.
+- Public endpoint probe: all 9 release Nostr WSS endpoints passed DNS, TCP, TLS and WebSocket upgrade on 2026-08-27.
 - UDP STUN binding: PASS for both configured Google endpoints and Cloudflare from the release network.
 - Custom TURN Allocate: NOT RUN because no user-owned TURN credentials were configured.
 - Physical Flowseal computer ↔ physical Karing computer: NOT RUN because those two endpoints were not available in this environment.

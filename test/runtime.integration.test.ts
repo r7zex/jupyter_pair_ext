@@ -8,6 +8,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { MeshTransport } from '../src/runtime/mesh';
+import { encodeFrame } from '../src/core/wire';
 import {
   createInMemoryTrysteroFactory,
   healInMemoryTrystero,
@@ -306,6 +307,7 @@ describe('production SessionRuntime integration', () => {
       sharedController.dispose();
 
       await waitFor(() => fileExists(path.join(peerFolder, 'notes.txt')), 3000, 'peer receives notes before disconnect');
+      useFastLogicalRecovery(host, peer);
       const hostDisconnected = onceEvent(host, 'peerDisconnected');
       const peerDisconnected = onceEvent(peer, 'peerDisconnected');
       partitionInMemoryTrystero();
@@ -314,6 +316,9 @@ describe('production SessionRuntime integration', () => {
 
       peer.project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 5, deleteCount: 0, insertText: ' # peer offline' }]);
       host.project.applyCellTextChanges('work.ipynb', 'b', [{ offset: 5, deleteCount: 0, insertText: ' # host online' }]);
+      const peerCreatedOffline = path.join(peerFolder, 'peer-created-offline.py');
+      await writeFile(peerCreatedOffline, 'print("created while disconnected")\n', 'utf8');
+      await peer.onLocalFile(fakeVscode.Uri.file(peerCreatedOffline), 'create');
 
       await rm(path.join(hostFolder, 'notes.txt'));
       await host.onLocalDelete(fakeVscode.Uri.file(path.join(hostFolder, 'notes.txt')));
@@ -333,6 +338,9 @@ describe('production SessionRuntime integration', () => {
           && a.cells[1].source.includes('host online');
       }, 5000, 'bidirectional reconnect convergence');
       await waitFor(() => host.snapshot().awareness.some((state: any) => state.peer.peerId === 'peer-z'), 3000, 'presence restoration');
+      await waitFor(() => host.project.has('peer-created-offline.py')
+        && host.project.text('peer-created-offline.py').toString() === 'print("created while disconnected")\n',
+      5000, 'participant-created file reconciliation');
       await waitFor(async () => !peer.project.has('notes.txt')
         && !await fileExists(path.join(peerFolder, 'notes.txt')), 5000, 'offline delete tombstone reconciliation');
       await waitFor(async () => await readFile(path.join(peerFolder, 'model.bin'), 'utf8') === 'OFFLINE_NEW_MODEL', 5000, 'offline binary revision reconciliation');
@@ -408,6 +416,7 @@ describe('production SessionRuntime integration', () => {
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       await peerC.start();
+      useFastLogicalRecovery(peerB, peerC);
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
       await waitFor(() => peerB.descriptor.localPeer.joinOrder === 1
         && peerC.descriptor.localPeer.joinOrder === 2, 2000, 'monotonic host-assigned participant order');
@@ -480,6 +489,7 @@ describe('production SessionRuntime integration', () => {
       await alpha.start();
       await beta.start();
       await waitFor(() => alpha.snapshot().peers.some((peer: any) => peer.peerId === 'beta' && peer.online), 5000, 'full mesh before partition');
+      useFastLogicalRecovery(alpha, beta);
 
       partitionInMemoryTrystero();
       host.descriptor.mode = 'host-only';
@@ -757,6 +767,55 @@ describe('runtime repair invariants', () => {
     assert.deepEqual(connected, ['host']);
   });
 
+  it('requests the full CRDT update when a peer state vector introduces a new document', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-new-document-vector-'));
+    const sourceFolder = path.join(root, 'source');
+    const receiverFolder = path.join(root, 'receiver');
+    const extensionRoot = path.join(root, 'extension');
+    await Promise.all([
+      mkdir(sourceFolder, { recursive: true }),
+      mkdir(receiverFolder, { recursive: true }),
+      mkdir(extensionRoot, { recursive: true }),
+    ]);
+    const source = new SessionRuntime(descriptor({
+      sessionId: 'new-document-vector', role: 'peer', peerId: 'peer-z', hostPeerId: 'host',
+      workingFolder: sourceFolder, pythonPath: process.execPath,
+    }), 'new-document-vector-token-that-is-long-enough', context(extensionRoot), logger());
+    const receiver = new SessionRuntime(descriptor({
+      sessionId: 'new-document-vector', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: receiverFolder, pythonPath: process.execPath,
+    }), 'new-document-vector-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array }> = [];
+    (receiver as any).transport = {
+      sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array = new Uint8Array()) => {
+        sent.push({ type, meta, payload });
+      },
+      broadcast: () => undefined,
+      stop: async () => undefined,
+    };
+    try {
+      source.project.ensureText('peer-created.py', 'print("from peer")');
+      const fileState = (source as any).ensureLiveFileState('peer-created.py', 'text');
+      await (receiver as any).onMessage({
+        type: 'stateVector',
+        payload: source.project.encodeStateVector('peer-created.py'),
+        meta: { key: 'peer-created.py', kind: 'text', fileState },
+      }, 'peer-z');
+
+      const stateRequest = sent.find((item) => item.type === 'stateVector');
+      assert.ok(stateRequest, 'the empty receiver must request the source state instead of returning an empty diff');
+      await (receiver as any).onMessage({
+        type: 'stateDiff',
+        payload: source.project.encodeUpdate('peer-created.py', stateRequest!.payload),
+        meta: { key: 'peer-created.py', kind: 'text', fileState },
+      }, 'peer-z');
+      assert.equal(receiver.project.text('peer-created.py').toString(), 'print("from peer")');
+    } finally {
+      await Promise.all([(source as any).disposeAsync(), (receiver as any).disposeAsync()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('defers every working-copy write until restored editors are bound', async () => {
     const runtime: any = Object.create(SessionRuntime.prototype);
     runtime.workingCopyWriter = undefined;
@@ -830,6 +889,38 @@ describe('runtime repair invariants', () => {
       assert.equal(sent.at(-1)?.meta.success, false);
 
       (runtime as any).remoteComputeTargetError = () => undefined;
+      const repeatableTarget = { executorId: 'host', device: 'cpu', epoch: 0, author: 'peer-a' };
+      const repeatableManifest = {
+        documents: { 'keep.txt': (runtime as any).projectDocumentHash('keep.txt') },
+        binaries: {},
+        directories: [],
+      };
+      await (runtime as any).handleExecutionBarrierCheck({
+        type: 'executionBarrierCheck', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      assert.equal(sent.at(-1)?.meta.success, true);
+      sent.length = 0;
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: {
+          requestId: 'repeatable-commit', notebookKey: 'work.ipynb',
+          target: repeatableTarget, manifest: repeatableManifest,
+        },
+      }, 'peer-a');
+      assert.equal(sent.at(-1)?.type, 'executionBarrierAck');
+      assert.equal(sent.at(-1)?.meta.success, true, 'a lost acknowledgement can be requested again safely');
+
       await (runtime as any).handleExecutionBarrierCheck({
         type: 'executionBarrierCheck', payload: new Uint8Array(),
         meta: {
@@ -965,7 +1056,12 @@ describe('compute and lifecycle regression coverage', () => {
     (runtime as any).updatePresence();
     const sent: any[] = [];
     (runtime as any).transport = {
-      sendTo: (peerId: string, type: string, meta: any) => sent.push({ peerId, type, meta }),
+      sendTo: (
+        peerId: string,
+        type: string,
+        meta: any,
+        payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+      ) => sent.push({ peerId, type, meta, payload }),
       stop: async () => undefined,
     };
     try {
@@ -980,8 +1076,9 @@ describe('compute and lifecycle regression coverage', () => {
       }, 'peer-z');
       assert.equal(sent.length, 1);
       assert.equal(sent[0].type, 'executeResult');
-      assert.equal(sent[0].meta.result.success, false);
-      assert.equal(sent[0].meta.result.content.ename, 'RemoteComputeDisabled');
+      const rejectedResult = JSON.parse(Buffer.from(sent[0].payload).toString('utf8'));
+      assert.equal(rejectedResult.success, false);
+      assert.equal(rejectedResult.content.ename, 'RemoteComputeDisabled');
 
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
@@ -1004,7 +1101,7 @@ describe('compute and lifecycle regression coverage', () => {
         },
       }, 'peer-z');
       assert.equal(sent.length, 1);
-      assert.equal(sent[0].meta.result.content.ename, 'ComputeTargetChanged');
+      assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'ComputeTargetChanged');
 
       // Turning off an advertised device must be enforced on the executor,
       // even if a peer still holds a previously selected target.
@@ -1018,7 +1115,7 @@ describe('compute and lifecycle regression coverage', () => {
           documentManifest: {}, binaryManifest: {}, directoryManifest: [],
         },
       }, 'peer-z');
-      assert.equal(sent[0].meta.result.content.ename, 'CpuComputeDisabled');
+      assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'CpuComputeDisabled');
 
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
@@ -1083,6 +1180,386 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('retries one idempotent execution request after a route replacement and acknowledges its result', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-route-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-route-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-route-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let attempts = 0;
+    let routeWaits = 0;
+    const sentTypes: string[] = [];
+    try {
+      runtime.descriptor.notebookCompute = {
+        'work.ipynb': { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
+      };
+      (runtime as any).synchronizeExecutionFiles = async () => ({ documents: {}, binaries: {}, directories: [] });
+      (runtime as any).transport = {
+        waitForRoute: async () => { routeWaits += 1; },
+        sendTo: (_peerId: string, type: string, meta: any) => {
+          sentTypes.push(type);
+          if (type !== 'executeRequest') return;
+          attempts += 1;
+          if (attempts === 1) throw new Error('No route to peer peer-z.');
+          queueMicrotask(() => {
+            void (runtime as any).onMessage({
+              type: 'executeAccepted', payload: new Uint8Array(), meta: { requestId: meta.requestId },
+            }, 'peer-z');
+            void (runtime as any).onMessage({
+              type: 'executeResult', payload: new Uint8Array(), meta: {
+                requestId: meta.requestId,
+                result: { requestId: meta.requestId, success: true, content: { status: 'ok' } },
+              },
+            }, 'peer-z');
+          });
+        },
+        stop: async () => undefined,
+      };
+      const result = await runtime.executeCell('work.ipynb', 'cell-a', '1+1', () => undefined);
+      assert.equal(result.success, true);
+      assert.equal(attempts, 2, 'the same request is retried after the route disappears');
+      assert.ok(routeWaits >= 2);
+      assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
+      assert.equal((runtime as any).pendingExecutions.size, 0);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers stdin replies and kernel commands after route recovery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-route-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'kernel-route-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'kernel-route-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let inputAttempts = 0;
+    let commandAttempts = 0;
+    let routeWaits = 0;
+    (runtime as any).transport = {
+      waitForRoute: async () => { routeWaits += 1; },
+      sendTo: (_peerId: string, type: string, meta: any) => {
+        if (type === 'inputReply') {
+          inputAttempts += 1;
+          if (inputAttempts === 1) throw new Error('No route to peer peer-z.');
+          if (inputAttempts >= 3) {
+            queueMicrotask(() => {
+              void (runtime as any).onMessage({
+                type: 'inputReplyAck', payload: new Uint8Array(), meta: {
+                  requestId: meta.requestId,
+                  eventSequence: meta.eventSequence,
+                  success: true,
+                },
+              }, 'peer-z');
+            });
+          }
+        }
+        if (type === 'kernelCommand') {
+          commandAttempts += 1;
+          if (commandAttempts === 1) throw new Error('No route to peer peer-z.');
+          queueMicrotask(() => {
+            void (runtime as any).onMessage({
+              type: 'kernelCommandResult', payload: new Uint8Array(), meta: {
+                requestId: meta.requestId, success: true,
+              },
+            }, 'peer-z');
+          });
+        }
+      },
+      stop: async () => undefined,
+    };
+    const pendingTimer = setTimeout(() => undefined, 60_000);
+    (runtime as any).pendingExecutions.set('stdin-request', {
+      resolve: () => undefined,
+      reject: () => undefined,
+      onEvent: () => undefined,
+      executorId: 'peer-z',
+      notebookKey: 'work.ipynb',
+      timer: pendingTimer,
+      accepted: true,
+      nextEventSequence: 0,
+      bufferedEvents: new Map(),
+      bufferedEventBytes: 0,
+      inputRequestSequence: 3,
+    });
+    try {
+      await assert.rejects(
+        runtime.replyToInput('stdin-request', 'x'.repeat(64 * 1024 + 1)),
+        /character limit/,
+      );
+      await runtime.replyToInput('stdin-request', 'answer');
+      clearTimeout(pendingTimer);
+      (runtime as any).pendingExecutions.delete('stdin-request');
+      await (runtime as any).sendKernelCommand(
+        'peer-z',
+        'work.ipynb',
+        { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
+        'interrupt',
+      );
+      assert.equal(inputAttempts, 3, 'a lost input acknowledgement must resend the same prompt reply');
+      assert.equal(commandAttempts, 2);
+      assert.ok(routeWaits >= 4);
+      assert.equal((runtime as any).pendingKernelCommands.size, 0);
+
+      let deliveredInputs = 0;
+      const inputAcks: any[] = [];
+      (runtime as any).executionOwners.set('owned-input', {
+        peerId: 'peer-z',
+        notebookKey: 'work.ipynb',
+        events: [],
+        inputRequestSequences: new Set([4]),
+        inputReplyDigests: new Map(),
+      });
+      (runtime as any).kernels.set('work.ipynb', {
+        inputReply: () => { deliveredInputs += 1; },
+        stop: () => undefined,
+      });
+      (runtime as any).transport.sendTo = (_peerId: string, type: string, meta: any) => {
+        if (type === 'inputReplyAck') inputAcks.push(meta);
+      };
+      const replyFrame = (value: string) => ({
+        type: 'inputReply', payload: new Uint8Array(), meta: {
+          requestId: 'owned-input', eventSequence: 4, value,
+        },
+      });
+      await (runtime as any).onMessage(replyFrame('same answer'), 'peer-z');
+      await (runtime as any).onMessage(replyFrame('same answer'), 'peer-z');
+      await (runtime as any).onMessage(replyFrame('different answer'), 'peer-z');
+      assert.equal(deliveredInputs, 1, 'retries must never write two stdin lines into the kernel');
+      assert.deepEqual(inputAcks.map((ack) => ack.success), [true, true, false]);
+    } finally {
+      clearTimeout(pendingTimer);
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retries an execution barrier commit when its acknowledgement is lost', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-barrier-ack-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'barrier-ack-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'barrier-ack-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let commits = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb');
+      const target = { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' };
+      (runtime as any).transport = {
+        waitForRoute: async () => undefined,
+        sendTo: (_peerId: string, type: string, meta: any) => {
+          if (type === 'executionBarrierCheck') {
+            queueMicrotask(() => (runtime as any).resolveBarrierReply(
+              meta.requestId, 'status', 'peer-z',
+              { success: true, missingDocuments: [], missingBinaries: [] },
+            ));
+          } else if (type === 'executionBarrierCommit') {
+            commits += 1;
+            if (commits >= 2) {
+              queueMicrotask(() => (runtime as any).resolveBarrierReply(
+                meta.requestId, 'ack', 'peer-z', { success: true },
+              ));
+            }
+          }
+        },
+        stop: async () => undefined,
+      };
+      const manifest = await (runtime as any).synchronizeExecutionFiles(
+        'peer-z', 'barrier-ack-retry-request', 'work.ipynb', target,
+      );
+      assert.ok(manifest.documents['work.ipynb']);
+      assert.equal(commits, 2);
+      assert.equal((runtime as any).pendingBarrierReplies.size, 0);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('executes a repeated remote request exactly once and replays the terminal result until acknowledged', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-idempotent-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-idempotent', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-idempotent-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let eventRouteAvailable = false;
+    (runtime as any).transport = {
+      sendTo: (
+        _peerId: string,
+        type: string,
+        meta: any,
+        payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+      ) => {
+        if (type === 'executionEvent' && !eventRouteAvailable) throw new Error('No route to peer peer-z.');
+        sent.push({ type, meta, payload });
+      },
+      peerRuntime: () => [],
+      stop: async () => undefined,
+    };
+    let finishExecution: ((value: any) => void) | undefined;
+    let executionCount = 0;
+    try {
+      fakeVscode.__config.allowRemoteCompute = true;
+      fakeVscode.__config.allowCpu = true;
+      runtime.project.ensureNotebook('work.ipynb');
+      (runtime as any).updatePresence();
+      const target = runtime.computeForNotebook('work.ipynb');
+      const manifest = (runtime as any).executionManifest();
+      const requestId = 'idempotent-request';
+      await (runtime as any).handleExecutionBarrierCheck({
+        type: 'executionBarrierCheck', payload: new Uint8Array(),
+        meta: { requestId, notebookKey: 'work.ipynb', target, manifest },
+      }, 'peer-z');
+      await (runtime as any).handleExecutionBarrierCommit({
+        type: 'executionBarrierCommit', payload: new Uint8Array(),
+        meta: { requestId, notebookKey: 'work.ipynb', target, manifest },
+      }, 'peer-z');
+      sent.length = 0;
+      const largeOutput = 'x'.repeat(1024 * 1024 + 64);
+      (runtime as any).executeLocally = async (
+        _notebookKey: string,
+        _target: unknown,
+        activeRequestId: string,
+        _code: string,
+        onEvent: (event: unknown) => void,
+      ) => {
+        executionCount += 1;
+        onEvent({
+          type: 'iopub',
+          requestId: activeRequestId,
+          messageType: 'stream',
+          content: { name: 'stdout', text: largeOutput },
+        });
+        return new Promise((resolve) => { finishExecution = resolve; });
+      };
+      const frame = {
+        type: 'executeRequest', payload: Buffer.from('1+1'),
+        meta: {
+          requestId, notebookKey: 'work.ipynb', target,
+          documentManifest: manifest.documents,
+          binaryManifest: manifest.binaries,
+          directoryManifest: manifest.directories,
+        },
+      };
+      const first = (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      assert.equal(executionCount, 1, 'an active duplicate must not launch a second kernel request');
+      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 3);
+      assert.equal(sent.filter((item) => item.type === 'executionEvent').length, 0);
+
+      eventRouteAvailable = true;
+      (runtime as any).replayRemoteExecutionsForPeer('peer-z');
+      const activeEvent = sent.find((item) => item.type === 'executionEvent');
+      assert.ok(activeEvent, 'the cached active event must replay when the route returns');
+      assert.equal(activeEvent.meta.event, undefined, 'large event data must not use the 1 MiB frame header');
+      assert.equal(activeEvent.meta.eventSequence, 0);
+      assert.ok(activeEvent.payload.byteLength > 1024 * 1024);
+      assert.doesNotThrow(() => encodeFrame('executionEvent', activeEvent.meta, activeEvent.payload));
+
+      assert.ok(finishExecution);
+      finishExecution!({ requestId, success: true, content: { status: 'ok' } });
+      await first;
+      assert.equal(sent.filter((item) => item.type === 'executeResult').length, 1);
+      const completedResult = sent.find((item) => item.type === 'executeResult');
+      assert.ok(completedResult);
+      assert.equal(completedResult.meta.result, undefined);
+      assert.equal(JSON.parse(Buffer.from(completedResult.payload).toString('utf8')).success, true);
+      assert.equal(sent.filter((item) => item.type === 'executionEvent').length, 2,
+        'terminal delivery replays output before the result');
+
+      await (runtime as any).handleExecutionRequest(frame, 'peer-z');
+      assert.equal(executionCount, 1, 'a completed duplicate must replay the cached result');
+      assert.equal(sent.filter((item) => item.type === 'executeResult').length, 2);
+      await (runtime as any).onMessage({
+        type: 'executeResultAck', payload: new Uint8Array(), meta: { requestId },
+      }, 'peer-z');
+      assert.equal((runtime as any).completedRemoteExecutions.size, 0);
+    } finally {
+      delete fakeVscode.__config.allowRemoteCompute;
+      delete fakeVscode.__config.allowCpu;
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('orders and deduplicates replayed execution events before resolving the result', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-event-order-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'exec-event-order', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'exec-event-order-token-that-is-long-enough', context(extensionRoot), logger());
+    const requestId = 'event-order-request';
+    const seen: string[] = [];
+    const sentTypes: string[] = [];
+    let resolved: any;
+    const resultPromise = new Promise<void>((resolve, reject) => {
+      (runtime as any).pendingExecutions.set(requestId, {
+        resolve: (result: any) => { resolved = result; resolve(); },
+        reject,
+        onEvent: (event: any) => seen.push(String(event.content.text)),
+        executorId: 'peer-z',
+        notebookKey: 'work.ipynb',
+        timer: setTimeout(() => reject(new Error('test timed out')), 10_000),
+        accepted: false,
+        nextEventSequence: 0,
+        bufferedEvents: new Map(),
+        bufferedEventBytes: 0,
+      });
+    });
+    (runtime as any).transport = {
+      sendTo: (_peerId: string, type: string) => sentTypes.push(type),
+      stop: async () => undefined,
+    };
+    const largeBuffer = Buffer.alloc(1024 * 1024, 7).toString('base64');
+    const eventFrame = (sequence: number, text: string, buffersBase64?: string[]) => ({
+      type: 'executionEvent',
+      meta: { requestId, eventSequence: sequence },
+      payload: Buffer.from(JSON.stringify({
+        type: 'iopub', requestId, messageType: 'stream', content: { name: 'stdout', text },
+        ...(buffersBase64 ? { buffersBase64 } : {}),
+      }), 'utf8'),
+    });
+    try {
+      await (runtime as any).onMessage(eventFrame(1, 'second', [largeBuffer]), 'peer-z');
+      assert.deepEqual(seen, [], 'a gap must be buffered instead of rendering out of order');
+      await (runtime as any).onMessage({
+        type: 'executeResult', payload: Buffer.from(JSON.stringify({
+          requestId, success: true, content: { status: 'ok' },
+        }), 'utf8'), meta: {
+          requestId,
+          eventCount: 2,
+        },
+      }, 'peer-z');
+      assert.equal(resolved, undefined, 'the result must wait for all preceding events');
+      await (runtime as any).onMessage(eventFrame(1, 'second', [largeBuffer]), 'peer-z');
+      await (runtime as any).onMessage(eventFrame(0, 'first'), 'peer-z');
+      await resultPromise;
+      await (runtime as any).onMessage(eventFrame(0, 'first'), 'peer-z');
+      assert.deepEqual(seen, ['first', 'second']);
+      assert.equal((resolved as { success: boolean } | undefined)?.success, true);
+      assert.ok(sentTypes.includes('executeResultAck'));
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects pending remote executions when the session closes', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-dispose-exec-'));
     const extensionRoot = path.join(root, 'extension');
@@ -1100,6 +1577,7 @@ describe('compute and lifecycle regression coverage', () => {
       executorId: 'peer-z',
       notebookKey: 'work.ipynb',
       timer: setTimeout(() => undefined, 60_000),
+      accepted: true,
     });
     try {
       await (runtime as any).disposeAsync();
@@ -1187,10 +1665,13 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(host.snapshot().runtimeState, 'waiting-for-host-folder');
       assert.equal(peer.snapshot().runtimeState, 'waiting-for-host-folder');
       assert.equal(await readFile(path.join(oldHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
-      const newHostBacking = path.join(root, 'new-host-backing');
-      await peer.setBackingFolder(newHostBacking);
+      const inspection = await peer.inspectBackingFolder(oldHostBacking);
+      assert.equal(inspection.empty, false);
+      assert.equal(inspection.matches, true, 'the Dropbox-style shared copy matches the transferred CRDT state');
+      await peer.setBackingFolder(oldHostBacking, 'reuse-existing');
       await waitFor(() => !host.snapshot().waitingForHostFolder && !peer.snapshot().waitingForHostFolder, 3000, 'manual host-transfer resume');
-      assert.equal(await readFile(path.join(newHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
+      assert.equal(await readFile(path.join(oldHostBacking, 'handoff.txt'), 'utf8'), 'saved before handoff');
+      assert.equal(peer.descriptor.backingFolder, oldHostBacking);
       assert.equal((host as any).pendingTransfers.size, 0);
       assert.equal((peer as any).preparedHostTransfers.size, 0);
     } finally {
@@ -2026,6 +2507,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   }
 });
 `;
+}
+
+function useFastLogicalRecovery(...runtimes: any[]): void {
+  for (const runtime of runtimes) {
+    (runtime as any).transport.options.logicalPeerRecoveryMs = 25;
+  }
 }
 
 function onceEvent(emitter: NodeJS.EventEmitter, event: string): Promise<void> {

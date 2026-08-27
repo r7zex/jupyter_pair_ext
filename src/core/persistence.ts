@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, rename, rm } from 'node:fs/promises';
@@ -10,6 +11,14 @@ export { safeRelativePath } from './projectPath';
 
 
 export type SerializeDocument = (relativePath: string) => Promise<Uint8Array>;
+
+export interface MaterializedFolderInspection {
+  empty: boolean;
+  matches: boolean;
+  missing: string[];
+  different: string[];
+  extra: string[];
+}
 
 /**
  * Retry delay after a failed flush.  It is deliberately longer than the edit
@@ -242,6 +251,36 @@ export class StorageAdapter extends EventEmitter {
     });
   }
 
+  public async inspectMaterializedFolder(
+    targetRoot: string,
+    documents: ReadonlyArray<{ relativePath: string; bytes: Uint8Array }>,
+    binaries: ReadonlyArray<{ relativePath: string; sourcePath: string; hash: string }>,
+    directories: readonly string[],
+  ): Promise<MaterializedFolderInspection> {
+    let inspection: MaterializedFolderInspection | undefined;
+    await this.enqueue(async () => {
+      inspection = await inspectMaterializedProjectTree(targetRoot, documents, binaries, directories);
+    });
+    if (!inspection) throw new Error('Backing-folder inspection did not complete.');
+    return inspection;
+  }
+
+  /** Verifies a shared copy and binds it without rewriting or deleting its contents. */
+  public async bindExistingBacking(
+    targetRoot: string,
+    documents: ReadonlyArray<{ relativePath: string; bytes: Uint8Array }>,
+    binaries: ReadonlyArray<{ relativePath: string; sourcePath: string; hash: string }>,
+    directories: readonly string[],
+  ): Promise<MaterializedFolderInspection> {
+    let inspection: MaterializedFolderInspection | undefined;
+    await this.enqueue(async () => {
+      inspection = await inspectMaterializedProjectTree(targetRoot, documents, binaries, directories);
+      if (inspection.matches) this.backingRoot = targetRoot;
+    });
+    if (!inspection) throw new Error('Backing-folder verification did not complete.');
+    return inspection;
+  }
+
   public async remove(relativePath: string): Promise<void> {
 
     if (!this.active) return;
@@ -400,6 +439,93 @@ export class StorageAdapter extends EventEmitter {
       if (isSameOrChild(relativePath, removedPath) || isSameOrChild(removedPath, relativePath)) this.removed.delete(removedPath);
     }
   }
+}
+
+async function inspectMaterializedProjectTree(
+  targetRoot: string,
+  documents: ReadonlyArray<{ relativePath: string; bytes: Uint8Array }>,
+  binaries: ReadonlyArray<{ relativePath: string; sourcePath: string; hash: string }>,
+  directories: readonly string[],
+): Promise<MaterializedFolderInspection> {
+  if (documents.length + binaries.length + directories.length > MAX_TRACKED_PROJECT_ENTRIES) {
+    throw new Error(`Project exceeds the ${MAX_TRACKED_PROJECT_ENTRIES}-entry limit.`);
+  }
+  const normalizedDocuments = documents.map((document) => ({
+    ...document,
+    relativePath: canonicalRelativePath(document.relativePath),
+  }));
+  const normalizedBinaries = binaries.map((binary) => {
+    if (!/^[a-f0-9]{64}$/i.test(binary.hash)) throw new Error('Materialized binary has an invalid SHA-256 digest.');
+    return { ...binary, relativePath: canonicalRelativePath(binary.relativePath), hash: binary.hash.toLowerCase() };
+  });
+  const normalizedDirectories = directories.map(canonicalRelativePath);
+  validateMaterializationManifest(normalizedDocuments, normalizedBinaries, normalizedDirectories);
+
+  let existingFiles: Awaited<ReturnType<typeof scanProject>> = [];
+  let existingDirectories: string[] = [];
+  try {
+    const info = await lstat(targetRoot);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error('The selected backing path must be a real directory.');
+    }
+    [existingFiles, existingDirectories] = await Promise.all([
+      scanProject(targetRoot),
+      scanDirectories(targetRoot),
+    ]);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const expectedFiles = new Map<string, { relativePath: string; hash: string }>();
+  for (const document of normalizedDocuments) {
+    expectedFiles.set(filesystemRelativeKey(document.relativePath), {
+      relativePath: document.relativePath,
+      hash: createHash('sha256').update(document.bytes).digest('hex'),
+    });
+  }
+  for (const binary of normalizedBinaries) {
+    expectedFiles.set(filesystemRelativeKey(binary.relativePath), {
+      relativePath: binary.relativePath,
+      hash: binary.hash,
+    });
+  }
+
+  const missing: string[] = [];
+  const different: string[] = [];
+  const extra: string[] = [];
+  const seenFiles = new Set<string>();
+  for (const file of existingFiles) {
+    const key = filesystemRelativeKey(file.relativePath);
+    const expected = expectedFiles.get(key);
+    if (!expected) {
+      extra.push(file.relativePath);
+      continue;
+    }
+    seenFiles.add(key);
+    if (file.hash !== expected.hash) different.push(expected.relativePath);
+  }
+  for (const [key, expected] of expectedFiles) {
+    if (!seenFiles.has(key)) missing.push(expected.relativePath);
+  }
+
+  const expectedDirectories = new Map(normalizedDirectories.map((directory) => [filesystemRelativeKey(directory), directory]));
+  const seenDirectories = new Set(existingDirectories.map(filesystemRelativeKey));
+  for (const [key, directory] of expectedDirectories) {
+    if (!seenDirectories.has(key)) missing.push(`${directory}/`);
+  }
+  for (const directory of existingDirectories) {
+    if (!expectedDirectories.has(filesystemRelativeKey(directory))) extra.push(`${directory}/`);
+  }
+  missing.sort();
+  different.sort();
+  extra.sort();
+  return {
+    empty: existingFiles.length === 0 && existingDirectories.length === 0,
+    matches: missing.length === 0 && different.length === 0 && extra.length === 0,
+    missing,
+    different,
+    extra,
+  };
 }
 
 async function materializeProjectTree(

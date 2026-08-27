@@ -2,7 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 
-const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
+const MAX_BRIDGE_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_BRIDGE_COMMAND_BYTES = 48 * 1024 * 1024;
 const MAX_KERNEL_PENDING_EXECUTIONS = 128;
 const MAX_KERNEL_PENDING_COMMANDS = 128;
@@ -282,7 +282,7 @@ export class JupyterKernel extends EventEmitter {
           const lineBytes = stdoutBuffer.subarray(0, newline);
           stdoutBuffer = stdoutBuffer.subarray(newline + 1);
           if (lineBytes.byteLength > MAX_BRIDGE_LINE_BYTES) {
-            failProtocol(new Error('Jupyter bridge message exceeds the 1 MiB safety limit.'));
+            failProtocol(new Error('Jupyter bridge message exceeds the 32 MiB safety limit.'));
             return;
           }
           const line = lineBytes.subarray(0, lineBytes.at(-1) === 0x0d ? lineBytes.byteLength - 1 : lineBytes.byteLength)
@@ -292,7 +292,7 @@ export class JupyterKernel extends EventEmitter {
           newline = stdoutBuffer.indexOf(0x0a);
         }
         if (stdoutBuffer.byteLength > MAX_BRIDGE_LINE_BYTES) {
-          failProtocol(new Error('Jupyter bridge message exceeds the 1 MiB safety limit.'));
+          failProtocol(new Error('Jupyter bridge message exceeds the 32 MiB safety limit.'));
         }
       });
       child.stderr.on('data', (chunk: Buffer) => this.emit('stderr', chunk.toString('utf8')));

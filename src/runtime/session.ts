@@ -50,7 +50,12 @@ import {
   shouldTrackProjectPath,
 } from '../core/projectFiles';
 import { metadataCellId, StableCellIdRegistry } from '../core/notebookIdentity';
-import { StorageAdapter, safeProjectTarget, safeRelativePath } from '../core/persistence';
+import {
+  MaterializedFolderInspection,
+  StorageAdapter,
+  safeProjectTarget,
+  safeRelativePath,
+} from '../core/persistence';
 import {
   filesystemPathComparisonKey,
   portablePathComparisonKey,
@@ -155,10 +160,24 @@ const MAX_EXECUTION_MANIFEST_ENTRIES = 50_000;
 const MAX_PENDING_BARRIER_AUTHORIZATIONS = 128;
 const BARRIER_AUTHORIZATION_TIMEOUT_MS = 60_000;
 const COMPLETED_BARRIER_TIMEOUT_MS = 2 * 60_000;
-const MAX_REMOTE_EXECUTION_CODE_BYTES = 4 * 1024 * 1024;
+const MAX_REMOTE_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
+const MAX_REMOTE_INPUT_CHARACTERS = 64 * 1024;
 const MAX_REMOTE_EXECUTIONS = 4;
 const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
 const REMOTE_EXECUTION_TIMEOUT_MS = 4 * 60 * 60_000;
+/** A routed request must be acknowledged before VS Code leaves the cell in a running state. */
+const EXECUTION_ACCEPT_TIMEOUT_MS = 45_000;
+const EXECUTION_REQUEST_RETRY_MS = 1_500;
+const EXECUTION_RESULT_RETRY_MS = 1_500;
+/** Keep terminal results long enough to replay them after a route replacement. */
+const COMPLETED_REMOTE_EXECUTION_TIMEOUT_MS = 5 * 60_000;
+const MAX_COMPLETED_REMOTE_EXECUTIONS = 256;
+/** Match the controller's bounded render queue so reconnect replay cannot grow without limit. */
+const MAX_REPLAYED_EXECUTION_EVENTS = 2_048;
+const MAX_REPLAYED_EXECUTION_EVENT_BYTES = 32 * 1024 * 1024;
+const MAX_RETAINED_REMOTE_EXECUTION_BYTES = 64 * 1024 * 1024;
+const MAX_REMOTE_JUPYTER_BUFFER_BASE64_CHARACTERS = Math.ceil(16 * 1024 * 1024 * 4 / 3) + 4;
+const EXECUTION_BARRIER_REPLY_TIMEOUT_MS = 60_000;
 const MAX_LIVE_KERNELS = 8;
 const MAX_SNAPSHOT_PROJECT_BYTES = 8 * 1024 * 1024 * 1024;
 const MAX_KNOWN_PEERS = 255;
@@ -200,6 +219,46 @@ interface PendingExecution {
   onEvent: (event: JupyterKernelEvent) => void;
   executorId: string;
   notebookKey: string;
+  timer: NodeJS.Timeout;
+  accepted: boolean;
+  nextEventSequence: number;
+  bufferedEvents: Map<number, { event: JupyterKernelEvent; byteLength: number }>;
+  bufferedEventBytes: number;
+  inputRequestSequence?: number | undefined;
+  deferredResult?: JupyterExecutionResult | undefined;
+  expectedEventCount?: number | undefined;
+}
+
+interface RemoteExecutionEventRecord {
+  sequence: number;
+  payload: Uint8Array<ArrayBufferLike>;
+}
+
+interface ExecutionOwner {
+  peerId: string;
+  notebookKey: string;
+  requestDigest?: string | undefined;
+  events?: RemoteExecutionEventRecord[] | undefined;
+  eventBytes?: number | undefined;
+  eventOverflow?: Error | undefined;
+  replayTimer?: NodeJS.Timeout | undefined;
+  inputRequestSequences?: Set<number> | undefined;
+  inputReplyDigests?: Map<number, string> | undefined;
+}
+
+interface CompletedRemoteExecution {
+  sourceId: string;
+  requestDigest: string;
+  resultPayload: Uint8Array<ArrayBufferLike>;
+  events: RemoteExecutionEventRecord[];
+  retainedBytes: number;
+  inputReplyDigests: Map<number, string>;
+  expiryTimer: NodeJS.Timeout;
+  retryTimer: NodeJS.Timeout | undefined;
+}
+
+interface CompletedExecutionReceipt {
+  executorId: string;
   timer: NodeJS.Timeout;
 }
 
@@ -331,6 +390,23 @@ export type RuntimeState = 'connecting' | 'connected' | 'syncing' | 'ready' | 'e
   | 'waiting-for-stdin' | 'reconnecting' | 'host-unavailable' | 'executor-unavailable'
   | 'waiting-for-host-folder' | 'kernel-starting' | 'kernel-failed' | 'file-synchronization-failed';
 
+export type BackingFolderMode = 'replace' | 'reuse-existing';
+export type BackingFolderInspection = MaterializedFolderInspection;
+
+export class BackingFolderMismatchError extends Error {
+  public constructor(public readonly inspection: BackingFolderInspection) {
+    super('The selected existing folder no longer matches the authoritative session state.');
+    this.name = 'BackingFolderMismatchError';
+  }
+}
+
+interface PendingInputReply {
+  executorId: string;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
 export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public readonly project = new CollaborativeProject();
   public readonly awareness = new Awareness(new Y.Doc());
@@ -360,7 +436,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingBarrierAuthorizations = new Map<string, BarrierAuthorization>();
   private readonly completedExecutionBarriers = new Map<string, BarrierAuthorization>();
   private readonly pendingKernelCommands = new Map<string, PendingKernelCommand>();
+  private readonly pendingInputReplies = new Map<string, PendingInputReply>();
   private readonly pendingExecutions = new Map<string, PendingExecution>();
+  private readonly completedRemoteExecutions = new Map<string, CompletedRemoteExecution>();
+  private completedRemoteExecutionBytes = 0;
+  private readonly completedExecutionReceipts = new Map<string, CompletedExecutionReceipt>();
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
   private readonly sentSnapshotTransfers = new Map<string, SentSnapshotTransfer>();
@@ -374,7 +454,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private readonly kernels = new Map<string, JupyterKernel>();
   private readonly kernelLastUsed = new Map<string, number>();
-  private readonly executionOwners = new Map<string, { peerId: string; notebookKey: string }>();
+  private readonly executionOwners = new Map<string, ExecutionOwner>();
   private hardware: HardwareInfo | undefined;
   private environments: PythonEnvironment[] = [];
   private resources: ResourceSample | undefined;
@@ -889,11 +969,26 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingExecutions.delete(requestId);
-        reject(new Error('Remote compute timed out after four hours.'));
-      }, REMOTE_EXECUTION_TIMEOUT_MS);
-      this.pendingExecutions.set(requestId, { resolve, reject, onEvent, executorId, notebookKey, timer });
-      try {
-        this.transport.sendTo(executorId, 'executeRequest', {
+        reject(new Error(
+          `Compute executor ${executorId} did not acknowledge the request after route recovery. `
+          + 'The cell was not left running remotely; retry it after the connection is stable.',
+        ));
+      }, EXECUTION_ACCEPT_TIMEOUT_MS);
+      this.pendingExecutions.set(requestId, {
+        resolve,
+        reject,
+        onEvent,
+        executorId,
+        notebookKey,
+        timer,
+        accepted: false,
+        nextEventSequence: 0,
+        bufferedEvents: new Map(),
+        bufferedEventBytes: 0,
+      });
+      void this.dispatchRemoteExecutionRequest(
+        executorId,
+        {
           requestId,
           notebookKey,
           cellId,
@@ -901,14 +996,146 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           documentManifest: manifest.documents,
           binaryManifest: manifest.binaries,
           directoryManifest: manifest.directories,
-        }, Buffer.from(code, 'utf8'));
-      } catch (error) {
-        clearTimeout(timer);
+        },
+        Buffer.from(code, 'utf8'),
+      ).catch((error) => {
+        const pending = this.pendingExecutions.get(requestId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
         this.pendingExecutions.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
     return remote.finally(() => this.transition('ready', `Execution finished for ${notebookKey}.`));
+  }
+
+  private async dispatchRemoteExecutionRequest(
+    executorId: string,
+    meta: Record<string, unknown>,
+    payload: Uint8Array<ArrayBufferLike>,
+  ): Promise<void> {
+    const requestId = String(meta.requestId ?? '');
+    const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
+    while (!this.closed && Date.now() < deadline) {
+      const pending = this.pendingExecutions.get(requestId);
+      if (!pending || pending.accepted) return;
+      const remaining = deadline - Date.now();
+      try {
+        await this.waitForTransportRoute(executorId, Math.min(5_000, Math.max(1, remaining)));
+        const current = this.pendingExecutions.get(requestId);
+        if (!current || current.accepted) return;
+        this.transport.sendTo(executorId, 'executeRequest', meta, payload);
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) throw error;
+      }
+      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  private markRemoteExecutionAccepted(requestId: string, executorId: string): void {
+    const pending = this.pendingExecutions.get(requestId);
+    if (!pending || pending.executorId !== executorId || pending.accepted) return;
+    clearTimeout(pending.timer);
+    pending.accepted = true;
+    pending.timer = setTimeout(() => {
+      if (this.pendingExecutions.get(requestId) !== pending) return;
+      this.pendingExecutions.delete(requestId);
+      pending.reject(new Error('Remote compute timed out after four hours.'));
+    }, REMOTE_EXECUTION_TIMEOUT_MS);
+  }
+
+  private acceptRemoteExecutionEvent(
+    requestId: string,
+    pending: PendingExecution,
+    sequence: number,
+    event: JupyterKernelEvent,
+    byteLength: number,
+  ): void {
+    if (sequence < pending.nextEventSequence) return;
+    if (sequence > pending.nextEventSequence) {
+      if (pending.bufferedEvents.has(sequence)) return;
+      if (pending.bufferedEvents.size >= MAX_REPLAYED_EXECUTION_EVENTS
+        || pending.bufferedEventBytes + byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+        throw new Error('Remote Jupyter event replay exceeded its bounded receive queue.');
+      }
+      pending.bufferedEvents.set(sequence, { event, byteLength });
+      pending.bufferedEventBytes += byteLength;
+      return;
+    }
+    if (event.type === 'inputRequest') pending.inputRequestSequence = sequence;
+    pending.onEvent(event);
+    pending.nextEventSequence += 1;
+    while (true) {
+      const buffered = pending.bufferedEvents.get(pending.nextEventSequence);
+      if (!buffered) break;
+      pending.bufferedEvents.delete(pending.nextEventSequence);
+      pending.bufferedEventBytes = Math.max(0, pending.bufferedEventBytes - buffered.byteLength);
+      if (buffered.event.type === 'inputRequest') pending.inputRequestSequence = pending.nextEventSequence;
+      pending.onEvent(buffered.event);
+      pending.nextEventSequence += 1;
+    }
+    if (pending.deferredResult !== undefined
+      && pending.expectedEventCount === pending.nextEventSequence) {
+      this.resolvePendingRemoteExecution(
+        requestId,
+        pending,
+        pending.executorId,
+        pending.deferredResult,
+      );
+    }
+  }
+
+  private rejectPendingRemoteExecution(requestId: string, pending: PendingExecution, message: string): void {
+    if (this.pendingExecutions.get(requestId) !== pending) return;
+    clearTimeout(pending.timer);
+    this.pendingExecutions.delete(requestId);
+    pending.reject(new Error(message));
+  }
+
+  private resolvePendingRemoteExecution(
+    requestId: string,
+    pending: PendingExecution,
+    executorId: string,
+    result: JupyterExecutionResult,
+  ): void {
+    if (this.pendingExecutions.get(requestId) !== pending) return;
+    clearTimeout(pending.timer);
+    this.pendingExecutions.delete(requestId);
+    this.rememberCompletedExecutionReceipt(requestId, executorId);
+    this.acknowledgeExecutionResult(requestId, executorId);
+    pending.resolve(result);
+  }
+
+  private async waitForTransportRoute(peerId: string, timeoutMs: number): Promise<void> {
+    const transport = this.transport as MeshTransport & {
+      waitForRoute?: ((targetPeerId: string, waitMs?: number) => Promise<void>) | undefined;
+    };
+    if (typeof transport.waitForRoute === 'function') {
+      await transport.waitForRoute(peerId, timeoutMs);
+    }
+  }
+
+  private async sendToWithRouteRecovery(
+    peerId: string,
+    type: string,
+    meta: Record<string, unknown>,
+    payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+    timeoutMs = EXECUTION_ACCEPT_TIMEOUT_MS,
+  ): Promise<void> {
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    let lastError: unknown;
+    while (!this.closed && Date.now() < deadline) {
+      try {
+        await this.waitForTransportRoute(peerId, Math.min(5_000, Math.max(1, deadline - Date.now())));
+        this.transport.sendTo(peerId, type, meta, payload);
+        return;
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) throw error;
+        lastError = error;
+        await runtimeDelay(Math.min(100, Math.max(1, deadline - Date.now())));
+      }
+    }
+    throw new Error(`Could not deliver ${type} to ${peerId} after route recovery: ${formatError(lastError)}`);
   }
 
   public reportWaitingForInput(notebookKey: string): void {
@@ -919,15 +1146,93 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transition('executing', `Kernel input supplied for ${notebookKey}.`);
   }
 
-  public replyToInput(requestId: string, value: string): void {
+  public async replyToInput(requestId: string, value: string): Promise<void> {
+    if (value.length > MAX_REMOTE_INPUT_CHARACTERS) {
+      throw new Error(`Jupyter input exceeds the ${MAX_REMOTE_INPUT_CHARACTERS}-character limit.`);
+    }
     const pending = this.pendingExecutions.get(requestId);
     if (pending && pending.executorId !== this.descriptor.localPeer.peerId) {
-      this.transport.sendTo(pending.executorId, 'inputReply', { requestId, notebookKey: pending.notebookKey, value });
+      if (pending.inputRequestSequence === undefined) {
+        // A 0.5.3 peer has no event sequence or input acknowledgement.
+        await this.sendToWithRouteRecovery(
+          pending.executorId,
+          'inputReply',
+          { requestId, notebookKey: pending.notebookKey, value },
+        );
+      } else {
+        await this.sendRemoteInputReply(
+          pending.executorId,
+          requestId,
+          pending.notebookKey,
+          pending.inputRequestSequence,
+          value,
+        );
+      }
       return;
     }
     const owner = this.executionOwners.get(requestId);
     const key = owner?.notebookKey ?? pending?.notebookKey;
     if (key) this.kernels.get(key)?.inputReply(value);
+  }
+
+  private sendRemoteInputReply(
+    executorId: string,
+    requestId: string,
+    notebookKey: string,
+    eventSequence: number,
+    value: string,
+  ): Promise<void> {
+    const key = inputReplyKey(requestId, eventSequence);
+    if (this.pendingInputReplies.has(key)) {
+      return Promise.reject(new Error('A reply for this Jupyter input prompt is already being delivered.'));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingInputReplies.delete(key);
+        reject(new Error('Jupyter input reply was not acknowledged after route recovery.'));
+      }, EXECUTION_ACCEPT_TIMEOUT_MS);
+      this.pendingInputReplies.set(key, { executorId, resolve, reject, timer });
+      void this.dispatchRemoteInputReply(
+        key,
+        executorId,
+        requestId,
+        notebookKey,
+        eventSequence,
+        value,
+      ).catch((error) => {
+        const pending = this.pendingInputReplies.get(key);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pendingInputReplies.delete(key);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  private async dispatchRemoteInputReply(
+    key: string,
+    executorId: string,
+    requestId: string,
+    notebookKey: string,
+    eventSequence: number,
+    value: string,
+  ): Promise<void> {
+    const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
+    while (!this.closed && Date.now() < deadline && this.pendingInputReplies.has(key)) {
+      try {
+        await this.waitForTransportRoute(executorId, Math.min(5_000, Math.max(1, deadline - Date.now())));
+        if (!this.pendingInputReplies.has(key)) return;
+        this.transport.sendTo(executorId, 'inputReply', {
+          requestId,
+          notebookKey,
+          eventSequence,
+          value,
+        });
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) throw error;
+      }
+      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+    }
   }
 
   public async cancelInput(requestId: string): Promise<void> {
@@ -1399,11 +1704,24 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(new Error('Pair Notebook session closed during kernel command.'));
     }
     this.pendingKernelCommands.clear();
+    for (const pending of this.pendingInputReplies.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Pair Notebook session closed during Jupyter input delivery.'));
+    }
+    this.pendingInputReplies.clear();
     for (const pending of this.pendingExecutions.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Pair Notebook session closed during remote execution.'));
     }
     this.pendingExecutions.clear();
+    for (const completed of this.completedRemoteExecutions.values()) {
+      clearTimeout(completed.expiryTimer);
+      if (completed.retryTimer) clearTimeout(completed.retryTimer);
+    }
+    this.completedRemoteExecutions.clear();
+    this.completedRemoteExecutionBytes = 0;
+    for (const receipt of this.completedExecutionReceipts.values()) clearTimeout(receipt.timer);
+    this.completedExecutionReceipts.clear();
     for (const pending of this.pendingTransfers.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Pair Notebook session closed during host transfer.'));
@@ -1421,6 +1739,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       clearTimeout(this.pendingSessionEndFence.timer);
       this.pendingSessionEndFence.resolve();
       this.pendingSessionEndFence = undefined;
+    }
+    for (const owner of this.executionOwners.values()) {
+      if (owner.replayTimer) clearTimeout(owner.replayTimer);
     }
     this.executionOwners.clear();
     this.kernelCommandWindows.clear();
@@ -1507,6 +1828,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (this.awareness.getLocalState()) {
           this.transport.sendTo(peer.peerId, 'awareness', {}, encodeAwarenessUpdate(this.awareness, [this.awareness.clientID]));
         }
+        this.replayRemoteExecutionsForPeer(peer.peerId);
       } catch (error) {
         this.log.appendLine(`[error] Failed to initialize peer ${peer.displayName}: ${formatError(error)}`);
       }
@@ -1569,7 +1891,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       for (const [requestId, owner] of [...this.executionOwners]) {
         if (owner.peerId !== peer.peerId) continue;
         void this.kernels.get(owner.notebookKey)?.interrupt().catch(() => undefined);
+        if (owner.replayTimer) clearTimeout(owner.replayTimer);
         this.executionOwners.delete(requestId);
+      }
+      for (const [requestId, completed] of [...this.completedRemoteExecutions]) {
+        if (completed.sourceId === peer.peerId) this.dropCompletedRemoteExecution(requestId);
+      }
+      for (const [requestId, receipt] of [...this.completedExecutionReceipts]) {
+        if (receipt.executorId !== peer.peerId) continue;
+        clearTimeout(receipt.timer);
+        this.completedExecutionReceipts.delete(requestId);
       }
       const affected = Object.entries(this.descriptor.notebookCompute ?? {})
         .filter(([, target]) => target.executorId === peer.peerId)
@@ -1824,6 +2155,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const key = normalizedTrackedPath(String(frame.meta.key ?? ''));
           const kind = frame.meta.kind as DocumentKind;
           if (key && (kind === 'text' || kind === 'notebook')) {
+            // acceptFileState materializes a new empty CRDT document. Remember
+            // whether it existed first, otherwise the branch that asks the
+            // source for its full state is permanently unreachable.
+            const hadDocument = this.project.has(key);
             const incomingState = normalizeFileState(frame.meta.fileState, sourceId, kind);
             if (!incomingState || !await this.acceptFileState(key, incomingState, sourceId)) break;
             const localState = this.effectiveFileState(key);
@@ -1831,7 +2166,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               this.transport.sendTo(sourceId, 'fileState', { relativePath: key, state: localState });
               break;
             }
-            if (!this.project.has(key)) {
+            if (!hadDocument) {
               const state = this.ensureLiveFileState(key, kind);
               if (kind === 'text') this.project.ensureText(key);
               else this.project.ensureNotebook(key);
@@ -1848,7 +2183,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         case 'fileState': {
           const relativePath = normalizedTrackedPath(String(frame.meta.relativePath ?? ''));
           const state = normalizeFileState(frame.meta.state, sourceId);
-          if (relativePath && state) await this.acceptFileState(relativePath, state, sourceId);
+          if (relativePath && state) {
+            const hadDocument = this.project.has(relativePath);
+            const accepted = await this.acceptFileState(relativePath, state, sourceId);
+            if (accepted && !hadDocument && !state.deleted && (state.kind === 'text' || state.kind === 'notebook')) {
+              this.requestDocumentState(sourceId, relativePath, state.kind);
+            }
+          }
           break;
         }
         case 'stateEnd':
@@ -2144,13 +2485,37 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             this.log.appendLine(`[error] Execute request: ${formatError(error)}`);
           });
           break;
+        case 'executeAccepted': {
+          const requestId = String(frame.meta.requestId ?? '');
+          this.markRemoteExecutionAccepted(requestId, sourceId);
+          break;
+        }
         case 'executionEvent': {
           const requestId = String(frame.meta.requestId ?? '');
           const pending = this.pendingExecutions.get(requestId);
           if (pending && pending.executorId === sourceId) {
-            const event = normalizeRemoteJupyterEvent(frame.meta.event, requestId);
-            if (!event) throw new Error('Remote executor sent a malformed Jupyter event.');
-            pending.onEvent(event);
+            this.markRemoteExecutionAccepted(requestId, sourceId);
+            const decoded = decodeRemoteExecutionEvent(frame, requestId);
+            if (!decoded) {
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent a malformed Jupyter event.');
+              break;
+            }
+            const rawSequence = frame.meta.eventSequence;
+            if (rawSequence === undefined) {
+              // Compatibility with pre-sequencing peers. Those events cannot be replayed.
+              pending.onEvent(decoded.event);
+              break;
+            }
+            const sequence = boundedNumber(rawSequence, 0, Number.MAX_SAFE_INTEGER, true);
+            if (sequence === undefined) {
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an invalid Jupyter event sequence.');
+              break;
+            }
+            try {
+              this.acceptRemoteExecutionEvent(requestId, pending, sequence, decoded.event, decoded.byteLength);
+            } catch (error) {
+              this.rejectPendingRemoteExecution(requestId, pending, formatError(error));
+            }
           }
           break;
         }
@@ -2158,21 +2523,104 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const requestId = String(frame.meta.requestId ?? '');
           const pending = this.pendingExecutions.get(requestId);
           if (pending && pending.executorId === sourceId) {
-            clearTimeout(pending.timer);
-            this.pendingExecutions.delete(requestId);
-            const result = normalizeRemoteExecutionResult(frame.meta.result, requestId);
-            if (result) pending.resolve(result);
-            else pending.reject(new Error('Remote executor sent a malformed execution result.'));
+            const result = decodeRemoteExecutionResult(frame, requestId);
+            if (result) {
+              const rawEventCount = frame.meta.eventCount;
+              const eventCount = rawEventCount === undefined
+                ? undefined
+                : boundedNumber(rawEventCount, 0, MAX_REPLAYED_EXECUTION_EVENTS, true);
+              if (rawEventCount !== undefined && eventCount === undefined) {
+                this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an invalid event count.');
+              } else if (eventCount !== undefined && pending.nextEventSequence < eventCount) {
+                pending.deferredResult = result;
+                pending.expectedEventCount = eventCount;
+              } else if (eventCount !== undefined && pending.nextEventSequence > eventCount) {
+                this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent an inconsistent event count.');
+              } else {
+                this.resolvePendingRemoteExecution(requestId, pending, sourceId, result);
+              }
+            } else {
+              this.rejectPendingRemoteExecution(requestId, pending, 'Remote executor sent a malformed execution result.');
+            }
+          } else {
+            const receipt = this.completedExecutionReceipts.get(requestId);
+            if (receipt?.executorId === sourceId) this.acknowledgeExecutionResult(requestId, sourceId);
           }
           break;
         }
+        case 'executeResultAck': {
+          const requestId = String(frame.meta.requestId ?? '');
+          const completed = this.completedRemoteExecutions.get(requestId);
+          if (completed?.sourceId === sourceId) this.dropCompletedRemoteExecution(requestId);
+          break;
+        }
         case 'inputReply': {
-          const requestId = String(frame.meta.requestId);
+          const requestId = String(frame.meta.requestId ?? '');
           const owner = this.executionOwners.get(requestId);
           const value = typeof frame.meta.value === 'string' ? frame.meta.value : '';
-          if (owner?.peerId === sourceId && value.length <= 64 * 1024) {
-            this.kernels.get(owner.notebookKey)?.inputReply(value);
+          const rawEventSequence = frame.meta.eventSequence;
+          if (rawEventSequence === undefined) {
+            // Compatibility with an unsequenced 0.5.3 input request.
+            if (owner?.peerId === sourceId && value.length <= MAX_REMOTE_INPUT_CHARACTERS) {
+              this.kernels.get(owner.notebookKey)?.inputReply(value);
+            }
+            break;
           }
+          const eventSequence = boundedNumber(rawEventSequence, 0, MAX_REPLAYED_EXECUTION_EVENTS - 1, true);
+          const digest = createHash('sha256').update(value, 'utf8').digest('hex');
+          let success = false;
+          let message = 'The input reply does not match an active Jupyter prompt.';
+          if (eventSequence !== undefined && value.length <= MAX_REMOTE_INPUT_CHARACTERS
+            && owner?.peerId === sourceId && owner.inputRequestSequences?.has(eventSequence)) {
+            const previous = owner.inputReplyDigests?.get(eventSequence);
+            if (previous === digest) {
+              success = true;
+              message = '';
+            } else if (previous) {
+              message = 'A different reply was already accepted for this Jupyter prompt.';
+            } else {
+              try {
+                const kernel = this.kernels.get(owner.notebookKey);
+                if (!kernel) throw new Error('The Jupyter kernel is no longer available for input.');
+                kernel.inputReply(value);
+                owner.inputReplyDigests?.set(eventSequence, digest);
+                success = true;
+                message = '';
+              } catch (error) {
+                message = formatError(error);
+              }
+            }
+          } else if (eventSequence !== undefined && value.length <= MAX_REMOTE_INPUT_CHARACTERS) {
+            const completed = this.completedRemoteExecutions.get(requestId);
+            const previous = completed?.sourceId === sourceId
+              ? completed.inputReplyDigests.get(eventSequence)
+              : undefined;
+            if (previous === digest) {
+              success = true;
+              message = '';
+            } else if (previous) {
+              message = 'A different reply was already accepted for this completed Jupyter prompt.';
+            }
+          }
+          this.sendInputReplyAcknowledgement(sourceId, requestId, eventSequence, success, message);
+          break;
+        }
+        case 'inputReplyAck': {
+          const requestId = String(frame.meta.requestId ?? '');
+          const eventSequence = boundedNumber(
+            frame.meta.eventSequence,
+            0,
+            MAX_REPLAYED_EXECUTION_EVENTS - 1,
+            true,
+          );
+          if (eventSequence === undefined) break;
+          const key = inputReplyKey(requestId, eventSequence);
+          const pending = this.pendingInputReplies.get(key);
+          if (!pending || pending.executorId !== sourceId) break;
+          clearTimeout(pending.timer);
+          this.pendingInputReplies.delete(key);
+          if (frame.meta.success === true) pending.resolve();
+          else pending.reject(new Error(String(frame.meta.message ?? 'Remote Jupyter input was rejected.')));
           break;
         }
         case 'kernelCommand':
@@ -2219,6 +2667,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (sent % 256 === 0) await this.transport.awaitDrain(peerId);
     }
     await this.transport.awaitDrain(peerId);
+  }
+
+  private requestDocumentState(peerId: string, key: string, kind: DocumentKind): void {
+    if (!this.project.has(key)) return;
+    try {
+      this.transport.sendTo(peerId, 'stateVector', {
+        key,
+        kind,
+        fileState: this.effectiveFileState(key),
+      }, this.project.encodeStateVector(key));
+    } catch (error) {
+      this.log.appendLine(`[debug] Could not request document state for ${key}: ${formatError(error)}`);
+    }
   }
 
   private sendFilesystemState(peerId: string): void {
@@ -3274,9 +3735,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (stateEntries.length + binaryEntries.length > MAX_EXECUTION_MANIFEST_ENTRIES) {
       throw new Error('Peer filesystem-state manifest exceeds the entry limit.');
     }
-    for (const [relativePath, raw] of stateEntries) {
+    for (const [rawPath, raw] of stateEntries) {
       const state = normalizeFileState(raw, sourceId);
-      if (state) await this.acceptFileState(relativePath, state, sourceId);
+      const relativePath = normalizedTrackedPath(rawPath);
+      if (!state || !relativePath) continue;
+      const hadDocument = this.project.has(relativePath);
+      const accepted = await this.acceptFileState(relativePath, state, sourceId);
+      if (accepted && !hadDocument && !state.deleted && (state.kind === 'text' || state.kind === 'notebook')) {
+        this.requestDocumentState(sourceId, relativePath, state.kind);
+      }
     }
     for (const [rawPath, raw] of binaryEntries) {
       const relativePath = normalizedTrackedPath(rawPath);
@@ -3319,14 +3786,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const manifest = this.executionManifest();
       const statusPromise = this.waitForBarrierReply(requestId, 'status', executorId);
-      try {
-        this.transport.sendTo(executorId, 'executionBarrierCheck', {
-          requestId, notebookKey, target, manifest,
-        });
-      } catch (error) {
-        this.dropBarrierReply(requestId, 'status');
-        throw error;
-      }
+      void this.dispatchExecutionBarrierFrame(
+        executorId,
+        requestId,
+        'status',
+        'executionBarrierCheck',
+        { requestId, notebookKey, target, manifest },
+      );
       const status = await statusPromise;
       if (status.success !== true) {
         throw new Error(`File synchronization was refused by the executor: ${String(status.message ?? 'invalid barrier request')}`);
@@ -3336,7 +3802,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       for (const key of missingDocuments) {
         const kind = this.project.kindOf(key);
         if (!kind) throw new Error(`File synchronization failed: local document ${key} disappeared.`);
-        this.transport.sendTo(executorId, 'stateDocument', {
+        await this.sendToWithRouteRecovery(executorId, 'stateDocument', {
           key,
           kind,
           fileState: this.fileStates.get(key),
@@ -3348,14 +3814,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         await this.synchronizeBinaryVersion(executorId, relativePath, version);
       }));
       const ackPromise = this.waitForBarrierReply(requestId, 'ack', executorId);
-      try {
-        this.transport.sendTo(executorId, 'executionBarrierCommit', {
-          requestId, notebookKey, target, manifest,
-        });
-      } catch (error) {
-        this.dropBarrierReply(requestId, 'ack');
-        throw error;
-      }
+      void this.dispatchExecutionBarrierFrame(
+        executorId,
+        requestId,
+        'ack',
+        'executionBarrierCommit',
+        { requestId, notebookKey, target, manifest },
+      );
       const ack = await ackPromise;
       if (ack.success === true) return manifest;
       lastError = String(ack.message ?? 'remote hash verification failed');
@@ -3460,6 +3925,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const authorizationKey = barrierAuthorizationKey(sourceId, requestId);
     const pending = this.pendingBarrierAuthorizations.get(authorizationKey);
     const manifestDigest = manifest ? executionManifestDigest(manifest) : '';
+    const completed = this.completedExecutionBarriers.get(authorizationKey);
+    if (completed && notebookKey && target && manifest
+      && completed.sourceId === sourceId
+      && completed.notebookKey === notebookKey
+      && sameComputeTarget(completed.target, target)
+      && completed.manifestDigest === manifestDigest) {
+      this.transport.sendTo(sourceId, 'executionBarrierAck', { requestId, success: true, message: '' });
+      return;
+    }
     const authorized = Boolean(pending && notebookKey && target && manifest
       && pending.sourceId === sourceId
       && pending.notebookKey === notebookKey
@@ -3493,6 +3967,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const success = !badDocuments.length && !badBinaries.length && !badDirectories.length
       && !extraDocuments.length && !extraBinaries.length && !extraDirectories.length;
     if (success) {
+      const previous = this.completedExecutionBarriers.get(authorizationKey);
+      if (previous) clearTimeout(previous.timer);
       const timer = setTimeout(() => this.completedExecutionBarriers.delete(authorizationKey), COMPLETED_BARRIER_TIMEOUT_MS);
       this.completedExecutionBarriers.set(authorizationKey, {
         sourceId, notebookKey, target, manifestDigest, timer,
@@ -3636,7 +4112,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const timer = setTimeout(() => {
         this.pendingBinaryAcks.delete(key);
         reject(new Error(`File synchronization timed out waiting for ${relativePath} acknowledgement.`));
-      }, 20_000);
+      }, EXECUTION_BARRIER_REPLY_TIMEOUT_MS);
       this.pendingBinaryAcks.set(key, { peerId, relativePath, expected: version, resolve, reject, timer });
     });
   }
@@ -3707,12 +4183,32 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
   }
 
-  private dropBarrierReply(requestId: string, phase: 'status' | 'ack'): void {
+  private async dispatchExecutionBarrierFrame(
+    executorId: string,
+    requestId: string,
+    phase: 'status' | 'ack',
+    type: 'executionBarrierCheck' | 'executionBarrierCommit',
+    meta: Record<string, unknown>,
+  ): Promise<void> {
     const key = `${requestId}:${phase}`;
-    const pending = this.pendingBarrierReplies.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingBarrierReplies.delete(key);
+    const deadline = Date.now() + EXECUTION_BARRIER_REPLY_TIMEOUT_MS;
+    while (!this.closed && Date.now() < deadline) {
+      const pending = this.pendingBarrierReplies.get(key);
+      if (!pending || pending.executorId !== executorId) return;
+      try {
+        await this.waitForTransportRoute(executorId, Math.min(5_000, Math.max(1, deadline - Date.now())));
+        if (this.pendingBarrierReplies.get(key) !== pending) return;
+        this.transport.sendTo(executorId, type, meta);
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) {
+          clearTimeout(pending.timer);
+          this.pendingBarrierReplies.delete(key);
+          pending.reject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+      }
+      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+    }
   }
 
   private resolveBarrierReply(
@@ -4035,6 +4531,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private cancelExecutorRequests(executorId: string, reason: string): void {
+    for (const [key, pending] of this.pendingInputReplies) {
+      if (pending.executorId !== executorId) continue;
+      clearTimeout(pending.timer);
+      this.pendingInputReplies.delete(key);
+      pending.reject(new Error(reason));
+    }
     for (const [requestId, pending] of this.pendingExecutions) {
       if (pending.executorId !== executorId) continue;
       clearTimeout(pending.timer);
@@ -4049,19 +4551,204 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private sendExecutionAccepted(peerId: string, requestId: string): void {
+    try {
+      this.transport.sendTo(peerId, 'executeAccepted', { requestId });
+    } catch (error) {
+      // The requester repeats the same idempotent request until this acknowledgement arrives.
+      this.log.appendLine(`[debug] Could not acknowledge execution ${requestId}: ${formatError(error)}`);
+    }
+  }
+
+  private sendRemoteExecutionEvents(peerId: string, requestId: string, events: RemoteExecutionEventRecord[]): void {
+    for (const event of events) {
+      this.transport.sendTo(peerId, 'executionEvent', {
+        requestId,
+        eventSequence: event.sequence,
+      }, event.payload);
+    }
+  }
+
+  private deliverActiveRemoteExecution(requestId: string): void {
+    const owner = this.executionOwners.get(requestId);
+    if (!owner || !owner.events || this.closed) return;
+    if (owner.replayTimer) {
+      clearTimeout(owner.replayTimer);
+      owner.replayTimer = undefined;
+    }
+    this.sendExecutionAccepted(owner.peerId, requestId);
+    try {
+      this.sendRemoteExecutionEvents(owner.peerId, requestId, owner.events);
+      return;
+    } catch (error) {
+      this.log.appendLine(`[debug] Execution events ${requestId} await route recovery: ${formatError(error)}`);
+    }
+    if (this.executionOwners.get(requestId) !== owner) return;
+    owner.replayTimer = setTimeout(() => {
+      owner.replayTimer = undefined;
+      this.deliverActiveRemoteExecution(requestId);
+    }, executionDeliveryRetryMs(owner.eventBytes ?? 0));
+  }
+
+  private replayRemoteExecutionsForPeer(peerId: string): void {
+    for (const [requestId, owner] of this.executionOwners) {
+      if (owner.peerId !== peerId || !owner.events) continue;
+      this.deliverActiveRemoteExecution(requestId);
+    }
+    for (const [requestId, completed] of this.completedRemoteExecutions) {
+      if (completed.sourceId === peerId) this.deliverCompletedRemoteExecution(requestId);
+    }
+  }
+
+  private rememberCompletedRemoteExecution(
+    sourceId: string,
+    requestId: string,
+    requestDigest: string,
+    result: JupyterExecutionResult,
+    events: RemoteExecutionEventRecord[] = [],
+    inputReplyDigests: Map<number, string> = new Map(),
+  ): void {
+    this.dropCompletedRemoteExecution(requestId);
+    let resultPayload: Uint8Array<ArrayBufferLike>;
+    try {
+      resultPayload = encodeRemoteExecutionResult(result);
+    } catch (error) {
+      resultPayload = encodeRemoteExecutionResult({
+        requestId,
+        success: false,
+        content: {
+          status: 'error',
+          ename: 'OutputReplayLimit',
+          evalue: formatError(error),
+        },
+      });
+    }
+    const retainedBytes = resultPayload.byteLength
+      + events.reduce((total, event) => total + event.payload.byteLength, 0);
+    while (this.completedRemoteExecutions.size >= MAX_COMPLETED_REMOTE_EXECUTIONS
+      || this.completedRemoteExecutionBytes + retainedBytes > MAX_RETAINED_REMOTE_EXECUTION_BYTES) {
+      const oldest = this.completedRemoteExecutions.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.dropCompletedRemoteExecution(oldest);
+    }
+    const expiryTimer = setTimeout(
+      () => this.dropCompletedRemoteExecution(requestId),
+      COMPLETED_REMOTE_EXECUTION_TIMEOUT_MS,
+    );
+    this.completedRemoteExecutions.set(requestId, {
+      sourceId,
+      requestDigest,
+      resultPayload,
+      events,
+      retainedBytes,
+      inputReplyDigests: new Map(inputReplyDigests),
+      expiryTimer,
+      retryTimer: undefined,
+    });
+    this.completedRemoteExecutionBytes += retainedBytes;
+    this.deliverCompletedRemoteExecution(requestId);
+  }
+
+  private deliverCompletedRemoteExecution(requestId: string): void {
+    const completed = this.completedRemoteExecutions.get(requestId);
+    if (!completed || this.closed) return;
+    if (completed.retryTimer) {
+      clearTimeout(completed.retryTimer);
+      completed.retryTimer = undefined;
+    }
+    try {
+      this.sendRemoteExecutionEvents(completed.sourceId, requestId, completed.events);
+      this.transport.sendTo(completed.sourceId, 'executeResult', {
+        requestId,
+        eventCount: completed.events.length,
+      }, completed.resultPayload);
+    } catch (error) {
+      this.log.appendLine(`[debug] Execution result ${requestId} awaits route recovery: ${formatError(error)}`);
+    }
+    if (this.completedRemoteExecutions.get(requestId) !== completed) return;
+    completed.retryTimer = setTimeout(() => {
+      completed.retryTimer = undefined;
+      this.deliverCompletedRemoteExecution(requestId);
+    }, executionDeliveryRetryMs(completed.retainedBytes));
+  }
+
+  private dropCompletedRemoteExecution(requestId: string): void {
+    const completed = this.completedRemoteExecutions.get(requestId);
+    if (!completed) return;
+    clearTimeout(completed.expiryTimer);
+    if (completed.retryTimer) clearTimeout(completed.retryTimer);
+    this.completedRemoteExecutions.delete(requestId);
+    this.completedRemoteExecutionBytes = Math.max(
+      0,
+      this.completedRemoteExecutionBytes - completed.retainedBytes,
+    );
+  }
+
+  private rememberCompletedExecutionReceipt(requestId: string, executorId: string): void {
+    const previous = this.completedExecutionReceipts.get(requestId);
+    if (previous) clearTimeout(previous.timer);
+    while (!previous && this.completedExecutionReceipts.size >= MAX_COMPLETED_REMOTE_EXECUTIONS) {
+      const oldest = this.completedExecutionReceipts.keys().next().value as string | undefined;
+      if (!oldest) break;
+      const receipt = this.completedExecutionReceipts.get(oldest);
+      if (receipt) clearTimeout(receipt.timer);
+      this.completedExecutionReceipts.delete(oldest);
+    }
+    const timer = setTimeout(
+      () => this.completedExecutionReceipts.delete(requestId),
+      COMPLETED_REMOTE_EXECUTION_TIMEOUT_MS,
+    );
+    this.completedExecutionReceipts.set(requestId, { executorId, timer });
+  }
+
+  private acknowledgeExecutionResult(requestId: string, executorId: string): void {
+    try {
+      this.transport.sendTo(executorId, 'executeResultAck', { requestId });
+    } catch (error) {
+      // The executor retains and repeats the result, so a later copy will trigger another acknowledgement.
+      this.log.appendLine(`[debug] Could not acknowledge execution result ${requestId}: ${formatError(error)}`);
+    }
+  }
+
+  private sendInputReplyAcknowledgement(
+    peerId: string,
+    requestId: string,
+    eventSequence: number | undefined,
+    success: boolean,
+    message: string,
+  ): void {
+    if (eventSequence === undefined) return;
+    try {
+      this.transport.sendTo(peerId, 'inputReplyAck', {
+        requestId,
+        eventSequence,
+        success,
+        message,
+      });
+    } catch (error) {
+      // The requester repeats the same digest-bound reply until this acknowledgement arrives.
+      this.log.appendLine(`[debug] Could not acknowledge Jupyter input ${requestId}: ${formatError(error)}`);
+    }
+  }
+
   private async handleExecutionRequest(frame: WireFrame, sourceId: string): Promise<void> {
     const requestId = String(frame.meta.requestId ?? '');
     const notebookKey = normalizedTrackedPath(String(frame.meta.notebookKey ?? ''));
     const rejectRequest = (ename: string, evalue: string): void => {
       if (!TRANSFER_ID_PATTERN.test(requestId)) return;
-      this.transport.sendTo(sourceId, 'executeResult', {
-        requestId,
-        result: {
+      try {
+        const result = {
           requestId,
           success: false,
           content: { status: 'error', ename, evalue },
-        } satisfies JupyterExecutionResult,
-      });
+        } satisfies JupyterExecutionResult;
+        this.transport.sendTo(sourceId, 'executeResult', {
+          requestId,
+          eventCount: 0,
+        }, encodeRemoteExecutionResult(result));
+      } catch (error) {
+        this.log.appendLine(`[debug] Could not reject execution ${requestId}: ${formatError(error)}`);
+      }
     };
     const target = normalizeComputeTarget(frame.meta.target, sourceId);
     const manifest = normalizeExecutionManifest({
@@ -4071,6 +4758,26 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }, sourceId);
     if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target || !manifest) {
       rejectRequest('InvalidExecutionRequest', 'The remote execution request is malformed.');
+      return;
+    }
+    const requestDigest = remoteExecutionRequestDigest(notebookKey, target, manifest, frame.payload);
+    const completed = this.completedRemoteExecutions.get(requestId);
+    if (completed) {
+      if (completed.sourceId === sourceId && completed.requestDigest === requestDigest) {
+        this.sendExecutionAccepted(sourceId, requestId);
+        this.deliverCompletedRemoteExecution(requestId);
+      } else {
+        rejectRequest('InvalidExecutionRequest', 'The execution request id was already used for different content.');
+      }
+      return;
+    }
+    const activeOwner = this.executionOwners.get(requestId);
+    if (activeOwner) {
+      if (activeOwner.peerId === sourceId && activeOwner.requestDigest === requestDigest) {
+        this.deliverActiveRemoteExecution(requestId);
+      } else {
+        rejectRequest('ExecutionBusy', 'The execution request id is already active.');
+      }
       return;
     }
     const expectedTarget = this.computeForNotebook(notebookKey);
@@ -4108,10 +4815,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       rejectRequest('InvalidExecutionRequest', 'The remote code cell is not valid UTF-8.');
       return;
     }
-    if (this.executionOwners.has(requestId)) {
-      rejectRequest('ExecutionBusy', 'The execution request id is already active.');
-      return;
-    }
     const remoteOwners = [...this.executionOwners.values()]
       .filter((owner) => owner.peerId !== this.descriptor.localPeer.peerId);
     if (remoteOwners.length >= MAX_REMOTE_EXECUTIONS
@@ -4140,22 +4843,30 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       ...extraDirectories,
     ];
     if (mismatch.length) {
-      this.transport.sendTo(sourceId, 'executeResult', {
+      this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, {
         requestId,
-        result: {
-          requestId,
-          success: false,
-          content: {
-            status: 'error',
-            ename: 'FileVersionBarrier',
-            evalue: `Executor project barrier mismatch: ${mismatch.join(', ')}`,
-          },
-        } satisfies JupyterExecutionResult,
+        success: false,
+        content: {
+          status: 'error',
+          ename: 'FileVersionBarrier',
+          evalue: `Executor project barrier mismatch: ${mismatch.join(', ')}`,
+        },
       });
       return;
     }
-    this.executionOwners.set(requestId, { peerId: sourceId, notebookKey });
+    const executionOwner: ExecutionOwner = {
+      peerId: sourceId,
+      notebookKey,
+      requestDigest,
+      events: [],
+      eventBytes: 0,
+      inputRequestSequences: new Set(),
+      inputReplyDigests: new Map(),
+    };
+    this.executionOwners.set(requestId, executionOwner);
+    this.sendExecutionAccepted(sourceId, requestId);
     let timeout: NodeJS.Timeout | undefined;
+    let result: JupyterExecutionResult;
     try {
       const execution = this.executeLocally(
         notebookKey,
@@ -4163,10 +4874,38 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         requestId,
         code,
         (event) => {
+          if (executionOwner.eventOverflow) return;
+          let payload: Uint8Array<ArrayBufferLike>;
           try {
-            this.transport.sendTo(sourceId, 'executionEvent', { requestId, event });
+            payload = encodeRemoteExecutionEvent(event);
           } catch (error) {
-            this.log.appendLine(`[error] Could not forward Jupyter event to ${sourceId}: ${formatError(error)}`);
+            executionOwner.eventOverflow = error instanceof Error ? error : new Error(String(error));
+            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            return;
+          }
+          const events = executionOwner.events ?? [];
+          const nextBytes = (executionOwner.eventBytes ?? 0) + payload.byteLength;
+          if (events.length >= MAX_REPLAYED_EXECUTION_EVENTS
+            || nextBytes > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+            executionOwner.eventOverflow = new Error(
+              'Remote Jupyter output exceeded the bounded reconnect replay queue.',
+            );
+            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            return;
+          }
+          const record = { sequence: events.length, payload } satisfies RemoteExecutionEventRecord;
+          events.push(record);
+          executionOwner.events = events;
+          executionOwner.eventBytes = nextBytes;
+          if (event.type === 'inputRequest') executionOwner.inputRequestSequences?.add(record.sequence);
+          try {
+            this.transport.sendTo(sourceId, 'executionEvent', {
+              requestId,
+              eventSequence: record.sequence,
+            }, record.payload);
+          } catch (error) {
+            this.log.appendLine(`[debug] Jupyter event ${record.sequence} awaits route recovery: ${formatError(error)}`);
+            this.deliverActiveRemoteExecution(requestId);
           }
         },
       );
@@ -4176,21 +4915,37 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           reject(new Error('Remote execution timed out after four hours.'));
         }, REMOTE_EXECUTION_TIMEOUT_MS);
       });
-      const result = await Promise.race([execution, timedOut]);
-      this.transport.sendTo(sourceId, 'executeResult', { requestId, result });
+      result = await Promise.race([execution, timedOut]);
     } catch (error) {
-      this.transport.sendTo(sourceId, 'executeResult', {
+      result = {
         requestId,
-        result: {
-          requestId,
-          success: false,
-          content: { status: 'error', ename: 'KernelError', evalue: formatError(error) },
-        } satisfies JupyterExecutionResult,
-      });
+        success: false,
+        content: { status: 'error', ename: 'KernelError', evalue: formatError(error) },
+      };
     } finally {
       if (timeout) clearTimeout(timeout);
+      if (executionOwner.replayTimer) clearTimeout(executionOwner.replayTimer);
       this.executionOwners.delete(requestId);
     }
+    if (executionOwner.eventOverflow) {
+      result = {
+        requestId,
+        success: false,
+        content: {
+          status: 'error',
+          ename: 'OutputReplayLimit',
+          evalue: executionOwner.eventOverflow.message,
+        },
+      };
+    }
+    this.rememberCompletedRemoteExecution(
+      sourceId,
+      requestId,
+      requestDigest,
+      result,
+      executionOwner.events ?? [],
+      executionOwner.inputReplyDigests ?? new Map(),
+    );
   }
 
   private async handleKernelCommand(frame: WireFrame, sourceId: string): Promise<void> {
@@ -4273,18 +5028,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   ): Promise<void> {
     const requestId = newId();
     return new Promise<void>((resolve, reject) => {
+      const commandTimeoutMs = command === 'restart' ? 40_000 : 10_000;
+      const routeTimeoutMs = EXECUTION_ACCEPT_TIMEOUT_MS;
       const timer = setTimeout(() => {
         this.pendingKernelCommands.delete(requestId);
-        reject(new Error(`Remote kernel ${command} timed out.`));
-      }, command === 'restart' ? 40_000 : 10_000);
+        reject(new Error(`Remote kernel ${command} could not be delivered after route recovery.`));
+      }, routeTimeoutMs + commandTimeoutMs);
       this.pendingKernelCommands.set(requestId, { executorId, resolve, reject, timer });
-      try {
-        this.transport.sendTo(executorId, 'kernelCommand', { requestId, notebookKey, target, command });
-      } catch (error) {
-        clearTimeout(timer);
+      void this.sendToWithRouteRecovery(
+        executorId,
+        'kernelCommand',
+        { requestId, notebookKey, target, command },
+        new Uint8Array(),
+        routeTimeoutMs,
+      ).then(() => {
+        const pending = this.pendingKernelCommands.get(requestId);
+        if (!pending || pending.executorId !== executorId) return;
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(() => {
+          if (this.pendingKernelCommands.get(requestId) !== pending) return;
+          this.pendingKernelCommands.delete(requestId);
+          pending.reject(new Error(`Remote kernel ${command} timed out after delivery.`));
+        }, commandTimeoutMs);
+      }).catch((error) => {
+        const pending = this.pendingKernelCommands.get(requestId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
         this.pendingKernelCommands.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 
@@ -4408,8 +5180,50 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.emit('state', state, detail);
   }
 
-  public async setBackingFolder(folder: string): Promise<void> {
+  public async inspectBackingFolder(folder: string): Promise<BackingFolderInspection> {
+    if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can inspect a shared backing folder.');
+    const resolved = await this.validateBackingFolder(folder);
+    if (!this.storage) throw new Error('Session storage is not ready.');
+    const snapshot = await this.collectMaterialization();
+    return this.storage.inspectMaterializedFolder(
+      resolved,
+      snapshot.documents,
+      snapshot.binaries,
+      snapshot.directories,
+    );
+  }
+
+  public async setBackingFolder(folder: string, mode: BackingFolderMode = 'replace'): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the shared backing folder.');
+    const resolved = await this.validateBackingFolder(folder);
+    if (!this.storage) throw new Error('Session storage is not ready.');
+    const previous = this.descriptor.backingFolder;
+    if (mode === 'reuse-existing') {
+      const snapshot = await this.collectMaterialization();
+      const inspection = await this.storage.bindExistingBacking(
+        resolved,
+        snapshot.documents,
+        snapshot.binaries,
+        snapshot.directories,
+      );
+      if (!inspection.matches) throw new BackingFolderMismatchError(inspection);
+    } else {
+      this.storage.setBackingRoot(resolved);
+    }
+    this.descriptor.backingFolder = resolved;
+    try {
+      if (mode === 'replace') await this.materializeBackingFolder();
+      await this.persistDescriptor();
+      await this.onHostStorageReady(this.descriptor.localPeer.peerId);
+      this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
+    } catch (error) {
+      this.descriptor.backingFolder = previous;
+      this.storage.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
+      throw error;
+    }
+  }
+
+  private async validateBackingFolder(folder: string): Promise<string> {
     const [resolved, workingFolder, autosaveFolder] = await Promise.all([
       canonicalFolderPath(folder),
       canonicalFolderPath(this.descriptor.workingFolder),
@@ -4421,19 +5235,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (pathsOverlap(resolved, autosaveFolder)) {
       throw new Error('The shared backing folder must be separate from the local autosave folder.');
     }
-    const previous = this.descriptor.backingFolder;
-    this.descriptor.backingFolder = resolved;
-    this.storage?.setBackingRoot(resolved);
-    try {
-      await this.materializeBackingFolder();
-      await this.persistDescriptor();
-      await this.onHostStorageReady(this.descriptor.localPeer.peerId);
-      this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
-    } catch (error) {
-      this.descriptor.backingFolder = previous;
-      this.storage?.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
-      throw error;
-    }
+    return resolved;
   }
 
   private async normalizeRestoredBackingFolder(): Promise<void> {
@@ -4588,6 +5390,19 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function runtimeDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function executionDeliveryRetryMs(retainedBytes: number): number {
+  const estimatedTransferMs = Math.ceil(Math.max(0, retainedBytes) / (512 * 1024)) * 1_000;
+  return Math.max(EXECUTION_RESULT_RETRY_MS, Math.min(60_000, estimatedTransferMs));
+}
+
+function isRouteUnavailableError(error: unknown): boolean {
+  return /no (?:authenticated )?route to peer|peer .+ disconnected during transfer/i.test(formatError(error));
 }
 
 function binaryAckKey(peerId: string, relativePath: string, hash: string, version: number, author: string): string {
@@ -4943,6 +5758,47 @@ function normalizeExecutionManifest(value: unknown, fallbackAuthor: string): Exe
   return { documents, binaries, directories };
 }
 
+function encodeRemoteExecutionEvent(event: JupyterKernelEvent): Uint8Array<ArrayBufferLike> {
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(event), 'utf8');
+  } catch (error) {
+    throw new Error(`Could not serialize the remote Jupyter event: ${formatError(error)}`);
+  }
+  if (payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+    throw new Error('A remote Jupyter event exceeded the reconnect replay byte limit.');
+  }
+  return payload;
+}
+
+function decodeRemoteExecutionEvent(
+  frame: WireFrame,
+  expectedRequestId: string,
+): { event: JupyterKernelEvent; byteLength: number } | undefined {
+  let value: unknown;
+  let byteLength: number;
+  if (frame.payload.byteLength) {
+    if (frame.payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+    try {
+      value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frame.payload));
+    } catch {
+      return undefined;
+    }
+    byteLength = frame.payload.byteLength;
+  } else {
+    // Compatibility with version 0.5.3, which put the event in frame metadata.
+    value = frame.meta.event;
+    try {
+      byteLength = Buffer.byteLength(JSON.stringify(value), 'utf8');
+    } catch {
+      return undefined;
+    }
+    if (byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+  }
+  const event = normalizeRemoteJupyterEvent(value, expectedRequestId);
+  return event ? { event, byteLength } : undefined;
+}
+
 function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string): JupyterKernelEvent | undefined {
   if (!isPlainRecord(value) || value.requestId !== expectedRequestId
     || typeof value.type !== 'string' || !REMOTE_JUPYTER_EVENT_TYPES.has(value.type)) return undefined;
@@ -4953,7 +5809,7 @@ function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string):
     if (!Array.isArray(value.buffersBase64) || value.buffersBase64.length > 16) return undefined;
     buffersBase64 = [];
     for (const item of value.buffersBase64) {
-      if (typeof item !== 'string' || item.length > 768 * 1024
+      if (typeof item !== 'string' || item.length > MAX_REMOTE_JUPYTER_BUFFER_BASE64_CHARACTERS
         || item.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(item)) return undefined;
       buffersBase64.push(item);
     }
@@ -4976,6 +5832,35 @@ function normalizeRemoteJupyterEvent(value: unknown, expectedRequestId: string):
     message: boundedString(value.message, 64 * 1024),
     traceback: boundedString(value.traceback, 256 * 1024),
   };
+}
+
+function encodeRemoteExecutionResult(result: JupyterExecutionResult): Uint8Array<ArrayBufferLike> {
+  let payload: Buffer;
+  try {
+    payload = Buffer.from(JSON.stringify(result), 'utf8');
+  } catch (error) {
+    throw new Error(`Could not serialize the remote execution result: ${formatError(error)}`);
+  }
+  if (payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) {
+    throw new Error('The remote execution result exceeded the replay byte limit.');
+  }
+  return payload;
+}
+
+function decodeRemoteExecutionResult(frame: WireFrame, expectedRequestId: string): JupyterExecutionResult | undefined {
+  let value: unknown;
+  if (frame.payload.byteLength) {
+    if (frame.payload.byteLength > MAX_REPLAYED_EXECUTION_EVENT_BYTES) return undefined;
+    try {
+      value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frame.payload));
+    } catch {
+      return undefined;
+    }
+  } else {
+    // Compatibility with version 0.5.3, which put the result in frame metadata.
+    value = frame.meta.result;
+  }
+  return normalizeRemoteExecutionResult(value, expectedRequestId);
 }
 
 function normalizeRemoteExecutionResult(value: unknown, expectedRequestId: string): JupyterExecutionResult | undefined {
@@ -5021,6 +5906,26 @@ function executionManifestDigest(manifest: ExecutionManifest): string {
   return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex');
 }
 
+function remoteExecutionRequestDigest(
+  notebookKey: string,
+  target: NotebookComputeTarget,
+  manifest: ExecutionManifest,
+  payload: Uint8Array<ArrayBufferLike>,
+): string {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      notebookKey,
+      target.executorId,
+      target.device,
+      target.pythonPath ?? null,
+      target.epoch,
+      target.author,
+      executionManifestDigest(manifest),
+    ]), 'utf8')
+    .update(Buffer.from(payload))
+    .digest('hex');
+}
+
 function requestedManifestPaths<T>(value: unknown, manifest: Record<string, T>): string[] {
   if (!Array.isArray(value) || value.length > MAX_EXECUTION_MANIFEST_ENTRIES) {
     throw new Error('Executor returned an invalid file synchronization request.');
@@ -5039,6 +5944,10 @@ function requestedManifestPaths<T>(value: unknown, manifest: Record<string, T>):
 
 function barrierAuthorizationKey(sourceId: string, requestId: string): string {
   return `${sourceId}:${requestId}`;
+}
+
+function inputReplyKey(requestId: string, eventSequence: number): string {
+  return `${requestId}:${eventSequence}`;
 }
 
 function computeAvailabilityErrorName(message: string): string {
@@ -5244,6 +6153,7 @@ function isClockAgnosticFrame(type: string): boolean {
     'snapshotRequest', 'snapshotCheckpointAck', 'snapshotFileRetry', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
     'fileDelete', 'directoryCreate', 'fileRename', 'computeChanged', 'computeState', 'hostTransferFinalize',
     'executionBarrierCheck', 'executionBarrierStatus', 'executionBarrierCommit', 'executionBarrierAck',
-    'executeRequest', 'executionEvent', 'executeResult', 'inputReply', 'kernelCommand', 'kernelCommandResult',
+    'executeRequest', 'executeAccepted', 'executionEvent', 'executeResult', 'executeResultAck',
+    'inputReply', 'inputReplyAck', 'kernelCommand', 'kernelCommandResult',
   ]).has(type);
 }

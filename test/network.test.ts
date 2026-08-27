@@ -430,6 +430,125 @@ describe('mesh network configuration', () => {
 describe('mesh relay fallback integration', function () {
   this.timeout(30_000);
 
+  it('keeps a logical peer online while immediately replacing a failed physical route', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'recovering-host', displayName: 'Recovering Host', joinOrder: 0 };
+    const transport = new MeshTransport({
+      sessionId: 'logical-route-recovery', token: 'logical-route-recovery-token-is-long-enough',
+      localPeer: { peerId: 'recovery-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: identity.peerId }),
+      isHost: () => false,
+      logicalPeerRecoveryMs: 100,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string;
+        identity: typeof identity;
+        purpose: 'runtime';
+        connectedAt: number;
+        lastSeen: number;
+        snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      relay: {
+        connectedRelayCount: number;
+        onFrame: () => void;
+        onPeerAnnounce: () => void;
+        start: () => void;
+        stop: () => void;
+        sendAnnounce: () => void;
+        send: () => void;
+      };
+      onPeerLeave: (transportPeerId: string) => void;
+      finishLogicalRecovery: (peerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    let relaySends = 0;
+    let disconnects = 0;
+    transport.connect(identity);
+    internals.relay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => { relaySends += 1; },
+      send: () => { relaySends += 1; },
+    };
+    internals.connections.set('direct-route', {
+      transportPeerId: 'direct-route', identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    internals.identityToTransport.set(identity.peerId, 'direct-route');
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      internals.onPeerLeave('direct-route');
+      assert.equal(disconnects, 0, 'physical leave became an immediate logical disconnect');
+      assert.equal(transport.isPeerRecovering(identity.peerId), true);
+      assert.equal(transport.peerRuntime().find((peer) => peer.peerId === identity.peerId)?.online, true);
+      assert.ok(relaySends >= 2, 'relay fallback was not started immediately');
+
+      const routed = transport.waitForRoute(identity.peerId, 100);
+      internals.connections.set('relay:recovering-host', {
+        transportPeerId: 'relay:recovering-host', identity, purpose: 'runtime',
+        connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      internals.identityToTransport.set(identity.peerId, 'relay:recovering-host');
+      internals.finishLogicalRecovery(identity.peerId);
+      await routed;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.equal(disconnects, 0);
+      assert.equal(transport.hasRoute(identity.peerId), true);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('emits one logical disconnect only after every route misses the recovery lease', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'lost-host', displayName: 'Lost Host', joinOrder: 0 };
+    const transport = new MeshTransport({
+      sessionId: 'logical-route-expiry', token: 'logical-route-expiry-token-is-long-enough',
+      localPeer: { peerId: 'expiry-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: identity.peerId }),
+      isHost: () => false,
+      logicalPeerRecoveryMs: 20,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string;
+        identity: typeof identity;
+        purpose: 'runtime';
+        connectedAt: number;
+        lastSeen: number;
+        snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      onPeerLeave: (transportPeerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    transport.connect(identity);
+    internals.connections.set('direct-route', {
+      transportPeerId: 'direct-route', identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    internals.identityToTransport.set(identity.peerId, 'direct-route');
+    let disconnects = 0;
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      internals.onPeerLeave('direct-route');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(disconnects, 1);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+      assert.equal(transport.peerRuntime().some((peer) => peer.peerId === identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it('refuses to advertise a session when the guaranteed relay readiness barrier fails', async () => {
     const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
     const deadRoom = {
@@ -589,7 +708,7 @@ describe('mesh relay fallback integration', function () {
       const failedNonce = localInternals.relayNegotiations.get('z-guest')?.localHs.nonce;
       assert.ok(failedNonce);
       localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
-        k: 'pr', pr: { version: 2, signature: Buffer.alloc(64).toString('base64') },
+        k: 'pr', pr: { version: 3, signature: Buffer.alloc(64).toString('base64') },
       })));
       await new Promise<void>((resolve) => queueMicrotask(resolve));
 
@@ -648,7 +767,7 @@ describe('mesh relay fallback integration', function () {
       localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
         k: 'pr',
         pr: {
-          version: 2,
+          version: 3,
           signature: Buffer.alloc(64).toString('base64'),
           transcriptId: '0'.repeat(64),
         },

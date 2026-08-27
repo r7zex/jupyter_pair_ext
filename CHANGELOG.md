@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.4 - 2026-08-27 (execution recovery and safe host promotion)
+
+- Keeps an authenticated logical participant online during a bounded physical-route recovery lease. A transient WebRTC path loss now starts immediate relay/direct rediscovery instead of prematurely transferring host authority.
+- Makes remote execution idempotent and recoverable: file barriers retry, requests receive bounded acceptance acknowledgements, completed results replay until acknowledged, and a request ID can never launch the same cell twice.
+- Replays ordered Jupyter events after route restoration, deduplicates repeated events, and waits for every preceding event before accepting the terminal result. Events and results now use the binary payload instead of the 1 MiB metadata header.
+- Aligns the complete rich-output pipeline at a bounded 32 MiB transport/bridge queue while retaining the 16 MiB rendered-cell limit. Large images/HTML no longer kill the Python bridge or fail the Mesh payload filter.
+- Makes stdin replies digest-bound and exactly-once with acknowledgements; lost replies are retried without writing duplicate input lines. Interrupt and Restart wait for route recovery instead of failing on a stale route snapshot.
+- Fixes newly discovered CRDT documents being materialized as empty before the missing-content check, which made the full-state request branch unreachable and hid participant file contents after reconnection.
+- Adds an explicit, retryable new-host folder workflow: empty-folder materialization, exact existing/Dropbox-folder verification without rewrite, explicit confirmation for mismatches, and a persistent pause-card action after cancellation.
+- Advances the signed transport handshake to protocol v3 so mixed 0.5.3/0.5.4 peers fail clearly during admission instead of connecting with incompatible execution framing.
+
 ## 0.5.3 - 2026-08-26 (verified relay data paths and recovery)
 
 - Fixes false emergency readiness after a protocol-defined Nostr `CLOSED`/negative `OK` response or a rejected/downgraded MQTT SUBACK. These states previously counted as connected even though they could not provide the required delivery semantics.

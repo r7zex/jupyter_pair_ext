@@ -2,7 +2,7 @@
 
 Date: 2026-08-27
 
-Target release: 0.5.3
+Target release: 0.5.4
 
 Target scenario: two Windows computers in Russia, including Flowseal/zapret on one endpoint and Karing TUN or Windows system-proxy mode on the other. The same transport must also work for every unordered pairing of direct, Flowseal/zapret, Karing TUN, Karing system proxy, explicit HTTP proxy, and environment proxy paths.
 
@@ -10,7 +10,7 @@ Target scenario: two Windows computers in Russia, including Flowseal/zapret on o
 
 Absolute operation without any outbound connectivity cannot be guaranteed by a networked application. The enforceable contract for this release is:
 
-1. Both computers run the same Pair Notebook 0.5.3 VSIX.
+1. Both computers run the same Pair Notebook 0.5.4 VSIX; protocol v3 rejects 0.5.3 peers before session admission.
 2. Each computer has a working outbound secure-WebSocket path through its active routing software.
 3. Start and Join attempt two independent complete emergency data families, Nostr and MQTT.
 4. The local transport does not report readiness until at least one complete emergency family returns an invite-key-encrypted publish-to-receive self-check.
@@ -30,11 +30,17 @@ Absolute operation without any outbound connectivity cannot be guaranteed by a n
 - Enabled MQTT retry after transient CONNACK rejection.
 - Fixed relay-construction failures so they cannot be silently ignored.
 - Added a permanent forced-relay public smoke test. It disables WebRTC and both normal signalling rooms, runs one process directly and one through the detected Windows/Karing system proxy, and exchanges eight 64 KiB frames in all seven compatible ordered Nostr-only, MQTT-only, and redundant combinations.
-- Updated the release documentation; the current release replaces the tracked 0.5.2 VSIX with 0.5.3.
+- Added a logical route-recovery lease so a physical path flap cannot prematurely transfer host authority.
+- Added acknowledged/idempotent execution, file-barrier retry, ordered event/result replay, and exactly-once stdin delivery.
+- Fixed missing content for newly discovered CRDT documents after reconnection.
+- Added persistent new-host folder retry with explicit empty-folder and exact existing/shared-folder modes.
+- Updated the release documentation; 0.5.4 replaces the tracked 0.5.3 VSIX and requires the new VSIX on both computers.
 
 ## Completed validation
 
-- `npm run artifacts`: PASS, including lint, compile, 262 deterministic tests, VSIX packaging, and artifact-content validation.
+- `npm run artifacts`: PASS, including lint, compile, 272 deterministic tests, VSIX packaging, and artifact-content validation.
+- Exact VSIX installation: PASS as `pair-notebook.pair-notebook@0.5.4`; the installed bundle and Python bridge match the release build.
+- VSIX SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
 - `python .\test\jupyter_bridge_unit.py`: PASS, 7 tests.
 - `npm audit --omit=dev`: PASS, 0 vulnerabilities.
 - `npm run test:live`: PASS, public Nostr signalling plus WebRTC between independent Node processes.
@@ -57,11 +63,11 @@ npm audit --omit=dev
 npm run test:live
 npm run test:live:mqtt
 npm run test:live:relay
-code --install-extension .\pair-notebook-0.5.3.vsix --force
+code --install-extension .\pair-notebook-0.5.4.vsix --force
 code --list-extensions --show-versions
-Get-FileHash -Algorithm SHA256 .\pair-notebook-0.5.3.vsix
+Get-FileHash -Algorithm SHA256 .\pair-notebook-0.5.4.vsix
 git ls-files "*.vsix"
 git diff --check
 ```
 
-Expected tracked artifact: `pair-notebook-0.5.3.vsix` only.
+Expected tracked artifact: `pair-notebook-0.5.4.vsix` only.
