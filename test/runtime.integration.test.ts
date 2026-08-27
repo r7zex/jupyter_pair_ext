@@ -757,6 +757,55 @@ describe('runtime repair invariants', () => {
     assert.deepEqual(connected, ['host']);
   });
 
+  it('requests the full CRDT update when a peer state vector introduces a new document', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-new-document-vector-'));
+    const sourceFolder = path.join(root, 'source');
+    const receiverFolder = path.join(root, 'receiver');
+    const extensionRoot = path.join(root, 'extension');
+    await Promise.all([
+      mkdir(sourceFolder, { recursive: true }),
+      mkdir(receiverFolder, { recursive: true }),
+      mkdir(extensionRoot, { recursive: true }),
+    ]);
+    const source = new SessionRuntime(descriptor({
+      sessionId: 'new-document-vector', role: 'peer', peerId: 'peer-z', hostPeerId: 'host',
+      workingFolder: sourceFolder, pythonPath: process.execPath,
+    }), 'new-document-vector-token-that-is-long-enough', context(extensionRoot), logger());
+    const receiver = new SessionRuntime(descriptor({
+      sessionId: 'new-document-vector', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: receiverFolder, pythonPath: process.execPath,
+    }), 'new-document-vector-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array }> = [];
+    (receiver as any).transport = {
+      sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array = new Uint8Array()) => {
+        sent.push({ type, meta, payload });
+      },
+      broadcast: () => undefined,
+      stop: async () => undefined,
+    };
+    try {
+      source.project.ensureText('peer-created.py', 'print("from peer")');
+      const fileState = (source as any).ensureLiveFileState('peer-created.py', 'text');
+      await (receiver as any).onMessage({
+        type: 'stateVector',
+        payload: source.project.encodeStateVector('peer-created.py'),
+        meta: { key: 'peer-created.py', kind: 'text', fileState },
+      }, 'peer-z');
+
+      const stateRequest = sent.find((item) => item.type === 'stateVector');
+      assert.ok(stateRequest, 'the empty receiver must request the source state instead of returning an empty diff');
+      await (receiver as any).onMessage({
+        type: 'stateDiff',
+        payload: source.project.encodeUpdate('peer-created.py', stateRequest!.payload),
+        meta: { key: 'peer-created.py', kind: 'text', fileState },
+      }, 'peer-z');
+      assert.equal(receiver.project.text('peer-created.py').toString(), 'print("from peer")');
+    } finally {
+      await Promise.all([(source as any).disposeAsync(), (receiver as any).disposeAsync()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('defers every working-copy write until restored editors are bound', async () => {
     const runtime: any = Object.create(SessionRuntime.prototype);
     runtime.workingCopyWriter = undefined;

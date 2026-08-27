@@ -1943,6 +1943,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const key = normalizedTrackedPath(String(frame.meta.key ?? ''));
           const kind = frame.meta.kind as DocumentKind;
           if (key && (kind === 'text' || kind === 'notebook')) {
+            // acceptFileState materializes a new empty CRDT document. Remember
+            // whether it existed first, otherwise the branch that asks the
+            // source for its full state is permanently unreachable.
+            const hadDocument = this.project.has(key);
             const incomingState = normalizeFileState(frame.meta.fileState, sourceId, kind);
             if (!incomingState || !await this.acceptFileState(key, incomingState, sourceId)) break;
             const localState = this.effectiveFileState(key);
@@ -1950,7 +1954,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               this.transport.sendTo(sourceId, 'fileState', { relativePath: key, state: localState });
               break;
             }
-            if (!this.project.has(key)) {
+            if (!hadDocument) {
               const state = this.ensureLiveFileState(key, kind);
               if (kind === 'text') this.project.ensureText(key);
               else this.project.ensureNotebook(key);
@@ -1967,7 +1971,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         case 'fileState': {
           const relativePath = normalizedTrackedPath(String(frame.meta.relativePath ?? ''));
           const state = normalizeFileState(frame.meta.state, sourceId);
-          if (relativePath && state) await this.acceptFileState(relativePath, state, sourceId);
+          if (relativePath && state) {
+            const hadDocument = this.project.has(relativePath);
+            const accepted = await this.acceptFileState(relativePath, state, sourceId);
+            if (accepted && !hadDocument && !state.deleted && (state.kind === 'text' || state.kind === 'notebook')) {
+              this.requestDocumentState(sourceId, relativePath, state.kind);
+            }
+          }
           break;
         }
         case 'stateEnd':
@@ -2358,6 +2368,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (sent % 256 === 0) await this.transport.awaitDrain(peerId);
     }
     await this.transport.awaitDrain(peerId);
+  }
+
+  private requestDocumentState(peerId: string, key: string, kind: DocumentKind): void {
+    if (!this.project.has(key)) return;
+    try {
+      this.transport.sendTo(peerId, 'stateVector', {
+        key,
+        kind,
+        fileState: this.effectiveFileState(key),
+      }, this.project.encodeStateVector(key));
+    } catch (error) {
+      this.log.appendLine(`[debug] Could not request document state for ${key}: ${formatError(error)}`);
+    }
   }
 
   private sendFilesystemState(peerId: string): void {
@@ -3413,9 +3436,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (stateEntries.length + binaryEntries.length > MAX_EXECUTION_MANIFEST_ENTRIES) {
       throw new Error('Peer filesystem-state manifest exceeds the entry limit.');
     }
-    for (const [relativePath, raw] of stateEntries) {
+    for (const [rawPath, raw] of stateEntries) {
       const state = normalizeFileState(raw, sourceId);
-      if (state) await this.acceptFileState(relativePath, state, sourceId);
+      const relativePath = normalizedTrackedPath(rawPath);
+      if (!state || !relativePath) continue;
+      const hadDocument = this.project.has(relativePath);
+      const accepted = await this.acceptFileState(relativePath, state, sourceId);
+      if (accepted && !hadDocument && !state.deleted && (state.kind === 'text' || state.kind === 'notebook')) {
+        this.requestDocumentState(sourceId, relativePath, state.kind);
+      }
     }
     for (const [rawPath, raw] of binaryEntries) {
       const relativePath = normalizedTrackedPath(rawPath);
