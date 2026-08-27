@@ -1230,6 +1230,116 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('delivers stdin replies and kernel commands after route recovery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-route-retry-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'kernel-route-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'kernel-route-retry-token-that-is-long-enough', context(extensionRoot), logger());
+    let inputAttempts = 0;
+    let commandAttempts = 0;
+    let routeWaits = 0;
+    (runtime as any).transport = {
+      waitForRoute: async () => { routeWaits += 1; },
+      sendTo: (_peerId: string, type: string, meta: any) => {
+        if (type === 'inputReply') {
+          inputAttempts += 1;
+          if (inputAttempts === 1) throw new Error('No route to peer peer-z.');
+          if (inputAttempts >= 3) {
+            queueMicrotask(() => {
+              void (runtime as any).onMessage({
+                type: 'inputReplyAck', payload: new Uint8Array(), meta: {
+                  requestId: meta.requestId,
+                  eventSequence: meta.eventSequence,
+                  success: true,
+                },
+              }, 'peer-z');
+            });
+          }
+        }
+        if (type === 'kernelCommand') {
+          commandAttempts += 1;
+          if (commandAttempts === 1) throw new Error('No route to peer peer-z.');
+          queueMicrotask(() => {
+            void (runtime as any).onMessage({
+              type: 'kernelCommandResult', payload: new Uint8Array(), meta: {
+                requestId: meta.requestId, success: true,
+              },
+            }, 'peer-z');
+          });
+        }
+      },
+      stop: async () => undefined,
+    };
+    const pendingTimer = setTimeout(() => undefined, 60_000);
+    (runtime as any).pendingExecutions.set('stdin-request', {
+      resolve: () => undefined,
+      reject: () => undefined,
+      onEvent: () => undefined,
+      executorId: 'peer-z',
+      notebookKey: 'work.ipynb',
+      timer: pendingTimer,
+      accepted: true,
+      nextEventSequence: 0,
+      bufferedEvents: new Map(),
+      bufferedEventBytes: 0,
+      inputRequestSequence: 3,
+    });
+    try {
+      await assert.rejects(
+        runtime.replyToInput('stdin-request', 'x'.repeat(64 * 1024 + 1)),
+        /character limit/,
+      );
+      await runtime.replyToInput('stdin-request', 'answer');
+      clearTimeout(pendingTimer);
+      (runtime as any).pendingExecutions.delete('stdin-request');
+      await (runtime as any).sendKernelCommand(
+        'peer-z',
+        'work.ipynb',
+        { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
+        'interrupt',
+      );
+      assert.equal(inputAttempts, 3, 'a lost input acknowledgement must resend the same prompt reply');
+      assert.equal(commandAttempts, 2);
+      assert.ok(routeWaits >= 4);
+      assert.equal((runtime as any).pendingKernelCommands.size, 0);
+
+      let deliveredInputs = 0;
+      const inputAcks: any[] = [];
+      (runtime as any).executionOwners.set('owned-input', {
+        peerId: 'peer-z',
+        notebookKey: 'work.ipynb',
+        events: [],
+        inputRequestSequences: new Set([4]),
+        inputReplyDigests: new Map(),
+      });
+      (runtime as any).kernels.set('work.ipynb', {
+        inputReply: () => { deliveredInputs += 1; },
+        stop: () => undefined,
+      });
+      (runtime as any).transport.sendTo = (_peerId: string, type: string, meta: any) => {
+        if (type === 'inputReplyAck') inputAcks.push(meta);
+      };
+      const replyFrame = (value: string) => ({
+        type: 'inputReply', payload: new Uint8Array(), meta: {
+          requestId: 'owned-input', eventSequence: 4, value,
+        },
+      });
+      await (runtime as any).onMessage(replyFrame('same answer'), 'peer-z');
+      await (runtime as any).onMessage(replyFrame('same answer'), 'peer-z');
+      await (runtime as any).onMessage(replyFrame('different answer'), 'peer-z');
+      assert.equal(deliveredInputs, 1, 'retries must never write two stdin lines into the kernel');
+      assert.deepEqual(inputAcks.map((ack) => ack.success), [true, true, false]);
+    } finally {
+      clearTimeout(pendingTimer);
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('retries an execution barrier commit when its acknowledgement is lost', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-barrier-ack-retry-'));
     const extensionRoot = path.join(root, 'extension');

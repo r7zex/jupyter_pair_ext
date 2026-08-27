@@ -193,7 +193,7 @@ export function configureMeshNetwork(config: MeshNetworkConfig): void {
 }
 
 const RELAY_REDUNDANCY = 8;
-const HANDSHAKE_VERSION = 2;
+const HANDSHAKE_VERSION = 3;
 const ACTION_NAMESPACE = 'pair-notebook-frame-v2';
 const MAX_OUTBOUND_QUEUE = 128 * 1024 * 1024;
 const MAX_TOTAL_OUTBOUND_QUEUE = 512 * 1024 * 1024;
@@ -2401,6 +2401,7 @@ public improvablePeerIds(): string[] {
 function maxPayloadBytes(type: string): number {
   if (BULK_CHUNK_TYPES.has(type)) return 1024 * 1024;
   if (type === 'awareness') return 1024 * 1024;
+  if (type === 'executeRequest' || type === 'executionEvent' || type === 'executeResult') return 32 * 1024 * 1024;
   if (type === 'projectUpdate' || type === 'stateDocument' || type === 'stateDiff') return 64 * 1024 * 1024;
   return 4 * 1024 * 1024;
 }

@@ -197,7 +197,7 @@ export class PairNotebookController implements vscode.Disposable {
         if (value === undefined) await runtime.cancelInput(String(event.requestId));
         else {
           try {
-            runtime.replyToInput(String(event.requestId), value);
+            await runtime.replyToInput(String(event.requestId), value);
           } catch (error) {
             await runtime.cancelInput(String(event.requestId));
             throw error;

@@ -160,7 +160,8 @@ const MAX_EXECUTION_MANIFEST_ENTRIES = 50_000;
 const MAX_PENDING_BARRIER_AUTHORIZATIONS = 128;
 const BARRIER_AUTHORIZATION_TIMEOUT_MS = 60_000;
 const COMPLETED_BARRIER_TIMEOUT_MS = 2 * 60_000;
-const MAX_REMOTE_EXECUTION_CODE_BYTES = 4 * 1024 * 1024;
+const MAX_REMOTE_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
+const MAX_REMOTE_INPUT_CHARACTERS = 64 * 1024;
 const MAX_REMOTE_EXECUTIONS = 4;
 const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
 const REMOTE_EXECUTION_TIMEOUT_MS = 4 * 60 * 60_000;
@@ -223,6 +224,7 @@ interface PendingExecution {
   nextEventSequence: number;
   bufferedEvents: Map<number, { event: JupyterKernelEvent; byteLength: number }>;
   bufferedEventBytes: number;
+  inputRequestSequence?: number | undefined;
   deferredResult?: JupyterExecutionResult | undefined;
   expectedEventCount?: number | undefined;
 }
@@ -240,6 +242,8 @@ interface ExecutionOwner {
   eventBytes?: number | undefined;
   eventOverflow?: Error | undefined;
   replayTimer?: NodeJS.Timeout | undefined;
+  inputRequestSequences?: Set<number> | undefined;
+  inputReplyDigests?: Map<number, string> | undefined;
 }
 
 interface CompletedRemoteExecution {
@@ -248,6 +252,7 @@ interface CompletedRemoteExecution {
   resultPayload: Uint8Array<ArrayBufferLike>;
   events: RemoteExecutionEventRecord[];
   retainedBytes: number;
+  inputReplyDigests: Map<number, string>;
   expiryTimer: NodeJS.Timeout;
   retryTimer: NodeJS.Timeout | undefined;
 }
@@ -395,6 +400,13 @@ export class BackingFolderMismatchError extends Error {
   }
 }
 
+interface PendingInputReply {
+  executorId: string;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
 export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public readonly project = new CollaborativeProject();
   public readonly awareness = new Awareness(new Y.Doc());
@@ -424,6 +436,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingBarrierAuthorizations = new Map<string, BarrierAuthorization>();
   private readonly completedExecutionBarriers = new Map<string, BarrierAuthorization>();
   private readonly pendingKernelCommands = new Map<string, PendingKernelCommand>();
+  private readonly pendingInputReplies = new Map<string, PendingInputReply>();
   private readonly pendingExecutions = new Map<string, PendingExecution>();
   private readonly completedRemoteExecutions = new Map<string, CompletedRemoteExecution>();
   private completedRemoteExecutionBytes = 0;
@@ -1049,6 +1062,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.bufferedEventBytes += byteLength;
       return;
     }
+    if (event.type === 'inputRequest') pending.inputRequestSequence = sequence;
     pending.onEvent(event);
     pending.nextEventSequence += 1;
     while (true) {
@@ -1056,6 +1070,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (!buffered) break;
       pending.bufferedEvents.delete(pending.nextEventSequence);
       pending.bufferedEventBytes = Math.max(0, pending.bufferedEventBytes - buffered.byteLength);
+      if (buffered.event.type === 'inputRequest') pending.inputRequestSequence = pending.nextEventSequence;
       pending.onEvent(buffered.event);
       pending.nextEventSequence += 1;
     }
@@ -1131,15 +1146,93 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transition('executing', `Kernel input supplied for ${notebookKey}.`);
   }
 
-  public replyToInput(requestId: string, value: string): void {
+  public async replyToInput(requestId: string, value: string): Promise<void> {
+    if (value.length > MAX_REMOTE_INPUT_CHARACTERS) {
+      throw new Error(`Jupyter input exceeds the ${MAX_REMOTE_INPUT_CHARACTERS}-character limit.`);
+    }
     const pending = this.pendingExecutions.get(requestId);
     if (pending && pending.executorId !== this.descriptor.localPeer.peerId) {
-      this.transport.sendTo(pending.executorId, 'inputReply', { requestId, notebookKey: pending.notebookKey, value });
+      if (pending.inputRequestSequence === undefined) {
+        // A 0.5.3 peer has no event sequence or input acknowledgement.
+        await this.sendToWithRouteRecovery(
+          pending.executorId,
+          'inputReply',
+          { requestId, notebookKey: pending.notebookKey, value },
+        );
+      } else {
+        await this.sendRemoteInputReply(
+          pending.executorId,
+          requestId,
+          pending.notebookKey,
+          pending.inputRequestSequence,
+          value,
+        );
+      }
       return;
     }
     const owner = this.executionOwners.get(requestId);
     const key = owner?.notebookKey ?? pending?.notebookKey;
     if (key) this.kernels.get(key)?.inputReply(value);
+  }
+
+  private sendRemoteInputReply(
+    executorId: string,
+    requestId: string,
+    notebookKey: string,
+    eventSequence: number,
+    value: string,
+  ): Promise<void> {
+    const key = inputReplyKey(requestId, eventSequence);
+    if (this.pendingInputReplies.has(key)) {
+      return Promise.reject(new Error('A reply for this Jupyter input prompt is already being delivered.'));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingInputReplies.delete(key);
+        reject(new Error('Jupyter input reply was not acknowledged after route recovery.'));
+      }, EXECUTION_ACCEPT_TIMEOUT_MS);
+      this.pendingInputReplies.set(key, { executorId, resolve, reject, timer });
+      void this.dispatchRemoteInputReply(
+        key,
+        executorId,
+        requestId,
+        notebookKey,
+        eventSequence,
+        value,
+      ).catch((error) => {
+        const pending = this.pendingInputReplies.get(key);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pendingInputReplies.delete(key);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  private async dispatchRemoteInputReply(
+    key: string,
+    executorId: string,
+    requestId: string,
+    notebookKey: string,
+    eventSequence: number,
+    value: string,
+  ): Promise<void> {
+    const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
+    while (!this.closed && Date.now() < deadline && this.pendingInputReplies.has(key)) {
+      try {
+        await this.waitForTransportRoute(executorId, Math.min(5_000, Math.max(1, deadline - Date.now())));
+        if (!this.pendingInputReplies.has(key)) return;
+        this.transport.sendTo(executorId, 'inputReply', {
+          requestId,
+          notebookKey,
+          eventSequence,
+          value,
+        });
+      } catch (error) {
+        if (!isRouteUnavailableError(error)) throw error;
+      }
+      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+    }
   }
 
   public async cancelInput(requestId: string): Promise<void> {
@@ -1611,6 +1704,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(new Error('Pair Notebook session closed during kernel command.'));
     }
     this.pendingKernelCommands.clear();
+    for (const pending of this.pendingInputReplies.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Pair Notebook session closed during Jupyter input delivery.'));
+    }
+    this.pendingInputReplies.clear();
     for (const pending of this.pendingExecutions.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Pair Notebook session closed during remote execution.'));
@@ -2457,12 +2555,72 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           break;
         }
         case 'inputReply': {
-          const requestId = String(frame.meta.requestId);
+          const requestId = String(frame.meta.requestId ?? '');
           const owner = this.executionOwners.get(requestId);
           const value = typeof frame.meta.value === 'string' ? frame.meta.value : '';
-          if (owner?.peerId === sourceId && value.length <= 64 * 1024) {
-            this.kernels.get(owner.notebookKey)?.inputReply(value);
+          const rawEventSequence = frame.meta.eventSequence;
+          if (rawEventSequence === undefined) {
+            // Compatibility with an unsequenced 0.5.3 input request.
+            if (owner?.peerId === sourceId && value.length <= MAX_REMOTE_INPUT_CHARACTERS) {
+              this.kernels.get(owner.notebookKey)?.inputReply(value);
+            }
+            break;
           }
+          const eventSequence = boundedNumber(rawEventSequence, 0, MAX_REPLAYED_EXECUTION_EVENTS - 1, true);
+          const digest = createHash('sha256').update(value, 'utf8').digest('hex');
+          let success = false;
+          let message = 'The input reply does not match an active Jupyter prompt.';
+          if (eventSequence !== undefined && value.length <= MAX_REMOTE_INPUT_CHARACTERS
+            && owner?.peerId === sourceId && owner.inputRequestSequences?.has(eventSequence)) {
+            const previous = owner.inputReplyDigests?.get(eventSequence);
+            if (previous === digest) {
+              success = true;
+              message = '';
+            } else if (previous) {
+              message = 'A different reply was already accepted for this Jupyter prompt.';
+            } else {
+              try {
+                const kernel = this.kernels.get(owner.notebookKey);
+                if (!kernel) throw new Error('The Jupyter kernel is no longer available for input.');
+                kernel.inputReply(value);
+                owner.inputReplyDigests?.set(eventSequence, digest);
+                success = true;
+                message = '';
+              } catch (error) {
+                message = formatError(error);
+              }
+            }
+          } else if (eventSequence !== undefined && value.length <= MAX_REMOTE_INPUT_CHARACTERS) {
+            const completed = this.completedRemoteExecutions.get(requestId);
+            const previous = completed?.sourceId === sourceId
+              ? completed.inputReplyDigests.get(eventSequence)
+              : undefined;
+            if (previous === digest) {
+              success = true;
+              message = '';
+            } else if (previous) {
+              message = 'A different reply was already accepted for this completed Jupyter prompt.';
+            }
+          }
+          this.sendInputReplyAcknowledgement(sourceId, requestId, eventSequence, success, message);
+          break;
+        }
+        case 'inputReplyAck': {
+          const requestId = String(frame.meta.requestId ?? '');
+          const eventSequence = boundedNumber(
+            frame.meta.eventSequence,
+            0,
+            MAX_REPLAYED_EXECUTION_EVENTS - 1,
+            true,
+          );
+          if (eventSequence === undefined) break;
+          const key = inputReplyKey(requestId, eventSequence);
+          const pending = this.pendingInputReplies.get(key);
+          if (!pending || pending.executorId !== sourceId) break;
+          clearTimeout(pending.timer);
+          this.pendingInputReplies.delete(key);
+          if (frame.meta.success === true) pending.resolve();
+          else pending.reject(new Error(String(frame.meta.message ?? 'Remote Jupyter input was rejected.')));
           break;
         }
         case 'kernelCommand':
@@ -4373,6 +4531,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private cancelExecutorRequests(executorId: string, reason: string): void {
+    for (const [key, pending] of this.pendingInputReplies) {
+      if (pending.executorId !== executorId) continue;
+      clearTimeout(pending.timer);
+      this.pendingInputReplies.delete(key);
+      pending.reject(new Error(reason));
+    }
     for (const [requestId, pending] of this.pendingExecutions) {
       if (pending.executorId !== executorId) continue;
       clearTimeout(pending.timer);
@@ -4442,6 +4606,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     requestDigest: string,
     result: JupyterExecutionResult,
     events: RemoteExecutionEventRecord[] = [],
+    inputReplyDigests: Map<number, string> = new Map(),
   ): void {
     this.dropCompletedRemoteExecution(requestId);
     let resultPayload: Uint8Array<ArrayBufferLike>;
@@ -4476,6 +4641,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       resultPayload,
       events,
       retainedBytes,
+      inputReplyDigests: new Map(inputReplyDigests),
       expiryTimer,
       retryTimer: undefined,
     });
@@ -4541,6 +4707,27 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     } catch (error) {
       // The executor retains and repeats the result, so a later copy will trigger another acknowledgement.
       this.log.appendLine(`[debug] Could not acknowledge execution result ${requestId}: ${formatError(error)}`);
+    }
+  }
+
+  private sendInputReplyAcknowledgement(
+    peerId: string,
+    requestId: string,
+    eventSequence: number | undefined,
+    success: boolean,
+    message: string,
+  ): void {
+    if (eventSequence === undefined) return;
+    try {
+      this.transport.sendTo(peerId, 'inputReplyAck', {
+        requestId,
+        eventSequence,
+        success,
+        message,
+      });
+    } catch (error) {
+      // The requester repeats the same digest-bound reply until this acknowledgement arrives.
+      this.log.appendLine(`[debug] Could not acknowledge Jupyter input ${requestId}: ${formatError(error)}`);
     }
   }
 
@@ -4673,6 +4860,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       requestDigest,
       events: [],
       eventBytes: 0,
+      inputRequestSequences: new Set(),
+      inputReplyDigests: new Map(),
     };
     this.executionOwners.set(requestId, executionOwner);
     this.sendExecutionAccepted(sourceId, requestId);
@@ -4708,6 +4897,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           events.push(record);
           executionOwner.events = events;
           executionOwner.eventBytes = nextBytes;
+          if (event.type === 'inputRequest') executionOwner.inputRequestSequences?.add(record.sequence);
           try {
             this.transport.sendTo(sourceId, 'executionEvent', {
               requestId,
@@ -4754,6 +4944,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       requestDigest,
       result,
       executionOwner.events ?? [],
+      executionOwner.inputReplyDigests ?? new Map(),
     );
   }
 
@@ -4837,18 +5028,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   ): Promise<void> {
     const requestId = newId();
     return new Promise<void>((resolve, reject) => {
+      const commandTimeoutMs = command === 'restart' ? 40_000 : 10_000;
+      const routeTimeoutMs = EXECUTION_ACCEPT_TIMEOUT_MS;
       const timer = setTimeout(() => {
         this.pendingKernelCommands.delete(requestId);
-        reject(new Error(`Remote kernel ${command} timed out.`));
-      }, command === 'restart' ? 40_000 : 10_000);
+        reject(new Error(`Remote kernel ${command} could not be delivered after route recovery.`));
+      }, routeTimeoutMs + commandTimeoutMs);
       this.pendingKernelCommands.set(requestId, { executorId, resolve, reject, timer });
-      try {
-        this.transport.sendTo(executorId, 'kernelCommand', { requestId, notebookKey, target, command });
-      } catch (error) {
-        clearTimeout(timer);
+      void this.sendToWithRouteRecovery(
+        executorId,
+        'kernelCommand',
+        { requestId, notebookKey, target, command },
+        new Uint8Array(),
+        routeTimeoutMs,
+      ).then(() => {
+        const pending = this.pendingKernelCommands.get(requestId);
+        if (!pending || pending.executorId !== executorId) return;
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(() => {
+          if (this.pendingKernelCommands.get(requestId) !== pending) return;
+          this.pendingKernelCommands.delete(requestId);
+          pending.reject(new Error(`Remote kernel ${command} timed out after delivery.`));
+        }, commandTimeoutMs);
+      }).catch((error) => {
+        const pending = this.pendingKernelCommands.get(requestId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
         this.pendingKernelCommands.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 
@@ -5738,6 +5946,10 @@ function barrierAuthorizationKey(sourceId: string, requestId: string): string {
   return `${sourceId}:${requestId}`;
 }
 
+function inputReplyKey(requestId: string, eventSequence: number): string {
+  return `${requestId}:${eventSequence}`;
+}
+
 function computeAvailabilityErrorName(message: string): string {
   if (/CPU/i.test(message)) return 'CpuComputeDisabled';
   if (/GPU|CUDA/i.test(message)) return 'GpuComputeDisabled';
@@ -5942,6 +6154,6 @@ function isClockAgnosticFrame(type: string): boolean {
     'fileDelete', 'directoryCreate', 'fileRename', 'computeChanged', 'computeState', 'hostTransferFinalize',
     'executionBarrierCheck', 'executionBarrierStatus', 'executionBarrierCommit', 'executionBarrierAck',
     'executeRequest', 'executeAccepted', 'executionEvent', 'executeResult', 'executeResultAck',
-    'inputReply', 'kernelCommand', 'kernelCommandResult',
+    'inputReply', 'inputReplyAck', 'kernelCommand', 'kernelCommandResult',
   ]).has(type);
 }

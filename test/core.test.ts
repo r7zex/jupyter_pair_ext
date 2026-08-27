@@ -782,7 +782,7 @@ describe('repair regressions', () => {
     });
     const projectedKey = generateIdentityCredentials().publicKey;
     const parsed = (transport as any).parseHandshake({
-      version: 2,
+      version: 3,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: {
@@ -795,6 +795,13 @@ describe('repair regressions', () => {
     assert.deepEqual(parsed.peer, {
       peerId: 'projected', displayName: 'Projected', joinOrder: 1, identityKey: projectedKey,
     });
+    assert.throws(() => (transport as any).parseHandshake({
+      version: 2,
+      sessionId: 'peer-directory',
+      purpose: 'runtime',
+      peer: parsed.peer,
+      nonce: newIdentityNonce(),
+    }), /incompatible Pair Notebook session protocol/);
 
     for (let index = 0; index < 255; index += 1) {
       transport.updateDirectory([{
@@ -1375,6 +1382,41 @@ describe('real transport and compute', () => {
       await onceEvent(client, 'peerConnected');
       client.broadcast('projectUpdate', { key: 'a.py', kind: 'text' }, Buffer.from([9, 8, 7]));
       assert.deepEqual(await received, Buffer.from([9, 8, 7]));
+    } finally {
+      await Promise.all([host.stop(), client.stop()]);
+      resetInMemoryTrystero();
+    }
+  });
+
+  it('carries large execution output through the real MeshTransport payload path', async () => {
+    const roomFactory = createInMemoryTrysteroFactory();
+    const token = 'large-output-token-that-is-long-enough';
+    const clock: HostClock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host' };
+    const host = new MeshTransport({
+      sessionId: 'large-output-mesh', token,
+      localPeer: { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true, roomFactory,
+    });
+    const client = new MeshTransport({
+      sessionId: 'large-output-mesh', token,
+      localPeer: { peerId: 'peer', displayName: 'Peer', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false, roomFactory,
+    });
+    const payload = Buffer.alloc(5 * 1024 * 1024, 0x5a);
+    try {
+      await host.start();
+      await client.start();
+      const received = new Promise<Buffer>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('large execution payload timed out')), 10_000);
+        host.on('message', (frame) => {
+          if (frame.type !== 'executionEvent') return;
+          clearTimeout(timer);
+          resolve(Buffer.from(frame.payload));
+        });
+      });
+      await onceEvent(client, 'peerConnected');
+      client.sendTo('host', 'executionEvent', { requestId: 'large-output', eventSequence: 0 }, payload);
+      assert.deepEqual(await received, payload);
     } finally {
       await Promise.all([host.stop(), client.stop()]);
       resetInMemoryTrystero();
