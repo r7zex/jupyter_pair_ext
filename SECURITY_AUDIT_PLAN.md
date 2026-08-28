@@ -100,7 +100,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. All four external actions are pinned to full SHAs verified against their official GitHub repositories (`checkout` v7.0.1, `setup-node` v7.0.0, `setup-python` v7.0.0, and `upload-artifact` v7.0.1). Checkout now sets `persist-credentials: false`; the release token remains scoped to the explicit `gh release` step. A regression test enforces immutable refs and token handling, and the workflow parses successfully as YAML.
 
-### SEC-006 — Low — Relay privacy documentation overstates what operators cannot observe
+### SEC-006 — Low — Fixed — Relay privacy documentation overstates what operators cannot observe
 
 **Evidence:** Project contents are encrypted, but relay/broker operators can still observe a stable per-session topic, timing, packet sizes, and plaintext routing identifiers. The shared invite-derived relay key also does not provide forward secrecy if the invite is later compromised.
 
@@ -109,6 +109,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Correct README and protocol/architecture language: distinguish encrypted content from observable metadata, state the bearer-invite and no-forward-secrecy limitations, and recommend starting a new session/invite after suspected disclosure.
 
 **Verification:** Search user-facing documentation for absolute claims such as “only ciphertext” and ensure the qualified threat model is consistent.
+
+**Resolution:** Implemented. README, protocol, architecture, and transport comments now distinguish encrypted frame content from observable topics, routing ids, timing, sizes, and chunk counts. They document the bearer-invite/no-forward-secrecy boundary and tell users to end the old session and create a fresh invite after suspected disclosure.
 
 ## Fix order and commit boundaries
 

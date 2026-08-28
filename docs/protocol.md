@@ -22,6 +22,8 @@ Protocol v4 authenticates every emergency-relay envelope with the sender's Ed255
 
 Pair Notebook uses one compact binary wire-frame format across every route. A direct WebRTC route carries it through a Trystero action; emergency Nostr/MQTT routes encrypt and chunk the same frame bytes before relay publication. Metadata includes a random message ID, source and optional target IDs, send time, and host clock. Duplicate message IDs are retained for 60 seconds.
 
+The emergency relay encrypts frame content, not traffic metadata. Nostr relay and MQTT broker operators can observe a stable invite-derived topic, routing peer IDs, publication timing, packet sizes, and chunk counts. The invite token is a bearer secret and the relay key is derived directly from it, so this fallback does not provide forward secrecy against later invite disclosure. After suspected disclosure, participants must end the old session and create a new session/invite rather than reconnecting it.
+
 Each target has ordered realtime and bulk queues. Realtime edits can overtake queued bulk snapshot/file chunks, while an in-flight item remains ordered. Queue accounting includes in-flight bytes and enforces 128 MiB per peer plus 512 MiB per session, with separate frame-count and inbound-rate limits. Trystero action promises provide the send-completion barrier.
 
 A physical `onPeerLeave` starts a 30-second logical recovery lease. The participant remains logically online while signed replacement routes are attempted immediately through direct discovery and the encrypted relay families. Host election and execution availability change only if every route misses that lease; admission of a replacement route cancels the logical disconnect and starts state reconciliation.

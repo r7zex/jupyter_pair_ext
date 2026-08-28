@@ -9,9 +9,10 @@
  *
  *   direct WebRTC  >  TURN UDP/TCP/TLS  >  this Nostr relay
  *
- * Security model: relay operators see only opaque ciphertext. The frame key
- * is derived via HKDF-SHA256 from the session token (which never reaches the
- * relays) bound to the session id; every packet is AES-256-GCM encrypted.
+ * Security model: relay operators cannot read the encrypted frame content,
+ * but they can observe the stable topic, routing ids, timing and packet sizes.
+ * The frame key is derived via HKDF-SHA256 from the session token (which never
+ * reaches the relays) bound to the session id; every packet is AES-256-GCM encrypted.
  * Participant authentication is unchanged - the regular signed Pair Notebook
  * handshake runs over this channel exactly as over the DataChannel, and
  * `assertPeerCanJoin` applies identically. Events are signed with an

@@ -3,8 +3,9 @@
  *
  * This is independent from Nostr and from Trystero's MQTT signalling room:
  * it carries complete Pair Notebook wire frames when ICE/TURN cannot build a
- * data channel and Nostr is unreachable. Broker operators see only a random
- * topic and AES-256-GCM ciphertext derived from the session secret.
+ * data channel and Nostr is unreachable. Broker operators cannot read the
+ * AES-256-GCM-encrypted frame content, but they can observe the stable topic,
+ * routing ids, timing and packet sizes.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
