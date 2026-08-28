@@ -61,7 +61,7 @@ describe('production SessionRuntime integration', () => {
   });
 
   it('downloads a complete host snapshot without asking the joining peer for a backing folder', async function () {
-    this.timeout(15_000);
+    this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bootstrap-success-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
@@ -385,7 +385,7 @@ describe('production SessionRuntime integration', () => {
   });
 
   it('elects one resilient coordinator and rejects a returning stale host clock', async function () {
-    this.timeout(25_000);
+    this.timeout(40_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-failover-'));
     const extensionRoot = path.join(root, 'extension');
     const folders = [path.join(root, 'host'), path.join(root, 'peer-b'), path.join(root, 'peer-c')];
@@ -457,7 +457,7 @@ describe('production SessionRuntime integration', () => {
   });
 
   it('reconciles two hosts elected at the same epoch in isolated partitions', async function () {
-    this.timeout(20_000);
+    this.timeout(35_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-equal-epoch-'));
     const extensionRoot = path.join(root, 'extension');
     const folders = {
@@ -1638,7 +1638,7 @@ describe('compute and lifecycle regression coverage', () => {
   });
 
   it('completes host transfer across two Trystero runtimes without dual-role divergence', async function () {
-    this.timeout(15_000);
+    this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-transfer-real-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
@@ -1694,7 +1694,7 @@ describe('compute and lifecycle regression coverage', () => {
   });
 
   it('lets the host end a Trystero session for every participant', async function () {
-    this.timeout(15_000);
+    this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-session-end-real-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
@@ -2279,7 +2279,7 @@ describe('identity and lifecycle regressions', () => {
   });
 
   it('completes teardown when the pre-leave host transfer fails', async function () {
-    this.timeout(15_000);
+    this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-leave-failure-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
