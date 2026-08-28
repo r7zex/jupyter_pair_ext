@@ -33,9 +33,16 @@ const SAFE_ENV_TEMPLATES = new Set(['.env.example', '.env.sample', '.env.templat
 const SENSITIVE_BASENAMES = new Set([
   '.env', '.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials',
   'credentials.json', 'service-account.json', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+  'application_default_credentials.json', 'client_secret.json', 'client_secrets.json',
+  'terraform.tfstate', 'terraform.tfstate.backup', 'kubeconfig',
 ]);
-const SENSITIVE_EXTENSIONS = new Set(['.pem', '.p12', '.pfx', '.key', '.keystore', '.jks']);
-const SENSITIVE_DIRECTORIES = new Set(['.ssh', '.aws', '.azure', '.gnupg']);
+const SENSITIVE_EXTENSIONS = new Set([
+  '.pem', '.p12', '.pfx', '.key', '.keystore', '.jks', '.ppk', '.mobileprovision',
+  '.ovpn', '.tfstate', '.tfvars', '.kubeconfig',
+]);
+const SENSITIVE_DIRECTORIES = new Set([
+  '.ssh', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.terraform', '.pulumi',
+]);
 
 const SKIP_CRDT_DIRECTORIES = new Set([
   '.git', 'node_modules', '.venv', 'venv', '__pycache__', '.pair-notebook-transfers',
@@ -53,7 +60,11 @@ export function shouldTrackProjectPath(relativePath: string): boolean {
   const segments = normalized.split('/');
   const basename = segments.at(-1)?.toLowerCase() ?? '';
   if (segments.some((segment) => SENSITIVE_DIRECTORIES.has(segment.toLowerCase()))) return false;
-  if (SENSITIVE_BASENAMES.has(basename) || SENSITIVE_EXTENSIONS.has(path.extname(basename))) return false;
+  if (SENSITIVE_BASENAMES.has(basename)
+    || SENSITIVE_EXTENSIONS.has(path.extname(basename))
+    || basename.endsWith('.tfstate.backup')
+    || basename.endsWith('.tfvars.json')
+    || /^client_secret(?:_.+)?\.json$/.test(basename)) return false;
   if (basename.startsWith('.env.') && !SAFE_ENV_TEMPLATES.has(basename)) return false;
   return segments.every((segment) => !SKIP_CRDT_DIRECTORIES.has(segment.toLowerCase()));
 }

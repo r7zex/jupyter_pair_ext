@@ -76,7 +76,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. Nostr and MQTT announce records now require a constant-time-verified HMAC bound to the session and peer id. Redundant announce deduplication retains at most 1,024 peers, while Mesh admits at most 256 unknown relay candidates without preventing a previously known friend from reconnecting. The focused Nostr, MQTT, deduplication, and Mesh-bound tests pass.
 
-### SEC-004 — Medium — Common local credential artifacts can enter a project snapshot
+### SEC-004 — Medium — Fixed — Common local credential artifacts can enter a project snapshot
 
 **Evidence:** The denylist already blocks `.env`, common private-key names, and `.ssh`/`.aws`/`.azure`/`.gnupg`, but it does not cover common Docker/Kubernetes client credentials, Terraform state/variable files, or several private-key/container formats.
 
@@ -85,6 +85,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Extend one shared path-classification policy with targeted, low-false-positive credential paths, names, and extensions. Apply matching protection to source archive creation so development artifacts cannot reintroduce the same files.
 
 **Regression tests:** Cover each new sensitive pattern plus nearby safe templates/configuration files that must remain shareable.
+
+**Resolution:** Implemented. Project snapshots and release-archive inspection now reject Docker, Kubernetes, Terraform, Pulumi, VPN, mobile-provisioning, PuTTY, cloud application-default, and OAuth client-secret artifacts. Regression coverage also preserves normal Docker Compose, Terraform source/lock files, kubeconfig examples, and variable templates.
 
 ### SEC-005 — Medium — Release workflow actions are mutable and checkout credentials persist
 

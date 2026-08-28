@@ -17,12 +17,19 @@ const EXCLUDED_DIRECTORIES = new Set([
   'node_modules', '.venv', 'venv', '__pycache__', '.git', '.pytest_cache',
   '.mypy_cache', '.pair-notebook-transfers', '.ruff_cache', '.tox', '.nox',
 ]);
-const SENSITIVE_DIRECTORIES = new Set(['.ssh', '.aws', '.azure', '.gnupg']);
+const SENSITIVE_DIRECTORIES = new Set([
+  '.ssh', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.terraform', '.pulumi',
+]);
 const SENSITIVE_FILE_NAMES = new Set([
   '.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials',
   'credentials.json', 'service-account.json', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+  'application_default_credentials.json', 'client_secret.json', 'client_secrets.json',
+  'terraform.tfstate', 'terraform.tfstate.backup', 'kubeconfig',
 ]);
-const SENSITIVE_EXTENSIONS = new Set(['.pem', '.p12', '.pfx', '.key', '.keystore', '.jks']);
+const SENSITIVE_EXTENSIONS = new Set([
+  '.pem', '.p12', '.pfx', '.key', '.keystore', '.jks', '.ppk', '.mobileprovision',
+  '.ovpn', '.tfstate', '.tfvars', '.kubeconfig',
+]);
 const SAFE_ENV_FILES = new Set(['.env.example', '.env.sample', '.env.template']);
 
 function listEntries(archivePath) {
@@ -74,13 +81,18 @@ function collectFiles(directory, relative = '') {
 function isSensitiveFileName(lowerName) {
   return (lowerName === '.env' || (lowerName.startsWith('.env.') && !SAFE_ENV_FILES.has(lowerName)))
     || SENSITIVE_FILE_NAMES.has(lowerName)
-    || SENSITIVE_EXTENSIONS.has(path.extname(lowerName));
+    || SENSITIVE_EXTENSIONS.has(path.extname(lowerName))
+    || lowerName.endsWith('.tfstate.backup')
+    || lowerName.endsWith('.tfvars.json')
+    || /^client_secret(?:_.+)?\.json$/.test(lowerName);
 }
 
 function sensitiveArchiveEntries(entries) {
   return entries.filter((entry) => {
-    const name = path.posix.basename(entry).toLowerCase();
-    return isSensitiveFileName(name);
+    const segments = entry.replaceAll('\\', '/').split('/').filter(Boolean);
+    const name = segments.at(-1)?.toLowerCase() ?? '';
+    return segments.some((segment) => SENSITIVE_DIRECTORIES.has(segment.toLowerCase()))
+      || isSensitiveFileName(name);
   });
 }
 
