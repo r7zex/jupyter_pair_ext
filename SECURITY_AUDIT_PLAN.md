@@ -40,7 +40,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 ## Confirmed findings
 
-### SEC-001 — High — Remote-compute consent survives unrelated sessions
+### SEC-001 — High — Fixed — Remote-compute consent survives unrelated sessions
 
 **Evidence:** The confirmation dialog says that participants in the current private session may run Python, but `toggleRemoteCompute()` writes `pairNotebook.allowRemoteCompute` at `ConfigurationTarget.Global`. `SessionRuntime` then reads that global value when advertising hardware and authorizing incoming execution and kernel-control frames.
 
@@ -49,6 +49,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Keep CPU/GPU preference settings for convenience, but move the execution authorization gate into ephemeral `SessionRuntime` state initialized to `false`. The command must toggle only the active session and update presence immediately. Retain the old configuration key as a deprecated, ignored compatibility entry so an existing user setting cannot silently re-enable execution.
 
 **Regression tests:** Prove that a globally stored legacy `true` value does not enable a newly constructed runtime, that explicit runtime opt-in advertises hardware, and that a second runtime starts disabled again.
+
+**Resolution:** Implemented. Remote-compute permission is now ephemeral runtime state, legacy persisted values are ignored, and the focused regression suite passes.
 
 ### SEC-002 — High — Shared relay key permits sender impersonation
 

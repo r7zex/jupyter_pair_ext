@@ -472,6 +472,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly notebookActiveExecutions = new Map<string, number>();
   private activeExecutions = 0;
   private computeEpoch = 0;
+  /** Explicit consent is scoped to this runtime and never restored from settings. */
+  private remoteComputeAllowedForSession = false;
   private closed = false;
   /** A stale former host may adopt exactly one deterministic epoch after proven isolation. */
   private clockReconciliationRequired = false;
@@ -788,6 +790,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       allowCpu: true,
       allowGpu: true,
     };
+  }
+
+  /** Remote Python execution always starts disabled for every new/restored session. */
+  public isRemoteComputeAllowed(): boolean {
+    return this.remoteComputeAllowedForSession;
+  }
+
+  public setRemoteComputeAllowed(allowed: boolean): void {
+    if (this.closed) throw new Error('The Pair Notebook session is closed.');
+    if (this.remoteComputeAllowedForSession === allowed) return;
+    this.remoteComputeAllowedForSession = allowed;
+    this.updatePresence();
   }
 
   public computeForNotebook(notebookKey: string): NotebookComputeTarget {
@@ -3102,7 +3116,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.lastDisplayNameWarning = warning;
       }
     }
-    const allowRemoteCompute = configuration.get<boolean>('allowRemoteCompute', false);
+    const allowRemoteCompute = this.remoteComputeAllowedForSession;
     const allowCpu = allowRemoteCompute && configuration.get<boolean>('allowCpu', false);
     const allowGpu = allowRemoteCompute && configuration.get<boolean>('allowGpu', false);
     const shareCursor = configuration.get<boolean>('shareMyCursor', true);
@@ -4015,7 +4029,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if ((!localExecutor || !localSelection) && !presence.allowRemoteCompute) {
       return 'The selected executor does not allow remote compute.';
     }
-    if (localExecutor && !localSelection && !configuration.get<boolean>('allowRemoteCompute', false)) {
+    if (localExecutor && !localSelection && !this.remoteComputeAllowedForSession) {
       return 'Remote compute is disabled on this computer.';
     }
     if (target.device === 'cpu') {

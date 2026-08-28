@@ -947,8 +947,9 @@ async function selectPythonEnvironment(): Promise<void> {
 }
 
 async function toggleRemoteCompute(): Promise<void> {
+  const active = requireRuntime();
   const configuration = vscode.workspace.getConfiguration('pairNotebook');
-  const current = configuration.get<boolean>('allowRemoteCompute', false);
+  const current = active.isRemoteComputeAllowed();
   const enabled = !current;
   if (enabled) {
     const confirmation = await vscode.window.showWarningMessage(
@@ -958,9 +959,9 @@ async function toggleRemoteCompute(): Promise<void> {
     );
     if (confirmation !== 'Разрешить удалённые вычисления') return;
   }
-  await configuration.update('allowRemoteCompute', enabled, vscode.ConfigurationTarget.Global);
   if (enabled) await configuration.update('allowCpu', true, vscode.ConfigurationTarget.Global);
-  void vscode.window.showInformationMessage(`Remote compute ${!current ? 'enabled' : 'disabled'} on this computer.`);
+  active.setRemoteComputeAllowed(enabled);
+  void vscode.window.showInformationMessage(`Remote compute ${enabled ? 'enabled for this session' : 'disabled'}.`);
 }
 
 async function toggleBooleanSetting(key: string, label: string): Promise<void> {

@@ -236,9 +236,8 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => !peer.project.has('moved.txt'), 3000, 'file deletion');
 
       assert.throws(() => host.changeCompute('peer-z', 'work.ipynb', 'cpu'), /not available for remote compute/);
-      fakeVscode.__config.allowRemoteCompute = true;
       fakeVscode.__config.allowCpu = true;
-      peer.updatePresence();
+      peer.setRemoteComputeAllowed(true);
       await waitFor(() => host.snapshot().awareness.some((state: any) =>
         state.peer.peerId === 'peer-z' && state.allowRemoteCompute && state.allowCpu), 3000, 'explicit remote compute opt-in');
       assert.throws(() => host.changeCompute('peer-z', 'work.ipynb', 'cpu', process.execPath), /cannot start a Jupyter kernel/);
@@ -695,7 +694,7 @@ describe('runtime repair invariants', () => {
     assert.equal(runtime.pendingSnapshotRequests, 0);
   });
 
-  it('keeps local hardware and executable paths private until remote compute is enabled', async () => {
+  it('keeps remote compute disabled until each session explicitly opts in', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-private-hardware-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -712,16 +711,23 @@ describe('runtime repair invariants', () => {
           torchVersion: '', torchCudaAvailable: false, torchCudaVersion: '', cudaDeviceNames: [] },
       };
       (runtime as any).resources = { cpuPercent: 10, ramUsedMb: 100, ramTotalMb: 200, gpus: [], sampledAt: Date.now() };
-      fakeVscode.__config.allowRemoteCompute = false;
+      fakeVscode.__config.allowRemoteCompute = true;
       (runtime as any).updatePresence();
       const advertised = runtime.awareness.getLocalState();
       assert.equal(advertised.hardware, undefined);
       assert.equal(advertised.resources, undefined);
+      assert.equal(runtime.isRemoteComputeAllowed(), false, 'legacy global setting must be ignored');
       assert.equal(runtime.localComputePresence()?.hardware?.python.executable, 'C:\\Users\\private\\python.exe');
 
-      fakeVscode.__config.allowRemoteCompute = true;
-      (runtime as any).updatePresence();
+      runtime.setRemoteComputeAllowed(true);
       assert.equal(runtime.awareness.getLocalState()?.hardware?.python.executable, 'C:\\Users\\private\\python.exe');
+
+      const nextRuntime = new SessionRuntime(descriptor({
+        sessionId: 'private-hardware-next', role: 'host', peerId: 'next-host', hostPeerId: 'next-host',
+        workingFolder: path.join(root, 'next-project'), pythonPath: process.execPath,
+      }), 'private-hardware-next-token-that-is-long-enough', context(extensionRoot), logger());
+      assert.equal(nextRuntime.isRemoteComputeAllowed(), false, 'a later session must require fresh consent');
+      await (nextRuntime as any).disposeAsync();
     } finally {
       delete fakeVscode.__config.allowRemoteCompute;
       await (runtime as any).disposeAsync();
@@ -1065,7 +1071,6 @@ describe('compute and lifecycle regression coverage', () => {
       stop: async () => undefined,
     };
     try {
-      fakeVscode.__config.allowRemoteCompute = false;
       await (runtime as any).handleExecutionRequest({
         type: 'executeRequest', payload: Buffer.from('1+1'),
         meta: {
@@ -1090,7 +1095,7 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(sent[0].meta.success, false);
       assert.match(sent[0].meta.message, /remote compute/i);
 
-      fakeVscode.__config.allowRemoteCompute = true;
+      runtime.setRemoteComputeAllowed(true);
       sent.length = 0;
       await (runtime as any).handleExecutionRequest({
         type: 'executeRequest', payload: Buffer.from('1+1'),
@@ -1411,8 +1416,8 @@ describe('compute and lifecycle regression coverage', () => {
     let finishExecution: ((value: any) => void) | undefined;
     let executionCount = 0;
     try {
-      fakeVscode.__config.allowRemoteCompute = true;
       fakeVscode.__config.allowCpu = true;
+      runtime.setRemoteComputeAllowed(true);
       runtime.project.ensureNotebook('work.ipynb');
       (runtime as any).updatePresence();
       const target = runtime.computeForNotebook('work.ipynb');
