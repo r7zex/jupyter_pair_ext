@@ -34,6 +34,22 @@ async function temporaryDirectory(prefix: string): Promise<string> {
 }
 
 describe('audit regressions', () => {
+  describe('release workflow credentials', () => {
+    it('pins external actions and does not persist the checkout token', async () => {
+      const workflowPath = path.resolve(__dirname, '../../.github/workflows/release.yml');
+      const workflow = await readFile(workflowPath, 'utf8');
+      const actionRefs = [...workflow.matchAll(/uses:\s+(actions\/[A-Za-z0-9_-]+)@([^\s#]+)/g)];
+
+      assert.equal(actionRefs.length, 4);
+      for (const [, action, reference] of actionRefs) {
+        assert.match(reference ?? '', /^[a-f0-9]{40}$/, `${action} must use an immutable full SHA`);
+      }
+      assert.doesNotMatch(workflow, /uses:\s+actions\/[A-Za-z0-9_-]+@v\d/);
+      assert.match(workflow, /uses:\s+actions\/checkout@[a-f0-9]{40}[^]*?persist-credentials:\s+false/);
+      assert.equal((workflow.match(/GH_TOKEN:/g) ?? []).length, 1);
+    });
+  });
+
   describe('host election stability', () => {
     it('does not steal the host role after a local event-loop stall', () => {
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };

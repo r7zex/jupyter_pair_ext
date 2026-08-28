@@ -88,7 +88,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. Project snapshots and release-archive inspection now reject Docker, Kubernetes, Terraform, Pulumi, VPN, mobile-provisioning, PuTTY, cloud application-default, and OAuth client-secret artifacts. Regression coverage also preserves normal Docker Compose, Terraform source/lock files, kubeconfig examples, and variable templates.
 
-### SEC-005 — Medium — Release workflow actions are mutable and checkout credentials persist
+### SEC-005 — Medium — Fixed — Release workflow actions are mutable and checkout credentials persist
 
 **Evidence:** The release job has `contents: write`, uses moving major tags such as `actions/checkout@v7`, and leaves checkout credentials persisted while `npm ci` executes dependency lifecycle scripts. GitHub documents full-length commit SHA pinning as the immutable form of action reference.
 
@@ -97,6 +97,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Pin every external action to a verified full commit SHA with a readable version comment, set `persist-credentials: false` on checkout, and keep the GitHub token exposed only to the explicit release step.
 
 **Verification:** Validate workflow syntax, verify every pinned SHA belongs to the expected upstream repository/tag, and rerun the local release build path.
+
+**Resolution:** Implemented. All four external actions are pinned to full SHAs verified against their official GitHub repositories (`checkout` v7.0.1, `setup-node` v7.0.0, `setup-python` v7.0.0, and `upload-artifact` v7.0.1). Checkout now sets `persist-credentials: false`; the release token remains scoped to the explicit `gh release` step. A regression test enforces immutable refs and token handling, and the workflow parses successfully as YAML.
 
 ### SEC-006 — Low — Relay privacy documentation overstates what operators cannot observe
 
