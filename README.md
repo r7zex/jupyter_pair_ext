@@ -4,7 +4,15 @@
 [![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
 [![Download VSIX](https://img.shields.io/badge/download-VSIX-2ea44f)](https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook.vsix)
 
-Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
+Pair Notebook is a self-contained VS Code extension for collaborative editing and remote execution across project files and Jupyter notebooks. Yjs keeps document state conflict-free; authenticated peers use direct WebRTC when possible and automatically retain a redundant encrypted Nostr/MQTT full-data route when direct connectivity is unavailable.
+
+## What it provides
+
+- Live text, notebook structure, outputs, files, directories, renames, deletions, and participant cursors.
+- Host-owned durable storage with folderless joins, deterministic failover, and explicit safe folder selection after host transfer.
+- Direct WebRTC for the normal low-latency path, optional user-configured TURN, and two independent encrypted emergency relay families.
+- Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
+- A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
 
 ## Install
 
@@ -101,7 +109,7 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 Trystero uses public Nostr and MQTT services for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, both emergency families send only AES-256-GCM ciphertext through Nostr relays and MQTT brokers. Duplicate deliveries are removed before the signed participant handshake. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
-Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Release 0.5.4 uses execution protocol v3 and intentionally rejects 0.5.3 peers, so both participants must install the same new VSIX instead of entering a partially compatible session.
+Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Protocol v3 was introduced in 0.5.4 and intentionally rejects 0.5.3 and older execution framing; all participants should install the same current release.
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
@@ -128,4 +136,4 @@ The release artifacts are:
 
 To publish a new release, update `package.json`, `package-lock.json`, and `CHANGELOG.md`, then push a matching `v<version>` tag. GitHub Actions rebuilds and verifies the artifacts before publishing them; an existing tag can also be republished from the **Release Pair Notebook** workflow.
 
-See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and the [network compatibility audit](docs/network-compatibility-audit.md) for implementation details.
+See the [documentation index](docs/README.md), [architecture](docs/architecture.md), and [protocol](docs/protocol.md) for current implementation details. Version-specific audits and repair records are preserved separately as release evidence.

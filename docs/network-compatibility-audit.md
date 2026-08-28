@@ -1,10 +1,12 @@
-# Network compatibility audit
+# Pair Notebook 0.5.4 network compatibility audit
 
 Date: 2026-08-27
 
 Release: 0.5.4
 
 Primary platform: Windows, VS Code 1.95+
+
+> This is a version-specific release record. See the [documentation index](README.md) for current guides and the changelog for later releases.
 
 ## Direct answer
 
@@ -79,9 +81,9 @@ All 21 combinations open their independently routed relay sockets and exchange o
 - `npm test`: PASS, 272 tests.
 - `npm run lint`: PASS.
 - `npm audit`: PASS, 0 vulnerabilities.
-- `npm run artifacts`: PASS; the VSIX contains only 14 required release entries and the complete ZIP contains 86 entries under one top-level directory.
+- `npm run artifacts`: PASS; the VSIX contains only 14 required release entries and the complete ZIP contains 87 entries under one top-level directory.
 - VS Code CLI install: PASS as `pair-notebook.pair-notebook@0.5.4`; installed bundle and Python bridge hashes match the release build.
-- `pair-notebook-0.5.4.vsix` SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
+- Published `pair-notebook-0.5.4.vsix` SHA-256: `c0140d25644ce7b87159a4f3d8601bfba324a18edf0aa13aa7daf6eff8192603`.
 - Active Windows proxy read: `ProxyEnable=1`, `ProxyServer=127.0.0.1:10809`.
 - Real WSS through that detected local system proxy: PASS to `wss://nos.lol`, with target TLS validation enabled.
 - Independent-process public Nostr/WebRTC smoke: PASS.

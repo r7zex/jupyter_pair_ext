@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5 - 2026-08-28 (documentation and release metadata)
+
+- Rewrote the project overview around the current transport: direct WebRTC when available, optional custom TURN, and redundant encrypted Nostr/MQTT full-data fallback.
+- Clarified current architecture and protocol documentation, including logical route recovery, host-owned persistence, recoverable remote execution, and the distinction between direct and relay delivery.
+- Converted the completed 0.5.4 execution/host-transfer plan into an explicit historical implementation record and separated current guides from version-specific release evidence.
+- Corrected the published 0.5.4 asset checksum and archive-entry evidence recorded in the release documents.
+- Added complete repository, issue-tracker, homepage, keyword, GitHub About, and topic metadata so the project is accurately described wherever it is discovered.
+- Runtime behavior is unchanged from 0.5.4; protocol v3 remains compatible with 0.5.4 and intentionally rejects 0.5.3 and older execution framing.
+
 ## 0.5.4 - 2026-08-27 (execution recovery and safe host promotion)
 
 - Keeps an authenticated logical participant online during a bounded physical-route recovery lease. A transient WebRTC path loss now starts immediate relay/direct rediscovery instead of prematurely transferring host authority.

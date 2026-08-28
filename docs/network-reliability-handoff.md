@@ -1,10 +1,12 @@
-# Network reliability implementation and release record
+# Pair Notebook 0.5.4 network reliability release record
 
 Date: 2026-08-27
 
 Target release: 0.5.4
 
 Target scenario: two Windows computers in Russia, including Flowseal/zapret on one endpoint and Karing TUN or Windows system-proxy mode on the other. The same transport must also work for every unordered pairing of direct, Flowseal/zapret, Karing TUN, Karing system proxy, explicit HTTP proxy, and environment proxy paths.
+
+> This document preserves the 0.5.4 implementation and validation record. See the [documentation index](README.md) for current project guidance.
 
 ## Exact guarantee contract
 
@@ -40,7 +42,7 @@ Absolute operation without any outbound connectivity cannot be guaranteed by a n
 
 - `npm run artifacts`: PASS, including lint, compile, 272 deterministic tests, VSIX packaging, and artifact-content validation.
 - Exact VSIX installation: PASS as `pair-notebook.pair-notebook@0.5.4`; the installed bundle and Python bridge match the release build.
-- VSIX SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
+- Published VSIX SHA-256: `c0140d25644ce7b87159a4f3d8601bfba324a18edf0aa13aa7daf6eff8192603`.
 - `python .\test\jupyter_bridge_unit.py`: PASS, 7 tests.
 - `npm audit --omit=dev`: PASS, 0 vulnerabilities.
 - `npm run test:live`: PASS, public Nostr signalling plus WebRTC between independent Node processes.

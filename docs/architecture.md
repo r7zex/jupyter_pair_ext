@@ -44,16 +44,18 @@ When host identity changes, every runtime disables its backing writer and enters
 
 The host writes the durable backing root before updating an open working-copy editor. Open editors remain dirty during ordinary debounced persistence; explicit execution, final save, and host transfer use VS Code's save API as filesystem barriers. Local recovery snapshots are staged under a verified non-symlink session directory and rotated independently of the backing root.
 
-## Compatibility boundary
+## Runtime and compatibility boundary
 
-The VSIX targets VS Code 1.95. Trystero runs in the extension host with bundled compatibility layers:
+The VSIX targets VS Code 1.95 or newer. The complete runtime is bundled into `out/extension.js`:
 
-- `werift` provides `RTCPeerConnection`.
+- Trystero and its Nostr/MQTT strategies coordinate discovery and direct WebRTC negotiation.
+- `werift` provides `RTCPeerConnection` inside the VS Code extension host.
 - `ws` provides `WebSocket` when the VS Code Node runtime has no global implementation.
+- MQTT, secp256k1, and the HTTP/HTTPS/SOCKS proxy agents support the independent relay and proxy paths.
 - `proxy.ts` resolves Pair Notebook/VS Code settings, environment variables, and the Windows system proxy for every WSS signalling and emergency-relay socket.
 
-Both are bundled by esbuild into `out/extension.js`; `node_modules` is excluded from the VSIX.
+Esbuild packages every runtime dependency into the extension bundle; `node_modules` is deliberately excluded from the VSIX. Python/Jupyter packages are needed only on a computer chosen to execute notebook cells.
 
 ## Execution recovery
 
-Remote execution is a request/accept/result state machine above the route layer. File barriers and unaccepted requests retry against `waitForRoute`; the executor deduplicates by request ID and caches acknowledged results. Ordered kernel events and results use binary frame payloads, are retained within bounded replay budgets, and are replayed after an authenticated replacement route appears. Stdin uses an event-sequence/digest acknowledgement so a retry cannot write duplicate input. Transport protocol v3 makes these framing guarantees an admission boundary: mixed 0.5.3 and 0.5.4 participants do not enter one session.
+Remote execution is a request/accept/result state machine above the route layer. File barriers and unaccepted requests retry against `waitForRoute`; the executor deduplicates by request ID and caches acknowledged results. Ordered kernel events and results use binary frame payloads, are retained within bounded replay budgets, and are replayed after an authenticated replacement route appears. Stdin uses an event-sequence/digest acknowledgement so a retry cannot write duplicate input. Transport protocol v3, introduced in 0.5.4, makes these framing guarantees an admission boundary: 0.5.4 and later protocol-v3 builds reject 0.5.3 and older execution framing.

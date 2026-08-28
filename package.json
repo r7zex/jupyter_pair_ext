@@ -1,10 +1,18 @@
 {
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
-  "description": "Install-only encrypted P2P collaboration for VS Code text files and Jupyter notebooks.",
-  "version": "0.5.4",
+  "description": "Self-contained encrypted collaboration for VS Code text files and Jupyter notebooks, with direct WebRTC and redundant Nostr/MQTT relay fallback.",
+  "version": "0.5.5",
   "publisher": "pair-notebook",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/r7zex/jupyter_pair_ext.git"
+  },
+  "homepage": "https://github.com/r7zex/jupyter_pair_ext#readme",
+  "bugs": {
+    "url": "https://github.com/r7zex/jupyter_pair_ext/issues"
+  },
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -18,6 +26,10 @@
     "yjs",
     "trystero",
     "webrtc",
+    "nostr",
+    "mqtt",
+    "crdt",
+    "remote execution",
     "pair programming"
   ],
   "activationEvents": [

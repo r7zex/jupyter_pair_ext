@@ -16,11 +16,11 @@ Before Trystero admits a peer, Pair Notebook exchanges a protocol-v3 handshake c
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v3 is intentionally incompatible with 0.5.3 execution framing. A mixed-version pair is rejected during admission; every participant must run 0.5.4 or newer.
+Protocol v3 was introduced in 0.5.4 and is intentionally incompatible with 0.5.3 and older execution framing. Incompatible peers are rejected during admission; participants should run the same current release.
 
 ## Frames and delivery
 
-Pair Notebook preserves its compact binary wire frame above a single Trystero action. Metadata includes a random message ID, source and optional target IDs, send time, and host clock. Duplicate message IDs are retained for 60 seconds.
+Pair Notebook uses one compact binary wire-frame format across every route. A direct WebRTC route carries it through a Trystero action; emergency Nostr/MQTT routes encrypt and chunk the same frame bytes before relay publication. Metadata includes a random message ID, source and optional target IDs, send time, and host clock. Duplicate message IDs are retained for 60 seconds.
 
 Each target has ordered realtime and bulk queues. Realtime edits can overtake queued bulk snapshot/file chunks, while an in-flight item remains ordered. Queue accounting includes in-flight bytes and enforces 128 MiB per peer plus 512 MiB per session, with separate frame-count and inbound-rate limits. Trystero action promises provide the send-completion barrier.
 

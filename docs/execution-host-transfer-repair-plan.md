@@ -1,4 +1,4 @@
-# Execution, route recovery, and host-folder repair plan
+# Pair Notebook 0.5.4 execution and host-transfer repair record
 
 Date: 2026-08-27
 
@@ -6,9 +6,9 @@ Target release: 0.5.4
 
 Incident scope: a two-participant Windows session connected successfully, but remote notebook execution lost its route, recent participant edits were not visible on the original host, host authority moved without an intentional transfer, and cancelling a non-empty-folder warning left the promoted host without an obvious recovery action.
 
-This document is the implementation contract for the repair. Changes are delivered as small pushed commits so every completed phase remains available on GitHub.
+This document preserves the incident evidence, implementation contract, completed checkpoints, and release acceptance for the 0.5.4 repair. See the [documentation index](README.md) for current project guidance.
 
-Status: implementation checkpoints A-F are complete on PR #11 for release 0.5.4. The exact two reported physical computers remain the only external acceptance item that cannot be executed in this development environment.
+Status: implementation checkpoints A-F were completed on PR #11 for release 0.5.4. The exact two reported physical computers remained the only external acceptance item unavailable in the development environment.
 
 ## Evidence from the reported incident
 
@@ -58,60 +58,60 @@ The current prompt offers only `Replace folder contents`. Materialization writes
 7. Folder intent is explicit. No non-empty directory is deleted or overwritten without a mode choice and a final confirmation.
 8. A promoted host broadcasts `hostStorageReady` only after authoritative state is safely materialized or an existing folder has passed the selected reconciliation policy.
 
-## Implementation phases and incremental GitHub checkpoints
+## Implemented phases and incremental GitHub checkpoints
 
 ### Checkpoint A — plan and deterministic reproductions
 
-- Commit this plan first.
-- Add a transport test where the active direct route dies while the emergency relay remains available.
-- Add a runtime test proving the old host is retained during recovery and participant edits converge after the replacement route appears.
-- Add execution tests for route loss before barrier send, after request acceptance, and while returning the result.
-- Add UI/runtime tests for warning cancellation, retry, empty-folder mode, existing-folder match, and existing-folder conflict.
+- Recorded the plan before implementation.
+- Added a transport test where the active direct route dies while the emergency relay remains available.
+- Added a runtime test proving the old host is retained during recovery and participant edits converge after the replacement route appears.
+- Added execution tests for route loss before barrier send, after request acceptance, and while returning the result.
+- Added UI/runtime tests for warning cancellation, retry, empty-folder mode, existing-folder match, and existing-folder conflict.
 
 ### Checkpoint B — logical route recovery lease
 
-- Introduce an authenticated logical-peer recovery state in `MeshTransport`.
-- On active-route loss, immediately start relay fallback and direct rediscovery instead of waiting for the 20-second sweep.
-- Keep host/election presence alive only for a bounded recovery lease; cancel the pending logical disconnect when a signed replacement route is admitted.
-- Emit `peerDisconnected` exactly once only after every recovery path misses the deadline.
-- Expose `waitForRoute(peerId, timeout)` so higher layers never race a stale route snapshot against `sendTo`.
+- Introduced an authenticated logical-peer recovery state in `MeshTransport`.
+- Started relay fallback and direct rediscovery immediately after active-route loss instead of waiting for the 20-second sweep.
+- Kept host/election presence alive for a bounded recovery lease and cancelled the pending logical disconnect when a signed replacement route was admitted.
+- Emitted `peerDisconnected` exactly once only after every recovery path missed the deadline.
+- Exposed `waitForRoute(peerId, timeout)` so higher layers did not race a stale route snapshot against `sendTo`.
 
 ### Checkpoint C — execution delivery state machine
 
-- Wait for a live route before beginning the file barrier.
-- Add `executeAccepted` and idempotent request handling keyed by `requestId`.
-- Use short bounded acceptance/recovery timers rather than relying on the four-hour kernel limit.
-- Retain completed results for a bounded period and replay them after a duplicate request or route restoration.
-- Retry critical barrier/request/result frames only after authenticated route recovery; never execute the same request twice.
-- Ensure controller output and `NotebookCellExecution.end(false)` receive a concise actionable error when recovery fails.
+- Waited for a live route before beginning the file barrier.
+- Added `executeAccepted` and idempotent request handling keyed by `requestId`.
+- Used short bounded acceptance/recovery timers rather than relying on the four-hour kernel limit.
+- Retained completed results for a bounded period and replayed them after a duplicate request or route restoration.
+- Retried critical barrier/request/result frames only after authenticated route recovery and never executed the same request twice.
+- Ensured controller output and `NotebookCellExecution.end(false)` received a concise actionable error when recovery failed.
 
 ### Checkpoint D — edit and filesystem reconciliation
 
-- Mark a replacement route application-ready only after state vectors and filesystem/compute state are exchanged.
-- Keep locally generated CRDT updates in Yjs and rely on state-vector diff for exact replay; do not treat a failed best-effort broadcast as successful convergence.
-- Queue bounded lifecycle controls needed for create/delete/rename reconciliation or include them in the reconnect manifest.
-- Add an execution preflight that waits for this reconciliation barrier before hashing its manifest.
-- Verify text, notebook structure/output, new/deleted/renamed files, binaries, and directories across a route flap.
+- Marked a replacement route application-ready only after state vectors and filesystem/compute state were exchanged.
+- Kept locally generated CRDT updates in Yjs and relied on state-vector diff for exact replay; failed best-effort broadcast was not treated as successful convergence.
+- Queued bounded lifecycle controls needed for create/delete/rename reconciliation or included them in the reconnect manifest.
+- Added an execution preflight that waits for this reconciliation barrier before hashing its manifest.
+- Verified text, notebook structure/output, new/deleted/renamed files, binaries, and directories across a route flap.
 
 ### Checkpoint E — retryable and explicit host-folder workflow
 
 - Put a persistent `Choose host folder` action directly inside the pause card and status bar, not only below the fold.
-- After dialog cancellation, keep the pause card/action active and offer `Choose another folder` without requiring a new host event.
-- Present folder intent before browsing:
-  - **Save current session to an empty folder** — require an empty directory, then materialize the authoritative session.
-  - **Use an existing synchronized project folder** — scan and compare it against the authoritative manifest without modifying it first.
-- When the existing folder matches, bind it without destructive replacement. Ignored local files may remain.
-- When tracked contents differ, show a bounded conflict summary and require an explicit follow-up choice: write the current authoritative session or choose another folder. Never infer a winner from timestamps.
-- Deliberately do not import a conflicting directory into the live session during host promotion. That would replace already-merged CRDT authority while peers are paused and cannot be made equivalent to the user's requested “use the same Dropbox copy” operation. Exact copies attach without writes; mismatches require an explicit session-to-folder replacement or another folder.
+- Kept the pause card/action active after dialog cancellation and offered `Choose another folder` without requiring a new host event.
+- Presented folder intent before browsing:
+  - **Save current session to an empty folder** — required an empty directory, then materialized the authoritative session.
+  - **Use an existing synchronized project folder** — scanned and compared it against the authoritative manifest without modifying it first.
+- Bound an exact existing folder without destructive replacement; ignored local files could remain.
+- Showed a bounded conflict summary when tracked contents differed and required an explicit follow-up choice: write the current authoritative session or choose another folder. It never inferred a winner from timestamps.
+- Deliberately did not import a conflicting directory into the live session during host promotion. That would replace already-merged CRDT authority while peers were paused and could not be made equivalent to the user's requested “use the same Dropbox copy” operation. Exact copies attached without writes; mismatches required an explicit session-to-folder replacement or another folder.
 
 ### Checkpoint F — release and installed-artifact acceptance
 
-- Bump to 0.5.4 and replace the tracked 0.5.3 VSIX.
-- Run lint, compile, deterministic tests, Python bridge tests, dependency audit, public Nostr/MQTT/WebRTC tests, and forced emergency-relay tests.
-- Install the exact VSIX and confirm the installed version.
-- Verify the packaged panel contains the persistent retry control.
-- Verify GitHub `main` contains only the current VSIX and no generated, temporary, internal research, or old release files.
-- Record the exact two-computer Flowseal/zapret-to-Karing acceptance as NOT RUN unless the final VSIX is actually exercised on those two computers.
+- Bumped to 0.5.4 and replaced the tracked 0.5.3 VSIX.
+- Ran lint, compile, deterministic tests, Python bridge tests, dependency audit, public Nostr/MQTT/WebRTC tests, and forced emergency-relay tests.
+- Installed the exact VSIX and confirmed the installed version.
+- Verified the packaged panel contains the persistent retry control.
+- Verified GitHub `main` contains only the current VSIX and no generated, temporary, internal research, or old release files.
+- Recorded the exact two-computer Flowseal/zapret-to-Karing acceptance as NOT RUN because the final VSIX was not exercised on those two computers in this environment.
 
 ## Acceptance matrix
 
@@ -137,7 +137,7 @@ The current prompt offers only `Replace folder contents`. Materialization writes
 
 ## Explicit limitations
 
-The exact two computers from the report and their Dropbox contents are unavailable in the development environment. The implementation must therefore use deterministic fault-injection tests plus final user-side acceptance. No test result may be represented as a passed physical two-computer check until that check is actually performed.
+The exact two computers from the report and their Dropbox contents were unavailable in the development environment. The implementation therefore used deterministic fault-injection tests while preserving final user-side acceptance as NOT RUN. No test result may be represented as a passed physical two-computer check until that check is actually performed.
 
 ## Completed checkpoints
 
@@ -146,4 +146,4 @@ The exact two computers from the report and their Dropbox contents are unavailab
 - `991661a`: full content request for newly discovered CRDT documents.
 - `b5d58eb`: persistent folder retry, empty-folder mode, and exact shared-folder binding.
 - `cbbf60e`, `7f0f7a7`, `bf09842`: ordered output replay, bounded large rich output, reliable stdin/control delivery, and protocol-v3 compatibility boundary.
-- Release acceptance: `npm run artifacts` passed lint, compilation, 272 deterministic tests, VSIX packaging, and archive validation; VS Code CLI then installed `pair-notebook.pair-notebook@0.5.4` successfully. The installed JavaScript bundle and Python bridge hashes match the packaged build. VSIX SHA-256: `f3b46552621b1a2e6007222eebf3f74329ed484387b03899ee723d02b5b32582`.
+- Release acceptance: `npm run artifacts` passed lint, compilation, 272 deterministic tests, VSIX packaging, and archive validation; VS Code CLI then installed `pair-notebook.pair-notebook@0.5.4` successfully. The installed JavaScript bundle and Python bridge hashes match the packaged build. Published VSIX SHA-256: `c0140d25644ce7b87159a4f3d8601bfba324a18edf0aa13aa7daf6eff8192603`.
