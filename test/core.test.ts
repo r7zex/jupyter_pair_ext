@@ -782,7 +782,7 @@ describe('repair regressions', () => {
     });
     const projectedKey = generateIdentityCredentials().publicKey;
     const parsed = (transport as any).parseHandshake({
-      version: 3,
+      version: 4,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: {
@@ -796,7 +796,7 @@ describe('repair regressions', () => {
       peerId: 'projected', displayName: 'Projected', joinOrder: 1, identityKey: projectedKey,
     });
     assert.throws(() => (transport as any).parseHandshake({
-      version: 2,
+      version: 3,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: parsed.peer,

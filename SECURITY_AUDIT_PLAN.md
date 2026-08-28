@@ -52,7 +52,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. Remote-compute permission is now ephemeral runtime state, legacy persisted values are ignored, and the focused regression suite passes.
 
-### SEC-002 — High — Shared relay key permits sender impersonation
+### SEC-002 — High — Fixed — Shared relay key permits sender impersonation
 
 **Evidence:** Nostr/MQTT emergency packets are encrypted with one AES-GCM key derived from the bearer invite. The outer `f` peer id is not cryptographically bound to the encrypted Mesh envelope. After one participant is admitted, any invite holder can encrypt a `fr` envelope, label it as that admitted peer, and submit a wire frame whose `sourceId` matches the label. The receiver then treats it as traffic from the admitted identity.
 
@@ -61,6 +61,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Introduce relay-envelope protocol v2. Every Mesh relay envelope must carry a random message id, timestamp, target identity, and Ed25519 signature over a domain-separated canonical transcript. Verify the signature against the handshake identity (initial handshake) or pinned admitted identity (all later messages), enforce a bounded freshness window, and deduplicate signed envelope ids. Increment the Pair Notebook handshake protocol version so mixed clients fail explicitly instead of silently downgrading.
 
 **Regression tests:** Reject unsigned, modified, wrong-target, stale, future, and replayed relay envelopes; keep a complete signed relay-only connection and data exchange working.
+
+**Resolution:** Implemented in transport protocol v4. Every emergency-relay envelope is signed by the sender identity and bound to the session, source, intended target, message id, timestamp, and canonical payload. Receivers verify the pinned or handshake identity before processing, reject packets outside the bounded clock window, and retain a bounded replay cache. Focused unit and relay-only integration tests pass.
 
 ### SEC-003 — Medium — Public relay announcements allow resource exhaustion
 

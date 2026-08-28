@@ -12,7 +12,7 @@ Target scenario: two Windows computers in Russia, including Flowseal/zapret on o
 
 Absolute operation without any outbound connectivity cannot be guaranteed by a networked application. The enforceable contract for this release is:
 
-1. Both computers run the same Pair Notebook 0.5.4 VSIX; protocol v3 rejects 0.5.3 peers before session admission.
+1. Both computers run the same current Pair Notebook VSIX; protocol v4 rejects protocol-v3 and older peers before session admission.
 2. Each computer has a working outbound secure-WebSocket path through its active routing software.
 3. Start and Join attempt two independent complete emergency data families, Nostr and MQTT.
 4. The local transport does not report readiness until at least one complete emergency family returns an invite-key-encrypted publish-to-receive self-check.

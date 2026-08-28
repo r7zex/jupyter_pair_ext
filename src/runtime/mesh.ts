@@ -168,6 +168,15 @@ interface RelayNegotiation {
   timeout: NodeJS.Timeout;
 }
 
+interface SignedRelayEnvelope {
+  version: number;
+  messageId: string;
+  sentAt: number;
+  targetPeerId: string;
+  payload: Record<string, unknown>;
+  signature: string;
+}
+
 
 const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> & MeshNetworkConfig = {
   disableTurnProbe: false,
@@ -193,7 +202,11 @@ export function configureMeshNetwork(config: MeshNetworkConfig): void {
 }
 
 const RELAY_REDUNDANCY = 8;
-const HANDSHAKE_VERSION = 3;
+const HANDSHAKE_VERSION = 4;
+const RELAY_ENVELOPE_VERSION = 2;
+const RELAY_ENVELOPE_MAX_AGE_MS = 10 * 60_000;
+const RELAY_ENVELOPE_MAX_FUTURE_SKEW_MS = 2 * 60_000;
+const MAX_SEEN_RELAY_ENVELOPES = 131_072;
 const ACTION_NAMESPACE = 'pair-notebook-frame-v2';
 const MAX_OUTBOUND_QUEUE = 128 * 1024 * 1024;
 const MAX_TOTAL_OUTBOUND_QUEUE = 512 * 1024 * 1024;
@@ -360,6 +373,8 @@ export class MeshTransport extends EventEmitter {
   private relay: FrameRelay | undefined;
   private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
+  /** Valid signed relay envelopes retained briefly to reject captured replays. */
+  private readonly seenRelayEnvelopes = new Map<string, number>();
   /** Make-before-break improvement attempts, keyed by logical peer id. */
   private readonly routeUpgrades = new Map<string, RouteUpgrade>();
   private upgradeRoom: Room | undefined;
@@ -1458,12 +1473,8 @@ public improvablePeerIds(): string[] {
   }
 
   private handleRelayData(fromPeerId: string, bytes: Buffer): void {
-    let envelope: { k?: string; hs?: unknown; pr?: unknown; d?: string; s?: string };
-    try {
-      envelope = JSON.parse(bytes.toString('utf8')) as typeof envelope;
-    } catch {
-      return;
-    }
+    const envelope = this.verifyRelayEnvelope(fromPeerId, bytes);
+    if (!envelope) return;
     if (envelope.k === 'up') {
       // Remote peer asked us to help build a better route. The working relay
       // channel stays up; we merely join the negotiation room.
@@ -1491,6 +1502,77 @@ public improvablePeerIds(): string[] {
       if (!connection) return;
       this.handleAction(exactArrayBuffer(Buffer.from(envelope.d, 'base64')), RELAY_TRANSPORT_PREFIX + fromPeerId);
     }
+  }
+
+  private verifyRelayEnvelope(
+    fromPeerId: string,
+    bytes: Buffer,
+  ): { k?: string; hs?: unknown; pr?: unknown; d?: string; s?: string } | undefined {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      return undefined;
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const envelope = raw as Partial<SignedRelayEnvelope>;
+    const { messageId, sentAt, targetPeerId, payload, signature } = envelope;
+    if (envelope.version !== RELAY_ENVELOPE_VERSION
+      || typeof messageId !== 'string'
+      || !MESSAGE_ID_PATTERN.test(messageId)
+      || typeof sentAt !== 'number'
+      || !Number.isSafeInteger(sentAt)
+      || sentAt <= 0
+      || targetPeerId !== this.options.localPeer.peerId
+      || !payload
+      || typeof payload !== 'object'
+      || Array.isArray(payload)
+      || typeof signature !== 'string') return undefined;
+    const now = Date.now();
+    if (sentAt < now - RELAY_ENVELOPE_MAX_AGE_MS
+      || sentAt > now + RELAY_ENVELOPE_MAX_FUTURE_SKEW_MS) return undefined;
+    const identityKey = this.relayEnvelopeIdentityKey(fromPeerId, payload);
+    if (!identityKey) return undefined;
+    let transcript: Buffer;
+    try {
+      transcript = relayEnvelopeTranscript(
+        this.options.sessionId,
+        fromPeerId,
+        this.options.localPeer.peerId,
+        messageId,
+        sentAt,
+        payload,
+      );
+    } catch {
+      return undefined;
+    }
+    if (!verifyIdentityTranscript(identityKey, transcript, signature)) return undefined;
+    const replayKey = `${fromPeerId}:${messageId}`;
+    if (this.seenRelayEnvelopes.has(replayKey)) return undefined;
+    if (this.seenRelayEnvelopes.size >= MAX_SEEN_RELAY_ENVELOPES) {
+      this.cleanupSeenRelayEnvelopes(now);
+      if (this.seenRelayEnvelopes.size >= MAX_SEEN_RELAY_ENVELOPES) return undefined;
+    }
+    this.seenRelayEnvelopes.set(replayKey, sentAt);
+    return payload;
+  }
+
+  private relayEnvelopeIdentityKey(
+    fromPeerId: string,
+    payload: Record<string, unknown>,
+  ): string | undefined {
+    const connectedKey = this.connections.get(RELAY_TRANSPORT_PREFIX + fromPeerId)?.identity.identityKey;
+    const rememberedKey = this.directory.get(fromPeerId)?.identityKey;
+    const negotiatedKey = this.relayNegotiations.get(fromPeerId)?.remoteHs?.peer.identityKey;
+    const pinnedKey = connectedKey ?? rememberedKey ?? negotiatedKey;
+    if (payload.k !== 'hs') return pinnedKey;
+    if (!payload.hs || typeof payload.hs !== 'object' || Array.isArray(payload.hs)) return undefined;
+    const handshake = payload.hs as { peer?: unknown };
+    if (!handshake.peer || typeof handshake.peer !== 'object' || Array.isArray(handshake.peer)) return undefined;
+    const peer = handshake.peer as Partial<PeerIdentity>;
+    if (peer.peerId !== fromPeerId || validateIdentityPublicKey(peer.identityKey)) return undefined;
+    if (pinnedKey && pinnedKey !== peer.identityKey) return undefined;
+    return peer.identityKey;
   }
 
   private advanceRelayHandshake(
@@ -1578,7 +1660,32 @@ public improvablePeerIds(): string[] {
   }
 
   private sendRelayEnvelope(peerId: string, payload: Record<string, unknown>): void {
-    this.relay?.send(Buffer.from(JSON.stringify(payload), 'utf8'), peerId);
+    this.relay?.send(this.createSignedRelayEnvelope(peerId, payload), peerId);
+  }
+
+  private createSignedRelayEnvelope(
+    peerId: string,
+    payload: Record<string, unknown>,
+    sentAt = Date.now(),
+  ): Buffer {
+    const messageId = newId();
+    const transcript = relayEnvelopeTranscript(
+      this.options.sessionId,
+      this.options.localPeer.peerId,
+      peerId,
+      messageId,
+      sentAt,
+      payload,
+    );
+    const envelope: SignedRelayEnvelope = {
+      version: RELAY_ENVELOPE_VERSION,
+      messageId,
+      sentAt,
+      targetPeerId: peerId,
+      payload,
+      signature: signIdentityTranscript(this.identityPrivateKey, transcript),
+    };
+    return Buffer.from(JSON.stringify(envelope), 'utf8');
   }
 
   public peerRuntime(): PeerRuntime[] {
@@ -1642,6 +1749,7 @@ public improvablePeerIds(): string[] {
     this.totalPendingInboundBytes = 0;
     this.outboundQueues.clear();
     this.seenIds.clear();
+    this.seenRelayEnvelopes.clear();
     this.inboundWindows.clear();
     if (room) await room.leave();
     this.relay?.stop();
@@ -2028,9 +2136,9 @@ public improvablePeerIds(): string[] {
           if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
             const relayChannel = this.relay;
             if (!relayChannel) throw new Error('Relay fallback transport stopped during send.');
-            relayChannel.send(
-              Buffer.from(JSON.stringify({ k: 'fr', d: item.bytes.toString('base64') }), 'utf8'),
+            this.sendRelayEnvelope(
               transportPeerId.slice(RELAY_TRANSPORT_PREFIX.length),
+              { k: 'fr', d: item.bytes.toString('base64') },
             );
           } else if (transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)) {
             // Promoted direct route living in the upgrade negotiation room.
@@ -2329,6 +2437,7 @@ public improvablePeerIds(): string[] {
       for (const [id, timestamp] of ids) if (timestamp < oldest) ids.delete(id);
       if (!ids.size) this.seenIds.delete(peerId);
     }
+    this.cleanupSeenRelayEnvelopes(now);
     this.pruneRemoteRouteStatuses();
     for (const [transportPeerId, handshake] of this.pendingHandshakes) {
       if ((handshake.admittedAt ?? now) >= now - PENDING_HANDSHAKE_TTL_MS) continue;
@@ -2337,6 +2446,13 @@ public improvablePeerIds(): string[] {
       const owner = this.roomForTransport(transportPeerId);
       try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* best effort */ }
       this.emit('protocolError', new Error(`Expired incomplete peer admission ${transportPeerId}.`));
+    }
+  }
+
+  private cleanupSeenRelayEnvelopes(now: number): void {
+    const oldest = now - RELAY_ENVELOPE_MAX_AGE_MS;
+    for (const [id, timestamp] of this.seenRelayEnvelopes) {
+      if (timestamp < oldest) this.seenRelayEnvelopes.delete(id);
     }
   }
 
@@ -2479,6 +2595,46 @@ function transcriptIdentity(handshake: HandshakeMessage): Record<string, unknown
     identityKey: handshake.peer.identityKey,
     nonce: handshake.nonce,
   };
+}
+
+function relayEnvelopeTranscript(
+  sessionId: string,
+  sourcePeerId: string,
+  targetPeerId: string,
+  messageId: string,
+  sentAt: number,
+  payload: Record<string, unknown>,
+): Buffer {
+  return Buffer.from([
+    'pair-notebook-relay-envelope-v2',
+    sessionId,
+    sourcePeerId,
+    targetPeerId,
+    messageId,
+    String(sentAt),
+    canonicalJson(payload),
+  ].join('\0'), 'utf8');
+}
+
+/** Deterministic JSON used only for signed protocol transcripts. */
+function canonicalJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('Signed relay payload contains a non-finite number.');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => item === undefined ? 'null' : canonicalJson(item)).join(',')}]`;
+  }
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error('Signed relay payload contains an unsupported value.');
+  }
+  const fields = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`);
+  return `{${fields.join(',')}}`;
 }
 
 function exactArrayBuffer(buffer: Buffer): ArrayBuffer {

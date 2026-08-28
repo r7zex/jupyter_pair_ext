@@ -682,6 +682,7 @@ describe('mesh relay fallback integration', function () {
     type RelayInternals = {
       relay: unknown;
       localHandshake: () => unknown;
+      createSignedRelayEnvelope: (peerId: string, payload: Record<string, unknown>) => Buffer;
       handleRelayData: (peerId: string, bytes: Buffer) => void;
       relayNegotiations: Map<string, Negotiation>;
     };
@@ -702,14 +703,14 @@ describe('mesh relay fallback integration', function () {
     local.on('connectionError', (_peer, error: Error) => errors.push(error));
 
     try {
-      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+      localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
         k: 'hs', hs: remoteInternals.localHandshake(),
-      })));
+      }));
       const failedNonce = localInternals.relayNegotiations.get('z-guest')?.localHs.nonce;
       assert.ok(failedNonce);
-      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
-        k: 'pr', pr: { version: 3, signature: Buffer.alloc(64).toString('base64') },
-      })));
+      localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
+        k: 'pr', pr: { version: 4, signature: Buffer.alloc(64).toString('base64') },
+      }));
       await new Promise<void>((resolve) => queueMicrotask(resolve));
 
       assert.match(errors[0]?.message ?? '', /failed the identity proof/);
@@ -740,6 +741,7 @@ describe('mesh relay fallback integration', function () {
     type RelayInternals = {
       relay: unknown;
       localHandshake: () => unknown;
+      createSignedRelayEnvelope: (peerId: string, payload: Record<string, unknown>) => Buffer;
       handleRelayData: (peerId: string, bytes: Buffer) => void;
       relayNegotiations: Map<string, Negotiation>;
     };
@@ -759,23 +761,109 @@ describe('mesh relay fallback integration', function () {
     local.on('connectionError', (_peer, error: Error) => errors.push(error));
 
     try {
-      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+      localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
         k: 'hs', hs: remoteInternals.localHandshake(),
-      })));
+      }));
       const negotiation = localInternals.relayNegotiations.get('z-guest');
       assert.ok(negotiation);
-      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify({
+      localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
         k: 'pr',
         pr: {
-          version: 3,
+          version: 4,
           signature: Buffer.alloc(64).toString('base64'),
           transcriptId: '0'.repeat(64),
         },
-      })));
+      }));
 
       assert.equal(errors.length, 0);
       assert.equal(localInternals.relayNegotiations.get('z-guest'), negotiation);
       assert.equal(negotiation.remoteProof, undefined);
+    } finally {
+      await local.stop();
+      await remote.stop();
+    }
+  });
+
+  it('authenticates and deduplicates every emergency relay envelope', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const local = new MeshTransport({
+      sessionId: 'signed-relay', token: 'signed-relay-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    const remote = new MeshTransport({
+      sessionId: 'signed-relay', token: 'signed-relay-token-that-is-long-enough',
+      localPeer: { peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false,
+    });
+    type Handshake = { peer: { peerId: string; displayName: string; joinOrder: number; identityKey?: string } };
+    type RelayInternals = {
+      localHandshake: () => Handshake;
+      createFrame: (type: string, meta: Record<string, unknown>, payload: Uint8Array) => Buffer;
+      createSignedRelayEnvelope: (
+        peerId: string,
+        payload: Record<string, unknown>,
+        sentAt?: number,
+      ) => Buffer;
+      handleRelayData: (peerId: string, bytes: Buffer) => void;
+      connections: Map<string, unknown>;
+      identityToTransport: Map<string, string>;
+      seenRelayEnvelopes: Map<string, number>;
+    };
+    const localInternals = local as unknown as RelayInternals;
+    const remoteInternals = remote as unknown as RelayInternals;
+    const remoteIdentity = remoteInternals.localHandshake().peer;
+    local.connect(remoteIdentity);
+    localInternals.connections.set('relay:z-guest', {
+      transportPeerId: 'relay:z-guest',
+      identity: remoteIdentity,
+      purpose: 'runtime',
+      connectedAt: Date.now(),
+      lastSeen: Date.now(),
+      snapshotRequested: false,
+    });
+    localInternals.identityToTransport.set('z-guest', 'relay:z-guest');
+
+    const received: Buffer[] = [];
+    local.on('message', (frame: { type: string; payload: Uint8Array }) => {
+      if (frame.type === 'probePing') received.push(Buffer.from(frame.payload));
+    });
+    const frame = remoteInternals.createFrame(
+      'probePing',
+      { messageId: 'signed-relay-frame' },
+      Buffer.from('authenticated'),
+    );
+    const payload = { k: 'fr', d: frame.toString('base64') };
+
+    try {
+      const valid = remoteInternals.createSignedRelayEnvelope('a-host', payload);
+      localInternals.handleRelayData('z-guest', valid);
+      assert.deepEqual(received.map((item) => item.toString('utf8')), ['authenticated']);
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1);
+
+      localInternals.handleRelayData('z-guest', valid);
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1, 'a captured signed envelope is deduplicated');
+      assert.equal(received.length, 1);
+
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify(payload)));
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1, 'unsigned relay input is ignored');
+
+      const modified = JSON.parse(valid.toString('utf8')) as { payload: Record<string, unknown> };
+      modified.payload = { k: 'up' };
+      localInternals.handleRelayData('z-guest', Buffer.from(JSON.stringify(modified)));
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1, 'modified signed content is ignored');
+
+      const wrongTarget = remoteInternals.createSignedRelayEnvelope('another-peer', payload);
+      localInternals.handleRelayData('z-guest', wrongTarget);
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1, 'an envelope for another identity is ignored');
+
+      const stale = remoteInternals.createSignedRelayEnvelope('a-host', payload, Date.now() - 11 * 60_000);
+      localInternals.handleRelayData('z-guest', stale);
+      const future = remoteInternals.createSignedRelayEnvelope('a-host', payload, Date.now() + 3 * 60_000);
+      localInternals.handleRelayData('z-guest', future);
+      assert.equal(localInternals.seenRelayEnvelopes.size, 1, 'stale and future envelopes are ignored');
+      assert.equal(received.length, 1);
     } finally {
       await local.stop();
       await remote.stop();

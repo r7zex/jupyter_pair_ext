@@ -16,7 +16,7 @@ Before Trystero admits a peer, Pair Notebook exchanges a protocol-v3 handshake c
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v3 was introduced in 0.5.4 and is intentionally incompatible with 0.5.3 and older execution framing. Incompatible peers are rejected during admission; participants should run the same current release.
+Protocol v4 authenticates every emergency-relay envelope with the sender's Ed25519 identity, its intended recipient, a freshness timestamp, and a replay-resistant message id. It is intentionally incompatible with protocol-v3 and older clients. Incompatible peers are rejected during admission; participants should run the same current release.
 
 ## Frames and delivery
 

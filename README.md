@@ -109,7 +109,7 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 Trystero uses public Nostr and MQTT services for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, both emergency families send only AES-256-GCM ciphertext through Nostr relays and MQTT brokers. Duplicate deliveries are removed before the signed participant handshake. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
-Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Protocol v3 was introduced in 0.5.4 and intentionally rejects 0.5.3 and older execution framing; all participants should install the same current release.
+Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Protocol v4 signs every emergency-relay envelope and intentionally rejects protocol-v3 and older clients; all participants should install the same current release.
 
 The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people.
 
