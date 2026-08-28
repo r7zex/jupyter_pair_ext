@@ -1,13 +1,17 @@
-# Pair Notebook 0.5.4
+# Pair Notebook
+
+[![Latest release](https://img.shields.io/github/v/release/r7zex/jupyter_pair_ext?display_name=tag&sort=semver)](https://github.com/r7zex/jupyter_pair_ext/releases/latest)
+[![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
+[![Download VSIX](https://img.shields.io/badge/download-VSIX-2ea44f)](https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook.vsix)
 
 Pair Notebook is a VS Code extension for collaborative editing of project files and Jupyter notebooks. It uses Yjs for conflict-free document state and Trystero for encrypted peer-to-peer transport.
 
 ## Install
 
-Install `pair-notebook-0.5.4.vsix` on **both computers** from **Extensions: Install from VSIX...**, or run:
+Download [`pair-notebook.vsix`](https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook.vsix) from the latest GitHub Release and install it on **both computers** from **Extensions: Install from VSIX...**, or run:
 
 ```powershell
-code --install-extension .\pair-notebook-0.5.4.vsix --force
+code --install-extension .\pair-notebook.vsix --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
@@ -115,9 +119,13 @@ npm run artifacts
 
 `npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport and failover tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies eight-by-64-KiB direct-to-system-proxy bursts across all seven compatible ordered Nostr-only, MQTT-only, and redundant-family combinations.
 
-The final artifacts are:
+The release artifacts are:
 
-- `pair-notebook-0.5.4.vsix` — installable extension.
-- `pair-notebook-complete-0.5.4.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `pair-notebook.vsix` — stable direct-download name for the latest installable extension.
+- `pair-notebook-<version>.vsix` — the same extension with its exact version in the filename.
+- `pair-notebook-complete-<version>.zip` — complete source project, build output, tests, documentation, and VSIX under one `pair-notebook/` directory.
+- `SHA256SUMS.txt` — checksums for download verification.
+
+To publish a new release, update `package.json`, `package-lock.json`, and `CHANGELOG.md`, then push a matching `v<version>` tag. GitHub Actions rebuilds and verifies the artifacts before publishing them; an existing tag can also be republished from the **Release Pair Notebook** workflow.
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), and the [network compatibility audit](docs/network-compatibility-audit.md) for implementation details.

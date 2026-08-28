@@ -1,0 +1,131 @@
+name: Release Pair Notebook
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish, for example v0.5.4
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify and publish VSIX
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies from lockfile
+        run: npm ci
+
+      - name: Test Python bridge
+        run: python -m unittest discover -s test -p jupyter_bridge_unit.py -v
+
+      - name: Validate production dependencies
+        run: npm audit --omit=dev
+
+      - name: Build and verify release artifacts
+        run: npm run artifacts
+
+      - name: Prepare release files and notes
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v${VERSION}"
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match package.json version ${VERSION}." >&2
+            exit 1
+          fi
+
+          VERSIONED_VSIX="pair-notebook-${VERSION}.vsix"
+          SOURCE_ZIP="pair-notebook-complete-${VERSION}.zip"
+          test -f "${VERSIONED_VSIX}"
+          test -f "${SOURCE_ZIP}"
+
+          cp "${VERSIONED_VSIX}" pair-notebook.vsix
+          sha256sum pair-notebook.vsix "${VERSIONED_VSIX}" "${SOURCE_ZIP}" > SHA256SUMS.txt
+          node scripts/create-release-notes.mjs "${VERSION}" release-notes.md
+
+          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "versioned_vsix=${VERSIONED_VSIX}" >> "${GITHUB_OUTPUT}"
+          echo "source_zip=${SOURCE_ZIP}" >> "${GITHUB_OUTPUT}"
+
+      - name: Keep verified artifacts with the workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: pair-notebook-${{ steps.release.outputs.version }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            pair-notebook.vsix
+            ${{ steps.release.outputs.versioned_vsix }}
+            ${{ steps.release.outputs.source_zip }}
+            SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          VERSIONED_VSIX: ${{ steps.release.outputs.versioned_vsix }}
+          SOURCE_ZIP: ${{ steps.release.outputs.source_zip }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_FLAGS=(--latest)
+          if [[ "${RELEASE_VERSION}" == *-* ]]; then
+            RELEASE_FLAGS=(--prerelease)
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "Pair Notebook ${RELEASE_VERSION}" \
+              --notes-file release-notes.md \
+              "${RELEASE_FLAGS[@]}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              --verify-tag \
+              --title "Pair Notebook ${RELEASE_VERSION}" \
+              --notes-file release-notes.md \
+              "${RELEASE_FLAGS[@]}"
+          fi
+
+          gh release upload "${RELEASE_TAG}" \
+            pair-notebook.vsix \
+            "${VERSIONED_VSIX}" \
+            "${SOURCE_ZIP}" \
+            SHA256SUMS.txt \
+            --clobber
