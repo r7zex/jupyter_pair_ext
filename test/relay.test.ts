@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { describe, it, before, after } from 'mocha';
+import {
+  createRelayAnnounceProof,
+  deriveRelayFrameKey,
+} from '../src/runtime/relayCrypto';
 
 class FakeRelaySocket extends EventEmitter {
   public readonly sent: string[] = [];
@@ -298,6 +302,41 @@ describe('emergency Nostr data relay', function () {
     publish({ t: 'd', f: 'peer-b', p: 'b'.repeat(24), s: 1, i: 0, n: 1, d: 'not-base64!' });
     publish({ t: 'a', f: '../not-a-peer' });
     assert.equal(frames, 0);
+    relay.stop();
+  });
+
+  it('rejects forged announces and accepts a same-session HMAC proof', () => {
+    const token = 'shared-token-that-is-long-enough';
+    const sessionId = 'authenticated-announces';
+    const socket = new FakeRelaySocket();
+    const relay = new NostrFrameRelayCtor({
+      token,
+      sessionId,
+      localPeerId: 'peer-a',
+      relays: ['wss://relay.test'],
+      socketFactory: () => socket,
+    });
+    const announced: string[] = [];
+    relay.onPeerAnnounce = (peerId) => announced.push(peerId);
+    relay.start();
+    const publish = (content: unknown): void => {
+      socket.emit('message', JSON.stringify(['EVENT', 'sub', { content: JSON.stringify(content) }]));
+    };
+    const key = deriveRelayFrameKey(token, sessionId);
+
+    publish({ t: 'a', f: 'missing-proof' });
+    publish({
+      t: 'a',
+      f: 'wrong-session',
+      d: createRelayAnnounceProof(key, 'another-session', 'wrong-session'),
+    });
+    publish({
+      t: 'a',
+      f: 'valid-peer',
+      d: createRelayAnnounceProof(key, sessionId, 'valid-peer'),
+    });
+
+    assert.deepEqual(announced, ['valid-peer']);
     relay.stop();
   });
 });

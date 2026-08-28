@@ -64,7 +64,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented in transport protocol v4. Every emergency-relay envelope is signed by the sender identity and bound to the session, source, intended target, message id, timestamp, and canonical payload. Receivers verify the pinned or handshake identity before processing, reject packets outside the bounded clock window, and retain a bounded replay cache. Focused unit and relay-only integration tests pass.
 
-### SEC-003 — Medium — Public relay announcements allow resource exhaustion
+### SEC-003 — Medium — Fixed — Public relay announcements allow resource exhaustion
 
 **Evidence:** Relay `announce` records contain only a syntactically valid peer id. Public relay or broker input can therefore emit unlimited unique ids. `RedundantFrameRelay.announcedPeers` and `MeshTransport.relayAttempts` did not have a complete global admission bound before initiating identity negotiations.
 
@@ -73,6 +73,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Authenticate announces with an HMAC derived from the session relay key, reject missing/invalid proofs, cap announce deduplication state, and cap unknown relay candidates/negotiations without blocking already-known peers.
 
 **Regression tests:** Reject forged Nostr and MQTT announces, accept valid same-session announces, bound redundant announce state, and refuse unbounded unknown Mesh relay candidates.
+
+**Resolution:** Implemented. Nostr and MQTT announce records now require a constant-time-verified HMAC bound to the session and peer id. Redundant announce deduplication retains at most 1,024 peers, while Mesh admits at most 256 unknown relay candidates without preventing a previously known friend from reconnecting. The focused Nostr, MQTT, deduplication, and Mesh-bound tests pass.
 
 ### SEC-004 — Medium — Common local credential artifacts can enter a project snapshot
 

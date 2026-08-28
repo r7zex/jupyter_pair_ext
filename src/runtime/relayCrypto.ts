@@ -1,7 +1,16 @@
-import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHmac,
+  hkdfSync,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 
 const IV_BYTES = 12;
 const READINESS_PREFIX = 'pair-notebook-relay-readiness-v1:';
+const ANNOUNCE_CONTEXT = 'pair-notebook-relay-announce-v1';
+const ANNOUNCE_PROOF_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export function deriveRelayFrameKey(token: string, sessionId: string): Buffer {
   return Buffer.from(hkdfSync(
@@ -41,4 +50,27 @@ export function verifyRelayReadinessProbe(key: Buffer, nonce: string, encoded: s
   } catch {
     return false;
   }
+}
+
+/** Proves that an announced peer id came from someone holding the session invite. */
+export function createRelayAnnounceProof(key: Buffer, sessionId: string, peerId: string): string {
+  return createHmac('sha256', key)
+    .update(ANNOUNCE_CONTEXT)
+    .update('\0')
+    .update(sessionId)
+    .update('\0')
+    .update(peerId)
+    .digest('base64url');
+}
+
+export function verifyRelayAnnounceProof(
+  key: Buffer,
+  sessionId: string,
+  peerId: string,
+  proof: unknown,
+): boolean {
+  if (typeof proof !== 'string' || !ANNOUNCE_PROOF_PATTERN.test(proof)) return false;
+  const actual = Buffer.from(proof, 'base64url');
+  const expected = Buffer.from(createRelayAnnounceProof(key, sessionId, peerId), 'base64url');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }

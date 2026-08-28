@@ -14,10 +14,12 @@ import { type FrameRelay } from './frameRelay';
 import { defaultRelayUrls } from './mqttRoom';
 import { proxyAwareMqttOptions } from './mqttProxy';
 import {
+  createRelayAnnounceProof,
   decryptRelayPacket,
   deriveRelayFrameKey,
   encryptRelayPacket,
   encryptRelayReadinessProbe,
+  verifyRelayAnnounceProof,
   verifyRelayReadinessProbe,
 } from './relayCrypto';
 
@@ -200,7 +202,12 @@ export class MqttFrameRelay implements FrameRelay {
 
   sendAnnounce(): void {
     this.announced = true;
-    this.executeOrQueue([{ v: 1, t: 'a', f: this.options.localPeerId }]);
+    this.executeOrQueue([{
+      v: 1,
+      t: 'a',
+      f: this.options.localPeerId,
+      d: createRelayAnnounceProof(this.key, this.options.sessionId, this.options.localPeerId),
+    }]);
   }
 
   send(bytes: Buffer, toPeerId?: string): void {
@@ -341,6 +348,7 @@ export class MqttFrameRelay implements FrameRelay {
         v: 1,
         t: 'a',
         f: this.options.localPeerId,
+        d: createRelayAnnounceProof(this.key, this.options.sessionId, this.options.localPeerId),
       } satisfies RelayMessage));
       this.flushOutbox();
       return;
@@ -348,6 +356,7 @@ export class MqttFrameRelay implements FrameRelay {
     if (message.f === this.options.localPeerId) return;
     if (message.to !== undefined && message.to !== this.options.localPeerId) return;
     if (message.t === 'a') {
+      if (!verifyRelayAnnounceProof(this.key, this.options.sessionId, message.f, message.d)) return;
       this.onPeerAnnounce(message.f);
       return;
     }

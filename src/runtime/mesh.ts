@@ -213,6 +213,7 @@ const MAX_TOTAL_OUTBOUND_QUEUE = 512 * 1024 * 1024;
 const MAX_OUTBOUND_FRAMES = 16_384;
 const MAX_TOTAL_OUTBOUND_FRAMES = 65_536;
 const MAX_DIRECTORY_PEERS = 256;
+const MAX_UNKNOWN_RELAY_CANDIDATES = MAX_DIRECTORY_PEERS;
 const MAX_SEEN_IDS_PER_PEER = 2048;
 const MAX_INBOUND_BYTES_PER_SECOND = 96 * 1024 * 1024;
 const MAX_INBOUND_MESSAGES_PER_SECOND = 4096;
@@ -1413,6 +1414,7 @@ public improvablePeerIds(): string[] {
     if (this.stopped || !this.relay) return;
     if (peerId === this.options.localPeer.peerId) return;
     if (this.identityToTransport.has(peerId)) return; // connected via another transport
+    if (!this.hasRelayCandidateCapacity(peerId)) return;
     const attempts = this.relayAttempts.get(peerId) ?? 0;
     if (attempts >= 6 || this.relayNegotiations.has(peerId)) return;
     this.relayAttempts.set(peerId, attempts + 1);
@@ -1504,6 +1506,21 @@ public improvablePeerIds(): string[] {
     }
   }
 
+  private hasRelayCandidateCapacity(peerId: string): boolean {
+    if (this.directory.has(peerId) || this.recoveringPeers.has(peerId)
+      || this.relayAttempts.has(peerId) || this.relayNegotiations.has(peerId)) return true;
+    const unknownCandidates = new Set<string>();
+    for (const candidate of this.relayAttempts.keys()) {
+      if (!this.directory.has(candidate) && !this.recoveringPeers.has(candidate)
+        && !this.identityToTransport.has(candidate)) unknownCandidates.add(candidate);
+    }
+    for (const candidate of this.relayNegotiations.keys()) {
+      if (!this.directory.has(candidate) && !this.recoveringPeers.has(candidate)
+        && !this.identityToTransport.has(candidate)) unknownCandidates.add(candidate);
+    }
+    return unknownCandidates.size < MAX_UNKNOWN_RELAY_CANDIDATES;
+  }
+
   private verifyRelayEnvelope(
     fromPeerId: string,
     bytes: Buffer,
@@ -1587,6 +1604,7 @@ public improvablePeerIds(): string[] {
         // A proof without a locally started negotiation is meaningless.
         return;
       }
+      if (!this.hasRelayCandidateCapacity(fromPeerId)) return;
       // An inbound hs IS the announcement of a new relay-only peer.
       // Role is derived from stable peer IDs on both sides. Treating every
       // inbound handshake as the responder makes two responders whenever the

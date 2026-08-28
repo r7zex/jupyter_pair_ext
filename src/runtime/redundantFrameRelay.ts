@@ -6,6 +6,7 @@ import { NostrFrameRelay } from './nostrRelay';
 const DEDUPE_TTL_MS = 120_000;
 const MAX_DEDUPE_ENTRIES = 65_536;
 const ANNOUNCE_DEDUPE_MS = 500;
+const MAX_ANNOUNCED_PEERS = 1_024;
 
 export interface RedundantFrameRelayOptions extends FrameRelayOptions {
   channels?: readonly FrameRelay[];
@@ -104,6 +105,7 @@ export class RedundantFrameRelay implements FrameRelay {
   private acceptAnnounce(peerId: string): void {
     const now = Date.now();
     if (now - (this.announcedPeers.get(peerId) ?? 0) < ANNOUNCE_DEDUPE_MS) return;
+    if (!this.announcedPeers.has(peerId) && this.announcedPeers.size >= MAX_ANNOUNCED_PEERS) return;
     this.announcedPeers.set(peerId, now);
     this.onPeerAnnounce(peerId);
   }

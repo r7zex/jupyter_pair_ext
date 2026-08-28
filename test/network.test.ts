@@ -665,6 +665,51 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
+  it('bounds unknown relay candidates without blocking a known friend', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const transport = new MeshTransport({
+      sessionId: 'bounded-relay-candidates', token: 'bounded-relay-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    type RelayInternals = {
+      relay: unknown;
+      relayAttempts: Map<string, number>;
+      relayNegotiations: Map<string, unknown>;
+      considerRelayFallback: (peerId: string) => void;
+    };
+    const internals = transport as unknown as RelayInternals;
+    let sends = 0;
+    internals.relay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: () => { sends += 1; },
+    };
+
+    try {
+      for (let index = 0; index < 300; index += 1) {
+        internals.considerRelayFallback(`unknown-${index}`);
+      }
+      const unknownAttempts = [...internals.relayAttempts.keys()]
+        .filter((peerId) => peerId.startsWith('unknown-'));
+      assert.equal(unknownAttempts.length, 256);
+      assert.equal(internals.relayNegotiations.size, 256);
+
+      transport.connect({ peerId: 'known-friend', displayName: 'Known Friend', joinOrder: 1 });
+      internals.considerRelayFallback('known-friend');
+      assert.equal(internals.relayAttempts.has('known-friend'), true);
+      assert.equal(internals.relayNegotiations.has('known-friend'), true);
+      assert.equal(sends, 257);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it('surfaces a bad relay proof, releases the negotiation, and retries', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };

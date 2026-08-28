@@ -28,10 +28,12 @@ import { MAX_WIRE_FRAME_BYTES } from '../core/wire';
 import { type FrameRelay } from './frameRelay';
 import { createProxiedNodeWebSocket } from './proxyWebSocket';
 import {
+  createRelayAnnounceProof,
   decryptRelayPacket,
   deriveRelayFrameKey,
   encryptRelayPacket,
   encryptRelayReadinessProbe,
+  verifyRelayAnnounceProof,
   verifyRelayReadinessProbe,
 } from './relayCrypto';
 
@@ -255,7 +257,11 @@ export class NostrFrameRelay implements FrameRelay {
   /** Publishes an announce so other session members can discover this peer via relay. */
   sendAnnounce(): void {
     this.announced = true;
-    void this.publish({ t: 'a', f: this.options.localPeerId });
+    void this.publish({
+      t: 'a',
+      f: this.options.localPeerId,
+      d: createRelayAnnounceProof(this.key, this.options.sessionId, this.options.localPeerId),
+    });
   }
 
   /** Sends one frame to a peer (or broadcasts when toPeerId is undefined). */
@@ -384,6 +390,7 @@ export class NostrFrameRelay implements FrameRelay {
     const addressedTo = (parsed as { to?: string }).to;
     if (addressedTo !== undefined && addressedTo !== this.options.localPeerId) return;
     if (parsed.t === 'a') {
+      if (!verifyRelayAnnounceProof(this.key, this.options.sessionId, parsed.f, parsed.d)) return;
       this.onPeerAnnounce(parsed.f);
       return;
     }

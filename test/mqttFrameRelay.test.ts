@@ -3,11 +3,16 @@ import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { describe, it } from 'mocha';
 import {
+  deriveMqttRelayTopic,
   MqttFrameRelay,
   type MqttRelayClient,
 } from '../src/runtime/mqttFrameRelay';
 import { RedundantFrameRelay } from '../src/runtime/redundantFrameRelay';
 import { type FrameRelay } from '../src/runtime/frameRelay';
+import {
+  createRelayAnnounceProof,
+  deriveRelayFrameKey,
+} from '../src/runtime/relayCrypto';
 
 class FakeMqttHub {
   public readonly clients = new Set<FakeMqttClient>();
@@ -190,6 +195,63 @@ describe('emergency MQTT data relay', () => {
     assert.ok(!hub.published.some((item) => item.payload.includes(payload.toString('utf8'))));
     first.stop();
     second.stop();
+  });
+
+  it('rejects forged MQTT announces and accepts a same-session HMAC proof', () => {
+    const hub = new FakeMqttHub();
+    const relay = buildRelay(hub, 'mqtt-local');
+    const announced: string[] = [];
+    relay.onPeerAnnounce = (peerId) => announced.push(peerId);
+    relay.start();
+    const token = 'mqtt-frame-token-that-is-long-enough';
+    const sessionId = 'mqtt-frame-session';
+    const topic = deriveMqttRelayTopic(sessionId, token);
+    const key = deriveRelayFrameKey(token, sessionId);
+
+    hub.publish(topic, JSON.stringify({ v: 1, t: 'a', f: 'missing-proof' }));
+    hub.publish(topic, JSON.stringify({
+      v: 1,
+      t: 'a',
+      f: 'wrong-session',
+      d: createRelayAnnounceProof(key, 'another-session', 'wrong-session'),
+    }));
+    hub.publish(topic, JSON.stringify({
+      v: 1,
+      t: 'a',
+      f: 'valid-peer',
+      d: createRelayAnnounceProof(key, sessionId, 'valid-peer'),
+    }));
+
+    assert.deepEqual(announced, ['valid-peer']);
+    relay.stop();
+  });
+
+  it('bounds redundant announce deduplication state', () => {
+    const channel: FrameRelay = {
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: () => undefined,
+    };
+    const redundant = new RedundantFrameRelay({
+      token: 'bounded-announces-token-that-is-long-enough',
+      sessionId: 'bounded-announces',
+      localPeerId: 'local-peer',
+      channels: [channel],
+    });
+    const accepted: string[] = [];
+    redundant.onPeerAnnounce = (peerId) => accepted.push(peerId);
+
+    for (let index = 0; index < 1_100; index += 1) {
+      channel.onPeerAnnounce(`peer-${index}`);
+    }
+
+    assert.equal(accepted.length, 1_024);
+    assert.equal((redundant as unknown as { announcedPeers: Map<string, number> }).announcedPeers.size, 1_024);
+    redundant.stop();
   });
 
   it('chunks a standard snapshot transfer frame and deduplicates QoS-1 delivery', () => {
