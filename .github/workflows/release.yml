@@ -26,18 +26,18 @@ jobs:
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -83,7 +83,7 @@ jobs:
           echo "source_zip=${SOURCE_ZIP}" >> "${GITHUB_OUTPUT}"
 
       - name: Keep verified artifacts with the workflow run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pair-notebook-${{ steps.release.outputs.version }}
           if-no-files-found: error
