@@ -112,6 +112,18 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. README, protocol, architecture, and transport comments now distinguish encrypted frame content from observable topics, routing ids, timing, sizes, and chunk counts. They document the bearer-invite/no-forward-secrecy boundary and tell users to end the old session and create a fresh invite after suspected disclosure.
 
+### SEC-007 — Low — Fixed — Compute selection briefly accepts an unadvertised interpreter
+
+**Evidence:** Immediately after session-scoped compute consent is enabled, environment discovery may still be pending. `changeCompute()` previously validated an explicit Python path only when the advertised environment list was non-empty, allowing a target with an unadvertised path to enter shared state. The executor-side availability check rejected it before execution, so this was not an authorization bypass.
+
+**Impact:** A friend could create a temporarily unusable shared compute target and trigger avoidable execution failures during the discovery race.
+
+**Fix:** Require every explicit Python path, local or remote, to match an advertised Jupyter-ready environment before changing shared compute state.
+
+**Regression tests:** Accept advertised CPU/CUDA environments and reject missing paths both when the environment list is populated and while it is empty.
+
+**Resolution:** Implemented. Compute selection now rejects any explicit interpreter that has not been advertised as Jupyter-ready; executor-side validation remains as a second boundary.
+
 ## Fix order and commit boundaries
 
 1. `fix(compute): scope remote execution consent to each session` — SEC-001.
@@ -120,7 +132,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 4. `fix(files): exclude additional credential artifacts` — SEC-004.
 5. `chore(ci): pin release actions and drop persisted credentials` — SEC-005.
 6. `docs(security): document relay metadata and invite limitations` — SEC-006.
-7. Final audit update and verification-only commit if the plan status changes require it.
+7. `fix(compute): require an advertised Python environment` — SEC-007.
+8. Final audit update and verification-only commit if the plan status changes require it.
 
 Each behavior change gets focused tests and its own commit. Pushes target `origin/codex/security-audit`; no force push is allowed.
 

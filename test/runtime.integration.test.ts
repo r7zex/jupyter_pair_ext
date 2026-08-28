@@ -1001,6 +1001,12 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(runtime.computeForNotebook('work.ipynb').device, 'gpu:0');
       assert.throws(() => runtime.changeCompute('peer-z', 'work.ipynb', 'cpu', '/missing/python'), /cannot start a Jupyter kernel/);
       assert.throws(() => runtime.changeCompute('peer-z', 'work.ipynb', 'gpu:0', '/default/python'), /does not expose CUDA/);
+      const remotePresence = runtime.awareness.getStates().get(99) as { environments?: unknown[] };
+      remotePresence.environments = [];
+      assert.throws(
+        () => runtime.changeCompute('peer-z', 'work.ipynb', 'cpu', '/default/python'),
+        /cannot start a Jupyter kernel/,
+      );
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });

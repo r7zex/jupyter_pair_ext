@@ -925,10 +925,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     if (pythonPath) {
       const environment = environments.find((candidate) => candidate.executable === pythonPath);
-      if (environments.length && (!environment || !environment.jupyterReady)) {
+      if (!environment || !environment.jupyterReady) {
         throw new Error('The selected Python environment cannot start a Jupyter kernel.');
       }
-      if (gpuMatch && environments.length && !environment?.cudaAvailable) {
+      if (gpuMatch && !environment.cudaAvailable) {
         throw new Error('The selected Python environment does not expose CUDA for this GPU target.');
       }
     }
