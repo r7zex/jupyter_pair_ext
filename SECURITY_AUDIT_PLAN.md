@@ -124,6 +124,66 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. Compute selection now rejects any explicit interpreter that has not been advertised as Jupyter-ready; executor-side validation remains as a second boundary.
 
+### SEC-008 — High — Open — Audited fixes are absent from the public and installed 0.5.5 release
+
+**Evidence:** The audited branch is at `a0a9b7a`, while remote tag `v0.5.5` resolves to baseline commit `a9744df` and `origin/codex/security-audit` does not exist. Both public VSIX names have SHA-256 `0672ac59e15bccf74b75b560e7537f0ff62eb7b233fb8e17a860af57995cd0e7`; the local audited VSIX has SHA-256 `18a07cc8c0d69c5096f9dc4e75a78e057f3547f6a0445b3771bdcdd33b0117e3`. The installed bundle exactly matches the public bundle and contains neither signed relay-envelope v2 nor the session-scoped remote-compute gate.
+
+**Impact:** Friends downloading or currently running the public `0.5.5` package remain exposed to SEC-001 and SEC-002 even though the local audit branch contains their fixes. The shared version number makes visual version checks insufficient.
+
+**Fix:** Complete the remaining release-blocking findings, bump to `0.5.6`, create a new immutable tag at the verified commit, publish without moving or overwriting `v0.5.5`, install the downloaded public VSIX, and compare the installed bundle with the locally verified release bundle.
+
+**Verification:** Confirm the remote tag commit, public asset hashes, downloaded archive contents, installed extension path/version, installed bundle hash, and the two fixed security markers.
+
+### SEC-009 — Medium — Open — Remaining common credential files enter snapshots and release archives
+
+**Evidence:** `shouldTrackProjectPath()` currently accepts `.envrc`, `.pgpass`, `.my.cnf`, `.authinfo`, `.cargo/credentials`, `.cargo/credentials.toml`, and `.config/gh/hosts.yml`. The runtime denylist, release-archive validator, and `.vscodeignore` repeat the same incomplete policy.
+
+**Impact:** A project opened from a broad folder, or an untracked credential file beside source code, can be copied to invited friends and included in the source ZIP or VSIX. These formats can contain reusable database, registry, or service credentials that exceed the intended project trust boundary.
+
+**Fix:** Extend every runtime and packaging boundary with basename- and path-aware rules for the confirmed credential formats while preserving ordinary project configuration and explicit safe templates.
+
+**Regression tests:** Reject the confirmed basenames and nested credential paths case-insensitively; keep `.env.example`, `.envrc.example`, `.cargo/config.toml`, and ordinary `.config` project content shareable.
+
+### SEC-010 — Medium — Open — Alternative direct routes bypass send completion and outbound backpressure
+
+**Evidence:** The normal Trystero route awaits `MessageAction.send()`, but MQTT-discovered and promoted-upgrade routes invoke it with `void` and immediately decrement `inFlightBytes`/`inFlightFrames`. A focused reproduction showed `awaitDrain()` resolving while the underlying send promise was still pending. Candidate-route probe sends also leave promise rejection unhandled.
+
+**Impact:** Large snapshots, state synchronization, and binary transfers can bypass the 128 MiB/512 MiB retained-queue accounting, send completion markers too early, interleave under transport backpressure, or lose actionable send failures. Hash and manifest checks prevent publication of incomplete files, but availability and bounded-memory guarantees are weakened.
+
+**Fix:** Await every active-route `MessageAction.send()` inside the queue drain, route rejection through the existing queue failure path, and explicitly handle candidate-probe rejection without retiring the working relay route.
+
+**Regression tests:** Hold and reject send promises for both `mqtt:` and `upgrade:` transports; prove `awaitDrain()` waits, limits retain in-flight bytes, failures disconnect only the failed active route, and a candidate failure leaves the working route intact.
+
+### SEC-011 — Medium — Open — Manual release input can resolve a branch instead of the intended tag
+
+**Evidence:** `workflow_dispatch.inputs.tag` is passed to `actions/checkout` as an unqualified ref. The pinned checkout implementation resolves an unqualified matching branch before a tag. The workflow checks only that the input string matches `v${package.json.version}` and then uses `gh release upload --clobber` for an existing release without proving that checked-out `HEAD` equals `refs/tags/$RELEASE_TAG`.
+
+**Impact:** A write-capable collaborator or compromised maintainer account can create a same-named branch, dispatch the workflow, and replace assets attached to an existing tagged release with artifacts built from different code.
+
+**Fix:** Resolve only a fully qualified tag, fetch tags explicitly, and assert that `HEAD` equals the dereferenced remote tag commit before dependency installation or publishing. Keep build/test work in a read-only job and grant `contents: write` only to a publishing job that consumes verified workflow artifacts.
+
+**Regression tests:** Statically require a qualified tag ref and a tag/HEAD equality assertion; reject workflow structures that give the build job write permission or use `--clobber` without the verified-tag gate.
+
+### SEC-012 — Low — Open — Authenticated explicit proxy passwords are stored in ordinary settings
+
+**Evidence:** `pairNotebook.proxyUrl` is a machine-scoped string setting and the parser intentionally accepts URL userinfo. Unlike the TURN password and session credentials, an explicit proxy password therefore remains in VS Code settings rather than extension SecretStorage.
+
+**Impact:** A proxy password is exposed to settings-file backups and other local components that can read configuration. This does not expose credentials through diagnostics, and a compromised local OS/VS Code installation remains out of scope, so severity is Low.
+
+**Fix:** Keep the endpoint and optional username as non-secret configuration, store the password in SecretStorage, reject newly entered password-bearing explicit URLs with actionable migration guidance, and preserve credential-free HTTP/SOCKS proxy behavior.
+
+**Regression tests:** Reject explicit URL passwords, accept credential-free and username-only URLs as intended, prove SecretStorage is used for the password, and retain diagnostic redaction.
+
+### SEC-013 — Low — Open — Protocol documentation identifies the v4 handshake as v3
+
+**Evidence:** `docs/protocol.md` says the admission handshake is protocol v3, while `HANDSHAKE_VERSION` is 4 and the same document later states that protocol v4 rejects v3 clients.
+
+**Impact:** Operators can make incorrect compatibility decisions and install the old public package despite the intentional security-incompatible protocol upgrade.
+
+**Fix:** Make every current protocol reference say v4 and explicitly point users to the new `0.5.6` release for the signed-envelope/session-consent security boundary.
+
+**Verification:** Search current documentation and packaged release notes for contradictory protocol-version claims.
+
 ## Fix order and commit boundaries
 
 1. `fix(compute): scope remote execution consent to each session` — SEC-001.
@@ -133,7 +193,13 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 5. `chore(ci): pin release actions and drop persisted credentials` — SEC-005.
 6. `docs(security): document relay metadata and invite limitations` — SEC-006.
 7. `fix(compute): require an advertised Python environment` — SEC-007.
-8. Final audit update and verification-only commit if the plan status changes require it.
+8. `docs(security): record release-blocking audit findings` — SEC-008 through SEC-013 plan entry.
+9. `fix(files): exclude remaining credential artifacts` — SEC-009.
+10. `fix(transport): await alternative route sends` — SEC-010.
+11. `fix(ci): require verified release tag checkout` — SEC-011.
+12. `fix(network): store explicit proxy password securely` — SEC-012.
+13. `docs(protocol): correct current handshake version` — SEC-013.
+14. `chore(release): prepare and verify version 0.5.6` — SEC-008 delivery.
 
 Each behavior change gets focused tests and its own commit. Pushes target `origin/codex/security-audit`; no force push is allowed.
 
@@ -146,6 +212,8 @@ Each behavior change gets focused tests and its own commit. Pushes target `origi
 - Relay-only integration tests prove identity authentication and replay rejection.
 - A newly started or restored session never inherits remote-compute permission.
 - The final source-to-sink review finds no remaining Critical or High issue in the stated friends-first threat model.
+- The public `0.5.6` VSIX, its versioned alias, the locally verified VSIX, and the installed extension contain the same bundle bytes.
+- The public and installed bundle contain relay-envelope v2 and session-scoped remote-compute enforcement.
 
 ## Primary references
 
