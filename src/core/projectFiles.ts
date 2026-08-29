@@ -31,11 +31,16 @@ const TEXT_BASENAMES = new Set([
 
 const SAFE_ENV_TEMPLATES = new Set(['.env.example', '.env.sample', '.env.template']);
 const SENSITIVE_BASENAMES = new Set([
-  '.env', '.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials',
+  '.env', '.envrc', '.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials',
+  '.pgpass', 'pgpass.conf', '.my.cnf', '.mylogin.cnf', '.authinfo',
   'credentials.json', 'service-account.json', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
   'application_default_credentials.json', 'client_secret.json', 'client_secrets.json',
   'terraform.tfstate', 'terraform.tfstate.backup', 'kubeconfig',
 ]);
+const SENSITIVE_PATH_SUFFIXES = [
+  '.cargo/credentials', '.cargo/credentials.toml',
+  '.config/gh/hosts.yml', 'github cli/hosts.yml',
+];
 const SENSITIVE_EXTENSIONS = new Set([
   '.pem', '.p12', '.pfx', '.key', '.keystore', '.jks', '.ppk', '.mobileprovision',
   '.ovpn', '.tfstate', '.tfvars', '.kubeconfig',
@@ -59,8 +64,10 @@ export function shouldTrackProjectPath(relativePath: string): boolean {
     || /\.pair-notebook-[A-Za-z0-9-]+(?:-backup)?\.tmp$/i.test(normalized)) return false;
   const segments = normalized.split('/');
   const basename = segments.at(-1)?.toLowerCase() ?? '';
+  const lowerPath = segments.map((segment) => segment.toLowerCase()).join('/');
   if (segments.some((segment) => SENSITIVE_DIRECTORIES.has(segment.toLowerCase()))) return false;
   if (SENSITIVE_BASENAMES.has(basename)
+    || SENSITIVE_PATH_SUFFIXES.some((suffix) => lowerPath === suffix || lowerPath.endsWith(`/${suffix}`))
     || SENSITIVE_EXTENSIONS.has(path.extname(basename))
     || basename.endsWith('.tfstate.backup')
     || basename.endsWith('.tfvars.json')

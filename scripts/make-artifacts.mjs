@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { builtinModules } from 'node:module';
 import yazl from 'yazl';
 import yauzl from 'yauzl';
+import sensitivePathPolicy from './sensitive-path-policy.cjs';
+
+const { isSensitiveArtifactPath } = sensitivePathPolicy;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -17,21 +20,6 @@ const EXCLUDED_DIRECTORIES = new Set([
   'node_modules', '.venv', 'venv', '__pycache__', '.git', '.pytest_cache',
   '.mypy_cache', '.pair-notebook-transfers', '.ruff_cache', '.tox', '.nox',
 ]);
-const SENSITIVE_DIRECTORIES = new Set([
-  '.ssh', '.aws', '.azure', '.gnupg', '.docker', '.kube', '.terraform', '.pulumi',
-]);
-const SENSITIVE_FILE_NAMES = new Set([
-  '.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials',
-  'credentials.json', 'service-account.json', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
-  'application_default_credentials.json', 'client_secret.json', 'client_secrets.json',
-  'terraform.tfstate', 'terraform.tfstate.backup', 'kubeconfig',
-]);
-const SENSITIVE_EXTENSIONS = new Set([
-  '.pem', '.p12', '.pfx', '.key', '.keystore', '.jks', '.ppk', '.mobileprovision',
-  '.ovpn', '.tfstate', '.tfvars', '.kubeconfig',
-]);
-const SAFE_ENV_FILES = new Set(['.env.example', '.env.sample', '.env.template']);
-
 function listEntries(archivePath) {
   return new Promise((resolve, reject) => {
     yauzl.open(archivePath, { lazyEntries: true }, (error, zip) => {
@@ -56,7 +44,7 @@ function collectFiles(directory, relative = '') {
       throw new Error(`Refusing to package symbolic link: ${relativePath}`);
     }
     if (item.isDirectory()) {
-      if (SENSITIVE_DIRECTORIES.has(item.name.toLowerCase())) {
+      if (isSensitiveArtifactPath(relativePath)) {
         throw new Error(`Refusing to package sensitive directory: ${relativePath}`);
       }
       if (EXCLUDED_DIRECTORIES.has(item.name.toLowerCase())) continue;
@@ -65,7 +53,7 @@ function collectFiles(directory, relative = '') {
       continue;
     }
     const lowerName = item.name.toLowerCase();
-    if (isSensitiveFileName(lowerName)) {
+    if (isSensitiveArtifactPath(relativePath)) {
       throw new Error(`Refusing to package sensitive file: ${relativePath}`);
     }
     if (/\.(?:zip|tgz|tar|gz)$/i.test(item.name)) continue;
@@ -78,22 +66,8 @@ function collectFiles(directory, relative = '') {
   return files;
 }
 
-function isSensitiveFileName(lowerName) {
-  return (lowerName === '.env' || (lowerName.startsWith('.env.') && !SAFE_ENV_FILES.has(lowerName)))
-    || SENSITIVE_FILE_NAMES.has(lowerName)
-    || SENSITIVE_EXTENSIONS.has(path.extname(lowerName))
-    || lowerName.endsWith('.tfstate.backup')
-    || lowerName.endsWith('.tfvars.json')
-    || /^client_secret(?:_.+)?\.json$/.test(lowerName);
-}
-
 function sensitiveArchiveEntries(entries) {
-  return entries.filter((entry) => {
-    const segments = entry.replaceAll('\\', '/').split('/').filter(Boolean);
-    const name = segments.at(-1)?.toLowerCase() ?? '';
-    return segments.some((segment) => SENSITIVE_DIRECTORIES.has(segment.toLowerCase()))
-      || isSensitiveFileName(name);
-  });
+  return entries.filter(isSensitiveArtifactPath);
 }
 
 function sha256(file) {
@@ -113,6 +87,11 @@ function externalRequires(bundle) {
 }
 
 async function main() {
+  const files = collectFiles(root);
+  if (process.argv.includes('--preflight-only')) {
+    console.log(`Source preflight OK: ${files.length} packageable files, no sensitive paths.`);
+    return;
+  }
   const vsixPath = path.join(root, vsixName);
   const vsixEntries = await listEntries(vsixPath);
   const required = [
@@ -156,7 +135,6 @@ async function main() {
 
   const zipPath = path.join(root, zipName);
   fs.rmSync(zipPath, { force: true });
-  const files = collectFiles(root);
   const archive = new yazl.ZipFile();
   for (const relativePath of files) {
     archive.addFile(path.join(root, relativePath), `pair-notebook/${relativePath}`);

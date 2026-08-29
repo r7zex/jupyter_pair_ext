@@ -29,7 +29,17 @@ eslint.config.mjs
 **/.azure/**
 **/.gnupg/**
 **/.env
-**/.env.*
+**/.env.!(example|sample|template)
+**/.envrc
+**/.pgpass
+**/pgpass.conf
+**/.my.cnf
+**/.mylogin.cnf
+**/.authinfo
+**/.cargo/credentials
+**/.cargo/credentials.toml
+**/.config/gh/hosts.yml
+**/GitHub CLI/hosts.yml
 **/*.pem
 **/*.p12
 **/*.pfx

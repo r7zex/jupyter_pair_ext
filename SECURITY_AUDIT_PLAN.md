@@ -134,7 +134,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Verification:** Confirm the remote tag commit, public asset hashes, downloaded archive contents, installed extension path/version, installed bundle hash, and the two fixed security markers.
 
-### SEC-009 — Medium — Open — Remaining common credential files enter snapshots and release archives
+### SEC-009 — Medium — Resolved — Remaining common credential files enter snapshots and release archives
 
 **Evidence:** `shouldTrackProjectPath()` currently accepts `.envrc`, `.pgpass`, `.my.cnf`, `.authinfo`, `.cargo/credentials`, `.cargo/credentials.toml`, and `.config/gh/hosts.yml`. The runtime denylist, release-archive validator, and `.vscodeignore` repeat the same incomplete policy.
 
@@ -143,6 +143,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Extend every runtime and packaging boundary with basename- and path-aware rules for the confirmed credential formats while preserving ordinary project configuration and explicit safe templates.
 
 **Regression tests:** Reject the confirmed basenames and nested credential paths case-insensitively; keep `.env.example`, `.envrc.example`, `.cargo/config.toml`, and ordinary `.config` project content shareable.
+
+**Resolution:** Implemented. Runtime filtering now rejects the confirmed Unix and Windows credential basenames plus path-scoped Cargo and GitHub CLI stores while retaining safe neighboring configuration. Packaging uses the same case-insensitive, separator-normalized path rules in a mandatory source preflight and in VSIX/ZIP post-validation. Focused path-policy and filesystem copy/scan tests pass, lint passes, and a real `vsce ls` check retained a temporary safe `.env.example` template.
 
 ### SEC-010 — Medium — Open — Alternative direct routes bypass send completion and outbound backpressure
 

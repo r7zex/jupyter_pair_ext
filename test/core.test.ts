@@ -130,6 +130,22 @@ describe('project file classification', () => {
     assert.equal(shouldTrackProjectPath('.env'), false);
     assert.equal(shouldTrackProjectPath('.env.local'), false);
     assert.equal(shouldTrackProjectPath('.npmrc'), false);
+    for (const credentialPath of [
+      '.envrc', '.pgpass', 'postgresql/pgpass.conf', '.my.cnf', '.mylogin.cnf', '.authinfo',
+      '.cargo/credentials', '.cargo/credentials.toml', '.config/gh/hosts.yml',
+      'AppData/Roaming/GitHub CLI/hosts.yml', 'HOME/.CARGO/CREDENTIALS.TOML',
+      '.CONFIG/GH/HOSTS.YML', '.CARGO\\CREDENTIALS.TOML',
+    ]) {
+      assert.equal(shouldTrackProjectPath(credentialPath), false, credentialPath);
+    }
+    for (const safePath of [
+      '.envrc.example', '.envrc.sample', '.envrc.template', '.pgpass.example',
+      '.my.cnf.example', '.authinfo.example', '.cargo/config', '.cargo/config.toml',
+      'config/credentials.toml', '.config/gh/config.yml', '.config/editor/hosts.yml',
+      '.config/project/settings.yml',
+    ]) {
+      assert.equal(shouldTrackProjectPath(safePath), true, safePath);
+    }
     assert.equal(shouldTrackProjectPath('.ssh/id_ed25519'), false);
     assert.equal(shouldTrackProjectPath('deploy/private.key'), false);
     assert.equal(shouldTrackProjectPath('.docker/config.json'), false);
@@ -155,6 +171,37 @@ describe('project file classification', () => {
     assert.equal(classifyFile('weights.bin'), 'binary');
     assert.equal(classifyFile('oversized.py', MAX_COLLABORATIVE_DOCUMENT_BYTES + 1), 'binary');
     assert.equal(classifyFile('oversized.ipynb', MAX_COLLABORATIVE_DOCUMENT_BYTES + 1), 'binary');
+  });
+
+  it('omits credential paths from scans and isolated copies without deleting the source', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-credential-filter-'));
+    const source = path.join(root, 'source');
+    const destination = path.join(root, 'copy');
+    try {
+      await Promise.all([
+        mkdir(path.join(source, '.cargo'), { recursive: true }),
+        mkdir(path.join(source, '.config/gh'), { recursive: true }),
+      ]);
+      await Promise.all([
+        writeFile(path.join(source, 'main.py'), 'print(1)', 'utf8'),
+        writeFile(path.join(source, '.envrc'), 'export TOKEN=secret', 'utf8'),
+        writeFile(path.join(source, '.cargo/credentials.toml'), '[registry]\ntoken="secret"', 'utf8'),
+        writeFile(path.join(source, '.config/gh/hosts.yml'), 'oauth_token: secret', 'utf8'),
+        writeFile(path.join(source, '.cargo/config.toml'), '[build]', 'utf8'),
+      ]);
+
+      assert.deepEqual((await scanProject(source)).map((file) => file.relativePath).sort(), [
+        '.cargo/config.toml', 'main.py',
+      ]);
+      await copyProject(source, destination);
+      assert.equal(await readFile(path.join(destination, '.cargo/config.toml'), 'utf8'), '[build]');
+      await assert.rejects(readFile(path.join(destination, '.envrc')));
+      await assert.rejects(readFile(path.join(destination, '.cargo/credentials.toml')));
+      await assert.rejects(readFile(path.join(destination, '.config/gh/hosts.yml')));
+      assert.equal(await readFile(path.join(source, '.envrc'), 'utf8'), 'export TOKEN=secret');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('refuses project copies whose source and isolated destination overlap', async () => {

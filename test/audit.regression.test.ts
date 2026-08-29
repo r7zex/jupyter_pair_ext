@@ -48,6 +48,35 @@ describe('audit regressions', () => {
       assert.match(workflow, /uses:\s+actions\/checkout@[a-f0-9]{40}[^]*?persist-credentials:\s+false/);
       assert.equal((workflow.match(/GH_TOKEN:/g) ?? []).length, 1);
     });
+
+    it('preflights package sources and rejects credential paths in every archive layout', async () => {
+      const manifest = JSON.parse(await readFile(path.resolve(__dirname, '../../package.json'), 'utf8')) as {
+        scripts?: Record<string, string>;
+      };
+      const packageScript = manifest.scripts?.package ?? '';
+      assert.match(packageScript, /make-artifacts\.mjs --preflight-only.*vsce package/);
+      const vscodeIgnore = await readFile(path.resolve(__dirname, '../../.vscodeignore'), 'utf8');
+      assert.match(vscodeIgnore, /^\*\*\/\.env\.!\(example\|sample\|template\)$/m);
+      assert.doesNotMatch(vscodeIgnore, /^\*\*\/\.env\.\*$/m);
+
+      const policyPath = path.resolve(__dirname, '../../scripts/sensitive-path-policy.cjs');
+      const policy = await import(policyPath) as { isSensitiveArtifactPath(relativePath: string): boolean };
+      for (const credentialPath of [
+        '.envrc', '.pgpass', 'postgresql/pgpass.conf', '.my.cnf', '.mylogin.cnf', '.authinfo',
+        '.cargo/credentials', '.cargo/credentials.toml', '.config/gh/hosts.yml',
+        'AppData/Roaming/GitHub CLI/hosts.yml', 'extension/.CARGO/CREDENTIALS.TOML',
+        'pair-notebook/.CONFIG/GH/HOSTS.YML', 'extension/.CARGO\\CREDENTIALS.TOML',
+      ]) {
+        assert.equal(policy.isSensitiveArtifactPath(credentialPath), true, credentialPath);
+      }
+      for (const safePath of [
+        '.envrc.example', '.pgpass.example', '.my.cnf.example', '.authinfo.example',
+        '.cargo/config.toml', 'config/credentials.toml', '.config/gh/config.yml',
+        '.config/editor/hosts.yml',
+      ]) {
+        assert.equal(policy.isSensitiveArtifactPath(safePath), false, safePath);
+      }
+    });
   });
 
   describe('host election stability', () => {

@@ -313,7 +313,7 @@
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
     "test:live:relay": "npm run compile && node scripts/emergency-relay-live-smoke.mjs",
-    "package": "npm run clean && npm run lint && npm test && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
+    "package": "npm run clean && npm run lint && npm test && node scripts/make-artifacts.mjs --preflight-only && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
     "artifacts": "npm run package && node scripts/make-artifacts.mjs",
     "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs"
   },
