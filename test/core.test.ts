@@ -760,6 +760,594 @@ describe('repair regressions', () => {
     await assert.rejects(transport.awaitDrain('remote', 0, 100), /disconnected/);
   });
 
+  it('keeps MQTT and promoted-upgrade sends in flight until their promises settle', async () => {
+    for (const route of ['mqtt:', 'upgrade:']) {
+      const transportPeerId = `${route}transport-peer`;
+      const routeName = route.slice(0, -1);
+      const transport = new MeshTransport({
+        sessionId: `pending-${routeName}`, token: 'pending-route-token-that-is-long-enough',
+        localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+        hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+      });
+      let releaseSend: (() => void) | undefined;
+      let sendStarted = false;
+      const routeAction = {
+        send: async () => {
+          sendStarted = true;
+          await new Promise<void>((resolve) => { releaseSend = resolve; });
+        },
+      };
+      (transport as any).connections.set(transportPeerId, {
+        transportPeerId,
+        identity: { peerId: 'remote', displayName: 'Remote', joinOrder: 1 },
+        purpose: 'runtime', connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      (transport as any).identityToTransport.set('remote', transportPeerId);
+      (transport as any).action = { send: async () => undefined };
+      if (route === 'mqtt:') (transport as any).mqttAction = routeAction;
+      else (transport as any).upgradeAction = routeAction;
+
+      (transport as any).enqueue(transportPeerId, Buffer.from('pending-frame'), 'realtime');
+      await waitFor(() => sendStarted, 1000, `${route} send start`);
+      const queue = (transport as any).outboundQueues.get(transportPeerId);
+      assert.equal(queue.inFlightFrames, 1, route);
+      assert.ok(queue.inFlightBytes > 0, route);
+      let drained = false;
+      const drain = transport.awaitDrain('remote', 0, 1000, 0).then(() => { drained = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(drained, false, `${route} awaitDrain must wait for send completion`);
+      releaseSend?.();
+      await drain;
+      assert.equal(queue.inFlightFrames, 0, route);
+      assert.equal(queue.inFlightBytes, 0, route);
+    }
+  });
+
+  it('disconnects failed active MQTT and promoted-upgrade routes', async () => {
+    for (const route of ['mqtt:', 'upgrade:']) {
+      const transportPeerId = `${route}transport-peer`;
+      const routeName = route.slice(0, -1);
+      const transport = new MeshTransport({
+        sessionId: `failed-${routeName}`, token: 'failed-route-token-that-is-long-enough',
+        localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+        hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+      });
+      const failures: Error[] = [];
+      transport.on('connectionError', (_peer, error: Error) => failures.push(error));
+      (transport as any).connections.set(transportPeerId, {
+        transportPeerId,
+        identity: { peerId: 'remote', displayName: 'Remote', joinOrder: 1 },
+        purpose: 'runtime', connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      (transport as any).identityToTransport.set('remote', transportPeerId);
+      (transport as any).action = { send: async () => undefined };
+      const failedAction = { send: async () => { throw new Error(`failed ${route} send`); } };
+      if (route === 'mqtt:') (transport as any).mqttAction = failedAction;
+      else (transport as any).upgradeAction = failedAction;
+
+      (transport as any).enqueue(transportPeerId, Buffer.from('failed-frame'), 'realtime');
+      await waitFor(() => !(transport as any).connections.has(transportPeerId), 1000, `${route} failed cleanup`);
+      assert.equal((transport as any).identityToTransport.has('remote'), false, route);
+      assert.equal((transport as any).outboundQueues.has(transportPeerId), false, route);
+      assert.equal(failures.length, 1, route);
+      assert.match(failures[0]?.message ?? '', /failed .* send/);
+    }
+  });
+
+  it('fails an unpromoted candidate send without retiring the working relay route', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'failed-candidate', token: 'failed-candidate-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:candidate-raw';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const failures: Error[] = [];
+    let disconnected = 0;
+    transport.on('connectionError', (_peer, error: Error) => failures.push(error));
+    transport.on('peerDisconnected', () => { disconnected += 1; });
+    (transport as any).connections.set(activeTransportId, {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).action = { send: async () => undefined };
+    (transport as any).upgradeAction = { send: async () => { throw new Error('candidate send failed'); } };
+    const upgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      verifiedPings: 0, candidateRawId: 'candidate-raw', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', upgrade);
+
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('candidate-probe'));
+    await waitFor(() => !(transport as any).routeUpgrades.has('remote'), 1000, 'candidate failure state');
+    assert.equal((transport as any).identityToTransport.get('remote'), activeTransportId);
+    assert.equal((transport as any).connections.has(activeTransportId), true);
+    assert.equal((transport as any).connections.has(candidateTransportId), false);
+    assert.equal((transport as any).outboundQueues.has(candidateTransportId), false);
+    assert.equal(failures.length, 0);
+    assert.equal(disconnected, 0);
+  });
+
+  it('rejects a stale upgrade join after cancellation without retiring the relay route', () => {
+    const transport = new MeshTransport({
+      sessionId: 'late-upgrade-handshake', token: 'late-upgrade-handshake-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:late-candidate-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).identityToTransport.set(identity.peerId, activeTransportId);
+    const upgrade = {
+      peerId: identity.peerId, role: 'initiator', status: 'requesting', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0,
+    };
+    (transport as any).routeUpgrades.set(identity.peerId, upgrade);
+    const admitted = (transport as any).assertPeerCanJoin(identity, candidateTransportId);
+    (transport as any).pendingHandshakes.set(candidateTransportId, {
+      version: 4,
+      sessionId: 'late-upgrade-handshake',
+      purpose: 'runtime',
+      peer: admitted,
+      nonce: newIdentityNonce(),
+      admittedAt: Date.now(),
+      upgradeGeneration: upgrade,
+    });
+    let candidateClosed = 0;
+    (transport as any).upgradeRoom = {
+      getPeers: () => ({
+        'late-candidate-id': { close: () => { candidateClosed += 1; } },
+      }),
+      leave: async () => undefined,
+    };
+    // Keep the shared upgrade room alive exactly as a different promoted
+    // route would while this attempt is cancelled.
+    (transport as any).identityToTransport.set('other-peer', 'upgrade:promoted-other');
+
+    transport.cancelRouteUpgrade(identity.peerId);
+    assert.equal((transport as any).routeUpgrades.has(identity.peerId), false);
+    (transport as any).onUpgradeCandidateJoin('late-candidate-id');
+
+    assert.equal((transport as any).identityToTransport.get(identity.peerId), activeTransportId);
+    assert.equal((transport as any).connections.get(activeTransportId), incumbentConnection);
+    assert.equal((transport as any).connections.has(candidateTransportId), false);
+    assert.equal((transport as any).pendingHandshakes.has(candidateTransportId), false);
+    assert.equal(candidateClosed, 1);
+  });
+
+  it('ignores a retired queue rejection after the candidate transport id is reused', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-queue-reuse', token: 'candidate-reuse-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:reused-raw-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    let rejectOldSend: ((reason?: unknown) => void) | undefined;
+    let oldSendStarted = false;
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).action = { send: async () => undefined };
+    (transport as any).upgradeAction = {
+      send: async () => {
+        oldSendStarted = true;
+        await new Promise<void>((_resolve, reject) => { rejectOldSend = reject; });
+      },
+    };
+    const oldUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0, candidateRawId: 'reused-raw-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', oldUpgrade);
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('old-probe'));
+    await waitFor(() => oldSendStarted, 1000, 'old candidate send start');
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('old-queued-probe'));
+    const oldQueue = (transport as any).outboundQueues.get(candidateTransportId);
+
+    transport.cancelRouteUpgrade('remote');
+    assert.equal(oldQueue.realtimeFrames.length, 0);
+    assert.equal(oldQueue.queuedBytes, 0);
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), true);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    const newPayloads: string[] = [];
+    (transport as any).upgradeAction = {
+      send: async (frame: ArrayBuffer) => { newPayloads.push(Buffer.from(frame).toString()); },
+    };
+    const newUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0, candidateRawId: 'reused-raw-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', newUpgrade);
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('new-probe'));
+    const newQueue = (transport as any).outboundQueues.get(candidateTransportId);
+    assert.notEqual(newQueue, oldQueue);
+
+    rejectOldSend?.(new Error('late old send failure'));
+    await waitFor(() => oldQueue.draining === false, 1000, 'retired queue settlement');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), false);
+    assert.equal((transport as any).routeUpgrades.get('remote'), newUpgrade);
+    assert.equal((transport as any).connections.has(candidateTransportId), true);
+    assert.equal((transport as any).outboundQueues.get(candidateTransportId), newQueue);
+    assert.equal((transport as any).identityToTransport.get('remote'), activeTransportId);
+    assert.deepEqual(newPayloads, ['new-probe']);
+  });
+
+  it('does not resume retired queued frames after a successful old send settles', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-queue-resolve', token: 'candidate-resolve-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:resolved-raw-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    let resolveOldSend: (() => void) | undefined;
+    let oldSendStarted = false;
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).action = { send: async () => undefined };
+    (transport as any).upgradeAction = {
+      send: async () => {
+        oldSendStarted = true;
+        await new Promise<void>((resolve) => { resolveOldSend = resolve; });
+      },
+    };
+    const oldUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0, candidateRawId: 'resolved-raw-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', oldUpgrade);
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('old-probe'));
+    await waitFor(() => oldSendStarted, 1000, 'old resolving candidate send start');
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('old-queued-probe'));
+    const oldQueue = (transport as any).outboundQueues.get(candidateTransportId);
+
+    transport.cancelRouteUpgrade('remote');
+    assert.equal(oldQueue.realtimeFrames.length, 0);
+    assert.equal(oldQueue.queuedBytes, 0);
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), true);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    const newPayloads: string[] = [];
+    (transport as any).upgradeAction = {
+      send: async (frame: ArrayBuffer) => { newPayloads.push(Buffer.from(frame).toString()); },
+    };
+    const newUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0, candidateRawId: 'resolved-raw-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', newUpgrade);
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('new-probe'));
+    const newQueue = (transport as any).outboundQueues.get(candidateTransportId);
+
+    resolveOldSend?.();
+    await waitFor(() => oldQueue.draining === false, 1000, 'retired queue successful settlement');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), false);
+    assert.equal((transport as any).routeUpgrades.get('remote'), newUpgrade);
+    assert.equal((transport as any).outboundQueues.get(candidateTransportId), newQueue);
+    assert.deepEqual(newPayloads, ['new-probe']);
+  });
+
+  it('counts retired in-flight candidate sends against the global queue limit', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-retired-budget', token: 'candidate-budget-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:retired-budget-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    let resolveOldSend: (() => void) | undefined;
+    let oldSendStarted = false;
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).action = { send: async () => undefined };
+    (transport as any).upgradeAction = {
+      send: async () => {
+        oldSendStarted = true;
+        await new Promise<void>((resolve) => { resolveOldSend = resolve; });
+      },
+    };
+    const upgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      verifiedPings: 0, candidateRawId: 'retired-budget-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', upgrade);
+    (transport as any).enqueueCandidateFrame(candidateTransportId, Buffer.from('old-probe'));
+    await waitFor(() => oldSendStarted, 1000, 'retired budget send start');
+    const oldQueue = (transport as any).outboundQueues.get(candidateTransportId);
+    const actualInFlightBytes = oldQueue.inFlightBytes;
+
+    transport.cancelRouteUpgrade('remote');
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), true);
+    oldQueue.inFlightBytes = 512 * 1024 * 1024;
+
+    const freshTransportId = 'fresh-transport';
+    const freshIdentity = { peerId: 'fresh-peer', displayName: 'Fresh', joinOrder: 2 };
+    (transport as any).connections.set(freshTransportId, {
+      transportPeerId: freshTransportId, identity: freshIdentity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set(freshIdentity.peerId, freshTransportId);
+    assert.throws(
+      () => (transport as any).enqueue(freshTransportId, Buffer.from('x'), 'realtime'),
+      /512 MiB safety limit/,
+    );
+
+    oldQueue.inFlightBytes = actualInFlightBytes;
+    resolveOldSend?.();
+    await waitFor(() => oldQueue.draining === false, 1000, 'retired budget send settlement');
+    assert.equal((transport as any).retiredOutboundQueues.has(oldQueue), false);
+  });
+
+  it('ignores a stale candidate ping after cancellation and a new upgrade generation', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-ping-reuse', token: 'candidate-ping-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:reused-ping-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    let resolveOldPing: ((latency: number) => void) | undefined;
+    let oldPingStarted = false;
+    const oldRoom = {
+      ping: async () => {
+        oldPingStarted = true;
+        return new Promise<number>((resolve) => { resolveOldPing = resolve; });
+      },
+      getPeers: () => ({ 'reused-ping-id': { close: () => undefined } }),
+      leave: async () => undefined,
+    };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).upgradeRoom = oldRoom;
+    (transport as any).upgradeAction = { send: async () => undefined };
+    const oldUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now() - 10_000,
+      connectedAt: Date.now() - 10_000, verifiedPings: 100,
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: true,
+      candidateRawId: 'reused-ping-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', oldUpgrade);
+    (transport as any).verifyCandidateTick(oldUpgrade);
+    await waitFor(() => oldPingStarted, 1000, 'old candidate ping start');
+
+    transport.cancelRouteUpgrade('remote');
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    const newRoom = {
+      ping: async () => 1,
+      getPeers: () => ({ 'reused-ping-id': { close: () => undefined } }),
+      leave: async () => undefined,
+    };
+    (transport as any).upgradeRoom = newRoom;
+    (transport as any).upgradeAction = { send: async () => undefined };
+    const newUpgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now(),
+      connectedAt: Date.now(), verifiedPings: 0,
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      candidateRawId: 'reused-ping-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', newUpgrade);
+
+    resolveOldPing?.(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((transport as any).routeUpgrades.get('remote'), newUpgrade);
+    assert.equal((transport as any).upgradeRoom, newRoom);
+    assert.equal((transport as any).identityToTransport.get('remote'), activeTransportId);
+    assert.equal((transport as any).connections.has(activeTransportId), true);
+    assert.equal((transport as any).connections.has(candidateTransportId), true);
+  });
+
+  it('ignores a parallel candidate ping rejection after successful promotion', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'parallel-candidate-ping', token: 'parallel-candidate-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:parallel-ping-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const pingSettlers: Array<{ resolve: (latency: number) => void; reject: (reason: unknown) => void }> = [];
+    const room = {
+      ping: async () => new Promise<number>((resolve, reject) => pingSettlers.push({ resolve, reject })),
+      getPeers: () => ({ 'parallel-ping-id': { close: () => undefined } }),
+      leave: async () => undefined,
+    };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).latency.set('remote', { current: 100, ema: 100 });
+    (transport as any).upgradeRoom = room;
+    (transport as any).upgradeAction = { send: async () => undefined };
+    const upgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now() - 10_000,
+      connectedAt: Date.now() - 10_000, verifiedPings: 100,
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: true,
+      candidateRawId: 'parallel-ping-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', upgrade);
+    (transport as any).verifyCandidateTick(upgrade);
+    (transport as any).verifyCandidateTick(upgrade);
+    await waitFor(() => pingSettlers.length === 2, 1000, 'parallel candidate pings');
+
+    pingSettlers[0]?.resolve(1);
+    await waitFor(
+      () => (transport as any).identityToTransport.get('remote') === candidateTransportId,
+      1000,
+      'candidate promotion',
+    );
+    pingSettlers[1]?.reject(new Error('late parallel ping failure'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal((transport as any).identityToTransport.get('remote'), candidateTransportId);
+    assert.equal((transport as any).connections.has(candidateTransportId), true);
+    assert.equal((transport as any).routeUpgrades.has('remote'), false);
+  });
+
+  it('requires a bidirectional candidate probe acknowledgement before promotion', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-probe-ack', token: 'candidate-probe-ack-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:probe-ack-id';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).latency.set('remote', { current: 100, ema: 100 });
+    (transport as any).upgradeRoom = {
+      ping: async () => 1,
+      getPeers: () => ({ 'probe-ack-id': { close: () => undefined } }),
+      leave: async () => undefined,
+    };
+    (transport as any).upgradeAction = { send: async () => undefined };
+    const upgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now() - 10_000,
+      connectedAt: Date.now() - 10_000, verifiedPings: 100,
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: false,
+      probeMessageId: 'probe-message-id', candidateRawId: 'probe-ack-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', upgrade);
+
+    (transport as any).verifyCandidateTick(upgrade);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((transport as any).identityToTransport.get('remote'), activeTransportId);
+
+    upgrade.probeAcknowledged = true;
+    (transport as any).verifyCandidateTick(upgrade);
+    await waitFor(
+      () => (transport as any).identityToTransport.get('remote') === candidateTransportId,
+      1000,
+      'probe-acknowledged candidate promotion',
+    );
+    assert.equal((transport as any).routeUpgrades.has('remote'), false);
+  });
+
+  it('does not promote a candidate after the incumbent connection is replaced', async () => {
+    const transport = new MeshTransport({
+      sessionId: 'candidate-incumbent-generation', token: 'candidate-incumbent-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const activeTransportId = 'relay:remote';
+    const candidateTransportId = 'upgrade:incumbent-generation-id';
+    const replacementTransportId = 'direct:replacement';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const incumbentConnection = {
+      transportPeerId: activeTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    let pingCalls = 0;
+    (transport as any).connections.set(activeTransportId, incumbentConnection);
+    (transport as any).connections.set(candidateTransportId, {
+      transportPeerId: candidateTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', activeTransportId);
+    (transport as any).upgradeRoom = {
+      ping: async () => { pingCalls += 1; return 1; },
+      getPeers: () => ({ 'incumbent-generation-id': { close: () => undefined } }),
+      leave: async () => undefined,
+    };
+    (transport as any).upgradeAction = { send: async () => undefined };
+    const upgrade = {
+      peerId: 'remote', role: 'initiator', status: 'verifying', startedAt: Date.now() - 10_000,
+      connectedAt: Date.now() - 10_000, verifiedPings: 100,
+      incumbentTransportId: activeTransportId, incumbentConnection, probeAcknowledged: true,
+      candidateRawId: 'incumbent-generation-id', candidateTransportId,
+    };
+    (transport as any).routeUpgrades.set('remote', upgrade);
+    (transport as any).connections.set(replacementTransportId, {
+      transportPeerId: replacementTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    (transport as any).identityToTransport.set('remote', replacementTransportId);
+
+    (transport as any).verifyCandidateTick(upgrade);
+    assert.equal((transport as any).identityToTransport.get('remote'), replacementTransportId);
+    assert.equal((transport as any).connections.has(replacementTransportId), true);
+    assert.equal((transport as any).connections.has(candidateTransportId), false);
+    assert.equal((transport as any).routeUpgrades.has('remote'), false);
+    assert.equal(pingCalls, 0);
+  });
+
   it('scopes packet deduplication to the admitted source and blocks forged control traffic', () => {
     const transport = new MeshTransport({
       sessionId: 'inbound-hardening', token: 'inbound-hardening-token-that-is-long-enough',

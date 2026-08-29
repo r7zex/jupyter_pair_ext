@@ -146,7 +146,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. Runtime filtering now rejects the confirmed Unix and Windows credential basenames plus path-scoped Cargo and GitHub CLI stores while retaining safe neighboring configuration. Packaging uses the same case-insensitive, separator-normalized path rules in a mandatory source preflight and in VSIX/ZIP post-validation. Focused path-policy and filesystem copy/scan tests pass, lint passes, and a real `vsce ls` check retained a temporary safe `.env.example` template.
 
-### SEC-010 — Medium — Open — Alternative direct routes bypass send completion and outbound backpressure
+### SEC-010 — Medium — Resolved — Alternative direct routes bypass send completion and outbound backpressure
 
 **Evidence:** The normal Trystero route awaits `MessageAction.send()`, but MQTT-discovered and promoted-upgrade routes invoke it with `void` and immediately decrement `inFlightBytes`/`inFlightFrames`. A focused reproduction showed `awaitDrain()` resolving while the underlying send promise was still pending. Candidate-route probe sends also leave promise rejection unhandled.
 
@@ -155,6 +155,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Await every active-route `MessageAction.send()` inside the queue drain, route rejection through the existing queue failure path, and explicitly handle candidate-probe rejection without retiring the working relay route.
 
 **Regression tests:** Hold and reject send promises for both `mqtt:` and `upgrade:` transports; prove `awaitDrain()` waits, limits retain in-flight bytes, failures disconnect only the failed active route, and a candidate failure leaves the working route intact.
+
+**Resolution:** Implemented. MQTT and promoted-upgrade sends now remain inside the bounded queue until their promises settle. Candidate failures preserve the active relay, retired in-flight sends stay in global memory accounting, and queue/ping callbacks are bound to their exact queue, candidate, incumbent, and upgrade generations. Promotion additionally requires a matching bidirectional candidate probe acknowledgement. Eleven focused transport-race regressions, eight MQTT/route-optimization integrations, lint, and 90 non-kernel core tests pass; the separate real-Jupyter core case remains not counted here because the local kernel died before `kernel_info`.
 
 ### SEC-011 — Medium — Open — Manual release input can resolve a branch instead of the intended tag
 

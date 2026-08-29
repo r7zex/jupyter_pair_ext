@@ -149,8 +149,12 @@ interface RouteUpgrade {
   role: 'initiator' | 'responder';
   status: RouteUpgradeStatus;
   startedAt: number;
+  incumbentTransportId: string;
+  incumbentConnection: ConnectedPeer;
   candidateTransportId?: string | undefined;
   candidateRawId?: string | undefined;
+  probeMessageId?: string | undefined;
+  probeAcknowledged: boolean;
   connectedAt?: number | undefined;
   verifiedPings: number;
   lastError?: string | undefined;
@@ -275,6 +279,11 @@ interface HandshakeMessage {
   admittedAt?: number;
 }
 
+interface PendingHandshake extends HandshakeMessage {
+  /** Exact make-before-break attempt that authorized an upgrade-room peer. */
+  upgradeGeneration?: RouteUpgrade | undefined;
+}
+
 interface HandshakeProof {
   version: number;
   signature: string;
@@ -348,7 +357,7 @@ export class MeshTransport extends EventEmitter {
   private readonly connections = new Map<string, ConnectedPeer>();
   private readonly identityToTransport = new Map<string, string>();
   private readonly recoveringPeers = new Map<string, RecoveringPeer>();
-  private readonly pendingHandshakes = new Map<string, HandshakeMessage>();
+  private readonly pendingHandshakes = new Map<string, PendingHandshake>();
   private readonly pendingInboundFrames = new Map<string, PendingInboundFrames>();
   private totalPendingInboundBytes = 0;
   private readonly directory = new Map<string, PeerIdentity>();
@@ -358,6 +367,8 @@ export class MeshTransport extends EventEmitter {
   private readonly latency = new Map<string, { current: number; ema: number }>();
   private readonly routes = new Map<string, ConnectionRoute>();
   private readonly outboundQueues = new Map<string, OutboundQueue>();
+  /** Retired sends still settling remain part of the global memory budget. */
+  private readonly retiredOutboundQueues = new Set<OutboundQueue>();
   private timers: NodeJS.Timeout[] = [];
   private stopped = false;
   private sentWindow = 0;
@@ -941,6 +952,14 @@ export class MeshTransport extends EventEmitter {
       await send(local);
     }
     const remote = this.parseHandshake(incoming.data);
+    const isUpgradeTransport = transportKey.startsWith(UPGRADE_TRANSPORT_PREFIX);
+    const upgradeGeneration = isUpgradeTransport
+      ? this.routeUpgrades.get(remote.peer.peerId)
+      : undefined;
+    if (isUpgradeTransport
+      && (!upgradeGeneration || !this.isUpgradeIncumbentCurrent(upgradeGeneration))) {
+      throw new Error('Route-upgrade handshake started without a current authorized attempt.');
+    }
     const transcript = handshakeTranscript(
       isInitiator ? local : remote,
       isInitiator ? remote : local,
@@ -965,10 +984,21 @@ export class MeshTransport extends EventEmitter {
     if (!verifyIdentityTranscript(remote.peer.identityKey!, transcript, remoteProof.signature)) {
       throw new Error(`Peer ${remote.peer.peerId} did not prove ownership of its identity key.`);
     }
+    if (isUpgradeTransport
+      && (!upgradeGeneration
+        || this.routeUpgrades.get(remote.peer.peerId) !== upgradeGeneration
+        || !this.isUpgradeIncumbentCurrent(upgradeGeneration))) {
+      throw new Error('Route-upgrade handshake outlived its authorized attempt.');
+    }
     // During an explicit upgrade the working route must survive the candidate
     // handshake, so assertPeerCanJoin defers retirement for prefixed keys.
     const admittedPeer = this.assertPeerCanJoin(remote.peer, transportKey);
-    this.pendingHandshakes.set(transportKey, { ...remote, peer: admittedPeer, admittedAt: Date.now() });
+    this.pendingHandshakes.set(transportKey, {
+      ...remote,
+      peer: admittedPeer,
+      admittedAt: Date.now(),
+      ...(upgradeGeneration ? { upgradeGeneration } : {}),
+    });
   }
 
   /**
@@ -1061,7 +1091,8 @@ public improvablePeerIds(): string[] {
     if (this.routeUpgrades.has(peerId)) return true; // already optimizing
     const current = this.identityToTransport.get(peerId);
     if (!current || !current.startsWith(RELAY_TRANSPORT_PREFIX)) return false;
-    if (!this.connections.has(current)) return false;
+    const incumbentConnection = this.connections.get(current);
+    if (!incumbentConnection) return false;
     this.ensureUpgradeRoom();
     if (!this.upgradeRoom) return false;
     const upgrade: RouteUpgrade = {
@@ -1069,6 +1100,9 @@ public improvablePeerIds(): string[] {
       role: this.options.localPeer.peerId < peerId ? 'initiator' : 'responder',
       status: 'requesting',
       startedAt: Date.now(),
+      incumbentTransportId: current,
+      incumbentConnection,
+      probeAcknowledged: false,
       verifiedPings: 0,
     };
     this.routeUpgrades.set(peerId, upgrade);
@@ -1123,6 +1157,8 @@ public improvablePeerIds(): string[] {
     if (this.stopped || !this.relay) return;
     const current = this.identityToTransport.get(fromPeerId);
     if (!current || !current.startsWith(RELAY_TRANSPORT_PREFIX)) return;
+    const incumbentConnection = this.connections.get(current);
+    if (!incumbentConnection) return;
     let upgrade = this.routeUpgrades.get(fromPeerId);
     if (!upgrade) {
       this.ensureUpgradeRoom();
@@ -1132,6 +1168,9 @@ public improvablePeerIds(): string[] {
         role: 'responder',
         status: 'waiting-peer',
         startedAt: Date.now(),
+        incumbentTransportId: current,
+        incumbentConnection,
+        probeAcknowledged: false,
         verifiedPings: 0,
       };
       this.routeUpgrades.set(fromPeerId, upgrade);
@@ -1181,19 +1220,15 @@ public improvablePeerIds(): string[] {
     this.pendingHandshakes.delete(key);
     if (!handshake) return;
     const identity = handshake.peer;
-    let upgrade = this.routeUpgrades.get(identity.peerId);
-    if (!upgrade) {
-      // A signed candidate can also arrive before our own request round-trip;
-      // treat it as a responder-side attempt rather than dropping it.
-      upgrade = {
-        peerId: identity.peerId,
-        role: 'responder',
-        status: 'authenticating',
-        startedAt: Date.now(),
-        verifiedPings: 0,
-      };
-      this.routeUpgrades.set(identity.peerId, upgrade);
-      this.armUpgradeDeadline(upgrade);
+    const upgrade = handshake.upgradeGeneration;
+    if (!upgrade || this.routeUpgrades.get(identity.peerId) !== upgrade) {
+      try { this.upgradeRoom?.getPeers()[rawId]?.close(); } catch { /* already gone */ }
+      return;
+    }
+    if (!this.isUpgradeIncumbentCurrent(upgrade)) {
+      try { this.upgradeRoom?.getPeers()[rawId]?.close(); } catch { /* already gone */ }
+      this.failRouteUpgrade(upgrade, 'The current route changed before verification completed.');
+      return;
     }
     // The candidate must present exactly the directory identity it claims:
     // a mismatched identity key would have failed the signature check above.
@@ -1204,6 +1239,7 @@ public improvablePeerIds(): string[] {
     upgrade.connectedAt = Date.now();
     upgrade.status = 'verifying';
     upgrade.verifiedPings = 0;
+    upgrade.probeAcknowledged = false;
     this.connections.set(key, {
       transportPeerId: key,
       identity,
@@ -1215,12 +1251,18 @@ public improvablePeerIds(): string[] {
     this.emitRouteUpgradeEvent(upgrade);
     // Bidirectional application-level probe: the reply proves frames travel
     // in both directions over the CANDIDATE channel specifically.
+    const probeMessageId = newId();
+    upgrade.probeMessageId = probeMessageId;
     try {
       this.enqueueCandidateFrame(
         key,
-        this.createFrame('routeProbe', { messageId: newId() }, new Uint8Array()),
+        this.createFrame('routeProbe', { messageId: probeMessageId }, new Uint8Array()),
       );
-    } catch { /* verification pings will fail the attempt */ }
+    } catch {
+      this.discardCandidate(upgrade);
+      this.failRouteUpgrade(upgrade, 'The candidate connection could not send a verification frame.');
+      return;
+    }
     upgrade.verifyTimer ??= setInterval(() => this.verifyCandidateTick(upgrade!), 1_000);
     upgrade.verifyTimer.unref?.();
   }
@@ -1240,7 +1282,7 @@ public improvablePeerIds(): string[] {
     if (connection) {
       // Only clean candidate-scoped state; never global identity mappings.
       this.connections.delete(key);
-      this.outboundQueues.delete(key);
+      this.retireOutboundQueue(key);
       this.takePendingInboundFrames(key);
     }
     for (const upgrade of this.routeUpgrades.values()) {
@@ -1249,24 +1291,45 @@ public improvablePeerIds(): string[] {
     }
   }
 
+  private isUpgradeIncumbentCurrent(upgrade: RouteUpgrade): boolean {
+    return upgrade.incumbentTransportId.startsWith(RELAY_TRANSPORT_PREFIX)
+      && this.identityToTransport.get(upgrade.peerId) === upgrade.incumbentTransportId
+      && this.connections.get(upgrade.incumbentTransportId) === upgrade.incumbentConnection;
+  }
+
   /** One verification step: candidate ping + stability window accounting. */
   private verifyCandidateTick(upgrade: RouteUpgrade): void {
     if (this.routeUpgrades.get(upgrade.peerId) !== upgrade) return;
+    if (!this.isUpgradeIncumbentCurrent(upgrade)) {
+      this.discardCandidate(upgrade);
+      this.failRouteUpgrade(upgrade, 'The current route changed during verification.');
+      return;
+    }
     const rawId = upgrade.candidateRawId;
     const room = this.upgradeRoom;
-    if (!rawId || !room || !upgrade.candidateTransportId) return;
+    const candidateTransportId = upgrade.candidateTransportId;
+    if (upgrade.status !== 'verifying' || !rawId || !room || !candidateTransportId) return;
+    const isCurrentCandidate = () => this.routeUpgrades.get(upgrade.peerId) === upgrade
+      && this.upgradeRoom === room
+      && upgrade.status === 'verifying'
+      && upgrade.candidateRawId === rawId
+      && upgrade.candidateTransportId === candidateTransportId
+      && this.isUpgradeIncumbentCurrent(upgrade)
+      && this.connections.has(candidateTransportId);
     void (async () => {
       try {
         const current = await room.ping(rawId);
+        if (!isCurrentCandidate()) return;
         if (!Number.isFinite(current) || current < 0) throw new Error('no rtt');
         const bounded = Math.min(60_000, current);
         const connectedFor = Date.now() - (upgrade.connectedAt ?? upgrade.startedAt);
-        if (connectedFor < ROUTE_UPGRADE_STABILITY_WINDOW_MS) return;
+        if (!upgrade.probeAcknowledged || connectedFor < ROUTE_UPGRADE_STABILITY_WINDOW_MS) return;
         upgrade.verifiedPings += 1;
         if (upgrade.verifiedPings >= ROUTE_UPGRADE_REQUIRED_PINGS) {
           this.promoteCandidate(upgrade, bounded);
         }
       } catch {
+        if (!isCurrentCandidate()) return;
         // A candidate that cannot hold one-second pings through the stability
         // window is not proven better than the working route: fail closed.
         this.discardCandidate(upgrade);
@@ -1282,8 +1345,13 @@ public improvablePeerIds(): string[] {
    * boundary overlap on the receiver.
    */
   private promoteCandidate(upgrade: RouteUpgrade, measuredRttMs: number): void {
-    const key = upgrade.candidateTransportId!;
-    if (upgrade.status === 'promoting' || upgrade.status === 'completed') return;
+    const key = upgrade.candidateTransportId;
+    if (this.routeUpgrades.get(upgrade.peerId) !== upgrade
+      || upgrade.status !== 'verifying'
+      || !upgrade.probeAcknowledged
+      || !this.isUpgradeIncumbentCurrent(upgrade)
+      || !key
+      || !this.connections.has(key)) return;
     // Route-selection policy (hysteresis + minimum improvement): the final
     // gate before promotion. The candidate already passed authentication and
     // the stability window; this only rejects migrations that would not be a
@@ -1301,7 +1369,7 @@ public improvablePeerIds(): string[] {
     }
     upgrade.status = 'promoting';
     this.emitRouteUpgradeEvent(upgrade);
-    const previous = this.identityToTransport.get(upgrade.peerId);
+    const previous = upgrade.incumbentTransportId;
     this.identityToTransport.set(upgrade.peerId, key);
     this.routes.set(upgrade.peerId, 'Direct');
     this.latency.set(upgrade.peerId, { current: measuredRttMs, ema: measuredRttMs });
@@ -1326,7 +1394,7 @@ public improvablePeerIds(): string[] {
         this.outboundQueues.set(key, newQueue);
         void this.drain(key, newQueue);
       }
-      this.outboundQueues.delete(previous);
+      this.retireOutboundQueue(previous);
       this.connections.delete(previous);
       this.inboundWindows.delete(previous);
       if (oldConnection) {
@@ -1347,7 +1415,7 @@ public improvablePeerIds(): string[] {
     const key = upgrade.candidateTransportId;
     if (key) {
       this.connections.delete(key);
-      this.outboundQueues.delete(key);
+      this.retireOutboundQueue(key);
       this.takePendingInboundFrames(key);
       try {
         const rawId = upgrade.candidateRawId;
@@ -1356,6 +1424,8 @@ public improvablePeerIds(): string[] {
     }
     upgrade.candidateTransportId = undefined;
     upgrade.candidateRawId = undefined;
+    upgrade.probeMessageId = undefined;
+    upgrade.probeAcknowledged = false;
   }
 
   /** Reports failure and releases the attempt; the active route is untouched. */
@@ -1395,9 +1465,7 @@ public improvablePeerIds(): string[] {
 
   /** Sends one application frame over a candidate transport (probe frames only). */
   private enqueueCandidateFrame(transportKey: string, frame: Buffer): void {
-    if (!this.upgradeAction) throw new Error('Route upgrade room is not active.');
-    const rawId = transportKey.slice(UPGRADE_TRANSPORT_PREFIX.length);
-    void this.upgradeAction.send(exactArrayBuffer(frame), { target: rawId });
+    this.enqueue(transportKey, frame, framePriority('routeProbe'));
   }
 
   /** Periodically looks for directory peers that never got any transport. */
@@ -1765,7 +1833,10 @@ public improvablePeerIds(): string[] {
     this.pendingHandshakes.clear();
     this.pendingInboundFrames.clear();
     this.totalPendingInboundBytes = 0;
-    this.outboundQueues.clear();
+    for (const transportPeerId of [...this.outboundQueues.keys()]) {
+      this.retireOutboundQueue(transportPeerId);
+    }
+    this.retiredOutboundQueues.clear();
     this.seenIds.clear();
     this.seenRelayEnvelopes.clear();
     this.inboundWindows.clear();
@@ -1874,8 +1945,12 @@ public improvablePeerIds(): string[] {
       identity = { ...identity, joinOrder: remembered.joinOrder };
     }
     const activeTransport = this.identityToTransport.get(identity.peerId);
-    const isUpgradeCandidate = transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
-      && this.routeUpgrades.has(identity.peerId);
+    // Every transport from the dedicated upgrade room is candidate-only at
+    // handshake time. An attempt may have been cancelled or timed out while
+    // its authenticated handshake was still settling; such a late candidate
+    // must never retire the active route. onUpgradeCandidateJoin() validates
+    // the current incumbent and attempt state after the join callback.
+    const isUpgradeCandidate = transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX);
     if (activeTransport && activeTransport !== transportPeerId && !isUpgradeCandidate) {
       // Both call sites verify the identity-proof signature before this point,
       // so a second handshake for a connected identity comes from the genuine
@@ -1923,7 +1998,7 @@ public improvablePeerIds(): string[] {
     this.takePendingInboundFrames(transportPeerId);
     const connection = this.connections.get(transportPeerId);
     this.connections.delete(transportPeerId);
-    this.outboundQueues.delete(transportPeerId);
+    this.retireOutboundQueue(transportPeerId);
     this.inboundWindows.delete(transportPeerId);
     if (!connection) return;
     this.seenIds.delete(connection.identity.peerId);
@@ -1997,14 +2072,8 @@ public improvablePeerIds(): string[] {
     const connection = this.connections.get(transportPeerId);
     if (!connection) return;
     const wasActiveIdentityRoute = this.identityToTransport.get(connection.identity.peerId) === transportPeerId;
-    const queue = this.outboundQueues.get(transportPeerId);
-    if (queue) {
-      queue.realtimeFrames.length = 0;
-      queue.bulkFrames.length = 0;
-      queue.queuedBytes = 0;
-    }
     this.connections.delete(transportPeerId);
-    this.outboundQueues.delete(transportPeerId);
+    this.retireOutboundQueue(transportPeerId);
     this.inboundWindows.delete(transportPeerId);
     this.seenIds.delete(connection.identity.peerId);
     this.latency.delete(connection.identity.peerId);
@@ -2120,11 +2189,12 @@ public improvablePeerIds(): string[] {
       throw error;
     }
     const totalRetainedBytes = [...this.outboundQueues.values()]
-      .reduce((total, item) => total + item.queuedBytes + item.inFlightBytes, 0);
+      .reduce((total, item) => total + item.queuedBytes + item.inFlightBytes, 0)
+      + [...this.retiredOutboundQueues].reduce((total, item) => total + item.inFlightBytes, 0);
     const totalRetainedFrames = [...this.outboundQueues.values()].reduce(
       (total, item) => total + item.realtimeFrames.length + item.bulkFrames.length + item.inFlightFrames,
       0,
-    );
+    ) + [...this.retiredOutboundQueues].reduce((total, item) => total + item.inFlightFrames, 0);
     if (totalRetainedBytes + frame.byteLength > MAX_TOTAL_OUTBOUND_QUEUE
       || totalRetainedFrames + 1 > MAX_TOTAL_OUTBOUND_FRAMES) {
       const error = new Error('Trystero total outbound queues exceeded the 512 MiB safety limit.');
@@ -2142,7 +2212,9 @@ public improvablePeerIds(): string[] {
     if (queue.draining || queue.failure) return;
     queue.draining = true;
     try {
-      while (!this.stopped && this.connections.has(transportPeerId)) {
+      while (!this.stopped
+        && this.connections.has(transportPeerId)
+        && this.outboundQueues.get(transportPeerId) === queue) {
         const item = queue.realtimeFrames.shift() ?? queue.bulkFrames.shift();
         if (!item) break;
         queue.queuedBytes -= item.bytes.byteLength;
@@ -2162,14 +2234,14 @@ public improvablePeerIds(): string[] {
             // Promoted direct route living in the upgrade negotiation room.
             const upgradeAction = this.upgradeAction;
             if (!upgradeAction) throw new Error('Route upgrade room stopped during send.');
-            void upgradeAction.send(exactArrayBuffer(item.bytes), {
+            await upgradeAction.send(exactArrayBuffer(item.bytes), {
               target: transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length),
             });
           } else if (transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)) {
             // Direct route discovered through the secondary signalling family.
             const mqttChannel = this.mqttAction;
             if (!mqttChannel) throw new Error('MQTT signalling stopped during send.');
-            void mqttChannel.send(exactArrayBuffer(item.bytes), {
+            await mqttChannel.send(exactArrayBuffer(item.bytes), {
               target: transportPeerId.slice(MQTT_TRANSPORT_PREFIX.length),
             });
           } else {
@@ -2180,6 +2252,7 @@ public improvablePeerIds(): string[] {
         } finally {
           queue.inFlightBytes -= item.bytes.byteLength;
           queue.inFlightFrames -= 1;
+          if (queue.inFlightFrames === 0) this.retiredOutboundQueues.delete(queue);
         }
       }
     } catch (error) {
@@ -2189,6 +2262,7 @@ public improvablePeerIds(): string[] {
       queue.draining = false;
       if (!this.stopped
         && this.connections.has(transportPeerId)
+        && this.outboundQueues.get(transportPeerId) === queue
         && !queue.failure
         && (queue.realtimeFrames.length || queue.bulkFrames.length)) {
         void this.drain(transportPeerId, queue);
@@ -2197,13 +2271,25 @@ public improvablePeerIds(): string[] {
   }
 
   private failOutboundQueue(transportPeerId: string, queue: OutboundQueue, failure: Error): void {
-    if (queue.failure) return;
+    if (this.outboundQueues.get(transportPeerId) !== queue || queue.failure) return;
     queue.failure = failure;
     queue.realtimeFrames.length = 0;
     queue.bulkFrames.length = 0;
     queue.queuedBytes = 0;
     const connection = this.connections.get(transportPeerId);
     if (!connection) return;
+    const activeTransportId = this.identityToTransport.get(connection.identity.peerId);
+    if (transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
+      && activeTransportId !== transportPeerId) {
+      const upgrade = this.routeUpgrades.get(connection.identity.peerId);
+      if (upgrade?.candidateTransportId === transportPeerId) {
+        this.discardCandidate(upgrade);
+        this.failRouteUpgrade(upgrade, 'The candidate connection failed while sending a verification frame.');
+      } else {
+        this.onUpgradeCandidateLeave(transportPeerId.slice(UPGRADE_TRANSPORT_PREFIX.length));
+      }
+      return;
+    }
     try {
       this.roomForTransport(transportPeerId).room?.getPeers()[this.roomForTransport(transportPeerId).rawId]?.close();
     } catch {
@@ -2211,6 +2297,16 @@ public improvablePeerIds(): string[] {
     }
     this.onPeerLeave(transportPeerId);
     this.emit('connectionError', connection.identity, failure);
+  }
+
+  private retireOutboundQueue(transportPeerId: string): void {
+    const queue = this.outboundQueues.get(transportPeerId);
+    if (!queue) return;
+    queue.realtimeFrames.length = 0;
+    queue.bulkFrames.length = 0;
+    queue.queuedBytes = 0;
+    this.outboundQueues.delete(transportPeerId);
+    if (queue.inFlightFrames > 0) this.retiredOutboundQueues.add(queue);
   }
 
   private handleAction(data: ArrayBuffer, transportPeerId: string): void {
@@ -2285,9 +2381,24 @@ public improvablePeerIds(): string[] {
         // transport the probe arrived on.
         this.enqueue(
           transportPeerId,
-          this.createFrame('routeProbeAck', { messageId: newId() }, new Uint8Array()),
+          this.createFrame('routeProbeAck', {
+            messageId: newId(),
+            probeMessageId: messageId,
+          }, new Uint8Array()),
           framePriority('routeProbeAck'),
         );
+      } else if (frame.type === 'routeProbeAck') {
+        const upgrade = this.routeUpgrades.get(sourceId);
+        const probeMessageId = typeof frame.meta.probeMessageId === 'string'
+          ? frame.meta.probeMessageId
+          : '';
+        if (transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
+          && upgrade?.status === 'verifying'
+          && upgrade.candidateTransportId === transportPeerId
+          && upgrade.probeMessageId === probeMessageId
+          && this.isUpgradeIncumbentCurrent(upgrade)) {
+          upgrade.probeAcknowledged = true;
+        }
       }
       const suppressBootstrapHello = (this.options.purpose ?? 'runtime') === 'runtime'
         && connection.purpose === 'bootstrap'
