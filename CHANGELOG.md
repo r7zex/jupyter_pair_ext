@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.7 - 2026-08-31 (paused-session control)
+
+- Lets the current host transfer the role to another online participant while the session is paused for host-folder selection. The next host remains paused and must still materialize or verify a folder before normal collaboration resumes.
+- Lets the current host end the session without choosing a new shared folder. Final merged state and an authenticated termination marker are retained in the extension-owned working copies instead of forcing an arbitrary shared-folder choice.
+- Exposes **Transfer Host** and **End Session** directly in the host-folder prompt and pause card, while keeping persistence, invitations, and notebook execution blocked until storage is ready.
+
 ## 0.5.6 - 2026-08-30 (security hardening and audited release)
 
 - Makes remote-compute consent ephemeral and session-scoped. Every new or restored session starts with remote execution disabled, ignores the deprecated persisted permission, and requires a fresh local opt-in before advertising or accepting remote execution.

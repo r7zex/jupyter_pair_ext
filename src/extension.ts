@@ -504,15 +504,20 @@ async function leaveSession(): Promise<void> {
 async function endSession(): Promise<void> {
   const active = requireRuntime();
   if (!active.coordinator.isCurrentHost()) throw new Error('Только текущий хост может завершить сессию для всех.');
+  const waitingForHostFolder = active.snapshot().waitingForHostFolder;
   const answer = await vscode.window.showWarningMessage(
-    'Завершить Pair Notebook для всех участников? Общая копия будет сохранена, а повторное подключение по старому приглашению станет невозможным.',
+    waitingForHostFolder
+      ? 'Завершить Pair Notebook для всех участников? Общая папка нового хоста ещё не выбрана, поэтому последнее объединённое состояние останется в изолированных рабочих копиях участников и не будет записано в новую общую папку.'
+      : 'Завершить Pair Notebook для всех участников? Общая копия будет сохранена, а повторное подключение по старому приглашению станет невозможным.',
     { modal: true },
     'Завершить для всех',
   );
   if (answer !== 'Завершить для всех') return;
   await active.endSession();
   await forgetWorkspaceSession(requireActivationContext(), active.descriptor, true);
-  void vscode.window.showInformationMessage('Pair Notebook: сессия завершена для всех участников.');
+  void vscode.window.showInformationMessage(waitingForHostFolder
+    ? 'Pair Notebook: сессия завершена. Последнее состояние сохранено в локальных рабочих копиях.'
+    : 'Pair Notebook: сессия завершена для всех участников.');
 }
 
 async function copyInvite(): Promise<void> {
@@ -548,10 +553,16 @@ async function transferHost(): Promise<void> {
       description: `${peer.route} • ${peer.latency >= 0 ? `${peer.latency} ms` : 'measuring'}`,
       peerId: peer.peerId,
     }));
+  if (!choices.length) {
+    void vscode.window.showWarningMessage('Нет другого подключённого участника, которому можно передать роль хоста.');
+    return;
+  }
   const target = await vscode.window.showQuickPick(choices, { title: 'Transfer Host', placeHolder: 'Choose the new Session Host' });
   if (!target) return;
   const confirm = await vscode.window.showWarningMessage(
-    `Transfer host to ${target.label}? The session will pause until they choose a folder on their computer.`,
+    snapshot.waitingForHostFolder
+      ? `Передать роль хоста участнику ${target.label}? Сессия останется на паузе, пока этот участник не выберет папку на своём компьютере.`
+      : `Transfer host to ${target.label}? The session will pause until they choose a folder on their computer.`,
     { modal: true },
     'Transfer',
   );
@@ -573,12 +584,16 @@ async function promptForNewHostFolder(active: SessionRuntime): Promise<void> {
   hostFolderPromptOpen = true;
   try {
     const action = await vscode.window.showWarningMessage(
-      'Вы стали новым хостом. Сессия поставлена на паузу. Можно записать текущее состояние в пустую папку или безопасно подключить уже синхронизированную общую папку.',
+      'Вы стали новым хостом. Сессия поставлена на паузу. Можно настроить общую папку, передать роль другому участнику или завершить сессию без создания новой общей папки.',
       { modal: true },
       'Настроить папку',
+      'Передать хоста',
+      'Завершить сессию',
     );
-    if (action !== 'Настроить папку' || runtime !== active) return;
-    await chooseHostFolder(active);
+    if (runtime !== active) return;
+    if (action === 'Настроить папку') await chooseHostFolder(active);
+    else if (action === 'Передать хоста') await transferHost();
+    else if (action === 'Завершить сессию') await endSession();
   } finally {
     hostFolderPromptOpen = false;
   }

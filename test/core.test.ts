@@ -258,6 +258,25 @@ describe('authenticated session termination marker', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('uses the isolated working copy when no host backing folder was selected', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-session-end-working-'));
+    const descriptor = {
+      sessionId: 'session-end-working', projectId: 'project-end-working', sessionEpoch: 2,
+      backingFolder: '', workingFolder: root,
+    };
+    const token = 'session-end-working-token-that-is-long-enough';
+    try {
+      await writeSessionTermination(descriptor as any, token, {
+        peerId: 'new-host', displayName: 'New Host', joinOrder: 1,
+      });
+      const marker = await readSessionTermination(descriptor, token);
+      assert.equal(marker?.endedByPeerId, 'new-host');
+      assert.equal(marker?.sessionEpoch, 2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Pair Notebook CRDT', () => {

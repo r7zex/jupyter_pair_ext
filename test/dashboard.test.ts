@@ -69,8 +69,12 @@ describe('dashboard webview startup', () => {
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
-    assert.match(assignedHtml, /Если закрыть диалог, эта кнопка останется доступна/);
+    assert.match(assignedHtml, /Отменённый выбор папки можно открыть снова/);
     assert.match(assignedHtml, /Настроить папку нового хоста/);
+    assert.match(assignedHtml, /Передать хоста','ДРУГОМУ УЧАСТНИКУ/);
+    assert.match(assignedHtml, /Завершить сессию','БЕЗ НОВОЙ ПАПКИ/);
+    assert.doesNotMatch(assignedHtml, /action\('transfer'[^\n]+disabled:!state\.isHost\|\|paused/);
+    assert.doesNotMatch(assignedHtml, /action\('end'[^\n]+disabled:paused/);
     assert.doesNotMatch(assignedHtml, new RegExp(['Tail', 'scale'].join(''), 'i'));
     assert.deepEqual(webview.options.localResourceRoots, []);
     assert.deepEqual(webview.options.enableCommandUris, ['pairNotebook.startSession', 'pairNotebook.joinSession']);

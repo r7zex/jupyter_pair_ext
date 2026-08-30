@@ -34,9 +34,8 @@ export async function writeSessionTermination(
   token: string,
   endedBy: PeerIdentity,
 ): Promise<SessionTermination> {
-  if (!descriptor.backingFolder) {
-    throw new Error('The host must choose a backing folder before ending the session.');
-  }
+  const targetRoot = descriptor.backingFolder || descriptor.workingFolder;
+  if (!targetRoot) throw new Error('No local folder is available for the session termination marker.');
   const marker: SessionTermination = {
     sessionId: descriptor.sessionId,
     projectId: descriptor.projectId,
@@ -47,19 +46,36 @@ export async function writeSessionTermination(
     proof: '',
   };
   marker.proof = sign(marker, token);
-  const target = path.join(descriptor.backingFolder, SESSION_TERMINATION_MARKER);
+  const target = path.join(targetRoot, SESSION_TERMINATION_MARKER);
   await atomicWriteFile(target, `${JSON.stringify(marker, null, 2)}\n`);
   return marker;
 }
 
 export async function readSessionTermination(
-  descriptor: Pick<SessionDescriptor, 'sessionId' | 'projectId' | 'sessionEpoch' | 'backingFolder'>,
+  descriptor: Pick<SessionDescriptor, 'sessionId' | 'projectId' | 'sessionEpoch' | 'backingFolder'>
+    & Partial<Pick<SessionDescriptor, 'workingFolder'>>,
   token: string,
 ): Promise<SessionTermination | undefined> {
-  if (!descriptor.backingFolder) return undefined;
+  const roots = [...new Set([descriptor.backingFolder, descriptor.workingFolder].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  ))];
+  for (const root of roots) {
+    const parsed = await readTerminationFile(root);
+    if (!isTermination(parsed)
+      || parsed.sessionId !== descriptor.sessionId
+      || parsed.projectId !== descriptor.projectId
+      || parsed.sessionEpoch !== descriptor.sessionEpoch) continue;
+    const expected = Buffer.from(sign(parsed, token), 'hex');
+    const actual = Buffer.from(parsed.proof, 'hex');
+    if (expected.length === actual.length && timingSafeEqual(expected, actual)) return parsed;
+  }
+  return undefined;
+}
+
+async function readTerminationFile(root: string): Promise<unknown> {
   let parsed: unknown;
   try {
-    const markerPath = path.join(descriptor.backingFolder, SESSION_TERMINATION_MARKER);
+    const markerPath = path.join(root, SESSION_TERMINATION_MARKER);
     const linkInfo = await lstat(markerPath);
     if (!linkInfo.isFile() || linkInfo.isSymbolicLink() || linkInfo.size > MAX_SESSION_TERMINATION_BYTES) {
       return undefined;
@@ -82,13 +98,6 @@ export async function readSessionTermination(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
     throw error;
   }
-  if (!isTermination(parsed)
-    || parsed.sessionId !== descriptor.sessionId
-    || parsed.projectId !== descriptor.projectId
-    || parsed.sessionEpoch !== descriptor.sessionEpoch) return undefined;
-  const expected = Buffer.from(sign(parsed, token), 'hex');
-  const actual = Buffer.from(parsed.proof, 'hex');
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return undefined;
   return parsed;
 }
 

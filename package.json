@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Self-contained encrypted collaboration for VS Code text files and Jupyter notebooks, with direct WebRTC and redundant Nostr/MQTT relay fallback.",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {

@@ -1693,6 +1693,93 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('lets a paused host transfer again and end without choosing a backing folder', async function () {
+    this.timeout(30_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-paused-host-actions-'));
+    const extensionRoot = path.join(root, 'extension');
+    const hostFolder = path.join(root, 'host');
+    const peerFolder = path.join(root, 'peer');
+    const sharedFolder = path.join(root, 'shared');
+    await Promise.all([
+      mkdir(extensionRoot, { recursive: true }),
+      mkdir(hostFolder, { recursive: true }),
+      mkdir(peerFolder, { recursive: true }),
+      mkdir(sharedFolder, { recursive: true }),
+    ]);
+    const token = 'paused-host-actions-token-that-is-long-enough';
+    const sessionId = `paused-actions-${Date.now()}`;
+    const host = new SessionRuntime(descriptor({
+      sessionId, role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: hostFolder,
+      pythonPath: process.execPath, backingFolder: sharedFolder,
+    }), token, context(extensionRoot), logger());
+    let peer: any;
+    let stale: any;
+    try {
+      await host.start();
+      host.setWorkingCopyWriter(async () => false, async () => undefined);
+      peer = new SessionRuntime(descriptor({
+        sessionId, role: 'peer', peerId: 'peer-z', hostPeerId: 'host', workingFolder: peerFolder,
+        pythonPath: process.execPath,
+        knownPeers: [{ ...host.descriptor.localPeer }],
+      }), token, context(extensionRoot), logger());
+      await peer.start();
+      peer.setWorkingCopyWriter(async () => false, async () => undefined);
+      await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'paused-action peer online');
+
+      await host.transferHost('peer-z');
+      await waitFor(() => peer.coordinator.clock.hostId === 'peer-z'
+        && host.snapshot().waitingForHostFolder && peer.snapshot().waitingForHostFolder,
+      5000, 'first paused host transfer');
+
+      await peer.transferHost('host');
+      await waitFor(() => host.coordinator.clock.hostId === 'host'
+        && host.snapshot().waitingForHostFolder && peer.snapshot().waitingForHostFolder,
+      5000, 'transfer while folder selection is paused');
+      assert.equal(host.descriptor.backingFolder, '', 'returning host must not silently reuse its old backing folder');
+
+      await host.transferHost('peer-z');
+      await waitFor(() => peer.coordinator.clock.hostId === 'peer-z'
+        && host.snapshot().waitingForHostFolder && peer.snapshot().waitingForHostFolder,
+      5000, 'second paused host transfer');
+
+      peer.project.ensureText('paused-final.txt', 'kept without a new shared folder');
+      await waitFor(() => host.project.has('paused-final.txt')
+        && host.project.text('paused-final.txt').toString() === 'kept without a new shared folder',
+      3000, 'final paused edit replication');
+      const peerStorage = (peer as any).storage;
+      const flushWorkingCopy = peerStorage.flush.bind(peerStorage);
+      peerStorage.flush = async () => { throw new Error('synthetic paused final-save failure'); };
+      await assert.rejects(peer.endSession(), /synthetic paused final-save failure/);
+      await waitFor(() => host.snapshot().runtimeState === 'waiting-for-host-folder'
+        && host.snapshot().waitingForHostFolder,
+      3000, 'cancelled paused end restores pause state');
+      assert.equal(peer.snapshot().closed, false);
+      peerStorage.flush = flushWorkingCopy;
+
+      const endedBy = new Promise<any>((resolve) => host.once('sessionEnded', resolve));
+      const hostClosed = onceEvent(host, 'closed');
+      const peerClosed = onceEvent(peer, 'closed');
+      await peer.endSession();
+
+      const [endingHost] = await Promise.all([endedBy, hostClosed, peerClosed]);
+      assert.equal(endingHost.peerId, 'peer-z');
+      assert.equal(await readFile(path.join(hostFolder, 'paused-final.txt'), 'utf8'), 'kept without a new shared folder');
+      assert.equal(await readFile(path.join(peerFolder, 'paused-final.txt'), 'utf8'), 'kept without a new shared folder');
+      const hostMarker = JSON.parse(await readFile(path.join(hostFolder, '.pair-notebook-ended.json'), 'utf8'));
+      const peerMarker = JSON.parse(await readFile(path.join(peerFolder, '.pair-notebook-ended.json'), 'utf8'));
+      assert.equal(hostMarker.endedByPeerId, 'peer-z');
+      assert.equal(peerMarker.endedByPeerId, 'peer-z');
+      await assert.rejects(readFile(path.join(sharedFolder, '.pair-notebook-ended.json')), /ENOENT/);
+
+      const staleDescriptor = { ...peer.descriptor, freshStart: false };
+      stale = new SessionRuntime(staleDescriptor, token, context(extensionRoot), logger());
+      await assert.rejects(stale.start(), /has already ended/);
+    } finally {
+      await Promise.allSettled([host.leave(), peer?.leave?.(), stale?.leave?.()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('lets the host end a Trystero session for every participant', async function () {
     this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-session-end-real-'));

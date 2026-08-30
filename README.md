@@ -90,8 +90,9 @@ Every new session is resilient:
 - A graceful host departure first drains peer traffic and flushes the latest state to the old host folder.
 - An abrupt departure is covered by continuous atomic host persistence, which uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
 - The earliest eligible connected participant becomes the new host deterministically.
-- Every participant sees a paused state. Persistence, invitations, host transfer, session ending, and notebook execution remain disabled during the pause.
+- Every participant sees a paused state. Persistence, invitations, and notebook execution remain disabled during the pause, while the current host can still transfer the role or end the session.
 - The new host has a persistent **Choose host folder** action even after cancelling a dialog. They explicitly choose either an empty folder that receives the current session, or an existing synchronized folder (for example Dropbox) that is fully hash-checked and attached without rewriting when it matches.
+- The pause card and initial prompt also expose **Transfer Host** and **End Session**. Ending before a new shared folder is selected keeps the final merged state and authenticated termination marker in the participants' isolated working copies.
 - A non-empty mismatched folder is never changed implicitly. The new host must explicitly write the current session into it or choose another folder; cancelling keeps the session paused and the retry action visible.
 - The previous host folder is not deleted or moved. If it is synchronized by Dropbox or another provider, its last completed host writes remain available there.
 

@@ -864,7 +864,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async transferHost(targetPeerId: string): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can transfer the host role.');
-    if (this.waitingForHostFolder) throw new Error('Choose a host folder before transferring the host role.');
+    if (this.endingSession) throw new Error('The session is already being ended.');
     const target = this.transport.peerRuntime().find((peer) => peer.peerId === targetPeerId && peer.online);
     if (!target) throw new Error('The selected participant is offline.');
     const next: HostClock = {
@@ -878,6 +878,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       'The new host did not acknowledge the transfer preparation.',
       () => this.transport.sendTo(targetPeerId, 'hostTransferPrepare', { transferId, nextClock: next }),
     );
+    await this.prepareWorkingCopy?.();
     await this.flush();
     const committed = await this.waitForHostTransfer(
       transferId, targetPeerId, next, 5000,
@@ -1634,15 +1635,21 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.coordinator.isCurrentHost()) {
       throw new Error('Only the current Session Host can end the session for everyone.');
     }
-    if (this.waitingForHostFolder) {
-      throw new Error('Choose a new host folder before ending the session for everyone.');
-    }
     this.endingSession = true;
     try {
       await this.awaitSessionEndFence();
       await this.messageQueue;
       await this.backgroundMessageQueue;
-      await this.saveAsHost();
+      if (this.waitingForHostFolder) {
+        // No canonical backing root exists during host-folder selection. Keep
+        // the authoritative final state and signed termination marker in the
+        // extension-owned working copy so ending never forces an arbitrary
+        // folder choice or discards the last merged edits.
+        await this.prepareWorkingCopy?.();
+        await this.flush();
+      } else {
+        await this.saveAsHost();
+      }
       await writeSessionTermination(this.descriptor, this.token, this.descriptor.localPeer);
       this.transport.broadcast('sessionEnded', {});
       try {
@@ -2227,6 +2234,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           if (!TRANSFER_ID_PATTERN.test(terminationId)) break;
           this.endingSession = true;
           this.transition('syncing', 'The host is finalizing the session.');
+          try {
+            await this.prepareWorkingCopy?.();
+            await this.flush();
+          } catch (error) {
+            this.log.appendLine(`[debug] Could not flush the local working copy before session end: ${formatError(error)}`);
+          }
           await this.transport.awaitDrainAll(0, 5000).catch((error) => {
             this.log.appendLine(`[debug] Session-end peer drain: ${formatError(error)}`);
           });
@@ -2242,7 +2255,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         case 'sessionEndingCancelled':
           if (sourceId === this.coordinator.clock.hostId) {
             this.endingSession = false;
-            this.transition('ready', 'Session ending was cancelled because final persistence failed.');
+            this.transition(
+              this.waitingForHostFolder ? 'waiting-for-host-folder' : 'ready',
+              this.waitingForHostFolder
+                ? 'Session ending was cancelled. Choose a host folder, transfer the host role, or try ending again.'
+                : 'Session ending was cancelled because final persistence failed.',
+            );
           }
           break;
         case 'sessionEnded': {
@@ -2251,8 +2269,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             break;
           }
           const endedBy = this.transport.peerRuntime().find((peer) => peer.peerId === sourceId)
-            ?? (this.descriptor.knownPeers ?? []).find((peer) => peer.peerId === sourceId);
-          if (endedBy) this.emit('sessionEnded', endedBy, 'explicit-end');
+            ?? (this.descriptor.knownPeers ?? []).find((peer) => peer.peerId === sourceId)
+            ?? resolveHostIdentity(this.descriptor, sourceId);
+          try {
+            await writeSessionTermination(this.descriptor, this.token, endedBy);
+          } catch (error) {
+            this.log.appendLine(`[debug] Could not persist the local session-end marker: ${formatError(error)}`);
+          }
+          this.emit('sessionEnded', endedBy, 'explicit-end');
           await this.disposeAsync();
           break;
         }
