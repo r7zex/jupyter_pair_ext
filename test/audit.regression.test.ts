@@ -35,18 +35,62 @@ async function temporaryDirectory(prefix: string): Promise<string> {
 
 describe('audit regressions', () => {
   describe('release workflow credentials', () => {
-    it('pins external actions and does not persist the checkout token', async () => {
+    it('pins external actions and isolates release write permission', async () => {
       const workflowPath = path.resolve(__dirname, '../../.github/workflows/release.yml');
       const workflow = await readFile(workflowPath, 'utf8');
       const actionRefs = [...workflow.matchAll(/uses:\s+(actions\/[A-Za-z0-9_-]+)@([^\s#]+)/g)];
 
-      assert.equal(actionRefs.length, 4);
       for (const [, action, reference] of actionRefs) {
         assert.match(reference ?? '', /^[a-f0-9]{40}$/, `${action} must use an immutable full SHA`);
       }
+      assert.deepEqual(new Set(actionRefs.map(([, action]) => action)), new Set([
+        'actions/checkout',
+        'actions/setup-node',
+        'actions/setup-python',
+        'actions/upload-artifact',
+        'actions/download-artifact',
+      ]));
       assert.doesNotMatch(workflow, /uses:\s+actions\/[A-Za-z0-9_-]+@v\d/);
       assert.match(workflow, /uses:\s+actions\/checkout@[a-f0-9]{40}[^]*?persist-credentials:\s+false/);
       assert.equal((workflow.match(/GH_TOKEN:/g) ?? []).length, 1);
+
+      const verifyJob = workflow.match(/^ {2}verify:[^]*?(?=^ {2}publish:)/m)?.[0] ?? '';
+      const publishJob = workflow.match(/^ {2}publish:[^]*/m)?.[0] ?? '';
+      assert.match(workflow, /^permissions:\s*\n\s+contents:\s+read$/m);
+      assert.match(verifyJob, /permissions:\s*\n\s+contents:\s+read/);
+      assert.doesNotMatch(verifyJob, /contents:\s+write/);
+      assert.match(publishJob, /needs:\s+verify/);
+      assert.match(publishJob, /permissions:[^]*?contents:\s+write/);
+      assert.equal((workflow.match(/contents:\s+write/g) ?? []).length, 1);
+    });
+
+    it('builds only a verified remote tag and never clobbers release assets', async () => {
+      const workflowPath = path.resolve(__dirname, '../../.github/workflows/release.yml');
+      const workflow = await readFile(workflowPath, 'utf8');
+      const verifyJob = workflow.match(/^ {2}verify:[^]*?(?=^ {2}publish:)/m)?.[0] ?? '';
+      const publishJob = workflow.match(/^ {2}publish:[^]*/m)?.[0] ?? '';
+
+      assert.match(verifyJob, /ref:\s+refs\/tags\/\$\{\{ inputs\.tag \|\| github\.ref_name \}\}/);
+      assert.match(verifyJob, /git fetch --force --no-tags origin/);
+      assert.match(verifyJob, /refs\/tags\/\$\{RELEASE_TAG\}\^\{commit\}/);
+      assert.match(verifyJob, /HEAD_COMMIT[^]*TAG_COMMIT[^]*REMOTE_TAG_COMMIT/);
+      assert.match(verifyJob, /"\$\{HEAD_COMMIT\}" != "\$\{TAG_COMMIT\}"/);
+      assert.match(verifyJob, /"\$\{TAG_COMMIT\}" != "\$\{REMOTE_TAG_COMMIT\}"/);
+      assert.ok(
+        verifyJob.indexOf('Verify immutable remote tag checkout') < verifyJob.indexOf('run: npm ci'),
+        'tag identity must be verified before dependency installation',
+      );
+
+      assert.match(verifyJob, /release-notes\.md/);
+      assert.match(publishJob, /uses:\s+actions\/download-artifact@[a-f0-9]{40}/);
+      assert.match(publishJob, /GH_REPO:\s+\$\{\{ github\.repository \}\}/);
+      assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
+      assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
+      assert.doesNotMatch(workflow, /--clobber/);
+      const compareIndex = publishJob.indexOf('cmp --silent');
+      const editIndex = publishJob.indexOf('gh release edit');
+      const uploadIndex = publishJob.indexOf('gh release upload');
+      assert.ok(compareIndex >= 0 && compareIndex < editIndex && compareIndex < uploadIndex);
     });
 
     it('preflights package sources and rejects credential paths in every archive layout', async () => {

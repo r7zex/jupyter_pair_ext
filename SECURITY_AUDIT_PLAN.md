@@ -158,7 +158,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. MQTT and promoted-upgrade sends now remain inside the bounded queue until their promises settle. Candidate failures preserve the active relay, retired in-flight sends stay in global memory accounting, and queue/ping callbacks are bound to their exact queue, candidate, incumbent, and upgrade generations. Promotion additionally requires a matching bidirectional candidate probe acknowledgement. Eleven focused transport-race regressions, eight MQTT/route-optimization integrations, lint, and 90 non-kernel core tests pass; the separate real-Jupyter core case remains not counted here because the local kernel died before `kernel_info`.
 
-### SEC-011 — Medium — Open — Manual release input can resolve a branch instead of the intended tag
+### SEC-011 — Medium — Resolved — Manual release input can resolve a branch instead of the intended tag
 
 **Evidence:** `workflow_dispatch.inputs.tag` is passed to `actions/checkout` as an unqualified ref. The pinned checkout implementation resolves an unqualified matching branch before a tag. The workflow checks only that the input string matches `v${package.json.version}` and then uses `gh release upload --clobber` for an existing release without proving that checked-out `HEAD` equals `refs/tags/$RELEASE_TAG`.
 
@@ -167,6 +167,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Resolve only a fully qualified tag, fetch tags explicitly, and assert that `HEAD` equals the dereferenced remote tag commit before dependency installation or publishing. Keep build/test work in a read-only job and grant `contents: write` only to a publishing job that consumes verified workflow artifacts.
 
 **Regression tests:** Statically require a qualified tag ref and a tag/HEAD equality assertion; reject workflow structures that give the build job write permission or use `--clobber` without the verified-tag gate.
+
+**Resolution:** Implemented. The read-only verification job checks out only `refs/tags/<name>`, force-fetches that exact tag, and proves `HEAD` equals both the local `^{commit}` result and the dereferenced remote commit before installing dependencies. A separate publishing job revalidates the remote commit, downloads the verified workflow artifact, and is the only job granted `contents: write`. Existing assets are compared byte-for-byte before metadata edits; mismatches abort and missing assets upload without `--clobber`. Three focused workflow regressions, lint, and YAML parsing pass. Local WSL `bash -n` was not run because the managed environment denied WSL startup; the actual GitHub Actions tag run remains the release-time shell validation.
 
 ### SEC-012 — Low — Open — Authenticated explicit proxy passwords are stored in ordinary settings
 

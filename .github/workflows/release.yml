@@ -12,24 +12,60 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Verify and publish VSIX
+  verify:
+    name: Verify release artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      versioned_vsix: ${{ steps.release.outputs.versioned_vsix }}
+      source_zip: ${{ steps.release.outputs.source_zip }}
+      verified_commit: ${{ steps.tag.outputs.commit }}
 
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
           persist-credentials: false
+
+      - name: Verify immutable remote tag checkout
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git fetch --force --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          REMOTE_TAG_COMMIT="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "${REMOTE_TAG_COMMIT}" ]]; then
+            REMOTE_TAG_COMMIT="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 { print $1 }')"
+          fi
+
+          if [[ -z "${REMOTE_TAG_COMMIT}" \
+            || "${HEAD_COMMIT}" != "${TAG_COMMIT}" \
+            || "${TAG_COMMIT}" != "${REMOTE_TAG_COMMIT}" ]]; then
+            echo "Checked-out HEAD is not the dereferenced remote tag ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          echo "commit=${TAG_COMMIT}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -94,39 +130,85 @@ jobs:
             ${{ steps.release.outputs.versioned_vsix }}
             ${{ steps.release.outputs.source_zip }}
             SHA256SUMS.txt
+            release-notes.md
 
-      - name: Create or update GitHub Release
+  publish:
+    name: Publish verified GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download verified release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pair-notebook-${{ needs.verify.outputs.version }}
+          path: .
+
+      - name: Revalidate tag and publish immutable assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-          VERSIONED_VSIX: ${{ steps.release.outputs.versioned_vsix }}
-          SOURCE_ZIP: ${{ steps.release.outputs.source_zip }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          VERSIONED_VSIX: ${{ needs.verify.outputs.versioned_vsix }}
+          SOURCE_ZIP: ${{ needs.verify.outputs.source_zip }}
+          VERIFIED_COMMIT: ${{ needs.verify.outputs.verified_commit }}
         run: |
           set -euo pipefail
+
+          REMOTE_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          REMOTE_TAG_COMMIT="$(git ls-remote "${REMOTE_URL}" "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "${REMOTE_TAG_COMMIT}" ]]; then
+            REMOTE_TAG_COMMIT="$(git ls-remote "${REMOTE_URL}" "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 { print $1 }')"
+          fi
+          if [[ -z "${REMOTE_TAG_COMMIT}" || "${REMOTE_TAG_COMMIT}" != "${VERIFIED_COMMIT}" ]]; then
+            echo "Remote tag ${RELEASE_TAG} changed after artifact verification." >&2
+            exit 1
+          fi
+
+          sha256sum --check SHA256SUMS.txt
 
           RELEASE_FLAGS=(--latest)
           if [[ "${RELEASE_VERSION}" == *-* ]]; then
             RELEASE_FLAGS=(--prerelease)
           fi
 
+          ASSETS=(pair-notebook.vsix "${VERSIONED_VSIX}" "${SOURCE_ZIP}" SHA256SUMS.txt)
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            EXISTING_NAMES="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
+            MISSING_ASSETS=()
+            DOWNLOAD_DIR="$(mktemp -d)"
+            trap 'rm -rf "${DOWNLOAD_DIR}"' EXIT
+
+            for asset in "${ASSETS[@]}"; do
+              if grep -Fqx -- "${asset}" <<< "${EXISTING_NAMES}"; then
+                gh release download "${RELEASE_TAG}" --pattern "${asset}" --dir "${DOWNLOAD_DIR}"
+                if ! cmp --silent -- "${asset}" "${DOWNLOAD_DIR}/${asset}"; then
+                  echo "Existing release asset ${asset} differs; refusing to overwrite it." >&2
+                  exit 1
+                fi
+              else
+                MISSING_ASSETS+=("${asset}")
+              fi
+            done
+
             gh release edit "${RELEASE_TAG}" \
               --title "Pair Notebook ${RELEASE_VERSION}" \
               --notes-file release-notes.md \
               "${RELEASE_FLAGS[@]}"
+            if (( ${#MISSING_ASSETS[@]} )); then
+              gh release upload "${RELEASE_TAG}" "${MISSING_ASSETS[@]}"
+            fi
           else
             gh release create "${RELEASE_TAG}" \
               --verify-tag \
               --title "Pair Notebook ${RELEASE_VERSION}" \
               --notes-file release-notes.md \
-              "${RELEASE_FLAGS[@]}"
+              "${RELEASE_FLAGS[@]}" \
+              "${ASSETS[@]}"
           fi
-
-          gh release upload "${RELEASE_TAG}" \
-            pair-notebook.vsix \
-            "${VERSIONED_VSIX}" \
-            "${SOURCE_ZIP}" \
-            SHA256SUMS.txt \
-            --clobber
