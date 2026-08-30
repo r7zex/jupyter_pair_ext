@@ -182,7 +182,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. The setting now accepts only a supported password-free endpoint plus optional username, while a masked command stores a bounded, versioned password record in VS Code SecretStorage and binds it to the normalized scheme, host, port, and username. One-time legacy migration sanitizes settings transactionally and discards malformed or oversized credentials without storing them. HTTP(S) agents receive credentials through a header closure instead of their URL; credential-bearing HTTP/HTTPS/SOCKS dependency DEBUG namespaces are disabled, and external authenticated VS Code, environment, and system proxies remain supported. Compilation, lint, 51 focused proxy/diagnostic tests, the 21-case network matrix, the manifest regression, the DEBUG smoke test, and offline lockfile validation pass. A fresh read-only post-fix review approved the control and found no blocking disclosure path.
 
-### SEC-013 — Low — Open — Protocol documentation identifies the v4 handshake as v3
+### SEC-013 — Low — Resolved — Protocol documentation identifies the v4 handshake as v3
 
 **Evidence:** `docs/protocol.md` says the admission handshake is protocol v3, while `HANDSHAKE_VERSION` is 4 and the same document later states that protocol v4 rejects v3 clients.
 
@@ -191,6 +191,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Make every current protocol reference say v4 and explicitly point users to the new `0.5.6` release for the signed-envelope/session-consent security boundary.
 
 **Verification:** Search current documentation and packaged release notes for contradictory protocol-version claims.
+
+**Resolution:** Implemented. Current protocol, architecture, and user documentation now identify protocol v4 and Pair Notebook 0.5.6 as the first release boundary for both signed emergency-relay envelopes and session-scoped remote-compute consent. The 0.5.4 release record was restored to its historical protocol-v3 contract, and existing 0.5.4/0.5.5 changelog statements remain unchanged. A repository search found no contradictory current v3 claim, and a fresh read-only post-fix review approved the documentation against `HANDSHAKE_VERSION = 4` and the session authorization implementation.
 
 ## Fix order and commit boundaries
 

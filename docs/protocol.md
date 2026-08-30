@@ -4,7 +4,7 @@
 
 The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port.
 
-Before Trystero admits a peer, Pair Notebook exchanges a protocol-v3 handshake containing:
+Before Trystero admits a peer, Pair Notebook 0.5.6 exchanges a protocol-v4 handshake containing:
 
 - session ID;
 - connection purpose (`runtime` or `bootstrap`);
@@ -16,7 +16,7 @@ Before Trystero admits a peer, Pair Notebook exchanges a protocol-v3 handshake c
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v4 authenticates every emergency-relay envelope with the sender's Ed25519 identity, its intended recipient, a freshness timestamp, and a replay-resistant message id. It is intentionally incompatible with protocol-v3 and older clients. Incompatible peers are rejected during admission; participants should run the same current release.
+Protocol v4 is first released in Pair Notebook 0.5.6. It authenticates every emergency-relay envelope with the sender's Ed25519 identity, its intended recipient, a freshness timestamp, and a replay-resistant message id. It is intentionally incompatible with protocol-v3 and older clients. Incompatible peers are rejected during admission; every participant must run 0.5.6 or another explicitly protocol-v4-compatible release.
 
 ## Frames and delivery
 
@@ -39,6 +39,8 @@ Only after the snapshot succeeds does the extension save the peer descriptor and
 Runtime peers exchange Yjs state vectors and only missing document updates. Filesystem state contains tombstones, directory entries, binary hashes/versions, and deterministic author/version tie breakers. Binary transfers are isolated by `(sourceId, transferId)` and are published atomically after hash verification.
 
 ## Notebook execution
+
+Beginning with Pair Notebook 0.5.6, remote-compute consent is local, session-scoped policy rather than a persisted wire capability. Every new or restored session starts with remote execution disabled on each participant; a participant must opt in again for that active session before advertising an execution environment or accepting remote execution and kernel-control requests.
 
 Before remote execution, the requester and executor complete an idempotent document/binary/directory manifest barrier. Barrier check and commit frames retry across route replacement. The execution request is keyed by a random request ID: the executor acknowledges acceptance, rejects reuse with different content, and returns the cached terminal result for an identical duplicate instead of launching another kernel request.
 
