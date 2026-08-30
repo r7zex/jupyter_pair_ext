@@ -170,7 +170,7 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 
 **Resolution:** Implemented. The read-only verification job checks out only `refs/tags/<name>`, force-fetches that exact tag, and proves `HEAD` equals both the local `^{commit}` result and the dereferenced remote commit before installing dependencies. A separate publishing job revalidates the remote commit, downloads the verified workflow artifact, and is the only job granted `contents: write`. Existing assets are compared byte-for-byte before metadata edits; mismatches abort and missing assets upload without `--clobber`. Three focused workflow regressions, lint, and YAML parsing pass. Local WSL `bash -n` was not run because the managed environment denied WSL startup; the actual GitHub Actions tag run remains the release-time shell validation.
 
-### SEC-012 — Low — Open — Authenticated explicit proxy passwords are stored in ordinary settings
+### SEC-012 — Low — Resolved — Authenticated explicit proxy passwords are stored in ordinary settings
 
 **Evidence:** `pairNotebook.proxyUrl` is a machine-scoped string setting and the parser intentionally accepts URL userinfo. Unlike the TURN password and session credentials, an explicit proxy password therefore remains in VS Code settings rather than extension SecretStorage.
 
@@ -179,6 +179,8 @@ The first sandboxed `npm test` attempt was blocked by filesystem isolation in `e
 **Fix:** Keep the endpoint and optional username as non-secret configuration, store the password in SecretStorage, reject newly entered password-bearing explicit URLs with actionable migration guidance, and preserve credential-free HTTP/SOCKS proxy behavior.
 
 **Regression tests:** Reject explicit URL passwords, accept credential-free and username-only URLs as intended, prove SecretStorage is used for the password, and retain diagnostic redaction.
+
+**Resolution:** Implemented. The setting now accepts only a supported password-free endpoint plus optional username, while a masked command stores a bounded, versioned password record in VS Code SecretStorage and binds it to the normalized scheme, host, port, and username. One-time legacy migration sanitizes settings transactionally and discards malformed or oversized credentials without storing them. HTTP(S) agents receive credentials through a header closure instead of their URL; credential-bearing HTTP/HTTPS/SOCKS dependency DEBUG namespaces are disabled, and external authenticated VS Code, environment, and system proxies remain supported. Compilation, lint, 51 focused proxy/diagnostic tests, the 21-case network matrix, the manifest regression, the DEBUG smoke test, and offline lockfile validation pass. A fresh read-only post-fix review approved the control and found no blocking disclosure path.
 
 ### SEC-013 — Low — Open — Protocol documentation identifies the v4 handshake as v3
 

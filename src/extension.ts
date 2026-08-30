@@ -37,12 +37,21 @@ import {
 } from './core/types';
 import { SnapshotBootstrapError, downloadProjectSnapshot } from './runtime/bootstrap';
 import { configureMeshNetwork } from './runtime/mesh';
+import { EXPLICIT_PROXY_PASSWORD_ERROR, inspectExplicitProxyPassword } from './runtime/proxy';
 import { BackingFolderMismatchError, SessionRuntime } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
+import {
+  PROXY_CREDENTIAL_MIGRATION_KEY,
+  PROXY_CREDENTIAL_MIGRATION_VERSION,
+  migrateLegacyProxyPassword,
+  readBoundProxyPassword,
+  shouldMigrateLegacyProxyPassword,
+  storeBoundProxyPassword,
+} from './vscode/proxyCredentials';
 
 const MARKER = '.pair-notebook-session.json';
 const MAX_SESSION_MARKER_BYTES = 64 * 1024 * 1024;
@@ -62,7 +71,13 @@ let meshNetworkConfigurationGeneration = 0;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
   output = vscode.window.createOutputChannel('Pair Notebook');
-  await applyMeshNetworkConfiguration(context);
+  const proxyMigrationPending = shouldMigrateLegacyProxyPassword(
+    context.globalState.get<unknown>(PROXY_CREDENTIAL_MIGRATION_KEY),
+  );
+  await applyMeshNetworkConfiguration(context, { allowLegacyProxyMigration: proxyMigrationPending });
+  if (proxyMigrationPending) {
+    await context.globalState.update(PROXY_CREDENTIAL_MIGRATION_KEY, PROXY_CREDENTIAL_MIGRATION_VERSION);
+  }
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
@@ -85,7 +100,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'http.noProxy',
       ].some((setting) => event.affectsConfiguration(setting))) {
         void applyMeshNetworkConfiguration(context).catch((error) => {
-          output.appendLine(`[error] Could not refresh network configuration: ${formatError(error)}`);
+          const message = `Could not refresh network configuration: ${formatError(error)}`;
+          output.appendLine(`[error] ${message}`);
+          void vscode.window.showErrorMessage(`Pair Notebook: ${message}`);
         });
       }
     }),
@@ -113,6 +130,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await context.secrets.store('pairNotebook.turnPassword', password);
     await applyMeshNetworkConfiguration(context);
     void vscode.window.showInformationMessage('Pair Notebook: TURN пароль сохранён в защищённом хранилище.');
+  });
+  register(context, 'pairNotebook.setProxyPassword', async () => {
+    const password = await vscode.window.showInputBox({
+      prompt: 'Password for pairNotebook.proxyUrl (bound to its endpoint and optional username; empty clears it)',
+      password: true,
+    });
+    if (password === undefined) return;
+    const configuration = vscode.workspace.getConfiguration('pairNotebook');
+    const explicitProxy = configuration.get<string>('proxyUrl', '').trim();
+    await storeBoundProxyPassword(context.secrets, explicitProxy, password);
+    await applyMeshNetworkConfiguration(context);
+    void vscode.window.showInformationMessage(password
+      ? 'Pair Notebook: proxy password saved in VS Code SecretStorage.'
+      : 'Pair Notebook: stored proxy password cleared.');
   });
   register(context, 'pairNotebook.selectBackingFolder', () => selectBackingFolder());
   register(context, 'pairNotebook.flush', async () => {
@@ -762,13 +793,60 @@ async function changeCompute(): Promise<void> {
  * session start. A generation guard prevents a slower stale refresh from
  * overwriting a newer settings change.
  */
-async function applyMeshNetworkConfiguration(context: vscode.ExtensionContext): Promise<void> {
+interface MeshNetworkRefreshOptions {
+  allowLegacyProxyMigration?: boolean;
+}
+
+function effectiveProxyConfigurationTarget(
+  configuration: vscode.WorkspaceConfiguration,
+): vscode.ConfigurationTarget {
+  const inspected = configuration.inspect<string>('proxyUrl');
+  if (inspected?.workspaceFolderValue !== undefined) return vscode.ConfigurationTarget.WorkspaceFolder;
+  if (inspected?.workspaceValue !== undefined) return vscode.ConfigurationTarget.Workspace;
+  return vscode.ConfigurationTarget.Global;
+}
+
+async function applyMeshNetworkConfiguration(
+  context: vscode.ExtensionContext,
+  options: MeshNetworkRefreshOptions = {},
+): Promise<void> {
   const generation = ++meshNetworkConfigurationGeneration;
   const configuration = vscode.workspace.getConfiguration('pairNotebook');
   const httpConfiguration = vscode.workspace.getConfiguration('http');
-  const [turnPassword, systemProxy] = await Promise.all([
+  let explicitProxy = configuration.get<string>('proxyUrl', '').trim();
+  const embeddedCredential = inspectExplicitProxyPassword(explicitProxy);
+  if (embeddedCredential?.passwordPresent) {
+    const target = effectiveProxyConfigurationTarget(configuration);
+    if (options.allowLegacyProxyMigration) {
+      const migration = await migrateLegacyProxyPassword(
+        context.secrets,
+        explicitProxy,
+        (passwordFreeUrl) => configuration.update('proxyUrl', passwordFreeUrl, target),
+      );
+      explicitProxy = migration.proxyUrl.trim();
+      if (migration.migrated) {
+        void vscode.window.showInformationMessage(
+          'Pair Notebook migrated the proxy password from settings to VS Code SecretStorage.',
+        );
+      } else if (migration.discarded) {
+        void vscode.window.showErrorMessage(
+          'Pair Notebook removed an invalid or oversized proxy password from settings. '
+          + 'Configure a supported proxy endpoint, then run Pair Notebook: Set Proxy Password.',
+        );
+      }
+    } else {
+      await configuration.update('proxyUrl', embeddedCredential.passwordFreeUrl, target);
+      explicitProxy = embeddedCredential.passwordFreeUrl.trim();
+      void vscode.window.showErrorMessage('Pair Notebook: ' + EXPLICIT_PROXY_PASSWORD_ERROR);
+    }
+  }
+  const [turnPassword, proxyPassword, systemProxy] = await Promise.all([
     Promise.resolve(context.secrets.get('pairNotebook.turnPassword')).catch((error: unknown) => {
       output.appendLine(`[error] Could not read TURN credentials: ${formatError(error)}`);
+      return undefined;
+    }),
+    readBoundProxyPassword(context.secrets, explicitProxy).catch((error: unknown) => {
+      output.appendLine(`[error] Could not read proxy credentials: ${formatError(error)}`);
       return undefined;
     }),
     readWindowsSystemProxy(),
@@ -779,7 +857,8 @@ async function applyMeshNetworkConfiguration(context: vscode.ExtensionContext): 
     turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
     turnPassword: turnPassword || undefined,
     proxy: {
-      explicitProxy: configuration.get<string>('proxyUrl', '').trim() || undefined,
+      explicitProxy: explicitProxy || undefined,
+      explicitProxyPassword: proxyPassword,
       vscodeProxy: httpConfiguration.get<string>('proxy') || undefined,
       vscodeProxySupport: httpConfiguration.get<string>('proxySupport'),
       vscodeNoProxy: httpConfiguration.get<string[]>('noProxy', []),

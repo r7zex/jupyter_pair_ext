@@ -32,14 +32,54 @@ export interface ProxyDescriptor {
   password?: string;
 }
 
+export interface BoundProxyPassword {
+  binding: string;
+  password: string;
+}
+
+export interface ExplicitProxyUrlDetails {
+  /** Password-free URL safe to keep in VS Code settings. */
+  proxyUrl: string;
+  /** Stable endpoint + username identity used to bind SecretStorage data. */
+  binding: string;
+  /** True when the supplied setting contained a non-empty password. */
+  passwordPresent: boolean;
+  /** Present only when the supplied URL embedded a non-empty password. */
+  password?: string | undefined;
+}
+
+export interface ExplicitProxyPasswordInspection {
+  /** Password-free replacement, or an empty string when an invalid URL must be cleared. */
+  passwordFreeUrl: string;
+  passwordPresent: boolean;
+  /** Omitted when the embedded password has malformed percent encoding. */
+  password?: string | undefined;
+}
+
 export interface ProxyResolutionInput {
   explicitProxy?: string | undefined;
+  /** SecretStorage credential, accepted only for its exact explicit proxy binding. */
+  explicitProxyPassword?: BoundProxyPassword | undefined;
   vscodeProxy?: string | undefined;
   vscodeProxySupport?: string | undefined;
   vscodeNoProxy?: readonly string[] | undefined;
   systemProxy?: string | undefined;
   systemNoProxy?: string | undefined;
   env?: Record<string, string | undefined>;
+}
+
+export const EXPLICIT_PROXY_PASSWORD_ERROR =
+  'pairNotebook.proxyUrl must not contain a password. Remove it and run Pair Notebook: Set Proxy Password.';
+
+function hasExplicitProxyPasswordShape(rawUrl: string): boolean {
+  const withoutPrefix = rawUrl
+    .replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/+/, '')
+    .replace(/^\/+/, '');
+  const at = withoutPrefix.lastIndexOf('@');
+  if (at < 0) return false;
+  const userInfo = withoutPrefix.slice(0, at);
+  const separator = userInfo.lastIndexOf(':');
+  return separator >= 0 && separator < userInfo.length - 1;
 }
 
 /** Removes userinfo from a proxy URL before it can reach a log or report. */
@@ -76,12 +116,77 @@ export function parseProxyUrl(rawUrl: string): ProxyDescriptor | undefined {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) return undefined;
   const host = url.hostname;
   if (!host) return undefined;
+  let username: string | undefined;
+  let password: string | undefined;
+  try {
+    username = url.username ? decodeURIComponent(url.username) : undefined;
+    password = url.password ? decodeURIComponent(url.password) : undefined;
+  } catch {
+    return undefined;
+  }
   return {
     kind,
     host,
     port,
-    ...(url.username ? { username: decodeURIComponent(url.username) } : {}),
-    ...(url.password ? { password: decodeURIComponent(url.password) } : {}),
+    ...(username !== undefined ? { username } : {}),
+    ...(password !== undefined ? { password } : {}),
+  };
+}
+
+/** Stable non-secret identity for one explicit proxy endpoint and username. */
+export function proxyCredentialBinding(proxy: ProxyDescriptor): string {
+  return JSON.stringify([
+    proxy.kind,
+    proxy.host.toLowerCase(),
+    proxy.port,
+    proxy.username ?? '',
+  ]);
+}
+
+/** Detects and removes embedded passwords independently from proxy support. */
+export function inspectExplicitProxyPassword(
+  rawUrl: string,
+): ExplicitProxyPasswordInspection | undefined {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return undefined;
+  const passwordShape = hasExplicitProxyPasswordShape(trimmed);
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return passwordShape
+      ? { passwordFreeUrl: '', passwordPresent: true }
+      : undefined;
+  }
+  if (!url.password) {
+    if (passwordShape) return { passwordFreeUrl: '', passwordPresent: true };
+    return { passwordFreeUrl: url.toString(), passwordPresent: false };
+  }
+  let password: string | undefined;
+  try {
+    password = decodeURIComponent(url.password);
+  } catch {
+    // The setting must still be sanitized even when the secret cannot be decoded.
+  }
+  url.password = '';
+  return {
+    passwordFreeUrl: url.toString(),
+    passwordPresent: true,
+    ...(password !== undefined ? { password } : {}),
+  };
+}
+
+/** Parses an explicit setting and returns the exact password-free replacement. */
+export function inspectExplicitProxyUrl(rawUrl: string): ExplicitProxyUrlDetails | undefined {
+  const credential = inspectExplicitProxyPassword(rawUrl);
+  if (!credential) return undefined;
+  const descriptor = parseProxyUrl(credential.passwordFreeUrl);
+  if (!descriptor) return undefined;
+  return {
+    proxyUrl: credential.passwordFreeUrl,
+    binding: proxyCredentialBinding(descriptor),
+    passwordPresent: credential.passwordPresent,
+    ...(credential.password !== undefined ? { password: credential.password } : {}),
   };
 }
 
@@ -156,9 +261,21 @@ export function resolveProxy(
   ].filter((value): value is string => Boolean(value?.trim())).join(',');
   if (isHostExcluded(target.hostname, noProxy, targetPort)) return undefined;
 
+  if (input.explicitProxy) {
+    const credential = inspectExplicitProxyPassword(input.explicitProxy);
+    if (credential?.passwordPresent) throw new Error(EXPLICIT_PROXY_PASSWORD_ERROR);
+    const explicit = parseProxyUrl(input.explicitProxy);
+    if (explicit) {
+      const secret = input.explicitProxyPassword;
+      if (secret && secret.binding === proxyCredentialBinding(explicit)) {
+        return { ...explicit, password: secret.password };
+      }
+      return explicit;
+    }
+  }
+
   const candidates: string[] = [];
   const vscodeSupportOff = input.vscodeProxySupport === 'off';
-  if (input.explicitProxy) candidates.push(input.explicitProxy);
   if (input.vscodeProxy && !vscodeSupportOff) candidates.push(input.vscodeProxy);
   if (target.protocol === 'wss:' || target.protocol === 'https:') {
     for (const key of ['HTTPS_PROXY', 'https_proxy']) if (env[key]?.trim()) candidates.push(env[key]!.trim());
@@ -181,7 +298,7 @@ export function resolveProxy(
 /** Human-readable, credential-free description used by diagnostics. */
 export function describeProxy(proxy: ProxyDescriptor | undefined): string {
   if (!proxy) return 'Direct';
-  const auth = proxy.username ? 'authenticated ' : '';
+  const auth = proxy.username !== undefined || proxy.password !== undefined ? 'authenticated ' : '';
   switch (proxy.kind) {
     case 'socks5': return `${auth}SOCKS5 ${proxy.host}:${proxy.port}`;
     case 'socks5h': return `${auth}SOCKS5 (remote DNS) ${proxy.host}:${proxy.port}`;

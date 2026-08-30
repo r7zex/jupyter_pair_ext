@@ -1781,6 +1781,25 @@ describe('protocol and notebook compatibility', () => {
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'].default, false);
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowGpu'].default, false);
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.pythonPath'].scope, 'machine');
+    const proxySetting = manifest.contributes.configuration.properties['pairNotebook.proxyUrl'];
+    const proxyPattern = new RegExp(proxySetting.pattern);
+    assert.equal(proxySetting.scope, 'machine');
+    assert.equal(proxyPattern.test('http://alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('ftp://alice:secret@proxy.local:21'), false);
+    assert.equal(proxyPattern.test('//alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('ht^tp:/alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('opaque:/alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('opaque:/decoy@alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('//decoy@alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('invalid@alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('alice:/secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test(' http://alice:secret@proxy.local:3128'), false);
+    assert.equal(proxyPattern.test('http://alice@proxy.local:3128'), true);
+    assert.equal(proxyPattern.test('SOCKS5H://alice@[::1]:1080/'), true);
+    assert.equal(proxyPattern.test('http://alice@host/' + 'a:'.repeat(50_000)), false);
+    assert.ok(manifest.contributes.commands.some(
+      (command: { command?: string }) => command.command === 'pairNotebook.setProxyPassword',
+    ));
   });
 
   it('round-trips a compatible ipynb with stable cell IDs and outputs', () => {

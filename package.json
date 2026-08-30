@@ -89,6 +89,10 @@
         "title": "Pair Notebook: Set TURN Password"
       },
       {
+        "command": "pairNotebook.setProxyPassword",
+        "title": "Pair Notebook: Set Proxy Password"
+      },
+      {
         "command": "pairNotebook.selectBackingFolder",
         "title": "Pair Notebook: Select Backing Folder"
       },
@@ -301,7 +305,9 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Optional HTTP(S), SOCKS4 or SOCKS5 proxy URL for signalling and encrypted relay fallback (for example http://127.0.0.1:10809). Pair Notebook otherwise uses VS Code, environment and Windows system proxy settings automatically."
+          "pattern": "^(?:|(?:[Hh][Tt][Tt][Pp][Ss]?|[Ss][Oo][Cc][Kk][Ss](?:4[Aa]?|5[Hh]?))://(?:[^\\s:/@]+@)?(?:\\[[^\\]\\s]+\\]|[^\\s/:@?#]+)(?::[0-9]{1,5})?/?)$",
+          "patternErrorMessage": "Do not put a proxy password in settings. Keep only the endpoint and optional username here, then run 'Pair Notebook: Set Proxy Password'.",
+          "description": "Optional HTTP(S), SOCKS4 or SOCKS5 proxy endpoint plus optional username for signalling and encrypted relay fallback (for example http://user@127.0.0.1:10809). Store its password with 'Pair Notebook: Set Proxy Password'. Pair Notebook otherwise uses VS Code, environment and Windows system proxy settings automatically."
         }
       }
     }
@@ -320,6 +326,7 @@
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",
     "@trystero-p2p/core": "^0.25.3",
+    "debug": "^4.4.3",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "mqtt": "^5.15.2",

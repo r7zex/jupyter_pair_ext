@@ -7,6 +7,7 @@ import {
   classifyAdapters,
   type AdapterObservation,
 } from '../src/runtime/diagnostics';
+import { inspectExplicitProxyUrl } from '../src/runtime/proxy';
 import type { TurnProbeResult, TurnTransport } from '../src/runtime/turn';
 
 function probe(transport: TurnTransport, ok: boolean): TurnProbeResult {
@@ -52,11 +53,14 @@ describe('passive diagnostics', () => {
       { name: 'TAP-Windows Adapter V9', kind: 'vpn-tun', hasIp: true },
       { name: 'Ethernet', kind: 'physical', hasIp: true },
     ];
+    const explicitProxy = inspectExplicitProxyUrl('http://alice@proxy.corp.example:8080')!;
     const report = await buildNetworkDiagnostics({
       turnProbes: [probe('udp', false), probe('tls', true)],
       adapters,
       proxyOptions: {
-        env: { HTTPS_PROXY: 'http://alice:sup3r-s3cret@proxy.corp.example:8080' },
+        explicitProxy: explicitProxy.proxyUrl,
+        explicitProxyPassword: { binding: explicitProxy.binding, password: 'sup3r-s3cret' },
+        env: { HTTPS_PROXY: 'http://fallback:external-secret@fallback.example:8080' },
       },
       relayFallbackEnabled: true,
       connectedRelayCount: 0,
@@ -78,6 +82,7 @@ describe('passive diagnostics', () => {
     assert.ok(!report.proxy.toLowerCase().includes('alice'));
     const serialized = JSON.stringify(report);
     assert.ok(!serialized.includes('sup3r-s3cret'));
+    assert.ok(!serialized.includes('external-secret'));
 
     // zapret/Flowseal is never named as a confirmed blocker anywhere.
     for (const observation of report.observations) {

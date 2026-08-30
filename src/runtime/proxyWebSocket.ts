@@ -17,11 +17,60 @@ import NodeWebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-import { describeProxy, parseProxyUrl, resolveProxy, type ProxyDescriptor } from './proxy';
+import {
+  describeProxy,
+  parseProxyUrl,
+  resolveProxy,
+  type BoundProxyPassword,
+  type ProxyDescriptor,
+} from './proxy';
+
+interface DebugController {
+  namespaces?: string;
+  enable(namespaces: string): void;
+}
+
+// The debug package is a direct runtime dependency without bundled declarations.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const proxyAgentDebug = require('debug') as DebugController;
+const PROXY_AGENT_DEBUG_EXCLUSIONS = [
+  '-http-proxy-agent*',
+  '-https-proxy-agent*',
+  '-socks-proxy-agent*',
+];
+
+/** Prevent dependency DEBUG output from exposing proxy URLs or auth headers. */
+function disableCredentialBearingProxyDebug(): void {
+  const current = proxyAgentDebug.namespaces?.trim() ?? '';
+  const entries = current ? current.split(',').map((entry) => entry.trim()) : [];
+  let changed = false;
+  for (const exclusion of PROXY_AGENT_DEBUG_EXCLUSIONS) {
+    if (!entries.includes(exclusion)) {
+      entries.push(exclusion);
+      changed = true;
+    }
+  }
+  if (changed) proxyAgentDebug.enable(entries.join(','));
+}
+
+disableCredentialBearingProxyDebug();
+
+function proxyAuthorizationHeaders(
+  proxy: ProxyDescriptor,
+): (() => Record<string, string>) | undefined {
+  if (proxy.username === undefined && proxy.password === undefined) return undefined;
+  const encoded = Buffer.from(
+    (proxy.username ?? '') + ':' + (proxy.password ?? ''),
+    'utf8',
+  ).toString('base64');
+  return () => ({ 'Proxy-Authorization': 'Basic ' + encoded });
+}
 
 export interface ProxyWebSocketRuntimeOptions {
   /** Pair Notebook override; useful for local Karing HTTP/SOCKS listeners. */
   explicitProxy?: string | undefined;
+  /** SecretStorage credential bound to the exact explicit endpoint + username. */
+  explicitProxyPassword?: BoundProxyPassword | undefined;
   vscodeProxy?: string | undefined;
   vscodeProxySupport?: string | undefined;
   vscodeNoProxy?: readonly string[] | undefined;
@@ -36,28 +85,31 @@ export function createProxyAgent(
 ): { agent: Agent; proxy: ProxyDescriptor } | undefined {
   const proxy = resolveProxy(targetUrl, options);
   if (!proxy) return undefined;
-  const credentials = proxy.username !== undefined
-    ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password ?? '')}@`
+  disableCredentialBearingProxyDebug();
+  const credentials = proxy.username !== undefined || proxy.password !== undefined
+    ? encodeURIComponent(proxy.username ?? '') + ':' + encodeURIComponent(proxy.password ?? '') + '@'
     : '';
-  const authority = `${proxy.host}:${proxy.port}`;
-  const proxyUrl = `${proxy.kind}://${credentials}${authority}`;
+  const authority = proxy.host + ':' + proxy.port;
+  const credentialFreeProxyUrl = proxy.kind + '://' + authority;
   switch (proxy.kind) {
     case 'socks4':
-      return { agent: new SocksProxyAgent(proxyUrl), proxy };
+      return { agent: new SocksProxyAgent(proxy.kind + '://' + credentials + authority), proxy };
     case 'socks5':
     case 'socks5h':
-      return { agent: new SocksProxyAgent(proxyUrl), proxy };
+      return { agent: new SocksProxyAgent(proxy.kind + '://' + credentials + authority), proxy };
     case 'https':
     case 'http': {
       const targetProtocol = new URL(targetUrl).protocol;
+      const headers = proxyAuthorizationHeaders(proxy);
+      const agentOptions = headers ? { headers } : undefined;
       // Secure WebSocket requests need a CONNECT tunnel even when the proxy
       // itself speaks plain HTTP. HttpProxyAgent forwards the request instead,
       // which makes ordinary HTTP proxies reject the WebSocket upgrade with
       // HTTP 400. HttpsProxyAgent supports both HTTP and HTTPS proxy transports
       // and upgrades the established tunnel to target TLS for `wss:`.
       const agent = targetProtocol === 'wss:' || targetProtocol === 'https:'
-        ? new HttpsProxyAgent(proxyUrl)
-        : new HttpProxyAgent(proxyUrl);
+        ? new HttpsProxyAgent(credentialFreeProxyUrl, agentOptions)
+        : new HttpProxyAgent(credentialFreeProxyUrl, agentOptions);
       return { agent, proxy };
     }
   }

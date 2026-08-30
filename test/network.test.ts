@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import path from 'node:path';
 import { describe, it } from 'mocha';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -16,6 +18,7 @@ import {
 } from '../src/runtime/turn';
 import {
   describeProxy,
+  inspectExplicitProxyUrl,
   isHostExcluded,
   parseProxyUrl,
   redactProxyUrl,
@@ -192,6 +195,90 @@ describe('proxy resolution', () => {
     assert.equal(resolveProxy('wss://nos.lol', { systemProxy: 'http://system:10809', env })?.host, 'env');
   });
 
+  it('applies a bound secret only to the exact password-free explicit proxy', () => {
+    const details = inspectExplicitProxyUrl('http://alice:p%40ss@proxy.local:3128');
+    assert.equal(details?.proxyUrl, 'http://alice@proxy.local:3128/');
+    assert.equal(details?.password, 'p@ss');
+    const credential = { binding: details!.binding, password: details!.password! };
+    const resolved = resolveProxy('wss://nos.lol', {
+      explicitProxy: details!.proxyUrl,
+      explicitProxyPassword: credential,
+      vscodeProxy: 'http://fallback:external@fallback.local:8080',
+      env: {},
+    });
+    assert.equal(resolved?.host, 'proxy.local');
+    assert.equal(resolved?.username, 'alice');
+    assert.equal(resolved?.password, 'p@ss');
+
+    assert.equal(resolveProxy('wss://nos.lol', {
+      explicitProxy: 'http://bob@proxy.local:3128',
+      explicitProxyPassword: credential,
+      env: {},
+    })?.password, undefined);
+    assert.equal(resolveProxy('wss://nos.lol', {
+      explicitProxy: 'not a proxy URL',
+      explicitProxyPassword: credential,
+      vscodeProxy: 'http://fallback:external@fallback.local:8080',
+      env: {},
+    })?.password, 'external');
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'http://alice:embedded@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'ftp://alice:embedded@proxy.local:21',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'http://alice:%E0%A4%A@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'http://alice:embedded@',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: '//alice:embedded@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'opaque:/alice:embedded@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'opaque:/decoy@alice:embedded@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+    assert.throws(
+      () => resolveProxy('wss://nos.lol', {
+        explicitProxy: 'alice:/embedded@proxy.local:3128',
+        env: {},
+      }),
+      /Set Proxy Password/,
+    );
+  });
+
   it('uses HTTP_PROXY for secure CONNECT when HTTPS_PROXY is absent', () => {
     assert.equal(resolveProxy('wss://nos.lol', {
       env: { HTTP_PROXY: 'http://karing:10809' },
@@ -258,8 +345,15 @@ describe('proxy resolution', () => {
     });
     assert.ok(httpsThroughHttps?.agent instanceof HttpsProxyAgent);
     assert.equal(httpsThroughHttps.agent.proxy.protocol, 'https:');
-    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.username), 'user');
-    assert.equal(decodeURIComponent(httpsThroughHttps.agent.proxy.password), 'p@ss');
+    assert.equal(httpsThroughHttps.agent.proxy.username, '');
+    assert.equal(httpsThroughHttps.agent.proxy.password, '');
+    const httpsHeaders = typeof httpsThroughHttps.agent.proxyHeaders === 'function'
+      ? httpsThroughHttps.agent.proxyHeaders()
+      : httpsThroughHttps.agent.proxyHeaders;
+    assert.equal(
+      httpsHeaders['Proxy-Authorization'],
+      'Basic ' + Buffer.from('user:p@ss').toString('base64'),
+    );
 
     const wsThroughHttp = createProxyAgent('ws://relay.example.com', {
       env: { HTTP_PROXY: 'http://corporate:3128' },
@@ -278,11 +372,46 @@ describe('proxy resolution', () => {
     });
     assert.equal(socks?.proxy.kind, 'socks5h');
 
+    const passwordOnlyDetails = inspectExplicitProxyUrl('http://password-only.local:3128')!;
+    const passwordOnly = createProxyAgent('wss://nos.lol', {
+      explicitProxy: passwordOnlyDetails.proxyUrl,
+      explicitProxyPassword: { binding: passwordOnlyDetails.binding, password: 'secret' },
+      env: {},
+    });
+    assert.equal(passwordOnly?.proxy.username, undefined);
+    assert.equal(passwordOnly?.proxy.password, 'secret');
+    const passwordOnlyAgent = passwordOnly!.agent as HttpsProxyAgent<string>;
+    assert.equal(passwordOnlyAgent.proxy.username, '');
+    assert.equal(passwordOnlyAgent.proxy.password, '');
+    const passwordOnlyHeaders = typeof passwordOnlyAgent.proxyHeaders === 'function'
+      ? passwordOnlyAgent.proxyHeaders()
+      : passwordOnlyAgent.proxyHeaders;
+    assert.equal(
+      passwordOnlyHeaders['Proxy-Authorization'],
+      'Basic ' + Buffer.from(':secret').toString('base64'),
+    );
+
     assert.equal(createProxyAgent('wss://nos.lol', { env: { NO_PROXY: 'nos.lol' } }), undefined);
+  });
+
+  it('keeps proxy credentials out of dependency DEBUG output', () => {
+    const result = spawnSync(
+      process.execPath,
+      [path.resolve(__dirname, '../../scripts/proxy-debug-smoke.mjs')],
+      {
+        cwd: path.resolve(__dirname, '../..'),
+        encoding: 'utf8',
+        timeout: 10_000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /proxy DEBUG redaction: passed/);
+    assert.ok(!result.stderr.includes('sec012-debug-canary'));
   });
 
   it('uses HTTP CONNECT for a secure WebSocket through an HTTP proxy', async () => {
     const connectTargets: string[] = [];
+    let proxyAuthorization: string | undefined;
     let forwardedRequestCount = 0;
     const proxyServer = createServer((_request, response) => {
       forwardedRequestCount += 1;
@@ -290,6 +419,7 @@ describe('proxy resolution', () => {
     });
     proxyServer.on('connect', (request, socket) => {
       connectTargets.push(request.url ?? '');
+      proxyAuthorization = request.headers['proxy-authorization'];
       socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
     });
     await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
@@ -297,8 +427,10 @@ describe('proxy resolution', () => {
     try {
       const proxyAddress = proxyServer.address();
       assert.ok(proxyAddress && typeof proxyAddress !== 'string');
+      const explicit = inspectExplicitProxyUrl(`http://alice@127.0.0.1:${proxyAddress.port}`)!;
       const resolved = createProxyAgent('wss://127.0.0.1:65534', {
-        vscodeProxy: `http://127.0.0.1:${proxyAddress.port}`,
+        explicitProxy: explicit.proxyUrl,
+        explicitProxyPassword: { binding: explicit.binding, password: 'connect-secret' },
         env: {},
       });
       assert.ok(resolved);
@@ -313,6 +445,10 @@ describe('proxy resolution', () => {
       });
 
       assert.deepEqual(connectTargets, ['127.0.0.1:65534']);
+      assert.equal(
+        proxyAuthorization,
+        'Basic ' + Buffer.from('alice:connect-secret').toString('base64'),
+      );
       assert.equal(forwardedRequestCount, 0);
     } finally {
       await new Promise<void>((resolve, reject) => {
