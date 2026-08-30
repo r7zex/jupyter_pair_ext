@@ -110,8 +110,6 @@ jobs:
           test -f "${VERSIONED_VSIX}"
           test -f "${SOURCE_ZIP}"
 
-          cp "${VERSIONED_VSIX}" pair-notebook.vsix
-          sha256sum pair-notebook.vsix "${VERSIONED_VSIX}" "${SOURCE_ZIP}" > SHA256SUMS.txt
           node scripts/create-release-notes.mjs "${VERSION}" release-notes.md
 
           echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
@@ -126,10 +124,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: |
-            pair-notebook.vsix
             ${{ steps.release.outputs.versioned_vsix }}
             ${{ steps.release.outputs.source_zip }}
-            SHA256SUMS.txt
             release-notes.md
 
   publish:
@@ -156,7 +152,6 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.tag }}
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
           VERSIONED_VSIX: ${{ needs.verify.outputs.versioned_vsix }}
-          SOURCE_ZIP: ${{ needs.verify.outputs.source_zip }}
           VERIFIED_COMMIT: ${{ needs.verify.outputs.verified_commit }}
         run: |
           set -euo pipefail
@@ -171,14 +166,12 @@ jobs:
             exit 1
           fi
 
-          sha256sum --check SHA256SUMS.txt
-
           RELEASE_FLAGS=(--latest)
           if [[ "${RELEASE_VERSION}" == *-* ]]; then
             RELEASE_FLAGS=(--prerelease)
           fi
 
-          ASSETS=(pair-notebook.vsix "${VERSIONED_VSIX}" "${SOURCE_ZIP}" SHA256SUMS.txt)
+          ASSETS=("${VERSIONED_VSIX}")
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             EXISTING_NAMES="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
             MISSING_ASSETS=()

@@ -67,6 +67,10 @@ describe('audit regressions', () => {
     it('builds only a verified remote tag and never clobbers release assets', async () => {
       const workflowPath = path.resolve(__dirname, '../../.github/workflows/release.yml');
       const workflow = await readFile(workflowPath, 'utf8');
+      const releaseNotesScript = await readFile(
+        path.resolve(__dirname, '../../scripts/create-release-notes.mjs'),
+        'utf8',
+      );
       const verifyJob = workflow.match(/^ {2}verify:[^]*?(?=^ {2}publish:)/m)?.[0] ?? '';
       const publishJob = workflow.match(/^ {2}publish:[^]*/m)?.[0] ?? '';
 
@@ -86,6 +90,10 @@ describe('audit regressions', () => {
       assert.match(publishJob, /GH_REPO:\s+\$\{\{ github\.repository \}\}/);
       assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
       assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
+      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}"\)/);
+      assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
+      assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
+      assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix|pair-notebook-complete|SHA256SUMS/);
       assert.doesNotMatch(workflow, /--clobber/);
       const compareIndex = publishJob.indexOf('cmp --silent');
       const editIndex = publishJob.indexOf('gh release edit');

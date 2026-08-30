@@ -27,12 +27,13 @@ if (!changes) {
 
 const repository = process.env.GITHUB_REPOSITORY;
 const tag = `v${version}`;
+const vsixName = `pair-notebook-${version}.vsix`;
 const downloadUrl = repository
-  ? `https://github.com/${repository}/releases/download/${tag}/pair-notebook.vsix`
+  ? `https://github.com/${repository}/releases/download/${tag}/${vsixName}`
   : undefined;
 const downloadLink = downloadUrl
-  ? `[Download pair-notebook.vsix](${downloadUrl})`
-  : '`pair-notebook.vsix`';
+  ? `[Download ${vsixName}](${downloadUrl})`
+  : `\`${vsixName}\``;
 
 const notes = `# Pair Notebook ${version}
 
@@ -49,19 +50,18 @@ Install this version on every participating computer.
 Or install it from a terminal:
 
 \`\`\`text
-code --install-extension pair-notebook.vsix --force
+code --install-extension ${vsixName} --force
 \`\`\`
 
 ## What's changed
 
 ${changes}
 
-## Downloads
+## Download
 
-- \`pair-notebook.vsix\` — stable filename for downloading the latest release directly.
-- \`pair-notebook-${version}.vsix\` — the same ready-to-install extension with its version in the filename.
-- \`pair-notebook-complete-${version}.zip\` — source snapshot, documentation, tests, and the packaged extension.
-- \`SHA256SUMS.txt\` — checksums for verifying downloaded files.
+- \`${vsixName}\` — the only release asset users need. GitHub displays its SHA-256 digest next to the file.
+
+GitHub also adds automatic **Source code** archives. They are for reading the source and cannot be installed as a VS Code extension.
 
 ## Verification
 
