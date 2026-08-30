@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.6 - 2026-08-30 (security hardening and audited release)
+
+- Makes remote-compute consent ephemeral and session-scoped. Every new or restored session starts with remote execution disabled, ignores the deprecated persisted permission, and requires a fresh local opt-in before advertising or accepting remote execution.
+- Advances the transport handshake to protocol v4. Every emergency-relay envelope is signed and bound to its session, sender, recipient, message ID, timestamp, and payload; replay, stale, modified, wrong-target, and impersonated envelopes are rejected. Protocol-v4 peers intentionally reject 0.5.5 and older clients.
+- Bounds untrusted relay announcements and identity negotiations, while preserving authenticated route recovery and applying send completion/backpressure accounting to MQTT and promoted direct routes.
+- Requires every selected Python interpreter to be an advertised Jupyter-ready environment before it can enter shared compute state.
+- Excludes additional credential stores and common secret files from collaboration snapshots, the VSIX, and the source archive while retaining safe template files.
+- Stores an explicit proxy password in VS Code SecretStorage, bound to its exact endpoint and username. Legacy embedded passwords migrate once; malformed or oversized values are removed without being copied, and proxy dependency DEBUG output is suppressed.
+- Hardens the release workflow with immutable action commits, credential-free checkout, exact remote-tag verification, separate read-only verification and write-only publication jobs, and refusal to overwrite mismatched release assets.
+- Documents the friends-first bearer-invite and remote-code-execution boundary, observable relay metadata, lack of forward secrecy after invite disclosure, protocol-v4 compatibility, and the 0.5.6 session-consent boundary.
+
 ## 0.5.5 - 2026-08-28 (documentation and release metadata)
 
 - Rewrote the project overview around the current transport: direct WebRTC when available, optional custom TURN, and redundant encrypted Nostr/MQTT full-data fallback.
