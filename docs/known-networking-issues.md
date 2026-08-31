@@ -83,8 +83,10 @@ Trystero topic strategy built on MQTT.js.
 9. Runtime direct-route loss gets a bounded logical recovery lease and immediately tries
    the emergency relay. Bootstrap route loss does not get that lease.
 10. A network fingerprint change searches for a fallback or an improved route and is
-    intended not to tear down an existing healthy route. Karing TUN is transparent packet
-    routing; a disabled Windows system proxy does not prove TUN is inactive.
+    intended not to tear down an existing healthy route. Manual Reconnect also reannounces
+    remembered peers and performs a bounded refresh of live Nostr/MQTT signalling sockets
+    without leaving their rooms. Karing TUN is transparent packet routing; a disabled
+    Windows system proxy does not prove TUN is inactive.
 
 ## Issue index
 
@@ -95,7 +97,7 @@ Trystero topic strategy built on MQTT.js.
 | NET-P0-003 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / bootstrap | CONFIRMED |
 | NET-P1-001 | P1 | BLOCKED | Architecture / route coverage | CONFIRMED |
 | NET-P1-002 | P1 | NEEDS-PHYSICAL-VALIDATION | Product bug / observability | CONFIRMED |
-| NET-P1-003 | P1 | INVESTIGATING | Product bug / reconnect | MEDIUM |
+| NET-P1-003 | P1 | NEEDS-PHYSICAL-VALIDATION | Product bug / reconnect | CONFIRMED |
 | NET-P1-004 | P1 | OPEN | Product bug / compatibility UX | CONFIRMED |
 | NET-P2-001 | P2 | OPEN | Diagnostics gap | CONFIRMED |
 | NET-P2-002 | P2 | OPEN | Test gap | CONFIRMED |
@@ -563,7 +565,7 @@ Physical validation: NOT RUN
 
 ## NET-P1-003 — Manual reconnect may not rebuild a stuck transport
 
-Status: INVESTIGATING
+Status: NEEDS-PHYSICAL-VALIDATION
 
 Priority: P1
 
@@ -574,29 +576,50 @@ after a VPN/proxy route change.
 
 Evidence:
 
-- [A] `SessionRuntime.reconnect()` only calls `transport.connect()` for remembered peers.
-- [A] `MeshTransport.connect()` remembers the peer and sends `helloAck` only when a route
-  already exists; it does not rebuild rooms or close sockets.
-- [A] Applying network configuration refreshes the global proxy-aware WebSocket
-  constructor, and Trystero/Nostr/MQTT have automatic reconnect behavior for sockets that
-  actually close.
-- The unproved condition is whether real Karing route changes leave half-open clients in
-  a state that never closes and therefore never uses the refreshed constructor.
+- [A] Before the fix, `SessionRuntime.reconnect()` only called `transport.connect()` for
+  remembered peers. Applying network configuration installed the updated proxy-aware
+  WebSocket constructor, but an existing half-open socket could remain `OPEN`, never emit
+  `close`, and therefore never instantiate a socket through the refreshed route.
+- [A] Trystero's Nostr relay manager retains relay clients by endpoint, while its normal
+  reconnect loop creates a replacement only after the current socket closes. MQTT.js also
+  reconnects automatically after disconnect; neither behavior makes a manual logical peer
+  reannouncement a physical socket refresh.
+- [A] The Nostr adapter now invalidates the old subscription/publication generation,
+  rotates subscription IDs, forces the current socket into its existing reconnect loop,
+  and reports progress only after a different `OPEN` socket plus fresh `EOSE` and `OK`
+  evidence.
+- [A] The MQTT adapter now invalidates pending `SUBACK`/publication generations, forces a
+  socket replacement, and reports progress only after a different `OPEN` socket plus a
+  fresh subscription acknowledgement and publication acknowledgement.
+- [A] `MeshTransport.refreshSignalling()` is single-flight and bounded to ten seconds by
+  default. It immediately reevaluates remembered routes, preserves live rooms, WebRTC
+  peers, identity admission, queues, and emergency-relay state, and returns sanitized
+  `verified`, `partial`, `timed-out`, or `no-sockets` results.
+- [B] Deterministic tests cover half-open sockets, stale Nostr `EOSE`/`OK`, stale MQTT
+  `SUBACK`/`PUBACK`, partial timeout, no-socket and consecutive refreshes, room scoping,
+  listener stability, single-flight behavior, route preservation, and reconnect ordering.
 
 Relevant files and symbols:
 
 - `src/extension.ts`: `pairNotebook.reconnect`
 - `src/runtime/session.ts`: `reconnect()`
-- `src/runtime/mesh.ts`: `configureMeshNetwork()`, `connect()`, `onNetworkChanged()`
-- `src/runtime/netWatch.ts`
+- `src/runtime/mesh.ts`: `refreshSignalling()`, `connect()`, `onNetworkChanged()`
+- `src/runtime/nostrRoom.ts`, `src/runtime/mqttRoom.ts`
+- `src/runtime/signallingSocketRefresh.ts`
+- `test/nostrRoom.test.ts`, `test/mqttRoom.test.ts`, `test/network.test.ts`
+- `test/runtime.test.ts`, `test/signallingSocketRefresh.test.ts`
 
 Root cause:
 
-Not established. The command is a logical peer reannouncement, while its label can be
-read as a physical transport restart. Automatic socket recovery may be sufficient after
-clean close events but not after all route changes.
+Confirmed. `applyMeshNetworkConfiguration()` installed updated proxy/TUN-aware connection
+configuration, but the Reconnect command only performed logical peer reannouncement. A
+half-open signalling socket that never emitted `close` could therefore keep its stale
+route indefinitely and never execute the new WebSocket construction path. Rebuilding the
+whole Trystero room would destroy live peer state and would still meet Trystero's cached
+relay clients; the safe refresh boundary is the signalling socket inside the retained
+room/client lifecycle.
 
-Confidence: MEDIUM
+Confidence: CONFIRMED
 
 Why this can affect Host-on-VPN:
 
@@ -605,29 +628,47 @@ immediate close event on every existing WSS client.
 
 Reproduction:
 
-On a controlled socket server, leave a connection half-open while changing the resolved
-proxy/route, invoke Reconnect, and record whether a new socket and subscription are
-created.
+The regression fixtures keep a signalling connection logically `OPEN` without emitting
+`close`, invoke the same refresh used by Reconnect, then deliver late acknowledgements from
+the displaced generation. The refresh must create a different socket and reject the stale
+evidence before accepting fresh subscription/publication acknowledgements.
 
 Required fix:
 
-First prove the lifecycle failure. If confirmed, add a bounded explicit transport refresh
-that preserves a healthy incumbent and rebuilds alternatives; do not tear down working
-sessions merely because a network fingerprint changed.
+Implemented a bounded socket-level refresh for the active room-scoped Nostr and MQTT
+endpoints. Reconnect first reannounces remembered peers, then refreshes signalling and
+surfaces a sanitized result without resetting the session.
 
 Regression test:
 
-Model clean disconnect, half-open socket, and already-healthy route. A refresh must create
-a replacement for the stuck path and leave the healthy path untouched.
+Model half-open sockets and delayed acknowledgements from the old generation. Require a
+different `OPEN` socket and fresh protocol evidence, while proving that existing routes,
+rooms, peer admission, and listener counts remain stable. A mixed Nostr-success/MQTT-stall
+test must produce a bounded partial result rather than false success or session teardown.
 
 Acceptance criteria:
 
-- the command has defined physical and logical semantics;
-- route refresh is make-before-break;
-- changed proxy/TUN routing is used by newly created sockets;
-- no duplicate peer admission or state loss occurs.
+- Reconnect has defined logical reannouncement and physical signalling-refresh semantics.
+- Every verified endpoint has a different `OPEN` socket and fresh protocol evidence.
+- Newly constructed sockets use the currently installed proxy/TUN-aware connection path.
+- The operation is single-flight, bounded, and returns a sanitized family-level result.
+- No room leave, `peerDisconnected` event, authenticated route loss, duplicate admission,
+  or application-state reset occurs during the refresh.
 
-Fixed by commit:
+Scope limitation:
+
+This refresh does not rebuild the ICE/TURN configuration captured by already-created
+Trystero rooms. Changing TURN settings for live rooms requires a separate make-before-break
+room-generation design so that an incumbent authenticated route is not destroyed.
+
+Software validation:
+
+- `npm test`: PASS, 316 tests on 2026-09-01; compile/bundle PASS in its first phase.
+- Focused Nostr/MQTT/network/runtime refresh suites: PASS on 2026-09-01.
+- `npm run lint`: PASS on 2026-09-01.
+- `git diff --check`: PASS (Git emitted only the repository's LF-to-CRLF warnings).
+
+Fixed by commit: `009d009` (`fix(network): rebuild stuck signalling sockets`)
 
 Physical validation: NOT RUN
 
@@ -918,43 +959,44 @@ Physical validation: NOT RUN
 
 ## NEXT ACTION
 
-Next issue: `NET-P1-003 — Manual reconnect may not rebuild a stuck transport`.
+Next issue: `NET-P1-004 — Protocol incompatibility is actionable only after a generic
+delay`.
 
-Current evidence: `SessionRuntime.reconnect()` reannounces remembered logical peers via
-`MeshTransport.connect()`. It does not force-close and recreate Nostr/MQTT signalling
-rooms or their sockets, so a half-open transport after a VPN/proxy route change may keep
-using stale routing state. Whether normal library close/reconnect events always make this
-safe remains unproved.
+Current evidence: protocol v4 correctly rejects older handshakes, but the bootstrap path
+normally retains that error until it surfaces through a generic connection-failed snapshot
+or timeout. The peer is never admitted, yet the user is not promptly told to install the
+same extension build on both computers.
 
 Files to inspect/change:
 
 - `src/runtime/mesh.ts`
-- `src/runtime/session.ts`
-- `src/runtime/netWatch.ts`
+- `src/runtime/bootstrap.ts`
+- `src/core/wire.ts`
 - `src/extension.ts`
-- reconnect and signalling lifecycle tests
+- handshake/bootstrap and extension-command tests
 
 Required implementation shape:
 
-1. reproduce a half-open signalling client that does not emit close while the route/proxy
-   changes;
-2. define a bounded restart operation that tears down and rebuilds signalling without
-   dropping a healthy authenticated data route prematurely;
-3. make the manual Reconnect command invoke that operation and surface useful sanitized
-   progress/failure state;
-4. prove new sockets/subscriptions are created and normal runtime/bootstrap recovery is
-   preserved.
+1. preserve the strict protocol-version admission gate;
+2. carry a typed, sanitized incompatibility result through bootstrap without waiting for
+   the generic discovery timeout;
+3. show actionable guidance to install the same extension build without disclosing invite
+   material, topics, identities, endpoints, or raw handshake contents;
+4. prove compatible protocol-v4 peers and ordinary transient-network failures keep their
+   current behavior.
 
 Commands after the focused fix:
 
 ```text
-rg -n "reconnect\(|connect\(|onNetworkChanged|NetworkChangeWatcher|leave\(" src test
-npm test -- --grep "reconnect|network change|signalling"
+rg -n "HANDSHAKE_VERSION|incompatible|parseHandshake|lastConnectionError|connection-failed" src test
+npm test -- --grep "incompatible|protocol|handshake|bootstrap"
 ```
 
-Keep existing authenticated routes available until a replacement is ready when possible;
-do not turn manual reconnect into an unbounded retry or a destructive session reset.
+NET-P1-003 still requires the exact two-computer validation: host Windows behind Karing
+TUN, guest on the remote network, invoke Reconnect after a route change, confirm a new
+sanitized signalling-refresh diagnostic, and verify snapshot/runtime continuity plus
+bidirectional edits. Until that run, its physical validation remains NOT RUN.
 
 Last confirmed pushed state: `a67ec86` on
-`origin/codex/networking-root-cause-repair`. NET-P1-002 commit `5cbe75d` is local because
-the origin push requires separate explicit egress approval.
+`origin/codex/networking-root-cause-repair`. NET-P1-002 and NET-P1-003 commits remain local
+because exporting them to origin requires separate explicit authorization.
