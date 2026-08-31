@@ -5,7 +5,7 @@ import { publishTemporaryFile } from '../core/atomicFile';
 import { safeProjectTarget, safeRelativePath } from '../core/persistence';
 import { hashFileContents, shouldTrackProjectPath } from '../core/projectFiles';
 import { portablePathComparisonKey } from '../core/projectPath';
-import { HostClock, InviteData, PeerIdentity } from '../core/types';
+import { HostClock, InviteData, newId, PeerIdentity } from '../core/types';
 import {
   DEFAULT_TRANSFER_CHUNK_SIZE,
   expectedTransferChunkBytes,
@@ -27,6 +27,18 @@ const MAX_PENDING_SNAPSHOT_MESSAGES = 2048;
 const MAX_PENDING_SNAPSHOT_BYTES = 128 * 1024 * 1024;
 /** A lossy relay route may drop individual chunk frames; ask the host to resend before giving up. */
 const MAX_SNAPSHOT_FILE_RETRIES = 5;
+const SNAPSHOT_GENERATION_FRAME_TYPES = new Set([
+  'snapshotBegin',
+  'snapshotManifest',
+  'snapshotManifestEnd',
+  'snapshotDirectory',
+  'snapshotFileStart',
+  'snapshotFileChunk',
+  'snapshotFileEnd',
+  'snapshotCheckpoint',
+  'snapshotEnd',
+  'snapshotError',
+]);
 
 export type SnapshotBootstrapErrorKind = 'display-name-conflict' | 'connection-failed';
 
@@ -96,7 +108,8 @@ export async function downloadProjectSnapshot(
   const announcedDirectories = new Set<string>();
   const startedFiles = new Set<string>();
   let declaredTransferBytes = 0;
-  let requested = false;
+  let activeSnapshotId: string | undefined;
+  let requestedSnapshotGenerations = 0;
   let finished = false;
   let lastConnectionError: Error | undefined;
   let messageQueue: Promise<void> = Promise.resolve();
@@ -141,10 +154,41 @@ export async function downloadProjectSnapshot(
         timer = setTimeout(() => fail(lastConnectionError ?? new Error(message)), timeoutMs);
       };
       const requestSnapshot = (sourceId: string) => {
-        if (requested || sourceId !== hostPeerId) return;
-        requested = true;
+        if (activeSnapshotId || sourceId !== hostPeerId) return;
+        activeSnapshotId = newId();
+        requestedSnapshotGenerations += 1;
         arm();
-        transport.sendTo(sourceId, 'snapshotRequest', { completed: Object.fromEntries(completed) });
+        try {
+          transport.sendTo(sourceId, 'snapshotRequest', {
+            snapshotId: activeSnapshotId,
+            completed: Object.fromEntries(completed),
+          });
+        } catch (error) {
+          activeSnapshotId = undefined;
+          if (!transport.isPeerRecovering(sourceId)) throw error;
+        }
+      };
+      const resetSnapshotGeneration = async () => {
+        for (const transfer of transfers.values()) await transfer.handle.close().catch(() => undefined);
+        transfers.clear();
+        await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+        totalFiles = 0;
+        transferFiles = 0;
+        declaredCompletedFiles = 0;
+        declaredDirectories = 0;
+        snapshotBegun = false;
+        manifestComplete = false;
+        chunkedManifest = false;
+        expectedFiles = undefined;
+        expectedDirectories = undefined;
+        expectedFileKeys = undefined;
+        expectedDirectoryKeys = undefined;
+        completedManifestFiles.clear();
+        completedManifestKeys.clear();
+        announcedDirectories.clear();
+        startedFiles.clear();
+        declaredTransferBytes = 0;
+        activeSnapshotId = undefined;
       };
       const completeManifest = async (materializeDirectories: boolean) => {
         if (!expectedFiles || !expectedDirectories) throw new Error('Snapshot manifest was not initialized.');
@@ -203,6 +247,16 @@ export async function downloadProjectSnapshot(
           fail(new Error('The Session Host disconnected during the project snapshot transfer.'));
         }
       });
+      transport.on('peerRecovered', (peer: PeerIdentity) => {
+        if (finished || peer.peerId !== hostPeerId) return;
+        messageQueue = messageQueue
+          .then(async () => {
+            if (finished) return;
+            await resetSnapshotGeneration();
+            requestSnapshot(peer.peerId);
+          })
+          .catch((error: unknown) => fail(error instanceof Error ? error : new Error(String(error))));
+      });
 
       let pendingMessages = 0;
       let pendingBytes = 0;
@@ -224,6 +278,11 @@ export async function downloadProjectSnapshot(
             return;
           }
           if (sourceId !== hostPeerId) return;
+          if (SNAPSHOT_GENERATION_FRAME_TYPES.has(frame.type)) {
+            const snapshotId = frame.meta.snapshotId;
+            const legacyInitialGeneration = snapshotId === undefined && requestedSnapshotGenerations === 1;
+            if (!legacyInitialGeneration && (!activeSnapshotId || snapshotId !== activeSnapshotId)) return;
+          }
           if (frame.type === 'snapshotError') {
             const reason = frame.meta.reason === 'stale-invite'
               ? 'This invite points to a computer that is no longer the Session Host. Ask the current host for a new invite.'
@@ -317,7 +376,14 @@ export async function downloadProjectSnapshot(
               throw new Error('Snapshot checkpoint has an unsupported identifier.');
             }
             arm();
-            transport.sendTo(sourceId, 'snapshotCheckpointAck', { checkpointId });
+            try {
+              transport.sendTo(sourceId, 'snapshotCheckpointAck', {
+                snapshotId: activeSnapshotId,
+                checkpointId,
+              });
+            } catch (error) {
+              if (!transport.isPeerRecovering(sourceId)) throw error;
+            }
             return;
           }
           if (frame.type === 'snapshotDirectory') {
@@ -406,7 +472,15 @@ export async function downloadProjectSnapshot(
                   if (!transfer.received.has(index)) missing.push(index);
                 }
                 arm();
-                transport.sendTo(sourceId, 'snapshotFileRetry', { transferId, indices: missing });
+                try {
+                  transport.sendTo(sourceId, 'snapshotFileRetry', {
+                    snapshotId: activeSnapshotId,
+                    transferId,
+                    indices: missing,
+                  });
+                } catch (error) {
+                  if (!transport.isPeerRecovering(sourceId)) throw error;
+                }
                 return;
               }
               abandon();

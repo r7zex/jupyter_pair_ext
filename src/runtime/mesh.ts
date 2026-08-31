@@ -302,6 +302,7 @@ interface ConnectedPeer {
 
 interface RecoveringPeer {
   identity: PeerIdentity;
+  purpose: PeerConnectionPurpose;
   startedAt: number;
   timer: NodeJS.Timeout;
 }
@@ -761,7 +762,7 @@ export class MeshTransport extends EventEmitter {
   public async waitForRoute(peerId: string, timeoutMs = LOGICAL_PEER_RECOVERY_MS): Promise<void> {
     if (this.hasRoute(peerId)) return;
     const remembered = this.directory.get(peerId);
-    if (remembered && peerId !== this.options.localPeer.peerId) this.beginLogicalRecovery(remembered);
+    if (remembered && peerId !== this.options.localPeer.peerId) this.beginLogicalRecovery(remembered, 'runtime');
     const deadline = Date.now() + Math.max(1, timeoutMs);
     while (!this.stopped && Date.now() < deadline) {
       if (this.hasRoute(peerId)) return;
@@ -1801,13 +1802,13 @@ public improvablePeerIds(): string[] {
     );
     return [...this.directory.values()]
       .filter((peer) => peer.peerId === this.options.localPeer.peerId
-        || activeRuntimeIds.has(peer.peerId) || this.recoveringPeers.has(peer.peerId))
+        || activeRuntimeIds.has(peer.peerId) || this.recoveringPeers.get(peer.peerId)?.purpose === 'runtime')
       .map((peer) => {
         const transportPeerId = this.identityToTransport.get(peer.peerId);
         const connection = transportPeerId ? this.connections.get(transportPeerId) : undefined;
         const latency = this.latency.get(peer.peerId);
         const local = peer.peerId === this.options.localPeer.peerId;
-        const recovering = this.recoveringPeers.has(peer.peerId);
+        const recovering = this.recoveringPeers.get(peer.peerId)?.purpose === 'runtime';
         return {
           ...peer,
           latency: latency?.current ?? (local ? 0 : -1),
@@ -2100,12 +2101,11 @@ public improvablePeerIds(): string[] {
       this.identityToTransport.delete(connection.identity.peerId);
     }
     if (!this.stopped && wasActiveIdentityRoute) {
-      if (connection.purpose === 'runtime') this.beginLogicalRecovery(connection.identity);
-      else this.emit('bootstrapDisconnected', connection.identity);
+      this.beginLogicalRecovery(connection.identity, connection.purpose);
     }
   }
 
-  private beginLogicalRecovery(identity: PeerIdentity): void {
+  private beginLogicalRecovery(identity: PeerIdentity, purpose: PeerConnectionPurpose): void {
     if (this.stopped || this.hasRoute(identity.peerId) || this.recoveringPeers.has(identity.peerId)) return;
     const startedAt = Date.now();
     const timer = setTimeout(() => {
@@ -2116,10 +2116,13 @@ public improvablePeerIds(): string[] {
         return;
       }
       this.recoveringPeers.delete(identity.peerId);
-      this.emit('peerDisconnected', recovery.identity);
+      this.emit(
+        recovery.purpose === 'bootstrap' ? 'bootstrapDisconnected' : 'peerDisconnected',
+        recovery.identity,
+      );
     }, this.options.logicalPeerRecoveryMs ?? LOGICAL_PEER_RECOVERY_MS);
     timer.unref?.();
-    this.recoveringPeers.set(identity.peerId, { identity: { ...identity }, startedAt, timer });
+    this.recoveringPeers.set(identity.peerId, { identity: { ...identity }, purpose, startedAt, timer });
     this.emit('peerRecovering', { ...identity });
 
     // Do not wait for the periodic 20-second sweep. The already-verified full

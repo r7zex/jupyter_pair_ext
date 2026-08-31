@@ -8,12 +8,13 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { MeshTransport } from '../src/runtime/mesh';
-import { encodeFrame } from '../src/core/wire';
+import { decodeFrame, encodeFrame } from '../src/core/wire';
 import {
   createInMemoryTrysteroFactory,
   healInMemoryTrystero,
   partitionInMemoryTrystero,
   resetInMemoryTrystero,
+  setInMemoryTrysteroSendObserver,
 } from './support/in_memory_trystero';
 
 const fakeVscode = createVscodeBoundary();
@@ -112,6 +113,91 @@ describe('production SessionRuntime integration', () => {
       assert.equal(await directoryExists(path.join(joiningFolder, 'empty-directory')), true);
       assert.equal(host.snapshot().peers.some((peer: any) => peer.peerId === 'joining-peer'), false, 'bootstrap connections are not session participants');
     } finally {
+      host.descriptor.mode = 'host-only';
+      await host.leave();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes a snapshot from completed files after authenticated route replacement', async function () {
+    this.timeout(30_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bootstrap-recovery-'));
+    const extensionRoot = path.join(root, 'extension');
+    const hostFolder = path.join(root, 'host');
+    const joiningFolder = path.join(root, 'joining-working-copy');
+    await Promise.all([
+      mkdir(extensionRoot, { recursive: true }),
+      mkdir(hostFolder, { recursive: true }),
+    ]);
+    const firstContents = 'completed before route replacement';
+    const secondContents = Buffer.alloc(192 * 1024, 73);
+    await Promise.all([
+      writeFile(path.join(hostFolder, 'a-first.txt'), firstContents, 'utf8'),
+      writeFile(path.join(hostFolder, 'b-second.bin'), secondContents),
+    ]);
+    const sessionId = `bootstrap-recovery-${Date.now()}`;
+    const token = 'bootstrap-recovery-token-that-is-long-enough';
+    const host = new SessionRuntime(descriptor({
+      sessionId,
+      role: 'host',
+      peerId: 'host',
+      hostPeerId: 'host',
+      workingFolder: hostFolder,
+      pythonPath: process.execPath,
+    }), token, context(extensionRoot), logger());
+    const snapshotRequests: Array<{ completed: Record<string, string>; snapshotId: string }> = [];
+    const sendSnapshot = host.sendSnapshot.bind(host);
+    host.sendSnapshot = async (
+      peerId: string,
+      completed: Record<string, string>,
+      snapshotId: string,
+    ) => {
+      snapshotRequests.push({ completed: { ...completed }, snapshotId });
+      return sendSnapshot(peerId, completed, snapshotId);
+    };
+    let routeReplaced = false;
+    let healTimer: NodeJS.Timeout | undefined;
+    try {
+      setInMemoryTrysteroSendObserver((_namespace, payload) => {
+        if (routeReplaced || !(payload instanceof ArrayBuffer)) return;
+        try {
+          if (decodeFrame(Buffer.from(payload)).type !== 'snapshotFileEnd') return;
+        } catch {
+          return;
+        }
+        routeReplaced = true;
+        partitionInMemoryTrystero();
+        healTimer = setTimeout(() => healInMemoryTrystero(), 100);
+      });
+      await host.start();
+      await downloadProjectSnapshot({
+        sessionId,
+        projectId: host.descriptor.projectId,
+        projectName: host.descriptor.projectName,
+        mode: 'resilient',
+        token,
+        sessionEpoch: host.descriptor.sessionEpoch,
+        hostPeerId: 'host',
+        hostDisplayName: 'host',
+      }, {
+        peerId: 'joining-peer',
+        displayName: 'Joining Peer',
+        joinOrder: 1,
+      }, joiningFolder, undefined, runtimeRoomFactory);
+
+      assert.equal(routeReplaced, true);
+      assert.equal(snapshotRequests.length, 2);
+      assert.notEqual(snapshotRequests[0]?.snapshotId, snapshotRequests[1]?.snapshotId);
+      assert.equal(
+        snapshotRequests[1]?.completed['a-first.txt'],
+        createHash('sha256').update(firstContents).digest('hex'),
+      );
+      assert.equal(await readFile(path.join(joiningFolder, 'a-first.txt'), 'utf8'), firstContents);
+      assert.deepEqual(await readFile(path.join(joiningFolder, 'b-second.bin')), secondContents);
+    } finally {
+      if (healTimer) clearTimeout(healTimer);
+      setInMemoryTrysteroSendObserver(undefined);
+      healInMemoryTrystero();
       host.descriptor.mode = 'host-only';
       await host.leave();
       await rm(root, { recursive: true, force: true });

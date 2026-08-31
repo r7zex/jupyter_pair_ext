@@ -685,6 +685,54 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
+  it('leases bootstrap route recovery without exposing the joiner as a runtime participant', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'joining-peer', displayName: 'Joining Peer', joinOrder: 1 };
+    const transport = new MeshTransport({
+      sessionId: 'bootstrap-route-expiry', token: 'bootstrap-route-expiry-token-is-long-enough',
+      localPeer: { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'host' }),
+      isHost: () => true,
+      logicalPeerRecoveryMs: 20,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string;
+        identity: typeof identity;
+        purpose: 'bootstrap';
+        connectedAt: number;
+        lastSeen: number;
+        snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      onPeerLeave: (transportPeerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    transport.connect(identity);
+    internals.connections.set('bootstrap-route', {
+      transportPeerId: 'bootstrap-route', identity, purpose: 'bootstrap',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: true,
+    });
+    internals.identityToTransport.set(identity.peerId, 'bootstrap-route');
+    let bootstrapDisconnects = 0;
+    let runtimeDisconnects = 0;
+    transport.on('bootstrapDisconnected', () => { bootstrapDisconnects += 1; });
+    transport.on('peerDisconnected', () => { runtimeDisconnects += 1; });
+
+    try {
+      internals.onPeerLeave('bootstrap-route');
+      assert.equal(transport.isPeerRecovering(identity.peerId), true);
+      assert.equal(bootstrapDisconnects, 0);
+      assert.equal(transport.peerRuntime().some((peer) => peer.peerId === identity.peerId), false);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(bootstrapDisconnects, 1);
+      assert.equal(runtimeDisconnects, 0);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   it('refuses to advertise a session when the guaranteed relay readiness barrier fails', async () => {
     const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
     const deadRoom = {

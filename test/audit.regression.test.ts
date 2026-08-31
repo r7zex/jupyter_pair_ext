@@ -7,6 +7,7 @@ import { SessionCoordinator } from '../src/core/election';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { StorageAdapter } from '../src/core/persistence';
 import { HostClock, PeerIdentity, PeerRuntime } from '../src/core/types';
+import { WireFrame } from '../src/core/wire';
 import { SnapshotBootstrapError, downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { MeshTransport, TrysteroRoomFactory } from '../src/runtime/mesh';
 import {
@@ -31,6 +32,12 @@ function peer(peerId: string, joinOrder: number, lastHeartbeat: number, online =
 
 async function temporaryDirectory(prefix: string): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), prefix));
+}
+
+function snapshotMeta(frame: WireFrame, meta: Record<string, unknown> = {}): Record<string, unknown> {
+  const snapshotId = String(frame.meta.snapshotId ?? '');
+  assert.match(snapshotId, /^[A-Za-z0-9_-]{1,64}$/);
+  return { snapshotId, ...meta };
 }
 
 describe('audit regressions', () => {
@@ -433,24 +440,24 @@ describe('audit regressions', () => {
       const acknowledgements: string[] = [];
       host.on('message', (frame, sourceId) => {
         if (frame.type === 'snapshotRequest') {
-          host.sendTo(sourceId, 'snapshotBegin', {
+          host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
             totalFiles: 0, fileCount: 0, completedFiles: 0, directoryCount: 2,
-          });
-          host.sendTo(sourceId, 'snapshotManifest', {
+          }));
+          host.sendTo(sourceId, 'snapshotManifest', snapshotMeta(frame, {
             expectedFiles: [], expectedDirectories: ['empty'], completedFiles: [],
-          });
-          host.sendTo(sourceId, 'snapshotCheckpoint', { checkpointId: 'checkpoint-one' });
-          host.sendTo(sourceId, 'snapshotManifest', {
+          }));
+          host.sendTo(sourceId, 'snapshotCheckpoint', snapshotMeta(frame, { checkpointId: 'checkpoint-one' }));
+          host.sendTo(sourceId, 'snapshotManifest', snapshotMeta(frame, {
             expectedFiles: [], expectedDirectories: ['empty/nested'], completedFiles: [],
-          });
-          host.sendTo(sourceId, 'snapshotManifestEnd', {});
-          host.sendTo(sourceId, 'snapshotCheckpoint', { checkpointId: 'checkpoint-two' });
+          }));
+          host.sendTo(sourceId, 'snapshotManifestEnd', snapshotMeta(frame));
+          host.sendTo(sourceId, 'snapshotCheckpoint', snapshotMeta(frame, { checkpointId: 'checkpoint-two' }));
           return;
         }
         if (frame.type !== 'snapshotCheckpointAck') return;
         const checkpointId = String(frame.meta.checkpointId);
         acknowledgements.push(checkpointId);
-        if (checkpointId === 'checkpoint-two') host.sendTo(sourceId, 'snapshotEnd', {});
+        if (checkpointId === 'checkpoint-two') host.sendTo(sourceId, 'snapshotEnd', snapshotMeta(frame));
       });
       const destination = await temporaryDirectory('pair-bootstrap-chunked-');
       try {
@@ -490,26 +497,26 @@ describe('audit regressions', () => {
       const retryRequests: number[][] = [];
       host.on('message', (frame, sourceId) => {
         if (frame.type === 'snapshotRequest') {
-          host.sendTo(sourceId, 'snapshotBegin', {
+          host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
             expectedFiles: ['notes.bin'], expectedDirectories: [], totalFiles: 1, fileCount: 1,
-          });
-          host.sendTo(sourceId, 'snapshotFileStart', {
+          }));
+          host.sendTo(sourceId, 'snapshotFileStart', snapshotMeta(frame, {
             transferId: 'transfer-one', relativePath: 'notes.bin',
             size: fileBytes.byteLength, chunks: 2, chunkSize, hash: fileHash,
-          });
+          }));
           // Simulate the lossy relay route: the second chunk frame is silently
           // dropped while the end frame still arrives.
-          host.sendTo(sourceId, 'snapshotFileChunk', { transferId: 'transfer-one', index: 0 }, fileBytes.subarray(0, chunkSize));
-          host.sendTo(sourceId, 'snapshotFileEnd', { transferId: 'transfer-one' });
+          host.sendTo(sourceId, 'snapshotFileChunk', snapshotMeta(frame, { transferId: 'transfer-one', index: 0 }), fileBytes.subarray(0, chunkSize));
+          host.sendTo(sourceId, 'snapshotFileEnd', snapshotMeta(frame, { transferId: 'transfer-one' }));
           return;
         }
         if (frame.type === 'snapshotFileRetry') {
           assert.equal(String(frame.meta.transferId), 'transfer-one');
           const indices = [...(frame.meta.indices as number[])];
           retryRequests.push(indices);
-          host.sendTo(sourceId, 'snapshotFileChunk', { transferId: 'transfer-one', index: 1 }, fileBytes.subarray(chunkSize));
-          host.sendTo(sourceId, 'snapshotFileEnd', { transferId: 'transfer-one' });
-          host.sendTo(sourceId, 'snapshotEnd', {});
+          host.sendTo(sourceId, 'snapshotFileChunk', snapshotMeta(frame, { transferId: 'transfer-one', index: 1 }), fileBytes.subarray(chunkSize));
+          host.sendTo(sourceId, 'snapshotFileEnd', snapshotMeta(frame, { transferId: 'transfer-one' }));
+          host.sendTo(sourceId, 'snapshotEnd', snapshotMeta(frame));
           return;
         }
       });
@@ -546,10 +553,10 @@ describe('audit regressions', () => {
       );
       host.on('message', (frame, sourceId) => {
         if (frame.type !== 'snapshotRequest') return;
-        host.sendTo(sourceId, 'snapshotBegin', {
+        host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
           expectedFiles: [], expectedDirectories: [], totalFiles: 0, fileCount: 0,
-        });
-        host.sendTo(sourceId, 'snapshotEnd', {});
+        }));
+        host.sendTo(sourceId, 'snapshotEnd', snapshotMeta(frame));
       });
       const root = await temporaryDirectory('pair-bootstrap-clean-');
       const destination = path.join(root, 'destination');
@@ -598,15 +605,15 @@ describe('audit regressions', () => {
       );
       host.on('message', (frame, sourceId) => {
         if (frame.type !== 'snapshotRequest') return;
-        host.sendTo(sourceId, 'snapshotBegin', {
+        host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
           totalFiles: 2, fileCount: 2, completedFiles: 0, directoryCount: 0,
-        });
-        host.sendTo(sourceId, 'snapshotManifest', {
+        }));
+        host.sendTo(sourceId, 'snapshotManifest', snapshotMeta(frame, {
           expectedFiles: ['Caf\u00e9.txt'], expectedDirectories: [], completedFiles: [],
-        });
-        host.sendTo(sourceId, 'snapshotManifest', {
+        }));
+        host.sendTo(sourceId, 'snapshotManifest', snapshotMeta(frame, {
           expectedFiles: ['Cafe\u0301.txt'], expectedDirectories: [], completedFiles: [],
-        });
+        }));
       });
       const destination = await temporaryDirectory('pair-bootstrap-cross-conflict-');
       try {
@@ -642,7 +649,7 @@ describe('audit regressions', () => {
       );
       host.on('message', (frame, sourceId) => {
         if (frame.type === 'snapshotRequest') {
-          host.sendTo(sourceId, 'snapshotError', { reason: 'host-snapshot-failed' });
+          host.sendTo(sourceId, 'snapshotError', snapshotMeta(frame, { reason: 'host-snapshot-failed' }));
         }
       });
       const destination = await temporaryDirectory('pair-bootstrap-host-error-');
@@ -679,9 +686,9 @@ describe('audit regressions', () => {
       );
       host.on('message', (frame, sourceId) => {
         if (frame.type !== 'snapshotRequest') return;
-        host.sendTo(sourceId, 'snapshotBegin', {
+        host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
           expectedFiles: ['Report.txt', 'report.txt'], expectedDirectories: [], totalFiles: 2, fileCount: 2,
-        });
+        }));
       });
       const destination = await temporaryDirectory('pair-bootstrap-conflicting-');
       try {
@@ -717,10 +724,10 @@ describe('audit regressions', () => {
       );
       host.on('message', (frame, sourceId) => {
         if (frame.type !== 'snapshotRequest') return;
-        host.sendTo(sourceId, 'snapshotBegin', {
+        host.sendTo(sourceId, 'snapshotBegin', snapshotMeta(frame, {
           expectedFiles: ['missing.txt'], expectedDirectories: [], totalFiles: 1, fileCount: 1,
-        });
-        host.sendTo(sourceId, 'snapshotEnd', {});
+        }));
+        host.sendTo(sourceId, 'snapshotEnd', snapshotMeta(frame));
       });
       const destination = await temporaryDirectory('pair-bootstrap-incomplete-');
       try {

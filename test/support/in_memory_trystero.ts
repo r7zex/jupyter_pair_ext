@@ -30,6 +30,7 @@ interface Mailbox {
 const clientsByKey = new Map<string, Set<TestClient>>();
 let nextPeerId = 1;
 let partitioned = false;
+let sendObserver: ((namespace: string, payload: DataPayload) => void) | undefined;
 
 export function createInMemoryTrysteroFactory(): TrysteroRoomFactory {
   return (config: NostrRoomConfig, roomId: string, callbacks?: JoinRoomCallbacks): Room => {
@@ -53,6 +54,13 @@ export function resetInMemoryTrystero(): void {
   clientsByKey.clear();
   nextPeerId = 1;
   partitioned = false;
+  sendObserver = undefined;
+}
+
+export function setInMemoryTrysteroSendObserver(
+  observer: ((namespace: string, payload: DataPayload) => void) | undefined,
+): void {
+  sendObserver = observer;
 }
 
 export function partitionInMemoryTrystero(): void {
@@ -136,6 +144,7 @@ function createClient(key: string, callbacks?: JoinRoomCallbacks): TestClient {
               ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
             });
           }));
+          sendObserver?.(namespace, clonePayload(data));
         },
         onMessage: null,
         onReceiveProgress: null,

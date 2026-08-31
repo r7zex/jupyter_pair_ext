@@ -322,6 +322,7 @@ interface PendingSessionEndFence {
 
 interface PendingSnapshotCheckpoint {
   peerId: string;
+  snapshotId: string;
   resolve: () => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -343,6 +344,7 @@ interface SnapshotSource {
  */
 interface SentSnapshotTransfer {
   peerId: string;
+  snapshotId: string;
   relativePath: string;
   size: number;
   chunkSize: number;
@@ -444,6 +446,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
   private readonly sentSnapshotTransfers = new Map<string, SentSnapshotTransfer>();
+  private readonly activeSnapshotGenerations = new Map<string, string>();
   private readonly preparedHostTransfers = new Map<string, PreparedHostTransfer>();
   private readonly awarenessOwnerByClientId = new Map<number, string>();
   private readonly awarenessClientsByPeer = new Map<string, Set<number>>();
@@ -1311,11 +1314,22 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.emit('hardware', this.hardware);
   }
 
-  public async sendSnapshot(peerId: string, completed: Record<string, string> = {}): Promise<void> {
+  public async sendSnapshot(
+    peerId: string,
+    completed: Record<string, string> = {},
+    snapshotId = newId(),
+  ): Promise<void> {
     if (!this.coordinator.isCurrentHost()) return;
+    if (!TRANSFER_ID_PATTERN.test(snapshotId)) throw new Error('Joining peer sent a malformed snapshot generation id.');
+    if (this.activeSnapshotGenerations.has(peerId)) {
+      throw new Error('Joining peer requested a snapshot while another generation is still active.');
+    }
+    this.activeSnapshotGenerations.set(peerId, snapshotId);
+    try {
     const snapshotClock = { ...this.coordinator.clock };
     const assertCurrentHost = () => {
-      if (!this.coordinator.isCurrentHost() || !sameClock(this.coordinator.clock, snapshotClock)) {
+      if (!this.coordinator.isCurrentHost() || !sameClock(this.coordinator.clock, snapshotClock)
+        || this.activeSnapshotGenerations.get(peerId) !== snapshotId) {
         throw new Error('Session Host changed while the project snapshot was being prepared.');
       }
     };
@@ -1348,6 +1362,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       .filter((file) => completed[file.relativePath] === file.hash)
       .map((file) => file.relativePath);
     this.transport.sendTo(peerId, 'snapshotBegin', {
+      snapshotId,
       fileCount: files.length,
       totalFiles: allFiles.length,
       completedFiles: resumedFiles.length,
@@ -1359,6 +1374,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       allFiles.map((file) => file.relativePath),
       directories,
       resumedFiles,
+      snapshotId,
       assertCurrentHost,
     );
 
@@ -1373,7 +1389,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (!force && checkpointFrames < MAX_SNAPSHOT_CHECKPOINT_FRAMES
         && checkpointBytes < MAX_SNAPSHOT_CHECKPOINT_BYTES) return;
       assertCurrentHost();
-      await this.awaitSnapshotCheckpoint(peerId);
+      await this.awaitSnapshotCheckpoint(peerId, snapshotId);
       checkpointFrames = 0;
       checkpointBytes = 0;
     };
@@ -1387,6 +1403,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const chunkSize = BINARY_CHUNK_SIZE;
       const chunks = Math.max(1, Math.ceil(file.size / chunkSize));
       this.transport.sendTo(peerId, 'snapshotFileStart', {
+        snapshotId,
         transferId,
         relativePath: file.relativePath,
         size: file.size,
@@ -1397,6 +1414,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       recordFrame();
       this.rememberSentSnapshotTransfer(transferId, {
         peerId,
+        snapshotId,
         relativePath: file.relativePath,
         size: file.size,
         chunkSize,
@@ -1405,7 +1423,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         ...(file.absolutePath ? { absolutePath: file.absolutePath } : {}),
       });
       const sendChunk = (index: number, chunk: Uint8Array) => {
-        this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
+        assertCurrentHost();
+        this.transport.sendTo(peerId, 'snapshotFileChunk', { snapshotId, transferId, index }, chunk);
         recordFrame(chunk.byteLength);
       };
       const drain = async () => {
@@ -1433,13 +1452,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       } else {
         throw new Error(`Snapshot source is unavailable: ${file.relativePath}`);
       }
-      this.transport.sendTo(peerId, 'snapshotFileEnd', { transferId });
+      assertCurrentHost();
+      this.transport.sendTo(peerId, 'snapshotFileEnd', { snapshotId, transferId });
       recordFrame();
       await checkpoint();
     }
     if (checkpointFrames) await checkpoint(true);
     assertCurrentHost();
-    this.transport.sendTo(peerId, 'snapshotEnd', {});
+    this.transport.sendTo(peerId, 'snapshotEnd', { snapshotId });
+    } finally {
+      if (this.activeSnapshotGenerations.get(peerId) === snapshotId) {
+        this.activeSnapshotGenerations.delete(peerId);
+      }
+    }
   }
 
   private async sendSnapshotManifest(
@@ -1447,6 +1472,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     expectedFiles: readonly string[],
     expectedDirectories: readonly string[],
     completedFiles: readonly string[],
+    snapshotId: string,
     assertCurrentHost: () => void,
   ): Promise<void> {
     let files: string[] = [];
@@ -1460,6 +1486,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (!entries) return;
       assertCurrentHost();
       this.transport.sendTo(peerId, 'snapshotManifest', {
+        snapshotId,
         expectedFiles: files,
         expectedDirectories: directories,
         completedFiles: completed,
@@ -1474,7 +1501,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       bytes = 1024;
       if (checkpointFrames >= MAX_SNAPSHOT_CHECKPOINT_FRAMES
         || checkpointBytes >= MAX_SNAPSHOT_CHECKPOINT_BYTES) {
-        await this.awaitSnapshotCheckpoint(peerId);
+        await this.awaitSnapshotCheckpoint(peerId, snapshotId);
         checkpointFrames = 0;
         checkpointBytes = 0;
       }
@@ -1496,10 +1523,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     for (const relativePath of completedFiles) await append('completed', relativePath);
     await flush();
     assertCurrentHost();
-    this.transport.sendTo(peerId, 'snapshotManifestEnd', {});
+    this.transport.sendTo(peerId, 'snapshotManifestEnd', { snapshotId });
   }
 
-  private async awaitSnapshotCheckpoint(peerId: string): Promise<void> {
+  private async awaitSnapshotCheckpoint(peerId: string, snapshotId: string): Promise<void> {
     const checkpointId = newId();
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1508,9 +1535,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.pendingSnapshotCheckpoints.delete(checkpointId);
         pending.reject(new Error('Joining peer did not process the project snapshot in time.'));
       }, SNAPSHOT_CHECKPOINT_TIMEOUT_MS);
-      this.pendingSnapshotCheckpoints.set(checkpointId, { peerId, resolve, reject, timer });
+      this.pendingSnapshotCheckpoints.set(checkpointId, { peerId, snapshotId, resolve, reject, timer });
       try {
-        this.transport.sendTo(peerId, 'snapshotCheckpoint', { checkpointId });
+        this.transport.sendTo(peerId, 'snapshotCheckpoint', { snapshotId, checkpointId });
       } catch (error) {
         clearTimeout(timer);
         this.pendingSnapshotCheckpoints.delete(checkpointId);
@@ -1519,23 +1546,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
   }
 
-  private acceptSnapshotCheckpoint(sourceId: string, checkpointId: string): void {
+  private acceptSnapshotCheckpoint(sourceId: string, snapshotId: string | undefined, checkpointId: string): void {
     if (!TRANSFER_ID_PATTERN.test(checkpointId)) {
       throw new Error('Joining peer sent a malformed snapshot checkpoint acknowledgement.');
     }
     const pending = this.pendingSnapshotCheckpoints.get(checkpointId);
-    if (!pending || pending.peerId !== sourceId) return;
+    if (!pending || pending.peerId !== sourceId || (snapshotId && pending.snapshotId !== snapshotId)) return;
     clearTimeout(pending.timer);
     this.pendingSnapshotCheckpoints.delete(checkpointId);
     pending.resolve();
   }
 
-  private rejectSnapshotCheckpoints(peerId: string, message: string): void {
+  private rejectSnapshotCheckpoints(peerId: string, message: string, snapshotId?: string): void {
     for (const [checkpointId, pending] of [...this.pendingSnapshotCheckpoints]) {
-      if (pending.peerId !== peerId) continue;
+      if (pending.peerId !== peerId || (snapshotId && pending.snapshotId !== snapshotId)) continue;
       clearTimeout(pending.timer);
       this.pendingSnapshotCheckpoints.delete(checkpointId);
       pending.reject(new Error(message));
+    }
+  }
+
+  private cancelSnapshotGeneration(peerId: string, message: string): void {
+    const snapshotId = this.activeSnapshotGenerations.get(peerId);
+    if (!snapshotId) return;
+    this.activeSnapshotGenerations.delete(peerId);
+    this.rejectSnapshotCheckpoints(peerId, message, snapshotId);
+    for (const [transferId, transfer] of [...this.sentSnapshotTransfers]) {
+      if (transfer.peerId === peerId && transfer.snapshotId === snapshotId) {
+        this.sentSnapshotTransfers.delete(transferId);
+      }
     }
   }
 
@@ -1557,12 +1596,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
    * without restarting the file or the snapshot.
    */
   private async resendSnapshotChunks(peerId: string, meta: Record<string, unknown>): Promise<void> {
+    const snapshotId = meta.snapshotId === undefined
+      ? this.activeSnapshotGenerations.get(peerId)
+      : String(meta.snapshotId);
+    if (!snapshotId || !TRANSFER_ID_PATTERN.test(snapshotId)) {
+      throw new Error('Joining peer sent a malformed snapshot generation id.');
+    }
     const transferId = String(meta.transferId ?? '');
     if (!TRANSFER_ID_PATTERN.test(transferId)) {
       throw new Error('Joining peer sent a malformed snapshot retry request.');
     }
     const record = this.sentSnapshotTransfers.get(transferId);
-    if (!record || record.peerId !== peerId || !this.coordinator.isCurrentHost()) return;
+    if (!record || record.peerId !== peerId || record.snapshotId !== snapshotId
+      || this.activeSnapshotGenerations.get(peerId) !== snapshotId || !this.coordinator.isCurrentHost()) return;
     const requested = Array.isArray(meta.indices) ? meta.indices : [];
     if (requested.length > record.chunks) {
       throw new Error('Joining peer requested more snapshot chunks than the transfer declared.');
@@ -1577,10 +1623,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     for (const index of [...indices].sort((left, right) => left - right)) {
       const chunk = await this.readSnapshotChunk(record, index);
-      this.transport.sendTo(peerId, 'snapshotFileChunk', { transferId, index }, chunk);
+      this.transport.sendTo(peerId, 'snapshotFileChunk', { snapshotId, transferId, index }, chunk);
     }
     await this.transport.awaitDrain(peerId);
-    this.transport.sendTo(peerId, 'snapshotFileEnd', { transferId });
+    this.transport.sendTo(peerId, 'snapshotFileEnd', { snapshotId, transferId });
   }
 
   private async readSnapshotChunk(record: SentSnapshotTransfer, index: number): Promise<Buffer> {
@@ -1754,6 +1800,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     this.pendingSnapshotCheckpoints.clear();
     this.sentSnapshotTransfers.clear();
+    this.activeSnapshotGenerations.clear();
     for (const prepared of this.preparedHostTransfers.values()) clearTimeout(prepared.timer);
     this.preparedHostTransfers.clear();
     if (this.pendingSessionEndFence) {
@@ -1859,7 +1906,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     });
     this.transport.on('bootstrapConnected', (peer: PeerIdentity) => {
-      if (this.coordinator.isCurrentHost()) this.assignPeerJoinOrder(peer);
+      if (this.coordinator.isCurrentHost()) {
+        this.cancelSnapshotGeneration(
+          peer.peerId,
+          `Joining peer ${peer.displayName} replaced its authenticated snapshot route.`,
+        );
+        this.assignPeerJoinOrder(peer);
+      }
     });
     this.transport.on('localIdentityUpdated', (peer: PeerIdentity) => {
       Object.assign(this.descriptor.localPeer, peer);
@@ -1942,7 +1995,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.emit('peerDisconnected', peer);
     });
     this.transport.on('bootstrapDisconnected', (peer: PeerIdentity) => {
-      this.rejectSnapshotCheckpoints(
+      this.cancelSnapshotGeneration(
         peer.peerId,
         `Joining peer ${peer.displayName} disconnected during project snapshot transfer.`,
       );
@@ -2281,27 +2334,37 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           break;
         }
         case 'snapshotCheckpointAck':
-          this.acceptSnapshotCheckpoint(sourceId, String(frame.meta.checkpointId ?? ''));
+          this.acceptSnapshotCheckpoint(
+            sourceId,
+            frame.meta.snapshotId === undefined
+              ? undefined
+              : normalizeSnapshotGenerationId(frame.meta.snapshotId),
+            String(frame.meta.checkpointId ?? ''),
+          );
           break;
         case 'snapshotFileRetry':
           await this.resendSnapshotChunks(sourceId, frame.meta);
           break;
-        case 'snapshotRequest':
+        case 'snapshotRequest': {
+          const snapshotId = frame.meta.snapshotId === undefined
+            ? newId()
+            : normalizeSnapshotGenerationId(frame.meta.snapshotId);
           if (!this.coordinator.isCurrentHost()) {
-            this.transport.sendTo(sourceId, 'snapshotError', { reason: 'stale-invite' });
+            this.transport.sendTo(sourceId, 'snapshotError', { snapshotId, reason: 'stale-invite' });
             break;
           }
           try {
-            await this.sendSnapshot(sourceId, normalizeCompletedSnapshot(frame.meta.completed));
+            await this.sendSnapshot(sourceId, normalizeCompletedSnapshot(frame.meta.completed), snapshotId);
           } catch (error) {
             // Do not expose local paths or operating-system diagnostics to an
             // untrusted invite holder. The exact failure remains in the host log.
             try {
-              this.transport.sendTo(sourceId, 'snapshotError', { reason: 'host-snapshot-failed' });
+              this.transport.sendTo(sourceId, 'snapshotError', { snapshotId, reason: 'host-snapshot-failed' });
             } catch { /* the bootstrap peer may already have disconnected */ }
             throw error;
           }
           break;
+        }
         case 'binaryStart':
           await this.beginBinaryTransfer(frame, sourceId);
           break;
@@ -5933,6 +5996,14 @@ function normalizeCompletedSnapshot(value: unknown): Record<string, string> {
     result[relativePath] = rawHash;
   }
   return result;
+}
+
+function normalizeSnapshotGenerationId(value: unknown): string {
+  const snapshotId = String(value ?? '');
+  if (!TRANSFER_ID_PATTERN.test(snapshotId)) {
+    throw new Error('Snapshot generation id is malformed.');
+  }
+  return snapshotId;
 }
 
 function executionManifestDigest(manifest: ExecutionManifest): string {
