@@ -6,8 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
+import { WebSocketServer } from 'ws';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
-import { MeshTransport } from '../src/runtime/mesh';
+import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
+import { NostrFrameRelay } from '../src/runtime/nostrRelay';
 import { decodeFrame, encodeFrame } from '../src/core/wire';
 import {
   createInMemoryTrysteroFactory,
@@ -200,6 +202,85 @@ describe('production SessionRuntime integration', () => {
       healInMemoryTrystero();
       host.descriptor.mode = 'host-only';
       await host.leave();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('downloads a complete snapshot over the emergency relay when WebRTC discovery is unavailable', async function () {
+    this.timeout(30_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bootstrap-relay-only-'));
+    const extensionRoot = path.join(root, 'extension');
+    const hostFolder = path.join(root, 'host');
+    const joiningFolder = path.join(root, 'joining-working-copy');
+    await Promise.all([
+      mkdir(extensionRoot, { recursive: true }),
+      mkdir(hostFolder, { recursive: true }),
+    ]);
+    await writeFile(path.join(hostFolder, 'relay-only.txt'), 'delivered without WebRTC', 'utf8');
+    const hub = new WebSocketServer({ port: 0 });
+    await new Promise<void>((resolve) => hub.on('listening', resolve));
+    const hubPort = (hub.address() as { port: number }).port;
+    hub.on('connection', (socket) => {
+      socket.on('message', (raw) => {
+        const message = JSON.parse(String(raw)) as unknown[];
+        if (message[0] !== 'EVENT') return;
+        for (const client of hub.clients) {
+          if (client.readyState === 1) client.send(JSON.stringify(['EVENT', 'sub', message[1]]));
+        }
+      });
+    });
+    const deadRoom = {
+      makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+      onPeerJoin: () => undefined,
+      onPeerLeave: () => undefined,
+      ping: async () => -1,
+      leave: async () => undefined,
+    };
+    const deadRoomFactory = () => deadRoom as never;
+    configureMeshNetwork({
+      disableRelayFallback: false,
+      relayFactory: ({ token, sessionId, localPeerId }) => new NostrFrameRelay({
+        token,
+        sessionId,
+        localPeerId,
+        relays: [`ws://127.0.0.1:${hubPort}`],
+      }),
+    });
+    MeshTransport.setRoomFactoryForTesting(deadRoomFactory);
+    const sessionId = `bootstrap-relay-only-${Date.now()}`;
+    const token = 'bootstrap-relay-only-token-that-is-long-enough';
+    const host = new SessionRuntime(descriptor({
+      sessionId,
+      role: 'host',
+      peerId: 'host',
+      hostPeerId: 'host',
+      workingFolder: hostFolder,
+      pythonPath: process.execPath,
+    }), token, context(extensionRoot), logger());
+    try {
+      await host.start();
+      await downloadProjectSnapshot({
+        sessionId,
+        projectId: host.descriptor.projectId,
+        projectName: host.descriptor.projectName,
+        mode: 'resilient',
+        token,
+        sessionEpoch: host.descriptor.sessionEpoch,
+        hostPeerId: 'host',
+        hostDisplayName: 'host',
+      }, {
+        peerId: 'joining-peer',
+        displayName: 'Joining Peer',
+        joinOrder: 1,
+      }, joiningFolder, undefined, deadRoomFactory);
+
+      assert.equal(await readFile(path.join(joiningFolder, 'relay-only.txt'), 'utf8'), 'delivered without WebRTC');
+    } finally {
+      host.descriptor.mode = 'host-only';
+      await host.leave();
+      await new Promise<void>((resolve) => hub.close(() => resolve()));
+      configureMeshNetwork({});
+      MeshTransport.setRoomFactoryForTesting(runtimeRoomFactory);
       await rm(root, { recursive: true, force: true });
     }
   });
