@@ -922,7 +922,7 @@ describe('runtime repair invariants', () => {
     }
   });
 
-  it('reconnects to remembered peers after a partition promoted it locally', () => {
+  it('reannounces remembered peers before refreshing signalling after local promotion', async () => {
     const runtime: any = Object.create(SessionRuntime.prototype);
     runtime.descriptor = {
       localPeer: { peerId: 'peer-z' },
@@ -932,12 +932,39 @@ describe('runtime repair invariants', () => {
       ],
     };
     runtime.coordinator = { clock: { sessionEpoch: 1, hostEpoch: 2, hostId: 'peer-z' } };
-    const connected: string[] = [];
-    runtime.transport = { connect: (peer: { peerId: string }) => connected.push(peer.peerId) };
+    const events: string[] = [];
+    const logLines: string[] = [];
+    const emitted: Array<{ event: string; payload: unknown }> = [];
+    runtime.log = { appendLine: (line: string) => logLines.push(line) };
+    runtime.emit = (event: string, payload: unknown) => {
+      emitted.push({ event, payload });
+      return true;
+    };
+    runtime.transport = {
+      refreshSignalling: async () => {
+        events.push('refresh');
+        return {
+          requestedAt: 123,
+          completedAt: 456,
+          status: 'verified',
+          nostr: { requestedSockets: 2, replacedSockets: 2, verifiedEndpoints: 1 },
+          mqtt: { requestedSockets: 1, replacedSockets: 1, verifiedEndpoints: 1 },
+        };
+      },
+      connect: (peer: { peerId: string }) => events.push(`connect:${peer.peerId}`),
+    };
 
-    runtime.reconnect();
+    const result = await runtime.reconnect();
 
-    assert.deepEqual(connected, ['host']);
+    assert.deepEqual(events, ['connect:host', 'refresh']);
+    assert.equal(result.status, 'verified');
+    assert.equal(result.nostr.verifiedEndpoints, 1);
+    assert.equal(result.mqtt.verifiedEndpoints, 1);
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0]?.event, 'connectionUpdated');
+    assert.equal((emitted[0]?.payload as { kind?: string }).kind, 'manual-reconnect');
+    assert.match(logLines[0] ?? '', /Manual reconnect completed with verified/);
+    assert.doesNotMatch(JSON.stringify({ emitted, logLines }), /room-token-secret|endpoint-secret/);
   });
 
   it('requests the full CRDT update when a peer state vector introduces a new document', async () => {

@@ -12,12 +12,16 @@ import {
   getRelayHealth as getNostrRelayHealth,
   getRelaySockets as getNostrRelaySockets,
   joinRoom,
+  relaySocketRefreshProgress as nostrRelaySocketRefreshProgress,
+  refreshRelaySockets as refreshNostrRelaySockets,
 } from './nostrRoom';
 import {
   defaultRelayUrls as MQTT_SIGNALLING_RELAY_URLS,
   getRelayHealth as getMqttRelayHealth,
   getRelaySockets as getMqttRelaySockets,
   joinRoom as joinMqttRoom,
+  relaySocketRefreshProgress as mqttRelaySocketRefreshProgress,
+  refreshRelaySockets as refreshMqttRelaySockets,
 } from './mqttRoom';
 import {
   generateIdentityCredentials,
@@ -276,6 +280,8 @@ export interface MeshOptions {
   identityPrivateKey?: string | undefined;
   /** Test hook; production uses the bounded logical recovery lease above. */
   logicalPeerRecoveryMs?: number | undefined;
+  /** Test seam; production uses a bounded ten-second signalling refresh. */
+  signallingRefreshTimeoutMs?: number | undefined;
 }
 
 export type TrysteroRoomFactory = (
@@ -328,6 +334,13 @@ interface SignallingEvidence {
   routeEstablishedAt?: number | undefined;
   routePurpose?: PeerConnectionPurpose | undefined;
   handshakesInFlight?: number | undefined;
+  lastRefresh?: {
+    at: number;
+    status: SignallingRefreshStatus;
+    requestedSockets: number;
+    replacedSockets: number;
+    verifiedEndpoints: number;
+  } | undefined;
   lastError?: SignallingFamilyDiagnostic['lastError'] | undefined;
 }
 
@@ -365,6 +378,22 @@ export interface MeshMetrics {
   totalBytesSent: number;
   totalBytesReceived: number;
   directPeers: number;
+}
+
+export type SignallingRefreshStatus = 'verified' | 'partial' | 'timed-out' | 'no-sockets';
+
+export interface SignallingFamilyRefreshResult {
+  requestedSockets: number;
+  replacedSockets: number;
+  verifiedEndpoints: number;
+}
+
+export interface SignallingRefreshResult {
+  requestedAt: number;
+  completedAt: number;
+  status: SignallingRefreshStatus;
+  nostr: SignallingFamilyRefreshResult;
+  mqtt: SignallingFamilyRefreshResult;
 }
 
 /**
@@ -427,6 +456,7 @@ export class MeshTransport extends EventEmitter {
     nostr: {},
     mqtt: {},
   };
+  private signallingRefreshInFlight: Promise<SignallingRefreshResult> | undefined;
   private readonly networkWatcher = new NetworkChangeWatcher(() => this.onNetworkChanged());
   /** Rate-limited remote migration notices for the participants panel. */
   private readonly remoteRouteStatuses = new Map<string, { status: string; at: number }>();
@@ -677,6 +707,10 @@ export class MeshTransport extends EventEmitter {
   private onNetworkChanged(): void {
     if (this.stopped) return;
     this.emit('networkChanged');
+    this.reevaluateRoutes();
+  }
+
+  private reevaluateRoutes(): void {
     for (const peerId of this.directory.keys()) {
       if (peerId === this.options.localPeer.peerId) continue;
       if (!this.identityToTransport.has(peerId) && !this.relayNegotiations.has(peerId)) {
@@ -770,6 +804,7 @@ export class MeshTransport extends EventEmitter {
       endpoints,
       evidence: directEvidence,
       routes,
+      ...(evidence.lastRefresh ? { lastRefresh: { ...evidence.lastRefresh } } : {}),
       ...(lastError ? { lastError: { ...lastError } } : {}),
     };
   }
@@ -998,6 +1033,112 @@ export class MeshTransport extends EventEmitter {
           }),
       },
     };
+  }
+
+  /**
+   * Recreates signalling sockets through their existing reconnect loops while
+   * leaving authenticated WebRTC/emergency-relay data routes untouched.
+   */
+  public refreshSignalling(): Promise<SignallingRefreshResult> {
+    if (this.signallingRefreshInFlight) return this.signallingRefreshInFlight;
+    const refresh = this.performSignallingRefresh();
+    this.signallingRefreshInFlight = refresh;
+    const clearRefresh = (): void => {
+      if (this.signallingRefreshInFlight === refresh) this.signallingRefreshInFlight = undefined;
+    };
+    void refresh.then(clearRefresh, clearRefresh);
+    return refresh;
+  }
+
+  private async performSignallingRefresh(): Promise<SignallingRefreshResult> {
+    const requestedAt = Date.now();
+    const emptyFamily = (): SignallingFamilyRefreshResult => ({
+      requestedSockets: 0,
+      replacedSockets: 0,
+      verifiedEndpoints: 0,
+    });
+    if (this.stopped) {
+      return {
+        requestedAt,
+        completedAt: requestedAt,
+        status: 'no-sockets',
+        nostr: emptyFamily(),
+        mqtt: emptyFamily(),
+      };
+    }
+    const nostrRequest = this.primaryUsesProductionSockets
+      ? refreshNostrRelaySockets(TRYSTERO_APP_ID, this.options.sessionId)
+      : { targets: [] };
+    const mqttRequest = this.secondaryUsesProductionSockets
+      ? refreshMqttRelaySockets(TRYSTERO_APP_ID, this.options.sessionId)
+      : { targets: [] };
+    this.reevaluateRoutes();
+    const timeoutMs = Math.max(1, this.options.signallingRefreshTimeoutMs ?? 10_000);
+    const deadline = requestedAt + timeoutMs;
+    let nostrProgress = { replaced: 0, verified: 0 };
+    let mqttProgress = { replaced: 0, verified: 0 };
+    const familyComplete = (requested: number, verified: number): boolean => requested === 0 || verified > 0;
+    while (!this.stopped && Date.now() < deadline) {
+      nostrProgress = nostrRelaySocketRefreshProgress(
+        TRYSTERO_APP_ID,
+        this.options.sessionId,
+        nostrRequest,
+      );
+      mqttProgress = mqttRelaySocketRefreshProgress(
+        TRYSTERO_APP_ID,
+        this.options.sessionId,
+        mqttRequest,
+      );
+      if (familyComplete(nostrRequest.targets.length, nostrProgress.verified)
+        && familyComplete(mqttRequest.targets.length, mqttProgress.verified)) break;
+      await delay(50);
+    }
+    const nostr: SignallingFamilyRefreshResult = {
+      requestedSockets: nostrRequest.targets.length,
+      replacedSockets: nostrProgress.replaced,
+      verifiedEndpoints: nostrProgress.verified,
+    };
+    const mqtt: SignallingFamilyRefreshResult = {
+      requestedSockets: mqttRequest.targets.length,
+      replacedSockets: mqttProgress.replaced,
+      verifiedEndpoints: mqttProgress.verified,
+    };
+    const requestedSockets = nostr.requestedSockets + mqtt.requestedSockets;
+    const verifiedEndpoints = nostr.verifiedEndpoints + mqtt.verifiedEndpoints;
+    const everyRequestedFamilyVerified = familyComplete(nostr.requestedSockets, nostr.verifiedEndpoints)
+      && familyComplete(mqtt.requestedSockets, mqtt.verifiedEndpoints);
+    const status: SignallingRefreshStatus = requestedSockets === 0
+      ? 'no-sockets'
+      : everyRequestedFamilyVerified
+        ? 'verified'
+        : verifiedEndpoints > 0
+          ? 'partial'
+          : 'timed-out';
+    const completedAt = Date.now();
+    const familyStatus = (family: SignallingFamilyRefreshResult): SignallingRefreshStatus => (
+      family.requestedSockets === 0
+        ? 'no-sockets'
+        : family.verifiedEndpoints > 0
+          ? 'verified'
+          : 'timed-out'
+    );
+    if (this.room) {
+      this.signallingEvidence.nostr.lastRefresh = {
+        at: completedAt,
+        status: familyStatus(nostr),
+        ...nostr,
+      };
+    }
+    if (this.mqttRoom) {
+      this.signallingEvidence.mqtt.lastRefresh = {
+        at: completedAt,
+        status: familyStatus(mqtt),
+        ...mqtt,
+      };
+    }
+    const result = { requestedAt, completedAt, status, nostr, mqtt };
+    this.emit('signallingRefreshed', result);
+    return result;
   }
 
   /** Trystero discovers room peers automatically; this re-announces identity to an already connected peer. */

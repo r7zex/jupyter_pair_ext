@@ -5,7 +5,10 @@ import type { SocketClient } from '@trystero-p2p/core';
 
 import {
   getRelayHealth,
+  getRelaySockets,
   joinRoom,
+  relaySocketRefreshProgress,
+  refreshRelaySockets,
   setNostrSocketFactoryForTesting,
 } from '../src/runtime/nostrRoom';
 import { MeshTransport } from '../src/runtime/mesh';
@@ -121,6 +124,134 @@ describe('Nostr signalling health', function () {
       await rejectedMesh?.stop();
       await acceptedMesh?.stop();
       await Promise.all([rejectedRoom?.leave(), acceptedRoom?.leave()]);
+      setNostrSocketFactoryForTesting(undefined);
+    }
+  });
+
+  it('replaces a half-open socket and revalidates the existing room subscription', async () => {
+    let socketGenerations = 0;
+    let closedSockets = 0;
+    let autoAcknowledge = true;
+    let deliverRelayMessage: ((message: unknown[]) => void) | undefined;
+    const subscriptionIds = new Map<number, string[]>();
+    const publicationIds = new Map<number, string[]>();
+    setNostrSocketFactoryForTesting(((url: string, onMessage: (data: string) => void, onReconnect?: () => void) => {
+      const client = {} as SocketClient;
+      deliverRelayMessage = (message) => onMessage(JSON.stringify(message));
+      const installSocket = (): void => {
+        socketGenerations += 1;
+        const socket = {
+          readyState: 1,
+          close: () => {
+            socket.readyState = 3;
+            closedSockets += 1;
+            installSocket();
+            queueMicrotask(() => onReconnect?.());
+          },
+        };
+        client.socket = socket as never;
+      };
+      client.url = url;
+      client.send = (data) => {
+        const message = JSON.parse(data) as unknown[];
+        if (message[0] === 'REQ' && typeof message[1] === 'string') {
+          const ids = subscriptionIds.get(socketGenerations) ?? [];
+          ids.push(message[1]);
+          subscriptionIds.set(socketGenerations, ids);
+          if (autoAcknowledge) queueMicrotask(() => deliverRelayMessage?.(['EOSE', message[1]]));
+        } else if (message[0] === 'EVENT') {
+          const event = message[1] as { id?: unknown; content?: unknown } | undefined;
+          if (typeof event?.id === 'string') {
+            assert.equal(typeof event.content, 'string');
+            assert.doesNotThrow(() => JSON.parse(event.content as string));
+            const ids = publicationIds.get(socketGenerations) ?? [];
+            ids.push(event.id);
+            publicationIds.set(socketGenerations, ids);
+            if (autoAcknowledge) queueMicrotask(() => deliverRelayMessage?.(['OK', event.id, true, '']));
+          }
+        }
+      };
+      installSocket();
+      client.ready = Promise.resolve(client);
+      return client;
+    }) as never);
+
+    const appId = 'nostr-refresh-app';
+    const roomId = 'nostr-refresh-room';
+    let room: ReturnType<typeof joinRoom> | undefined;
+    try {
+      room = joinRoom({
+        appId,
+        password: 'nostr-refresh-room-password',
+        rtcPolyfill: WeriftPeerConnection,
+        relayConfig: {
+          urls: ['wss://nostr-refresh.example/private-path?token=secret'],
+          redundancy: 1,
+          warnOnRelayFailure: false,
+        },
+      } as never, roomId);
+      await waitUntil(() => {
+        const health = getRelayHealth(appId, roomId)[0];
+        return health?.subscription === 'verified' && health.publication === 'verified';
+      });
+
+      const endpoint = 'wss://nostr-refresh.example/private-path?token=secret';
+      const previousSocket = getRelaySockets()[endpoint];
+      const oldSubscriptionId = subscriptionIds.get(1)?.[0];
+      const oldPublicationId = publicationIds.get(1)?.[0];
+      assert.ok(oldSubscriptionId);
+      assert.ok(oldPublicationId);
+      autoAcknowledge = false;
+      const request = refreshRelaySockets(appId, roomId);
+      assert.equal(request.targets.length, 1);
+      assert.equal(closedSockets, 1);
+      assert.equal(socketGenerations, 2);
+      assert.notEqual(getRelaySockets()[endpoint], previousSocket);
+      const refreshing = getRelayHealth(appId, roomId)[0];
+      assert.equal(refreshing?.subscription, 'not-observed');
+      assert.equal(refreshing?.publication, 'not-observed');
+
+      await waitUntil(() => (
+        (subscriptionIds.get(2)?.length ?? 0) > 0
+        && (publicationIds.get(2)?.length ?? 0) > 0
+      ), 8_000);
+      const newSubscriptionIds = subscriptionIds.get(2) ?? [];
+      const newPublicationId = publicationIds.get(2)?.[0];
+      assert.ok(newSubscriptionIds.length > 0);
+      assert.ok(newPublicationId);
+      assert.ok(newSubscriptionIds.every((subId) => subId !== oldSubscriptionId));
+      assert.notEqual(newPublicationId, oldPublicationId);
+
+      // Deliver old acknowledgements only after the replacement generation
+      // has installed its own pending subscription/publication identifiers.
+      deliverRelayMessage?.(['EOSE', oldSubscriptionId]);
+      deliverRelayMessage?.(['OK', oldPublicationId, true, 'stale']);
+      assert.equal(getRelayHealth(appId, roomId)[0]?.subscription, 'not-observed');
+      assert.equal(getRelayHealth(appId, roomId)[0]?.publication, 'not-observed');
+      assert.deepEqual(
+        relaySocketRefreshProgress(appId, roomId, request),
+        { replaced: 1, verified: 0 },
+      );
+      for (const subId of newSubscriptionIds) deliverRelayMessage?.(['EOSE', subId]);
+      autoAcknowledge = true;
+      for (const eventId of publicationIds.get(2) ?? []) {
+        deliverRelayMessage?.(['OK', eventId, true, '']);
+      }
+
+      await waitUntil(() => {
+        const health = getRelayHealth(appId, roomId)[0];
+        return health?.subscription === 'verified' && health.publication === 'verified';
+      }, 8_000);
+      assert.deepEqual(
+        relaySocketRefreshProgress(appId, roomId, request),
+        { replaced: 1, verified: 1 },
+      );
+      await room.leave();
+      room = undefined;
+      assert.equal(refreshRelaySockets(appId, roomId).targets.length, 0);
+      assert.equal(closedSockets, 1);
+    } finally {
+      await room?.leave();
       setNostrSocketFactoryForTesting(undefined);
     }
   });

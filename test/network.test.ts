@@ -31,6 +31,7 @@ import {
 } from '../src/runtime/proxyWebSocket';
 import { proxyAwareMqttOptions } from '../src/runtime/mqttProxy';
 import { signallingEndpointIdentity } from '../src/runtime/signallingEndpoint';
+import { forceSignallingSocketRefresh } from '../src/runtime/signallingSocketRefresh';
 import {
   parseWindowsSystemProxyOutput,
   proxyUrlFromWindowsValue,
@@ -654,6 +655,37 @@ describe('mesh network configuration', () => {
   });
 });
 
+describe('signalling socket refresh', () => {
+  it('prefers termination, falls back to close, and ignores closed sockets', () => {
+    let beforeRefreshCalls = 0;
+    let terminateCalls = 0;
+    let closeCalls = 0;
+    assert.equal(forceSignallingSocketRefresh({
+      readyState: 1,
+      terminate: () => { terminateCalls += 1; },
+      close: () => { closeCalls += 1; },
+    }, () => { beforeRefreshCalls += 1; }), true);
+    assert.equal(terminateCalls, 1);
+    assert.equal(closeCalls, 0);
+    assert.equal(beforeRefreshCalls, 1);
+
+    assert.equal(forceSignallingSocketRefresh({
+      readyState: 0,
+      terminate: () => { throw new Error('termination unavailable'); },
+      close: () => { closeCalls += 1; },
+    }, () => { beforeRefreshCalls += 1; }), true);
+    assert.equal(closeCalls, 1);
+    assert.equal(beforeRefreshCalls, 2);
+
+    assert.equal(forceSignallingSocketRefresh({
+      readyState: 3,
+      close: () => { closeCalls += 1; },
+    }, () => { beforeRefreshCalls += 1; }), false);
+    assert.equal(closeCalls, 1);
+    assert.equal(beforeRefreshCalls, 2);
+  });
+});
+
 describe('mesh relay fallback integration', function () {
   this.timeout(30_000);
 
@@ -665,13 +697,14 @@ describe('mesh relay fallback integration', function () {
       roomId: string;
       peerId: string;
     }) => void } | undefined;
+    let roomLeaveCalls = 0;
     const deadRoom = {
       makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
       onPeerJoin: () => undefined,
       onPeerLeave: () => undefined,
       getPeers: () => ({}),
       ping: async () => -1,
-      leave: async () => undefined,
+      leave: async () => { roomLeaveCalls += 1; },
     };
     const transport = new MeshTransport({
       sessionId: 'signalling-health', token: 'signalling-health-token-is-long-enough',
@@ -749,11 +782,38 @@ describe('mesh relay fallback integration', function () {
         purpose: 'runtime', connectedAt: now, lastSeen: now, snapshotRequested: false,
       });
       routeInternals.identityToTransport.set('runtime-peer', 'runtime-route');
+      assert.equal(transport.hasRoute('runtime-peer'), true);
       const selectedRouteDiagnostic = transport.signallingDiagnostics()
         .find((family) => family.family === 'nostr');
       assert.equal(selectedRouteDiagnostic?.stage, 'route-established');
       assert.deepEqual(selectedRouteDiagnostic?.routes, [{ purpose: 'runtime', count: 1 }]);
       assert.equal(selectedRouteDiagnostic?.active, false, 'a route does not prove current rendezvous health');
+      const selectedConnection = routeInternals.connections.get('runtime-route');
+      let refreshDisconnects = 0;
+      let refreshEvents = 0;
+      transport.on('peerDisconnected', () => { refreshDisconnects += 1; });
+      transport.on('signallingRefreshed', () => { refreshEvents += 1; });
+      const firstRefresh = transport.refreshSignalling();
+      const coalescedRefresh = transport.refreshSignalling();
+      assert.strictEqual(coalescedRefresh, firstRefresh, 'concurrent refreshes were not coalesced');
+      const refreshResult = await firstRefresh;
+      assert.equal(refreshResult.status, 'no-sockets');
+      assert.strictEqual(routeInternals.connections.get('runtime-route'), selectedConnection);
+      assert.equal(routeInternals.identityToTransport.get('runtime-peer'), 'runtime-route');
+      assert.equal(transport.hasRoute('runtime-peer'), true);
+      assert.equal(roomLeaveCalls, 0, 'refresh tore down the allocated Trystero room');
+      assert.equal(refreshDisconnects, 0, 'refresh disconnected an authenticated data route');
+      assert.equal(refreshEvents, 1);
+      assert.equal(
+        transport.signallingDiagnostics().find((family) => family.family === 'nostr')?.lastRefresh?.status,
+        'no-sockets',
+      );
+      const nextRefresh = transport.refreshSignalling();
+      assert.notStrictEqual(nextRefresh, firstRefresh, 'completed refresh remained permanently cached');
+      await nextRefresh;
+      assert.equal(refreshEvents, 2);
+      assert.equal(roomLeaveCalls, 0);
+      assert.equal(transport.hasRoute('runtime-peer'), true);
       routeInternals.onPeerLeave('runtime-route');
       assert.equal(
         transport.signallingDiagnostics().find((family) => family.family === 'nostr')?.lastError?.phase,

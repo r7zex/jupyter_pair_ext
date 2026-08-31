@@ -21,11 +21,13 @@ import {
 } from '@trystero-p2p/core';
 import { proxyAwareMqttOptions } from './mqttProxy';
 import { signallingEndpointIdentity } from './signallingEndpoint';
+import { forceSignallingSocketRefresh } from './signallingSocketRefresh';
 
 const DEFAULT_REDUNDANCY = 4;
 const MAX_RELAY_HEALTH_ENTRIES = 32;
 const MAX_ROOM_RELAY_HEALTH_ENTRIES = 128;
 const MAX_PENDING_SUBACKS_PER_CLIENT = 128;
+const MAX_RELAY_SOCKET_REFRESHES = 32;
 const relayManager = createRelayManager<mqtt.MqttClient>(
   (client) => (client.stream as { socket?: WebSocket } | undefined)?.socket,
 );
@@ -38,6 +40,7 @@ type MqttSignallingErrorCategory = 'timeout' | 'dns' | 'socket' | 'authenticatio
 
 interface MqttEndpointHealthState {
   connected: boolean;
+  generation: number;
   lastError?: {
     category: MqttSignallingErrorCategory;
     phase: 'endpoint';
@@ -52,8 +55,10 @@ interface MqttRoomRelayHealthState {
   subscriptions: Map<symbol, {
     topic: string;
     state: 'pending' | 'verified' | 'failed';
+    generation: number;
   }>;
   publication: 'verified' | 'failed' | 'not-observed';
+  publicationGeneration: number;
   lastError?: {
     category: MqttSignallingErrorCategory;
     phase: 'subscription' | 'publication';
@@ -74,9 +79,21 @@ export interface MqttRelayHealth {
   } | undefined;
 }
 
+export interface MqttRelaySocketRefreshRequest {
+  targets: Array<{
+    endpoint: string;
+    endpointId: string;
+    previousSocket: unknown;
+  }>;
+}
+
 const endpointHealth = new Map<string, MqttEndpointHealthState>();
 const roomRelayHealth = new Map<string, MqttRoomRelayHealthState>();
-const pendingSubacks = new WeakMap<mqtt.MqttClient, Map<number, string[]>>();
+const relayClients = new Map<string, mqtt.MqttClient>();
+const pendingSubacks = new WeakMap<mqtt.MqttClient, Map<number, {
+  topics: string[];
+  generation: number;
+}>>();
 let connectMqtt: typeof mqtt.connect = mqtt.connect;
 
 export type MqttRoomConfig = JoinRoomConfig;
@@ -86,6 +103,7 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
     const client = relayManager.register(url, () => connectMqtt(url, proxyAwareMqttOptions({
       reconnectOnConnackError: true,
     })));
+    relayClients.set(url, client);
     const health = endpointHealthFor(url, client.connected);
     const handlers = messageHandlers.forRelay(client);
     if (!observedClients.has(client)) {
@@ -98,12 +116,10 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
           resetRoomHealthForEndpoint(url);
         })
         .on('close', () => {
-          health.connected = false;
-          resetRoomHealthForEndpoint(url);
+          invalidateMqttEndpoint(url, client);
         })
         .on('offline', () => {
-          health.connected = false;
-          resetRoomHealthForEndpoint(url);
+          invalidateMqttEndpoint(url, client);
         })
         .on('error', (error) => recordMqttHealthError(health, error))
         .on('packetsend', (packet) => trackMqttSubscribePacket(client, url, packet))
@@ -120,8 +136,9 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
     const references = subscriptionReferences.forRelay(client);
     const token = Symbol(topic);
     const endpoint = relayManager.keyOf(client);
+    const generation = endpointHealthFor(endpoint, client.connected).generation;
     const health = roomHealthFor(endpoint, context);
-    health.subscriptions.set(token, { topic, state: 'pending' });
+    health.subscriptions.set(token, { topic, state: 'pending', generation });
     const topicHandler = (incomingTopic: string, data: string): void => {
       void onMessage(incomingTopic, data);
     };
@@ -130,12 +147,13 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
     references[topic] = (references[topic] ?? 0) + 1;
     if (references[topic] === 1) {
       client.subscribe(topic, { qos: 1 }, (error, grants) => {
-        if (!health.subscriptions.has(token)) return;
+        const subscription = health.subscriptions.get(token);
+        if (!subscription || subscription.generation !== generation) return;
         if (error || !grants?.length || grants.some((grant) => grant.qos === 128)) {
-          health.subscriptions.set(token, { topic, state: 'failed' });
+          subscription.state = 'failed';
           recordMqttRoomHealthError(health, error ?? new Error('MQTT subscription rejected'), 'subscription');
         } else {
-          health.subscriptions.set(token, { topic, state: 'verified' });
+          subscription.state = 'verified';
         }
       });
     }
@@ -154,7 +172,10 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
 
   publishTopic: (client, topic, message, context) => {
     const health = roomHealthFor(relayManager.keyOf(client), context);
+    const generation = ++health.publicationGeneration;
+    health.publication = 'not-observed';
     client.publish(topic, typeof message === 'string' ? message : toJson(message), { qos: 1 }, (error) => {
+      if (health.publicationGeneration !== generation) return;
       if (error) {
         health.publication = 'failed';
         recordMqttRoomHealthError(health, error, 'publication');
@@ -166,6 +187,49 @@ export const joinRoom: JoinRoom<MqttRoomConfig> = createTopicStrategy({
 });
 
 export const getRelaySockets = relayManager.getSockets;
+/** Forces this room's half-open broker sockets through MQTT.js' reconnect path. */
+export function refreshRelaySockets(appId: string, roomId: string): MqttRelaySocketRefreshRequest {
+  const activeEndpoints = activeRoomEndpoints(appId, roomId);
+  const targets: MqttRelaySocketRefreshRequest['targets'] = [];
+  for (const [endpoint, socket] of Object.entries(relayManager.getSockets())
+    .filter(([endpoint]) => activeEndpoints.has(endpoint))
+    .slice(0, MAX_RELAY_SOCKET_REFRESHES)) {
+    const client = relayClients.get(endpoint);
+    if (!client || !forceSignallingSocketRefresh(
+      socket,
+      () => invalidateMqttEndpoint(endpoint, client),
+    )) continue;
+    targets.push({
+      endpoint,
+      endpointId: signallingEndpointIdentity(endpoint).id,
+      previousSocket: socket,
+    });
+  }
+  return { targets };
+}
+
+export function relaySocketRefreshProgress(
+  appId: string,
+  roomId: string,
+  request: MqttRelaySocketRefreshRequest,
+): { replaced: number; verified: number } {
+  const sockets = relayManager.getSockets();
+  const healthById = new Map(getRelayHealth(appId, roomId).map((health) => [health.endpointId, health]));
+  let replaced = 0;
+  let verified = 0;
+  for (const target of request.targets) {
+    const current = sockets[target.endpoint];
+    const isReplacement = Boolean(current && current !== target.previousSocket && current.readyState === 1);
+    if (!isReplacement) continue;
+    replaced += 1;
+    const health = healthById.get(target.endpointId);
+    if (health?.connected && health.subscription === 'verified' && health.publication === 'verified') {
+      verified += 1;
+    }
+  }
+  return { replaced, verified };
+}
+
 export function getRelayHealth(appId: string, roomId: string): MqttRelayHealth[] {
   return [...endpointHealth].flatMap(([endpoint, health]) => {
     const roomHealth = roomRelayHealth.get(roomHealthKey({ appId, roomId }, endpoint));
@@ -206,7 +270,7 @@ function endpointHealthFor(endpoint: string, connected: boolean): MqttEndpointHe
       if (oldest === undefined) break;
       endpointHealth.delete(oldest);
     }
-    health = { connected };
+    health = { connected, generation: 0 };
     endpointHealth.set(endpoint, health);
   } else if (connected) {
     health.connected = true;
@@ -232,6 +296,7 @@ function roomHealthFor(
       endpoint,
       subscriptions: new Map(),
       publication: 'not-observed',
+      publicationGeneration: 0,
     };
     roomRelayHealth.set(key, health);
   }
@@ -255,11 +320,31 @@ function subscriptionState(
 }
 
 function resetRoomHealthForEndpoint(endpoint: string): void {
+  const generation = endpointHealthFor(endpoint, false).generation;
   for (const health of roomRelayHealth.values()) {
     if (health.endpoint !== endpoint) continue;
-    for (const subscription of health.subscriptions.values()) subscription.state = 'pending';
+    for (const subscription of health.subscriptions.values()) {
+      subscription.state = 'pending';
+      subscription.generation = generation;
+    }
     health.publication = 'not-observed';
+    health.publicationGeneration += 1;
   }
+}
+
+function invalidateMqttEndpoint(endpoint: string, client: mqtt.MqttClient): void {
+  const health = endpointHealthFor(endpoint, false);
+  health.connected = false;
+  health.generation += 1;
+  pendingSubacks.delete(client);
+  resetRoomHealthForEndpoint(endpoint);
+}
+
+function activeRoomEndpoints(appId: string, roomId: string): Set<string> {
+  const prefix = `${appId}\0${roomId}\0`;
+  return new Set([...roomRelayHealth]
+    .filter(([key, health]) => key.startsWith(prefix) && health.subscriptions.size > 0)
+    .map(([, health]) => health.endpoint));
 }
 
 function trackMqttSubscribePacket(client: mqtt.MqttClient, endpoint: string, packet: unknown): void {
@@ -283,11 +368,14 @@ function trackMqttSubscribePacket(client: mqtt.MqttClient, endpoint: string, pac
     if (oldest === undefined) break;
     clientPending.delete(oldest);
   }
-  clientPending.set(details.messageId, topics);
+  const generation = endpointHealthFor(endpoint, false).generation;
+  clientPending.set(details.messageId, { topics, generation });
   for (const health of roomRelayHealth.values()) {
     if (health.endpoint !== endpoint) continue;
     for (const subscription of health.subscriptions.values()) {
-      if (topics.includes(subscription.topic)) subscription.state = 'pending';
+      if (!topics.includes(subscription.topic)) continue;
+      subscription.state = 'pending';
+      subscription.generation = generation;
     }
   }
 }
@@ -296,13 +384,15 @@ function applyMqttSubackPacket(client: mqtt.MqttClient, endpoint: string, packet
   const details = packet as { cmd?: unknown; messageId?: unknown; granted?: unknown[] };
   if (details.cmd !== 'suback' || typeof details.messageId !== 'number') return;
   const clientPending = pendingSubacks.get(client);
-  const topics = clientPending?.get(details.messageId);
-  if (!topics) return;
+  const pending = clientPending?.get(details.messageId);
+  if (!pending) return;
   clientPending!.delete(details.messageId);
+  if (pending.generation !== endpointHealthFor(endpoint, false).generation) return;
   for (const health of roomRelayHealth.values()) {
     if (health.endpoint !== endpoint) continue;
     for (const subscription of health.subscriptions.values()) {
-      const index = topics.indexOf(subscription.topic);
+      if (subscription.generation !== pending.generation) continue;
+      const index = pending.topics.indexOf(subscription.topic);
       if (index < 0) continue;
       const granted = details.granted?.[index];
       subscription.state = granted === 0 || granted === 1 || granted === 2 ? 'verified' : 'failed';

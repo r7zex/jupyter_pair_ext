@@ -91,7 +91,13 @@ import {
   MAX_TRANSFER_BYTES,
   validateIncomingTransfer,
 } from '../core/transfer';
-import { MeshMetrics, MeshTransport, RouteUpgradeState, RouteUpgradeStatus } from './mesh';
+import {
+  MeshMetrics,
+  MeshTransport,
+  RouteUpgradeState,
+  RouteUpgradeStatus,
+  type SignallingRefreshResult,
+} from './mesh';
 
 export interface PresenceState {
   peer: PeerIdentity;
@@ -849,7 +855,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     for (const key of this.project.keys()) this.storage?.schedule(key);
   }
 
-  public reconnect(): void {
+  public async reconnect(): Promise<SignallingRefreshResult> {
     const selfId = this.descriptor.localPeer.peerId;
     const candidates = new Map<string, PeerIdentity>();
     for (const peer of this.descriptor.knownPeers ?? []) {
@@ -863,6 +869,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // Reconnecting to every remembered peer lets the higher host clock heal
     // that split instead of leaving two permanent, disconnected hosts.
     for (const peer of candidates.values()) this.transport.connect(peer);
+    const refreshed = await this.transport.refreshSignalling();
+    this.log.appendLine(
+      `[debug] Manual reconnect completed with ${refreshed.status}: `
+      + `${refreshed.nostr.verifiedEndpoints}/${refreshed.nostr.requestedSockets} Nostr and `
+      + `${refreshed.mqtt.verifiedEndpoints}/${refreshed.mqtt.requestedSockets} MQTT endpoints verified; `
+      + 'authenticated data routes were retained.',
+    );
+    this.emit('connectionUpdated', { kind: 'manual-reconnect', ...refreshed });
+    return refreshed;
   }
 
   public async transferHost(targetPeerId: string): Promise<void> {

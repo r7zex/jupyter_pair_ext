@@ -154,7 +154,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.createAutosave', () => createAutosave());
   register(context, 'pairNotebook.reconnect', async () => {
     await applyMeshNetworkConfiguration(context);
-    requireRuntime().reconnect();
+    const refreshed = await requireRuntime().reconnect();
+    const requested = refreshed.nostr.requestedSockets + refreshed.mqtt.requestedSockets;
+    const verified = refreshed.nostr.verifiedEndpoints + refreshed.mqtt.verifiedEndpoints;
+    const detail = `${verified}/${requested} refreshed signalling endpoints verified; existing authenticated routes were kept.`;
+    if (refreshed.status === 'timed-out') {
+      void vscode.window.showWarningMessage(`Pair Notebook: signalling refresh timed out; ${detail}`);
+    } else if (refreshed.status === 'partial') {
+      void vscode.window.showWarningMessage(`Pair Notebook: signalling refresh was partial; ${detail}`);
+    } else if (refreshed.status === 'verified') {
+      void vscode.window.showInformationMessage(`Pair Notebook: signalling refresh verified; ${detail}`);
+    } else {
+      void vscode.window.showInformationMessage(
+        'Pair Notebook: no live signalling socket required a forced refresh; remembered peers were reannounced.',
+      );
+    }
   });
   register(context, 'pairNotebook.changeCompute', () => changeCompute());
   register(context, 'pairNotebook.refreshHardware', async () => {
@@ -937,6 +951,13 @@ async function showDiagnostics(advanced = false): Promise<void> {
       'Signalling lifecycle:',
       ...(network.signalling ?? []).flatMap((family) => [
         `  ${family.family.toUpperCase()}: ${family.active ? 'active' : 'inactive'}; stage=${family.stage}`
+          + `${family.lastRefresh
+            ? `; lastRefresh=${family.lastRefresh.status}`
+              + ` at=${new Date(family.lastRefresh.at).toISOString()}`
+              + ` requested=${family.lastRefresh.requestedSockets}`
+              + ` replaced=${family.lastRefresh.replacedSockets}`
+              + ` verified=${family.lastRefresh.verifiedEndpoints}`
+            : ''}`
           + `${family.lastError
             ? `; lastError=${family.lastError.phase}/${family.lastError.category}`
               + ` at=${new Date(family.lastError.at).toISOString()}`

@@ -66,6 +66,13 @@ export interface SignallingFamilyDiagnostic {
     purpose: 'runtime' | 'bootstrap';
     count: number;
   }>;
+  lastRefresh?: {
+    at: number;
+    status: 'verified' | 'partial' | 'timed-out' | 'no-sockets';
+    requestedSockets: number;
+    replacedSockets: number;
+    verifiedEndpoints: number;
+  } | undefined;
   lastError?: {
     category: 'timeout' | 'dns' | 'socket' | 'authentication' | 'protocol' | 'startup' | 'unknown';
     phase: 'startup' | 'endpoint' | 'subscription' | 'publication'

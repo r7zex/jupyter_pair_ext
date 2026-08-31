@@ -18,6 +18,7 @@ import {
   genId,
   getRelays,
   makeSocket,
+  resumeRelayReconnection,
   selfId,
   strToNum,
   toJson,
@@ -29,10 +30,12 @@ import {
   type TopicSubscriptionContext,
 } from '@trystero-p2p/core';
 import { signallingEndpointIdentity } from './signallingEndpoint';
+import { forceSignallingSocketRefresh } from './signallingSocketRefresh';
 
 const DEFAULT_REDUNDANCY = 5;
 const MAX_ROOM_RELAY_HEALTH_ENTRIES = 128;
 const MAX_PENDING_PUBLICATIONS_PER_RELAY = 128;
+const MAX_RELAY_SOCKET_REFRESHES = 32;
 
 type NostrHealthState = 'pending' | 'verified' | 'failed';
 
@@ -68,11 +71,21 @@ export interface NostrRelayHealth {
   lastError?: NostrRoomRelayHealthState['lastError'];
 }
 
+export interface NostrRelaySocketRefreshRequest {
+  targets: Array<{
+    endpoint: string;
+    endpointId: string;
+    previousSocket: unknown;
+  }>;
+}
+
 const relayManager = createRelayManager<SocketClient>((client) => client.socket);
 const subscriptions = relayManager.scoped<NostrSubscription>();
 const pendingPublications = relayManager.scoped<NostrPublication>();
 const roomRelayHealth = new Map<string, NostrRoomRelayHealthState>();
+const relayClients = new Map<string, SocketClient>();
 let createNostrSocket: typeof makeSocket = makeSocket;
+let publicationSequence = 0;
 
 export type NostrRoomConfig = JoinRoomConfig;
 
@@ -83,6 +96,7 @@ export const joinRoom: JoinRoom<NostrRoomConfig> = createTopicStrategy({
       (data) => handleRelayMessage(client, data),
       () => resubscribe(client),
     ));
+    relayClients.set(url, client);
     return client.ready;
   }),
 
@@ -109,7 +123,8 @@ export const joinRoom: JoinRoom<NostrRoomConfig> = createTopicStrategy({
     const generation = ++health.publicationGeneration;
     let encoded: string;
     try {
-      encoded = await createEvent(topic, typeof message === 'string' ? message : toJson(message));
+      const content = typeof message === 'string' ? message : toJson(message);
+      encoded = await createEvent(topic, withPublicationSequence(content));
     } catch (error) {
       if (health.publicationGeneration === generation) {
         health.publication = 'failed';
@@ -117,6 +132,10 @@ export const joinRoom: JoinRoom<NostrRoomConfig> = createTopicStrategy({
       }
       throw error;
     }
+    // Signing is asynchronous. A refresh may have advanced the room while
+    // createEvent was awaiting crypto; never send that old generation through
+    // the replacement socket or let its acknowledgement affect new evidence.
+    if (health.publicationGeneration !== generation) return;
     const parsed = safeNostrMessage(encoded);
     const event = parsed?.[1];
     const eventId = event && typeof event === 'object' && !Array.isArray(event)
@@ -137,6 +156,45 @@ export const joinRoom: JoinRoom<NostrRoomConfig> = createTopicStrategy({
 });
 
 export const getRelaySockets = relayManager.getSockets;
+
+/** Forces this room's half-open relay sockets through the normal reconnect path. */
+export function refreshRelaySockets(appId: string, roomId: string): NostrRelaySocketRefreshRequest {
+  const activeEndpoints = activeRoomEndpoints(appId, roomId);
+  if (activeEndpoints.size === 0) return { targets: [] };
+  resumeRelayReconnection();
+  const targets: NostrRelaySocketRefreshRequest['targets'] = [];
+  for (const [endpoint, socket] of Object.entries(relayManager.getSockets())
+    .filter(([endpoint]) => activeEndpoints.has(endpoint))
+    .slice(0, MAX_RELAY_SOCKET_REFRESHES)) {
+    if (!forceSignallingSocketRefresh(socket, () => prepareRelayRefresh(endpoint))) continue;
+    targets.push({
+      endpoint,
+      endpointId: signallingEndpointIdentity(endpoint).id,
+      previousSocket: socket,
+    });
+  }
+  return { targets };
+}
+
+export function relaySocketRefreshProgress(
+  appId: string,
+  roomId: string,
+  request: NostrRelaySocketRefreshRequest,
+): { replaced: number; verified: number } {
+  const sockets = relayManager.getSockets();
+  const healthById = new Map(getRelayHealth(appId, roomId).map((health) => [health.endpointId, health]));
+  let replaced = 0;
+  let verified = 0;
+  for (const target of request.targets) {
+    const current = sockets[target.endpoint];
+    const isReplacement = Boolean(current && current !== target.previousSocket && current.readyState === 1);
+    if (!isReplacement) continue;
+    replaced += 1;
+    const health = healthById.get(target.endpointId);
+    if (health?.subscription === 'verified' && health.publication === 'verified') verified += 1;
+  }
+  return { replaced, verified };
+}
 
 /** Replaces core socket creation only for deterministic adapter tests. */
 export function setNostrSocketFactoryForTesting(factory: typeof makeSocket | undefined): void {
@@ -216,14 +274,41 @@ function handleRelayMessage(client: SocketClient, data: string): void {
 
 function resubscribe(client: SocketClient): void {
   const endpoint = relayManager.keyOf(client);
+  prepareRelayRefresh(endpoint);
+  for (const [subId, subscription] of Object.entries(subscriptions.forRelay(client))) {
+    client.send(encodeSubscription(subId, subscription.topic));
+  }
+}
+
+function prepareRelayRefresh(endpoint: string): void {
+  const client = relayClients.get(endpoint);
+  if (client) {
+    const publications = pendingPublications.forRelay(client);
+    for (const eventId of Object.keys(publications)) delete publications[eventId];
+    rotateSubscriptions(client);
+  }
   for (const health of roomRelayHealth.values()) {
     if (health.endpoint !== endpoint) continue;
     for (const token of health.subscriptions.keys()) health.subscriptions.set(token, 'pending');
     health.publication = 'not-observed';
+    health.publicationGeneration += 1;
   }
-  for (const [subId, subscription] of Object.entries(subscriptions.forRelay(client))) {
-    client.send(encodeSubscription(subId, subscription.topic));
+}
+
+function rotateSubscriptions(client: SocketClient): void {
+  const current = subscriptions.forRelay(client);
+  for (const [previousSubId, subscription] of Object.entries(current)) {
+    delete current[previousSubId];
+    const nextSubId = genId(64);
+    current[nextSubId] = subscription;
   }
+}
+
+function activeRoomEndpoints(appId: string, roomId: string): Set<string> {
+  const prefix = roomHealthKeyPrefix(appId, roomId);
+  return new Set([...roomRelayHealth]
+    .filter(([key, health]) => key.startsWith(prefix) && health.subscriptions.size > 0)
+    .map(([, health]) => health.endpoint));
 }
 
 function encodeSubscription(subId: string, topic: string): string {
@@ -236,6 +321,23 @@ function encodeSubscription(subId: string, topic: string): string {
       '#x': [topic],
     },
   ]);
+}
+
+/**
+ * Nostr event ids include second-resolution time, so identical announcements
+ * created in the same second otherwise reuse an id. A fixed-width trailing
+ * JSON-whitespace sequence preserves Trystero wire compatibility while making
+ * every publication in this process distinct from the generation it replaces.
+ */
+function withPublicationSequence(content: string): string {
+  publicationSequence = (publicationSequence + 1) >>> 0;
+  let value = publicationSequence;
+  let suffix = '\n';
+  for (let bit = 0; bit < 32; bit += 1) {
+    suffix += (value & 1) === 1 ? '\t' : ' ';
+    value >>>= 1;
+  }
+  return content + suffix;
 }
 
 function roomHealthFor(
