@@ -92,7 +92,7 @@ Trystero topic strategy built on MQTT.js.
 | --- | --- | --- | --- | --- |
 | NET-P0-001 | P0 | BLOCKED | Architecture / connectivity | HIGH |
 | NET-P0-002 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / connectivity | CONFIRMED |
-| NET-P0-003 | P0 | OPEN | Product bug / bootstrap | CONFIRMED |
+| NET-P0-003 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / bootstrap | CONFIRMED |
 | NET-P1-001 | P1 | OPEN | Architecture / route coverage | CONFIRMED |
 | NET-P1-002 | P1 | OPEN | Product bug / observability | CONFIRMED |
 | NET-P1-003 | P1 | INVESTIGATING | Product bug / reconnect | MEDIUM |
@@ -275,7 +275,7 @@ Physical validation: NOT RUN
 
 ## NET-P0-003 — Snapshot bootstrap cannot recover across route replacement
 
-Status: OPEN
+Status: NEEDS-PHYSICAL-VALIDATION
 
 Priority: P0
 
@@ -286,26 +286,36 @@ route drops or changes to the emergency relay during the initial project snapsho
 
 Evidence:
 
-- [A] Runtime-purpose connections call `beginLogicalRecovery()` after active route loss;
-  bootstrap-purpose connections immediately emit `bootstrapDisconnected` instead.
-- [A] The host `SessionRuntime` immediately rejects snapshot checkpoints on
+- [A, pre-fix] Runtime-purpose connections called `beginLogicalRecovery()` after active
+  route loss; bootstrap-purpose connections immediately emitted `bootstrapDisconnected`.
+- [A, pre-fix] The host `SessionRuntime` immediately rejected snapshot checkpoints on
   `bootstrapDisconnected`.
-- [A] `downloadProjectSnapshot()` sends `snapshotRequest` only once because `requested`
-  remains true. It listens for `peerDisconnected`, not `bootstrapDisconnected`, and does
-  not restart the request on a new `helloAck`.
-- [A] Snapshot file retry repairs missing chunks on one surviving route, but does not
-  resume a transfer after route identity replacement.
-- [B] The existing runtime integration test covers a stable in-memory bootstrap, not
-  direct-to-relay route replacement during transfer.
+- [A, pre-fix] `downloadProjectSnapshot()` sent `snapshotRequest` only once because
+  `requested` remained true and did not restart after an authenticated replacement.
+- [A, fixed] Bootstrap and runtime routes now share the bounded identity recovery lease,
+  while terminal disconnect events remain purpose-specific and recovering bootstrap peers
+  remain excluded from the runtime participant projection.
+- [A, fixed] Every request, data frame, checkpoint ACK, and file retry carries a
+  `snapshotId`. The receiver ignores stale generations, preserves only hash-verified
+  complete files, and closes/removes partial transfers before requesting a new generation.
+- [A, fixed] `SessionRuntime` cancels only the active generation after an authenticated
+  bootstrap route replacement and binds pending checkpoints/retry records to that
+  generation.
+- [B] The route-replacement integration test disconnects the physical route immediately
+  after the first file-end delivery, authenticates a replacement, observes two distinct
+  snapshot generations, verifies the completed-file resume hash, and verifies final bytes.
+- [B] A separate relay-only integration test disables Trystero/WebRTC discovery and
+  downloads the complete project through `NostrFrameRelay` and a local WebSocket relay hub.
 
 Relevant files and symbols:
 
 - `src/runtime/mesh.ts`: `onPeerLeave()`, `beginLogicalRecovery()`, `waitForRoute()`
 - `src/runtime/bootstrap.ts`: `downloadProjectSnapshot()`, `requestSnapshot()`,
-  `requested`, snapshot checkpoints
+  `resetSnapshotGeneration()`, `activeSnapshotId`, snapshot checkpoints
 - `src/runtime/session.ts`: `sendSnapshot()`, `awaitSnapshotCheckpoint()`,
-  `bootstrapDisconnected` handler
-- `test/runtime.integration.test.ts`
+  `cancelSnapshotGeneration()`, `activeSnapshotGenerations`
+- `test/runtime.integration.test.ts`: route-replacement and relay-only bootstrap tests
+- `test/network.test.ts`: purpose-specific bootstrap recovery lease test
 
 Root cause:
 
@@ -327,17 +337,18 @@ Begin a multi-file bootstrap over a direct route, acknowledge at least one check
 drop that route, admit an authenticated relay replacement inside the recovery bound, and
 observe that the current transfer is rejected or stalls rather than resuming.
 
-Required fix:
+Implemented fix:
 
-Give bootstrap an identity-scoped bounded recovery lease. Preserve completed-file state,
-reissue a fresh snapshot request after authenticated route replacement, and make host
-checkpoint cleanup generation-aware so an old route cannot reject the new transfer.
+Bootstrap now has an identity-scoped bounded recovery lease. After an authenticated route
+replacement the receiver discards partial state, preserves complete hash-verified files,
+and sends a new generation request. Host checkpoint and retransmission state is bound to
+that generation, so delayed old frames cannot complete or corrupt the replacement.
 
 Regression test:
 
-Add an integration test for bootstrap over relay only and another that replaces direct
-with relay mid-transfer, verifies hashes/materialization, and proves no duplicate or
-cross-generation checkpoint is accepted.
+Implemented: one relay-only full snapshot test with WebRTC discovery disabled, one
+mid-transfer authenticated route-replacement test with completed-file resume, and one
+bounded bootstrap lease test that verifies purpose-specific terminal disconnect behavior.
 
 Acceptance criteria:
 
@@ -348,7 +359,15 @@ Acceptance criteria:
 - failure remains explicit after the recovery bound;
 - targeted, full, lint, and compile checks pass.
 
-Fixed by commit:
+Software validation:
+
+- `npm test -- --grep snapshot`: PASS, 20 tests on 2026-08-31.
+- Focused bootstrap recovery lease test: PASS on 2026-08-31.
+- `npm test`: PASS, 306 tests on 2026-08-31; compile/bundle PASS in its first phase.
+- `npm run lint`: PASS on 2026-08-31.
+- Target two-physical-computer Host-on-VPN scenario: NOT RUN.
+
+Fixed by commits: `356df91`, `0aac1f5`
 
 Physical validation: NOT RUN
 
@@ -846,39 +865,36 @@ Physical validation: NOT RUN
 
 ## NEXT ACTION
 
-Next issue: `NET-P0-003 — Snapshot bootstrap cannot recover across route replacement`.
+Next issue: `NET-P1-001 — No built-in TURN route for restrictive NAT combinations`.
 
-Established root cause: runtime connections receive an identity-scoped logical recovery
-lease, but bootstrap connections immediately emit `bootstrapDisconnected`. The guest
-sends `snapshotRequest` only once, while the host rejects the old route's pending
-checkpoint state, so an authenticated replacement route cannot resume the same join.
+Established root cause: TURN is currently an optional operator-supplied capability. The
+repository has no product-owned service, credentials, or rotation mechanism, and anonymous
+demo TURN credentials must not be restored. A code-only change cannot create a production
+TURN guarantee.
 
 Files to inspect/change:
 
+- `src/runtime/turn.ts`
 - `src/runtime/mesh.ts`
-- `src/runtime/bootstrap.ts`
-- `src/runtime/session.ts`
-- `test/runtime.integration.test.ts`
+- `package.json`
+- current README/configuration text
 
 Required implementation shape:
 
-1. give bootstrap peers a bounded identity-scoped route-recovery lease;
-2. reissue the snapshot request only after an authenticated replacement route;
-3. resume from completed-file hashes and restart partial files safely;
-4. make host checkpoint cleanup generation-aware;
-5. preserve host-key pinning, purpose restrictions, and signed admission.
+1. confirm that no deployable credentialed TURN service exists in the supplied scope;
+2. preserve direct-first behavior and reject dead anonymous credentials;
+3. record the external infrastructure/product-decision blocker precisely;
+4. if blocked, continue to the next fixable P1 without claiming TURN coverage.
 
 Commands after the focused fix:
 
 ```text
-npm test -- --grep "snapshot"
-npm test
-npm run lint
-npm run compile
+rg -n "DEFAULT_TURN_URLS|TRYSTERO_TURN_SERVERS|turnUrls|turnUsername" src package.json README.md
+npm test -- --grep "TURN"
 ```
 
-Then update this file, set software status to `NEEDS-PHYSICAL-VALIDATION` if all software
-acceptance checks pass, commit only this issue, and push before starting the next issue.
+Do not add a public TURN endpoint or credentials without an operated service, rotation
+plan, and explicit user-provided authority.
 
-Last safe pushed fix state: `001b117` on
+Last safe pushed fix state: `0aac1f5` on
 `origin/codex/networking-root-cause-repair`.
