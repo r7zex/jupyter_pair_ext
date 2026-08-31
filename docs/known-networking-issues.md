@@ -94,7 +94,7 @@ Trystero topic strategy built on MQTT.js.
 | NET-P0-002 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / connectivity | CONFIRMED |
 | NET-P0-003 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / bootstrap | CONFIRMED |
 | NET-P1-001 | P1 | BLOCKED | Architecture / route coverage | CONFIRMED |
-| NET-P1-002 | P1 | OPEN | Product bug / observability | CONFIRMED |
+| NET-P1-002 | P1 | NEEDS-PHYSICAL-VALIDATION | Product bug / observability | CONFIRMED |
 | NET-P1-003 | P1 | INVESTIGATING | Product bug / reconnect | MEDIUM |
 | NET-P1-004 | P1 | OPEN | Product bug / compatibility UX | CONFIRMED |
 | NET-P2-001 | P2 | OPEN | Diagnostics gap | CONFIRMED |
@@ -466,7 +466,7 @@ Physical validation: NOT RUN
 
 ## NET-P1-002 — Signalling health is reported from object existence, not endpoint state
 
-Status: OPEN
+Status: NEEDS-PHYSICAL-VALIDATION
 
 Priority: P1
 
@@ -527,7 +527,37 @@ Acceptance criteria:
 - endpoint failures remain visible without secrets;
 - diagnostics distinguish discovery, handshake, route, and bootstrap failures.
 
-Fixed by commit:
+Implementation and evidence:
+
+- [A] Nostr now retains room-scoped NIP-01 `EOSE`, `OK`, `CLOSED`, and `NOTICE`
+  results. MQTT uses QoS 1 and retains room-scoped `SUBACK`/`PUBACK` outcomes. Socket,
+  subscription, and publication failures are bounded and reduced to category, phase,
+  and timestamp.
+- [A] A family is active only while an endpoint has both verified subscription and
+  publication capability, or while a current discovery handshake is pending/in flight.
+  An allocated room, a connected socket alone, historical discovery, or an already
+  selected WebRTC route is not reported as current rendezvous capability.
+- [A] Selected runtime/bootstrap routes and discovery/authentication stages remain
+  separately visible even when the signalling endpoint is inactive.
+- [A] Endpoint correlation uses an opaque SHA-256 identity of the complete endpoint and
+  a separate origin-only display label. Different paths or credentials on one origin do
+  not merge health state, while neither the original value nor its userinfo/path/query is
+  exposed.
+- [A] The local Nostr subscription encoder has symmetric local lifecycle ownership; it
+  does not populate Trystero's unbounded module-level subscription lookup.
+- [B] Fake Nostr and MQTT endpoints cover verified operation, DNS/socket failure,
+  subscription rejection, publication failure, reconnect reset/revalidation, room
+  isolation, mixed failure/pending states, peer discovery, route-vs-rendezvous semantics,
+  same-origin endpoint separation, and secret redaction.
+
+Software validation:
+
+- `npm test`: PASS, 312 tests on 2026-08-31; compile/bundle PASS in its first phase.
+- Focused network/Nostr/MQTT/diagnostics suite: PASS, 53 tests on 2026-08-31.
+- `npm run lint`: PASS on 2026-08-31.
+- `git diff --check`: PASS (Git emitted only the repository's LF-to-CRLF warnings).
+
+Fixed by commit: `5cbe75d` (`fix(network): report verified signalling health`)
 
 Physical validation: NOT RUN
 
@@ -888,35 +918,43 @@ Physical validation: NOT RUN
 
 ## NEXT ACTION
 
-Next issue: `NET-P1-002 — Signalling health is reported from object existence, not endpoint state`.
+Next issue: `NET-P1-003 — Manual reconnect may not rebuild a stuck transport`.
 
-Established root cause: `activeSignallingFamilies()` treats allocated Trystero/MQTT room
-objects as active signalling even when no endpoint has connected, subscribed, published,
-or discovered a peer. Secondary signalling errors are not retained as sanitized state.
+Current evidence: `SessionRuntime.reconnect()` reannounces remembered logical peers via
+`MeshTransport.connect()`. It does not force-close and recreate Nostr/MQTT signalling
+rooms or their sockets, so a half-open transport after a VPN/proxy route change may keep
+using stale routing state. Whether normal library close/reconnect events always make this
+safe remains unproved.
 
 Files to inspect/change:
 
 - `src/runtime/mesh.ts`
-- `src/runtime/mqttRoom.ts`
-- `src/runtime/diagnostics.ts`
-- related network/diagnostics tests
+- `src/runtime/session.ts`
+- `src/runtime/netWatch.ts`
+- `src/extension.ts`
+- reconnect and signalling lifecycle tests
 
 Required implementation shape:
 
-1. model bounded sanitized signalling lifecycle state per family;
-2. make `active` require evidence beyond room object existence;
-3. retain useful connection/subscription/publication/discovery failures without secrets;
-4. expose the state through diagnostics and add deterministic transition/redaction tests.
+1. reproduce a half-open signalling client that does not emit close while the route/proxy
+   changes;
+2. define a bounded restart operation that tears down and rebuilds signalling without
+   dropping a healthy authenticated data route prematurely;
+3. make the manual Reconnect command invoke that operation and surface useful sanitized
+   progress/failure state;
+4. prove new sockets/subscriptions are created and normal runtime/bootstrap recovery is
+   preserved.
 
 Commands after the focused fix:
 
 ```text
-rg -n "activeSignallingFamilies|startSecondarySignalling|networkDiagnostics|onJoinError" src test
-npm test -- --grep "signalling|diagnostics"
+rg -n "reconnect\(|connect\(|onNetworkChanged|NetworkChangeWatcher|leave\(" src test
+npm test -- --grep "reconnect|network change|signalling"
 ```
 
-Keep endpoint URLs useful where already public configuration, but never expose room topics,
-session tokens, identity keys, credentials, raw SDP, or unsanitized exception text.
+Keep existing authenticated routes available until a replacement is ready when possible;
+do not turn manual reconnect into an unbounded retry or a destructive session reset.
 
-Last safe pushed state: `04a1d15` on
-`origin/codex/networking-root-cause-repair`.
+Last confirmed pushed state: `a67ec86` on
+`origin/codex/networking-root-cause-repair`. NET-P1-002 commit `5cbe75d` is local because
+the origin push requires separate explicit egress approval.
