@@ -91,7 +91,7 @@ Trystero topic strategy built on MQTT.js.
 | ID | Priority | Status | Category | Confidence |
 | --- | --- | --- | --- | --- |
 | NET-P0-001 | P0 | BLOCKED | Architecture / connectivity | HIGH |
-| NET-P0-002 | P0 | OPEN | Product bug / connectivity | CONFIRMED |
+| NET-P0-002 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / connectivity | CONFIRMED |
 | NET-P0-003 | P0 | OPEN | Product bug / bootstrap | CONFIRMED |
 | NET-P1-001 | P1 | OPEN | Architecture / route coverage | CONFIRMED |
 | NET-P1-002 | P1 | OPEN | Product bug / observability | CONFIRMED |
@@ -190,7 +190,7 @@ The overall scenario failed; attribution to this specific issue is not isolated.
 
 ## NET-P0-002 — Emergency relay routes use the wrong ownership and liveness model
 
-Status: OPEN
+Status: NEEDS-PHYSICAL-VALIDATION
 
 Priority: P0
 
@@ -212,6 +212,12 @@ Evidence:
   room abstraction.
 - [B] Route-upgrade tests cover the dedicated `upgrade:` room, not duplicate admission
   while an emergency relay is incumbent.
+- [B] Regression tests now prove that a fresh authenticated relay incumbent survives
+  late duplicate signalling and that stale or locally unavailable relay routes can be
+  replaced without consulting or closing a primary-room peer.
+- [C] The public emergency-relay live smoke passed all seven Nostr/MQTT/redundant
+  combinations after the fix. Both processes still ran on one computer, so this is not
+  physical target validation.
 
 Relevant files and symbols:
 
@@ -241,26 +247,29 @@ current code retires the relay mapping instead of deterministically preserving i
 
 Required fix:
 
-Represent emergency-relay ownership explicitly. Its liveness must come from relay-route
-state and authenticated peer freshness, never an unrelated Trystero room map. Preserve
-the incumbent until a replacement is authenticated and selected; keep explicit route
-upgrades make-before-break.
+Implemented: `roomForTransport()` now represents `relay:` as a logical `FrameRelay`
+route with no Trystero room owner. Duplicate admission checks the actual owner, local
+verified relay availability, and authenticated peer freshness. Route retirement closes
+only a real owning-room peer and leaves explicit upgrades make-before-break.
 
 Regression test:
 
-Cover relay incumbent plus late direct/MQTT duplicate, relay liveness, relay leave, and
-stale relay replacement without accessing or closing the primary room under a prefixed
-ID.
+Added `keeps a fresh emergency relay route during late duplicate signalling` and
+`replaces a stale or locally unavailable relay route without closing a room peer` in
+`test/core.test.ts`. Full suite: PASS, 303 tests. Lint and compile: PASS. Public
+emergency-relay live smoke: PASS for seven Nostr/MQTT/redundant combinations.
 
 Acceptance criteria:
 
-- a fresh relay incumbent survives duplicate signalling;
-- a stale relay route can still be replaced by a signed route from the same identity;
-- room peer operations use only the room that owns that transport;
-- route migration remains make-before-break;
-- targeted, full, lint, and compile checks pass.
+- PASS: a fresh relay incumbent survives duplicate signalling;
+- PASS: a stale or locally unavailable relay route can be replaced by a signed route
+  from the same identity;
+- PASS: room peer operations use only the room that owns that transport;
+- PASS: route migration remains make-before-break;
+- PASS: targeted, full, lint, compile, and relevant level-C live checks pass;
+- PENDING: the target level-D two-physical-computer scenario.
 
-Fixed by commit:
+Fixed by commit: `001b117`
 
 Physical validation: NOT RUN
 
@@ -837,37 +846,39 @@ Physical validation: NOT RUN
 
 ## NEXT ACTION
 
-Next issue: `NET-P0-002 — Emergency relay routes use the wrong ownership and liveness model`.
+Next issue: `NET-P0-003 — Snapshot bootstrap cannot recover across route replacement`.
 
-Established root cause: `roomForTransport()` has no `relay:` case, so duplicate admission,
-retirement, leave handling, and ping handling consult the primary Trystero room for a
-logical emergency-relay route.
+Established root cause: runtime connections receive an identity-scoped logical recovery
+lease, but bootstrap connections immediately emit `bootstrapDisconnected`. The guest
+sends `snapshotRequest` only once, while the host rejects the old route's pending
+checkpoint state, so an authenticated replacement route cannot resume the same join.
 
 Files to inspect/change:
 
 - `src/runtime/mesh.ts`
-- `test/network.test.ts`
-- `test/routeOptimization.test.ts` only if existing route-owner helpers belong there
+- `src/runtime/bootstrap.ts`
+- `src/runtime/session.ts`
+- `test/runtime.integration.test.ts`
 
 Required implementation shape:
 
-1. add explicit emergency-relay ownership/liveness semantics;
-2. preserve a fresh authenticated relay incumbent during late duplicate signalling;
-3. allow a stale route to be replaced without weakening identity proof;
-4. keep route upgrades make-before-break;
-5. add focused regressions before any broader refactor.
+1. give bootstrap peers a bounded identity-scoped route-recovery lease;
+2. reissue the snapshot request only after an authenticated replacement route;
+3. resume from completed-file hashes and restart partial files safely;
+4. make host checkpoint cleanup generation-aware;
+5. preserve host-key pinning, purpose restrictions, and signed admission.
 
 Commands after the focused fix:
 
 ```text
-npm test -- --grep "relay|duplicate|route"
+npm test -- --grep "snapshot"
 npm test
 npm run lint
 npm run compile
 ```
 
 Then update this file, set software status to `NEEDS-PHYSICAL-VALIDATION` if all software
-acceptance checks pass, commit only this issue, and push before starting NET-P0-003.
+acceptance checks pass, commit only this issue, and push before starting the next issue.
 
-Last safe pushed state before the research checkpoint: `312454e` on
+Last safe pushed fix state: `001b117` on
 `origin/codex/networking-root-cause-repair`.
