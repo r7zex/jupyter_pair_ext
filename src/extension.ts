@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from './core/atomicFile';
-import { buildNetworkDiagnostics } from './runtime/diagnostics';
+import { buildNetworkDiagnostics, type SignallingFamilyDiagnostic } from './runtime/diagnostics';
 import { GpuInfo } from './core/hardware';
 import {
   generateIdentityCredentials,
@@ -896,6 +896,7 @@ async function showDiagnostics(advanced = false): Promise<void> {
     proxy?: string;
     relayFallback?: { enabled?: boolean; connectedRelays?: number };
     udpAvailability?: { state?: string; confidence?: string };
+    signalling?: SignallingFamilyDiagnostic[];
   } | undefined;
   // Passive diagnostics run automatically with ordinary user permissions and
   // never modify system state; every inference carries an explicit confidence.
@@ -910,6 +911,7 @@ async function showDiagnostics(advanced = false): Promise<void> {
       ? { relayFallbackEnabled: network.relayFallback.enabled } : {}),
     ...(network?.relayFallback?.connectedRelays !== undefined
       ? { connectedRelayCount: network.relayFallback.connectedRelays } : {}),
+    ...(network?.signalling ? { signalling: network.signalling } : {}),
     resolveDns: async (host) => (await lookup(host)),
   });
 
@@ -932,6 +934,24 @@ async function showDiagnostics(advanced = false): Promise<void> {
       '',
       'Discovery (Nostr relays):',
       ...(network.relays ?? []).map((relay, index) => `  ${index + 1}. ${relay}`),
+      'Signalling lifecycle:',
+      ...(network.signalling ?? []).flatMap((family) => [
+        `  ${family.family.toUpperCase()}: ${family.active ? 'active' : 'inactive'}; stage=${family.stage}`
+          + `${family.lastError
+            ? `; lastError=${family.lastError.phase}/${family.lastError.category}`
+              + ` at=${new Date(family.lastError.at).toISOString()}`
+            : ''}`,
+        `    evidence=${family.evidence.length > 0 ? family.evidence.join(',') : 'none'}`,
+        `    selectedRoutes=${family.routes.length > 0
+          ? family.routes.map((route) => `${route.purpose}:${route.count}`).join(',')
+          : 'none'}`,
+        ...family.endpoints.map((endpoint) => `    ${endpoint.endpoint} [${endpoint.id.slice(0, 12)}] — ${endpoint.state}`
+          + `; subscribe=${endpoint.subscription}; publish=${endpoint.publication}`
+          + `${endpoint.lastError
+            ? `; lastError=${endpoint.lastError.phase}/${endpoint.lastError.category}`
+              + ` at=${new Date(endpoint.lastError.at).toISOString()}`
+            : ''}`),
+      ]),
       network.turnStatus === 'not-configured'
         ? 'TURN: not configured (direct ICE + encrypted emergency relay remain enabled)'
         : network.turnStatus === 'invalid'

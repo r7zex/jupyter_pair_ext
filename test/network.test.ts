@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'mocha';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import NodeWebSocket from 'ws';
+import NodeWebSocket, { WebSocketServer as NodeWebSocketServer } from 'ws';
 
 import {
   orderTurnEndpoints,
@@ -24,13 +24,104 @@ import {
   redactProxyUrl,
   resolveProxy,
 } from '../src/runtime/proxy';
-import { createProxyAgent } from '../src/runtime/proxyWebSocket';
+import {
+  createProxyAgent,
+  getSignallingSocketHealth,
+  installProxyAwareWebSocket,
+} from '../src/runtime/proxyWebSocket';
 import { proxyAwareMqttOptions } from '../src/runtime/mqttProxy';
+import { signallingEndpointIdentity } from '../src/runtime/signallingEndpoint';
 import {
   parseWindowsSystemProxyOutput,
   proxyUrlFromWindowsValue,
   readWindowsSystemProxy,
 } from '../src/runtime/systemProxy';
+
+describe('signalling WebSocket health', () => {
+  it('keeps same-origin relay identities separate without exposing URL secrets', () => {
+    const first = signallingEndpointIdentity(
+      'wss://alice:first-secret@relay.example/private-one?token=first-token',
+    );
+    const second = signallingEndpointIdentity(
+      'wss://bob:second-secret@relay.example/private-two?token=second-token',
+    );
+    assert.equal(first.label, 'wss://relay.example');
+    assert.equal(second.label, 'wss://relay.example');
+    assert.notEqual(first.id, second.id);
+    assert.doesNotMatch(
+      JSON.stringify([first, second]),
+      /alice|bob|first-secret|second-secret|private-one|private-two|first-token|second-token/,
+    );
+  });
+
+  it('retains a sanitized endpoint failure without credentials or query data', async () => {
+    let acceptUpgrade = false;
+    const server = createServer();
+    const hub = new NodeWebSocketServer({ noServer: true });
+    server.on('upgrade', (request, socket, head) => {
+      if (!acceptUpgrade) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      hub.handleUpgrade(request, socket, head, (accepted) => hub.emit('connection', accepted, request));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
+    let socket: NodeWebSocket | undefined;
+    let reconnectingSocket: NodeWebSocket | undefined;
+    try {
+      installProxyAwareWebSocket({ env: {} });
+      const WebSocketRuntime = (globalThis as unknown as { WebSocket: typeof NodeWebSocket }).WebSocket;
+      socket = new WebSocketRuntime(
+        `ws://user:password-secret@127.0.0.1:${address.port}/topic-secret?token=query-secret`,
+      );
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 3_000);
+        socket!.once('close', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
+      const health = getSignallingSocketHealth()
+        .find((item) => item.endpoint === `ws://127.0.0.1:${address.port}`);
+      assert.equal(health?.state, 'failed');
+      assert.equal(health?.lastError?.category, 'authentication');
+      assert.equal(health?.lastError?.phase, 'endpoint');
+      assert.doesNotMatch(JSON.stringify(health), /password-secret|query-secret|topic-secret/);
+
+      acceptUpgrade = true;
+      reconnectingSocket = new WebSocketRuntime(
+        `ws://user:password-secret@127.0.0.1:${address.port}/topic-secret?token=query-secret`,
+      );
+      const reconnecting = getSignallingSocketHealth()
+        .find((item) => item.endpoint === `ws://127.0.0.1:${address.port}`);
+      assert.equal(reconnecting?.state, 'connecting');
+      assert.equal(reconnecting?.lastError?.category, 'authentication');
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('WebSocket reconnect timed out.')), 3_000);
+        reconnectingSocket!.once('open', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
+      const connected = getSignallingSocketHealth()
+        .find((item) => item.endpoint === `ws://127.0.0.1:${address.port}`);
+      assert.equal(connected?.state, 'connected');
+      assert.equal(connected?.lastError, undefined);
+    } finally {
+      socket?.terminate();
+      reconnectingSocket?.terminate();
+      for (const client of hub.clients) client.terminate();
+      hub.close();
+      if (descriptor) Object.defineProperty(globalThis, 'WebSocket', descriptor);
+      else delete (globalThis as { WebSocket?: unknown }).WebSocket;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
 
 describe('TURN endpoint configuration', () => {
   it('parses turn and turns URLs with explicit transports', () => {
@@ -565,6 +656,124 @@ describe('mesh network configuration', () => {
 
 describe('mesh relay fallback integration', function () {
   this.timeout(30_000);
+
+  it('does not call allocated signalling rooms active without endpoint or peer evidence', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    let primaryCallbacks: { onJoinError?: (details: {
+      error: string;
+      appId: string;
+      roomId: string;
+      peerId: string;
+    }) => void } | undefined;
+    const deadRoom = {
+      makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+      onPeerJoin: () => undefined,
+      onPeerLeave: () => undefined,
+      getPeers: () => ({}),
+      ping: async () => -1,
+      leave: async () => undefined,
+    };
+    const transport = new MeshTransport({
+      sessionId: 'signalling-health', token: 'signalling-health-token-is-long-enough',
+      localPeer: { peerId: 'health-host', displayName: 'Health Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'health-host' }),
+      isHost: () => true,
+      roomFactory: (_config, _roomId, callbacks) => {
+        primaryCallbacks = callbacks;
+        return deadRoom as never;
+      },
+      secondaryRoomFactory: () => {
+        throw new Error('authentication failed for wss://user:super-secret@broker.example/private-topic');
+      },
+    });
+
+    try {
+      await transport.start();
+      assert.deepEqual(transport.activeSignallingFamilies(), []);
+      primaryCallbacks?.onJoinError?.({
+        error: 'WebSocket failed for token=another-super-secret',
+        appId: 'private-app',
+        roomId: 'private-room-topic',
+        peerId: 'unknown-peer',
+      });
+      const diagnostics = transport.networkDiagnostics() as {
+        signalling: Array<{
+          family: string;
+          active: boolean;
+          stage: string;
+          lastError?: { category: string; phase: string };
+        }>;
+      };
+      const nostr = diagnostics.signalling.find((family) => family.family === 'nostr');
+      const mqtt = diagnostics.signalling.find((family) => family.family === 'mqtt');
+      assert.equal(nostr?.active, false);
+      assert.equal(nostr?.stage, 'failed');
+      assert.equal(nostr?.lastError?.category, 'socket');
+      assert.equal(nostr?.lastError?.phase, 'handshake');
+      assert.equal(mqtt?.active, false);
+      assert.equal(mqtt?.stage, 'failed');
+      assert.equal(mqtt?.lastError?.category, 'startup');
+      assert.equal(mqtt?.lastError?.phase, 'startup');
+      const serialized = JSON.stringify(diagnostics);
+      assert.doesNotMatch(serialized, /super-secret|private-topic|private-room-topic|another-super-secret/);
+      const noteHistoricalRoute = transport as unknown as {
+        noteSignallingPeerStage: (
+          family: 'nostr',
+          stage: 'peer-discovered' | 'identity-authenticated' | 'route-established',
+        ) => void;
+      };
+      noteHistoricalRoute.noteSignallingPeerStage('nostr', 'peer-discovered');
+      noteHistoricalRoute.noteSignallingPeerStage('nostr', 'identity-authenticated');
+      noteHistoricalRoute.noteSignallingPeerStage('nostr', 'route-established');
+      assert.deepEqual(
+        transport.activeSignallingFamilies(),
+        [],
+        'historical peer/route timestamps are not current capability',
+      );
+      const routeInternals = transport as unknown as {
+        connections: Map<string, {
+          transportPeerId: string;
+          identity: { peerId: string; displayName: string; joinOrder: number };
+          purpose: 'runtime' | 'bootstrap';
+          connectedAt: number;
+          lastSeen: number;
+          snapshotRequested: boolean;
+        }>;
+        identityToTransport: Map<string, string>;
+        onPeerLeave: (transportPeerId: string) => void;
+      };
+      const now = Date.now();
+      routeInternals.connections.set('runtime-route', {
+        transportPeerId: 'runtime-route',
+        identity: { peerId: 'runtime-peer', displayName: 'Runtime Peer', joinOrder: 1 },
+        purpose: 'runtime', connectedAt: now, lastSeen: now, snapshotRequested: false,
+      });
+      routeInternals.identityToTransport.set('runtime-peer', 'runtime-route');
+      const selectedRouteDiagnostic = transport.signallingDiagnostics()
+        .find((family) => family.family === 'nostr');
+      assert.equal(selectedRouteDiagnostic?.stage, 'route-established');
+      assert.deepEqual(selectedRouteDiagnostic?.routes, [{ purpose: 'runtime', count: 1 }]);
+      assert.equal(selectedRouteDiagnostic?.active, false, 'a route does not prove current rendezvous health');
+      routeInternals.onPeerLeave('runtime-route');
+      assert.equal(
+        transport.signallingDiagnostics().find((family) => family.family === 'nostr')?.lastError?.phase,
+        'route',
+      );
+      routeInternals.connections.set('bootstrap-route', {
+        transportPeerId: 'bootstrap-route',
+        identity: { peerId: 'bootstrap-peer', displayName: 'Bootstrap Peer', joinOrder: 2 },
+        purpose: 'bootstrap', connectedAt: now, lastSeen: now, snapshotRequested: false,
+      });
+      routeInternals.identityToTransport.set('bootstrap-peer', 'bootstrap-route');
+      routeInternals.onPeerLeave('bootstrap-route');
+      assert.equal(
+        transport.signallingDiagnostics().find((family) => family.family === 'nostr')?.lastError?.phase,
+        'bootstrap',
+      );
+    } finally {
+      await transport.stop();
+    }
+  });
 
   it('keeps a logical peer online while immediately replacing a failed physical route', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');

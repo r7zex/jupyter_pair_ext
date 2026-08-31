@@ -72,7 +72,15 @@ describe('secondary signalling family (MQTT)', function () {
       const mapped = [...(host as unknown as { identityToTransport: Map<string, string> }).identityToTransport.values()][0];
       assert.ok(mapped, 'peer should be mapped through the secondary signalling family');
       assert.ok(mapped.startsWith('mqtt:'), `expected an mqtt-family transport, got ${mapped}`);
-      assert.ok(host.activeSignallingFamilies().includes('mqtt'));
+      const mqttDiagnostic = host.signallingDiagnostics().find((family) => family.family === 'mqtt');
+      assert.equal(mqttDiagnostic?.stage, 'route-established');
+      assert.deepEqual(mqttDiagnostic?.routes, [{ purpose: 'runtime', count: 1 }]);
+      assert.ok(mqttDiagnostic?.evidence.includes('peer-discovered'));
+      assert.equal(
+        mqttDiagnostic?.active,
+        false,
+        'an injected room can prove discovery and a selected route, but not current broker health',
+      );
       const got = new Promise<string>((resolve) => {
         host.on('message', (frame: { type: string; payload: Uint8Array }) => {
           if (frame.type === 'probePing') resolve(Buffer.from(frame.payload).toString('utf8'));

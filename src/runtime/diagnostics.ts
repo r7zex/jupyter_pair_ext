@@ -38,6 +38,42 @@ export interface UdpAvailability {
   detail: string;
 }
 
+export interface SignallingEndpointDiagnostic {
+  /** Opaque full-endpoint identity; safe to expose and distinct from the redacted label. */
+  id: string;
+  endpoint: string;
+  state: 'connecting' | 'connected' | 'subscribed' | 'publish-verified'
+    | 'disconnected' | 'failed' | 'not-observed';
+  subscription: 'verified' | 'failed' | 'not-observed';
+  publication: 'verified' | 'failed' | 'not-observed';
+  lastError?: {
+    category: 'timeout' | 'dns' | 'socket' | 'authentication' | 'protocol' | 'startup' | 'unknown';
+    phase: 'endpoint' | 'subscription' | 'publication';
+    at: number;
+  } | undefined;
+}
+
+export interface SignallingFamilyDiagnostic {
+  family: 'nostr' | 'mqtt';
+  enabled: boolean;
+  active: boolean;
+  stage: 'disabled' | 'idle' | 'starting' | 'socket-connected' | 'peer-discovered'
+    | 'identity-authenticated' | 'route-established' | 'failed';
+  roomCreated: boolean;
+  endpoints: SignallingEndpointDiagnostic[];
+  evidence: string[];
+  routes: Array<{
+    purpose: 'runtime' | 'bootstrap';
+    count: number;
+  }>;
+  lastError?: {
+    category: 'timeout' | 'dns' | 'socket' | 'authentication' | 'protocol' | 'startup' | 'unknown';
+    phase: 'startup' | 'endpoint' | 'subscription' | 'publication'
+      | 'discovery' | 'handshake' | 'route' | 'bootstrap';
+    at: number;
+  } | undefined;
+}
+
 export interface AdapterObservation {
   name: string;
   kind: 'vpn-tun' | 'virtual' | 'physical' | 'other';
@@ -110,6 +146,7 @@ export interface DiagnosticsInput {
   turnStatus?: 'not-configured' | 'invalid' | 'configured';
   relayFallbackEnabled?: boolean;
   connectedRelayCount?: number;
+  signalling?: readonly SignallingFamilyDiagnostic[];
   /** Hosts to check for DNS resolution; failures are reported per host. */
   dnsHosts?: readonly string[];
   resolveDns?(host: string): Promise<{ address: string }>;
@@ -215,6 +252,18 @@ export async function buildNetworkDiagnostics(input: DiagnosticsInput = {}): Pro
       impact: 'The last-resort encrypted Nostr transport is not available right now.',
       confidence: 'confirmed',
       possibleCauses: ['Nostr relays unreachable', 'Proxy blocking WSS', 'DNS resolution failure'],
+    });
+  }
+
+  for (const family of input.signalling ?? []) {
+    if (!family.enabled || family.active) continue;
+    observations.push({
+      observation: `${family.family.toUpperCase()} signalling has no evidenced active endpoint.`,
+      impact: family.lastError
+        ? `Peer discovery is unavailable through this family; last failure: ${family.lastError.phase}/${family.lastError.category}.`
+        : 'The signalling room exists, but no connected endpoint or peer discovery has been observed.',
+      confidence: 'confirmed',
+      possibleCauses: ['Signalling WebSocket unavailable', 'Proxy or DNS failure', 'Relay or broker rejection'],
     });
   }
 

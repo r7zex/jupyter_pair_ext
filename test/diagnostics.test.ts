@@ -105,6 +105,35 @@ describe('passive diagnostics', () => {
     assert.equal(dnsObservation.confidence, 'confirmed');
   });
 
+  it('reports inactive signalling from lifecycle evidence instead of room allocation', async () => {
+    const report = await buildNetworkDiagnostics({
+      adapters: [],
+      relayFallbackEnabled: false,
+      signalling: [{
+        family: 'mqtt',
+        enabled: true,
+        active: false,
+        stage: 'failed',
+        roomCreated: true,
+        endpoints: [{
+          id: 'endpoint-id',
+          endpoint: 'wss://broker.example/mqtt',
+          state: 'disconnected',
+          subscription: 'not-observed',
+          publication: 'not-observed',
+        }],
+        evidence: [],
+        routes: [],
+        lastError: { category: 'authentication', phase: 'handshake', at: 123 },
+      }],
+    });
+
+    const signalling = report.observations.find((item) => item.observation.includes('MQTT signalling'));
+    assert.ok(signalling);
+    assert.equal(signalling.confidence, 'confirmed');
+    assert.match(signalling.impact, /last failure: handshake\/authentication/i);
+  });
+
   it('distinguishes absent, invalid, and unreachable custom TURN configuration', async () => {
     const absent = await buildNetworkDiagnostics({
       turnStatus: 'not-configured', adapters: [], relayFallbackEnabled: false,

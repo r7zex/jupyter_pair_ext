@@ -24,6 +24,7 @@ import {
   type BoundProxyPassword,
   type ProxyDescriptor,
 } from './proxy';
+import { signallingEndpointIdentity } from './signallingEndpoint';
 
 interface DebugController {
   namespaces?: string;
@@ -38,6 +39,29 @@ const PROXY_AGENT_DEBUG_EXCLUSIONS = [
   '-https-proxy-agent*',
   '-socks-proxy-agent*',
 ];
+const MAX_SIGNALLING_SOCKET_HEALTH_ENTRIES = 32;
+
+type SignallingSocketErrorCategory = 'timeout' | 'dns' | 'socket'
+  | 'authentication' | 'protocol' | 'unknown';
+
+interface SignallingSocketHealthState {
+  socket: NodeWebSocket;
+  state: 'connecting' | 'connected' | 'disconnected' | 'failed';
+  lastError?: {
+    category: SignallingSocketErrorCategory;
+    phase: 'endpoint';
+    at: number;
+  } | undefined;
+}
+
+export interface SignallingSocketHealth {
+  endpointId: string;
+  endpoint: string;
+  state: SignallingSocketHealthState['state'];
+  lastError?: SignallingSocketHealthState['lastError'];
+}
+
+const signallingSocketHealth = new Map<string, SignallingSocketHealthState>();
 
 /** Prevent dependency DEBUG output from exposing proxy URLs or auth headers. */
 function disableCredentialBearingProxyDebug(): void {
@@ -159,15 +183,81 @@ export function installProxyAwareWebSocket(options: ProxyWebSocketRuntimeOptions
         resolved = undefined;
       }
       super(url, protocols, resolved ? { agent: resolved.agent } : undefined);
+      const health = trackSignallingSocket(target, this);
+      this.on('open', () => updateSignallingSocketState(target, this, 'connected'));
+      this.on('close', () => {
+        if (health.lastError) return;
+        updateSignallingSocketState(target, this, 'disconnected');
+      });
       // An unhandled 'error' event crashes Node by default (`ws` semantics).
       // Relay failures are routine on filtered networks; Trystero reacts to
       // the subsequent 'close' with per-relay reconnection, so a single bad
       // relay must never take down the whole extension host.
-      this.on('error', () => { /* handled via close/reconnect */ });
+      this.on('error', (error) => {
+        if (signallingSocketHealth.get(target)?.socket !== this) return;
+        health.state = 'failed';
+        health.lastError = {
+          category: classifySignallingSocketError(error),
+          phase: 'endpoint',
+          at: Date.now(),
+        };
+      });
     }
   }
 
   runtime.WebSocket = ProxyAwareWebSocket;
+}
+
+/** Sanitized lifecycle snapshots for Trystero's proxy-aware WebSockets. */
+export function getSignallingSocketHealth(): SignallingSocketHealth[] {
+  return [...signallingSocketHealth].map(([endpoint, health]) => {
+    const identity = signallingEndpointIdentity(endpoint);
+    return {
+      endpointId: identity.id,
+      endpoint: identity.label,
+      state: health.state,
+      ...(health.lastError ? { lastError: { ...health.lastError } } : {}),
+    };
+  });
+}
+
+function trackSignallingSocket(endpoint: string, socket: NodeWebSocket): SignallingSocketHealthState {
+  while (signallingSocketHealth.size >= MAX_SIGNALLING_SOCKET_HEALTH_ENTRIES
+    && !signallingSocketHealth.has(endpoint)) {
+    const oldest = signallingSocketHealth.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    signallingSocketHealth.delete(oldest);
+  }
+  const previousError = signallingSocketHealth.get(endpoint)?.lastError;
+  const health: SignallingSocketHealthState = {
+    socket,
+    state: 'connecting',
+    ...(previousError ? { lastError: { ...previousError } } : {}),
+  };
+  signallingSocketHealth.set(endpoint, health);
+  return health;
+}
+
+function updateSignallingSocketState(
+  endpoint: string,
+  socket: NodeWebSocket,
+  state: SignallingSocketHealthState['state'],
+): void {
+  const health = signallingSocketHealth.get(endpoint);
+  if (!health || health.socket !== socket) return;
+  health.state = state;
+  if (state === 'connected') health.lastError = undefined;
+}
+
+function classifySignallingSocketError(error: unknown): SignallingSocketErrorCategory {
+  const details = error as { code?: unknown; message?: unknown } | undefined;
+  const message = `${String(details?.code ?? '')} ${String(details?.message ?? error)}`.toLowerCase();
+  if (/timeout|timed out|etimedout/.test(message)) return 'timeout';
+  if (/dns|getaddrinfo|enotfound|eai_again/.test(message)) return 'dns';
+  if (/auth|credential|forbidden|unauthori[sz]ed|401|403/.test(message)) return 'authentication';
+  if (/websocket|socket|econn|network|closed|disconnect/.test(message)) return 'socket';
+  if (/protocol|handshake|malformed|invalid/.test(message)) return 'protocol';
+  return 'unknown';
 }
 
 /** Credential-free description of what signalling would use for `url`. */

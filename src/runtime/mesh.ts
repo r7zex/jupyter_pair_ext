@@ -2,14 +2,23 @@ import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
 import {
-  joinRoom,
   type JoinError,
   type JoinRoomCallbacks,
   type MessageAction,
   type NostrRoomConfig,
   type Room,
 } from 'trystero';
-import { joinRoom as joinMqttRoom } from './mqttRoom';
+import {
+  getRelayHealth as getNostrRelayHealth,
+  getRelaySockets as getNostrRelaySockets,
+  joinRoom,
+} from './nostrRoom';
+import {
+  defaultRelayUrls as MQTT_SIGNALLING_RELAY_URLS,
+  getRelayHealth as getMqttRelayHealth,
+  getRelaySockets as getMqttRelaySockets,
+  joinRoom as joinMqttRoom,
+} from './mqttRoom';
 import {
   generateIdentityCredentials,
   newIdentityNonce,
@@ -40,12 +49,17 @@ import {
   type TurnProbeResult,
 } from './turn';
 import { describeProxy, resolveProxy, type ProxyDescriptor } from './proxy';
-import { installProxyAwareWebSocket, type ProxyWebSocketRuntimeOptions } from './proxyWebSocket';
+import {
+  getSignallingSocketHealth,
+  installProxyAwareWebSocket,
+  type ProxyWebSocketRuntimeOptions,
+} from './proxyWebSocket';
 import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
 import { RedundantFrameRelay } from './redundantFrameRelay';
-import { assessUdpAvailability } from './diagnostics';
+import { assessUdpAvailability, type SignallingFamilyDiagnostic } from './diagnostics';
 import { shouldMigrateRoute } from './routeScoring';
 import { NetworkChangeWatcher } from './netWatch';
+import { signallingEndpointIdentity } from './signallingEndpoint';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -307,6 +321,16 @@ interface RecoveringPeer {
   timer: NodeJS.Timeout;
 }
 
+interface SignallingEvidence {
+  startedAt?: number | undefined;
+  peerDiscoveredAt?: number | undefined;
+  identityAuthenticatedAt?: number | undefined;
+  routeEstablishedAt?: number | undefined;
+  routePurpose?: PeerConnectionPurpose | undefined;
+  handshakesInFlight?: number | undefined;
+  lastError?: SignallingFamilyDiagnostic['lastError'] | undefined;
+}
+
 interface QueuedFrame {
   bytes: Buffer;
   priority: FramePriority;
@@ -397,6 +421,12 @@ export class MeshTransport extends EventEmitter {
   private mqttRoom: Room | undefined;
   private mqttAction: MessageAction<ArrayBuffer> | undefined;
   private mqttJoining = false;
+  private primaryUsesProductionSockets = false;
+  private secondaryUsesProductionSockets = false;
+  private readonly signallingEvidence: Record<'nostr' | 'mqtt', SignallingEvidence> = {
+    nostr: {},
+    mqtt: {},
+  };
   private readonly networkWatcher = new NetworkChangeWatcher(() => this.onNetworkChanged());
   /** Rate-limited remote migration notices for the participants panel. */
   private readonly remoteRouteStatuses = new Map<string, { status: string; at: number }>();
@@ -443,10 +473,13 @@ export class MeshTransport extends EventEmitter {
     if (this.room) return 0;
     const restarting = this.hasStarted;
     this.stopped = false;
+    this.signallingEvidence.nostr = { startedAt: Date.now() };
     ensureWebSocketRuntime();
     const callbacks: JoinRoomCallbacks = {
       handshakeTimeoutMs: 15_000,
       onPeerHandshake: async (transportPeerId, send, receive, isInitiator) => {
+        this.beginSignallingHandshake('nostr');
+        this.noteSignallingPeerStage('nostr', 'peer-discovered');
         try {
           await this.runPeerHandshake(
             transportPeerId,
@@ -454,6 +487,7 @@ export class MeshTransport extends EventEmitter {
             receive as () => Promise<{ data: unknown }>,
             isInitiator,
           );
+          this.noteSignallingPeerStage('nostr', 'identity-authenticated');
         } catch (error) {
           if (isDuplicatePeerError(error)) {
             // Same participant already connected via the other signalling
@@ -461,10 +495,16 @@ export class MeshTransport extends EventEmitter {
             try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* gone */ }
             return;
           }
+          this.noteSignallingError('nostr', error);
           throw error;
+        } finally {
+          this.endSignallingHandshake('nostr');
         }
       },
-      onJoinError: (details) => this.onJoinError(details),
+      onJoinError: (details) => {
+        this.noteSignallingError('nostr', details.error);
+        this.onJoinError(details);
+      },
     };
     const turnConfig = this.buildTurnConfig();
     const config: NostrRoomConfig = {
@@ -479,15 +519,20 @@ export class MeshTransport extends EventEmitter {
       ...(turnConfig !== undefined ? { turnConfig } : {}),
     };
     const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
+    this.primaryUsesProductionSockets = factory === joinRoom;
     try {
       this.room = factory(config, this.options.sessionId, callbacks);
       this.action = this.room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
       this.action.onMessage = (data, { peerId }) => this.handleAction(data, peerId);
-      this.room.onPeerJoin = (peerId) => this.onPeerJoin(peerId);
+      this.room.onPeerJoin = (peerId) => {
+        this.onPeerJoin(peerId);
+        if (this.connections.has(peerId)) this.noteSignallingPeerStage('nostr', 'route-established', peerId);
+      };
       this.room.onPeerLeave = (peerId) => this.onPeerLeave(peerId);
     } catch (error) {
       this.room = undefined;
       this.action = undefined;
+      this.noteSignallingError('nostr', error, 'startup', 'startup');
       throw new Error(`Could not start Trystero: ${formatError(error)}`, { cause: error });
     }
     this.hasStarted = true;
@@ -521,6 +566,8 @@ export class MeshTransport extends EventEmitter {
     const testFactory = this.options.roomFactory || MeshTransport.testingRoomFactory;
     const factory = this.options.secondaryRoomFactory ?? (testFactory ? undefined : joinMqttRoom);
     if (!factory) return;
+    this.signallingEvidence.mqtt = { startedAt: Date.now() };
+    this.secondaryUsesProductionSockets = factory === joinMqttRoom;
     this.mqttJoining = true;
     try {
       const turnConfig = this.buildTurnConfig();
@@ -533,6 +580,8 @@ export class MeshTransport extends EventEmitter {
       const room = factory(config, `${this.options.sessionId}`, {
         handshakeTimeoutMs: 15_000,
         onPeerHandshake: async (rawId, send, receive, isInitiator) => {
+          this.beginSignallingHandshake('mqtt');
+          this.noteSignallingPeerStage('mqtt', 'peer-discovered');
           try {
             await this.runPeerHandshake(
               MQTT_TRANSPORT_PREFIX + rawId,
@@ -540,6 +589,7 @@ export class MeshTransport extends EventEmitter {
               receive as () => Promise<{ data: unknown }>,
               isInitiator,
             );
+            this.noteSignallingPeerStage('mqtt', 'identity-authenticated');
           } catch (error) {
             if (isDuplicatePeerError(error)) {
               // The same logical participant is already connected through the
@@ -547,20 +597,30 @@ export class MeshTransport extends EventEmitter {
               try { this.mqttRoom?.getPeers()[rawId]?.close(); } catch { /* already gone */ }
               return;
             }
+            this.noteSignallingError('mqtt', error);
             throw error;
+          } finally {
+            this.endSignallingHandshake('mqtt');
           }
         },
-        onJoinError: () => undefined,
+        onJoinError: (details) => this.noteSignallingError('mqtt', details.error),
       });
       this.mqttRoom = room;
       this.mqttAction = room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
       this.mqttAction.onMessage = (data, { peerId }) =>
         this.handleAction(data, MQTT_TRANSPORT_PREFIX + peerId);
-      room.onPeerJoin = (rawId) => this.onPeerJoin(MQTT_TRANSPORT_PREFIX + rawId);
+      room.onPeerJoin = (rawId) => {
+        const transportPeerId = MQTT_TRANSPORT_PREFIX + rawId;
+        this.onPeerJoin(transportPeerId);
+        if (this.connections.has(transportPeerId)) {
+          this.noteSignallingPeerStage('mqtt', 'route-established', transportPeerId);
+        }
+      };
       room.onPeerLeave = (rawId) => this.onPeerLeave(MQTT_TRANSPORT_PREFIX + rawId);
-    } catch {
+    } catch (error) {
       this.mqttRoom = undefined;
       this.mqttAction = undefined;
+      this.noteSignallingError('mqtt', error, 'startup', 'startup');
     } finally {
       this.mqttJoining = false;
     }
@@ -632,12 +692,211 @@ export class MeshTransport extends EventEmitter {
     }
   }
 
-  /** Signalling families with a live room right now (diagnostics/UI). */
+  /** Signalling families backed by an open endpoint or real peer lifecycle evidence. */
   public activeSignallingFamilies(): string[] {
-    const families: string[] = [];
-    if (this.room) families.push('nostr');
-    if (this.mqttRoom) families.push('mqtt');
-    return families;
+    return this.signallingDiagnostics()
+      .filter((family) => family.active)
+      .map((family) => family.family);
+  }
+
+  /** Sanitized signalling lifecycle evidence safe for diagnostics and UI. */
+  public signallingDiagnostics(): SignallingFamilyDiagnostic[] {
+    return [this.signallingFamilyDiagnostic('nostr'), this.signallingFamilyDiagnostic('mqtt')];
+  }
+
+  private signallingFamilyDiagnostic(family: 'nostr' | 'mqtt'): SignallingFamilyDiagnostic {
+    const evidence = this.signallingEvidence[family];
+    const roomCreated = family === 'nostr' ? Boolean(this.room) : Boolean(this.mqttRoom);
+    const enabled = family === 'nostr'
+      ? !this.stopped
+      : !this.stopped && !this.options.disableSecondarySignalling
+        && Boolean(this.mqttRoom || evidence.startedAt || this.options.secondaryRoomFactory
+          || (!this.options.roomFactory && !MeshTransport.testingRoomFactory));
+    const endpoints = this.signallingEndpointDiagnostics(family);
+    const connectedEndpoints = endpoints.filter((endpoint) =>
+      endpoint.state === 'connected' || endpoint.state === 'subscribed'
+        || endpoint.state === 'publish-verified').length;
+    const capableEndpoints = endpoints.filter((endpoint) =>
+      endpoint.state === 'publish-verified'
+        && endpoint.subscription === 'verified'
+        && endpoint.publication === 'verified').length;
+    const currentConnections = [...this.connections.entries()]
+      .filter(([transportPeerId, connection]) =>
+        this.transportBelongsToSignallingFamily(transportPeerId, family)
+          && this.identityToTransport.get(connection.identity.peerId) === transportPeerId)
+      .map(([, connection]) => connection);
+    const pendingHandshakes = [...this.pendingHandshakes.keys()]
+      .filter((transportPeerId) => this.transportBelongsToSignallingFamily(transportPeerId, family)).length;
+    const handshakesInFlight = evidence.handshakesInFlight ?? 0;
+    const active = enabled && (capableEndpoints > 0
+      || pendingHandshakes > 0
+      || handshakesInFlight > 0);
+    const routes = (['runtime', 'bootstrap'] as const).flatMap((purpose) => {
+      const count = currentConnections.filter((connection) => connection.purpose === purpose).length;
+      return count > 0 ? [{ purpose, count }] : [];
+    });
+    const directEvidence: string[] = [];
+    if (connectedEndpoints > 0) directEvidence.push(`socket-connected:${connectedEndpoints}`);
+    const subscribedEndpoints = endpoints.filter((endpoint) => endpoint.subscription === 'verified').length;
+    const publishingEndpoints = endpoints.filter((endpoint) => endpoint.publication === 'verified').length;
+    if (subscribedEndpoints > 0) directEvidence.push(`subscription-verified:${subscribedEndpoints}`);
+    if (publishingEndpoints > 0) directEvidence.push(`publication-verified:${publishingEndpoints}`);
+    if (evidence.peerDiscoveredAt !== undefined) directEvidence.push('peer-discovered');
+    if (evidence.identityAuthenticatedAt !== undefined) directEvidence.push('identity-authenticated');
+    for (const route of routes) directEvidence.push(`${route.purpose}-route-selected:${route.count}`);
+    const endpointLastError = endpoints
+      .flatMap((endpoint) => endpoint.lastError ? [endpoint.lastError] : [])
+      .sort((left, right) => right.at - left.at)[0];
+    const lastError = !evidence.lastError
+      ? endpointLastError
+      : !endpointLastError || evidence.lastError.at >= endpointLastError.at
+        ? evidence.lastError
+        : endpointLastError;
+    let stage: SignallingFamilyDiagnostic['stage'];
+    if (!enabled) stage = 'disabled';
+    else if (currentConnections.length > 0) stage = 'route-established';
+    else if (pendingHandshakes > 0) stage = 'identity-authenticated';
+    else if (handshakesInFlight > 0) stage = 'peer-discovered';
+    else if (connectedEndpoints > 0) stage = 'socket-connected';
+    else if (lastError) stage = 'failed';
+    else if (roomCreated || evidence.startedAt !== undefined) stage = 'starting';
+    else stage = 'idle';
+    return {
+      family,
+      enabled,
+      active,
+      stage,
+      roomCreated,
+      endpoints,
+      evidence: directEvidence,
+      routes,
+      ...(lastError ? { lastError: { ...lastError } } : {}),
+    };
+  }
+
+  private signallingEndpointDiagnostics(family: 'nostr' | 'mqtt'): SignallingFamilyDiagnostic['endpoints'] {
+    const productionSockets = family === 'nostr'
+      ? this.primaryUsesProductionSockets
+      : this.secondaryUsesProductionSockets;
+    if (!productionSockets) return [];
+    const configured = family === 'nostr' ? TRYSTERO_RELAY_URLS : MQTT_SIGNALLING_RELAY_URLS.slice(0, 4);
+    let sockets: Record<string, { readyState?: number }> = {};
+    try {
+      sockets = (family === 'nostr' ? getNostrRelaySockets() : getMqttRelaySockets()) as typeof sockets;
+    } catch { /* diagnostics must never affect transport */ }
+    const mqttHealth = family === 'mqtt'
+      ? new Map(getMqttRelayHealth(TRYSTERO_APP_ID, this.options.sessionId)
+        .map((health) => [health.endpointId, health]))
+      : new Map();
+    const nostrRoomHealth = family === 'nostr'
+      ? new Map(getNostrRelayHealth(TRYSTERO_APP_ID, this.options.sessionId)
+        .map((health) => [health.endpointId, health]))
+      : new Map();
+    const nostrHealth = family === 'nostr'
+      ? new Map(getSignallingSocketHealth().map((health) => [health.endpointId, health]))
+      : new Map();
+    const endpointLabels = new Map<string, string>();
+    for (const url of configured) {
+      const identity = signallingEndpointIdentity(url);
+      endpointLabels.set(identity.id, identity.label);
+    }
+    for (const health of [...mqttHealth.values(), ...nostrRoomHealth.values(), ...nostrHealth.values()]) {
+      endpointLabels.set(health.endpointId, health.endpoint);
+    }
+    const readyStates = new Map(Object.entries(sockets).map(([url, socket]) => {
+      const identity = signallingEndpointIdentity(url);
+      endpointLabels.set(identity.id, identity.label);
+      return [identity.id, socket.readyState];
+    }));
+    return [...endpointLabels].map(([endpointId, endpoint]) => {
+      const readyState = readyStates.get(endpointId);
+      const health = family === 'mqtt' ? mqttHealth.get(endpointId) : nostrRoomHealth.get(endpointId);
+      const socketHealth = family === 'nostr' ? nostrHealth.get(endpointId) : undefined;
+      const connected = health?.connected ?? readyState === 1;
+      const state: SignallingFamilyDiagnostic['endpoints'][number]['state'] = connected
+        ? health?.subscription === 'failed' || health?.publication === 'failed'
+          ? 'failed'
+          : health?.publication === 'verified'
+            && health.subscription === 'verified'
+          ? 'publish-verified'
+          : health?.subscription === 'verified'
+            ? 'subscribed'
+            : 'connected'
+        : socketHealth?.state === 'failed'
+          ? 'failed'
+          : readyState === 0 || socketHealth?.state === 'connecting'
+          ? 'connecting'
+          : health?.lastError
+            ? 'failed'
+            : readyState === undefined && !health
+            ? 'not-observed'
+            : 'disconnected';
+      return {
+        id: endpointId,
+        endpoint,
+        state,
+        subscription: health?.subscription ?? 'not-observed',
+        publication: health?.publication ?? 'not-observed',
+        ...(health?.lastError || socketHealth?.lastError
+          ? { lastError: { ...(health?.lastError ?? socketHealth!.lastError!) } }
+          : {}),
+      };
+    });
+  }
+
+  private transportBelongsToSignallingFamily(
+    transportPeerId: string,
+    family: 'nostr' | 'mqtt',
+  ): boolean {
+    if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) return false;
+    return family === 'mqtt'
+      ? transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)
+      : !transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX);
+  }
+
+  private signallingFamilyForTransport(transportPeerId: string): 'nostr' | 'mqtt' | undefined {
+    if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) return undefined;
+    return transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX) ? 'mqtt' : 'nostr';
+  }
+
+  private beginSignallingHandshake(family: 'nostr' | 'mqtt'): void {
+    const evidence = this.signallingEvidence[family];
+    evidence.handshakesInFlight = (evidence.handshakesInFlight ?? 0) + 1;
+  }
+
+  private endSignallingHandshake(family: 'nostr' | 'mqtt'): void {
+    const evidence = this.signallingEvidence[family];
+    evidence.handshakesInFlight = Math.max(0, (evidence.handshakesInFlight ?? 1) - 1);
+  }
+
+  private noteSignallingPeerStage(
+    family: 'nostr' | 'mqtt',
+    stage: 'peer-discovered' | 'identity-authenticated' | 'route-established',
+    transportPeerId?: string,
+  ): void {
+    const evidence = this.signallingEvidence[family];
+    const now = Date.now();
+    if (stage === 'peer-discovered') evidence.peerDiscoveredAt = now;
+    else if (stage === 'identity-authenticated') evidence.identityAuthenticatedAt = now;
+    else {
+      evidence.routeEstablishedAt = now;
+      evidence.routePurpose = transportPeerId
+        ? this.connections.get(transportPeerId)?.purpose ?? this.pendingHandshakes.get(transportPeerId)?.purpose
+        : undefined;
+    }
+  }
+
+  private noteSignallingError(
+    family: 'nostr' | 'mqtt',
+    error: unknown,
+    category?: NonNullable<SignallingFamilyDiagnostic['lastError']>['category'],
+    phase?: NonNullable<SignallingFamilyDiagnostic['lastError']>['phase'],
+  ): void {
+    this.signallingEvidence[family].lastError = {
+      category: category ?? classifySignallingError(error),
+      phase: phase ?? (this.options.purpose === 'bootstrap' ? 'bootstrap' : 'handshake'),
+      at: Date.now(),
+    };
   }
 
   /**
@@ -727,6 +986,7 @@ export class MeshTransport extends EventEmitter {
       stunServers: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
       udpAvailability: assessUdpAvailability(this.turnProbes ?? []),
       signallingFamilies: this.activeSignallingFamilies(),
+      signalling: this.signallingDiagnostics(),
       relayFallback: {
         enabled: !meshNetworkConfig.disableRelayFallback,
         connectedRelays: this.relay?.connectedRelayCount ?? 0,
@@ -2092,6 +2352,15 @@ public improvablePeerIds(): string[] {
     const connection = this.connections.get(transportPeerId);
     if (!connection) return;
     const wasActiveIdentityRoute = this.identityToTransport.get(connection.identity.peerId) === transportPeerId;
+    const signallingFamily = this.signallingFamilyForTransport(transportPeerId);
+    if (wasActiveIdentityRoute && signallingFamily) {
+      this.noteSignallingError(
+        signallingFamily,
+        new Error('Selected direct route closed.'),
+        'socket',
+        connection.purpose === 'bootstrap' ? 'bootstrap' : 'route',
+      );
+    }
     this.connections.delete(transportPeerId);
     this.retireOutboundQueue(transportPeerId);
     this.inboundWindows.delete(transportPeerId);
@@ -2596,7 +2865,17 @@ public improvablePeerIds(): string[] {
       this.takePendingInboundFrames(transportPeerId);
       const owner = this.roomForTransport(transportPeerId);
       try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* best effort */ }
-      this.emit('protocolError', new Error(`Expired incomplete peer admission ${transportPeerId}.`));
+      const error = new Error(`Expired incomplete peer admission ${transportPeerId}.`);
+      const signallingFamily = this.signallingFamilyForTransport(transportPeerId);
+      if (signallingFamily) {
+        this.noteSignallingError(
+          signallingFamily,
+          error,
+          'timeout',
+          handshake.purpose === 'bootstrap' ? 'bootstrap' : 'route',
+        );
+      }
+      this.emit('protocolError', error);
     }
   }
 
@@ -2824,6 +3103,18 @@ function framePriority(type: string): FramePriority {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function classifySignallingError(
+  error: unknown,
+): NonNullable<SignallingFamilyDiagnostic['lastError']>['category'] {
+  const message = formatError(error).toLowerCase();
+  if (/timeout|timed out/.test(message)) return 'timeout';
+  if (/dns|getaddrinfo|enotfound|eai_again/.test(message)) return 'dns';
+  if (/auth|credential|forbidden|unauthori[sz]ed|connack/.test(message)) return 'authentication';
+  if (/websocket|socket|econn|network|closed|disconnect/.test(message)) return 'socket';
+  if (/protocol|handshake|sdp|signal|malformed|invalid/.test(message)) return 'protocol';
+  return 'unknown';
 }
 
 function formatError(error: unknown): string {
