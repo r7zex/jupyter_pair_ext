@@ -571,6 +571,15 @@ export class MeshTransport extends EventEmitter {
     action: MessageAction<ArrayBuffer> | undefined;
     rawId: string;
   } {
+    if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
+      // Emergency relay routes are logical authenticated connections carried
+      // by FrameRelay, not peers owned by any Trystero room.
+      return {
+        room: undefined,
+        action: undefined,
+        rawId: transportPeerId.slice(RELAY_TRANSPORT_PREFIX.length),
+      };
+    }
     if (transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)) {
       return {
         room: this.mqttRoom,
@@ -586,6 +595,16 @@ export class MeshTransport extends EventEmitter {
       };
     }
     return { room: this.room, action: this.action, rawId: transportPeerId };
+  }
+
+  /** Tests liveness through the transport that actually owns the route. */
+  private isTransportRouteLive(transportPeerId: string): boolean {
+    if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
+      return this.connections.has(transportPeerId)
+        && Boolean(this.relay && this.relay.connectedRelayCount > 0);
+    }
+    const owner = this.roomForTransport(transportPeerId);
+    return Boolean(owner.room?.getPeers()[owner.rawId]);
   }
 
   /**
@@ -1955,16 +1974,15 @@ public improvablePeerIds(): string[] {
       // Both call sites verify the identity-proof signature before this point,
       // so a second handshake for a connected identity comes from the genuine
       // identity holder re-connecting. If the existing route is provably ALIVE
-      // at its room level, this is the SAME participant discovered through the
-      // other signalling family: keep the incumbent (deterministic, no
-      // flapping) and let the caller drop the duplicate. A dead or zombie
-      // route - lost leave events, vanished trystero peers - has no live room
-      // peer and is retired below exactly as before, so lost-leave recovery
-      // is unchanged.
+      // through its actual owner, this is the SAME participant discovered
+      // through the other signalling family: keep the incumbent
+      // (deterministic, no flapping) and let the caller drop the duplicate. A
+      // dead or zombie route - lost leave events, vanished Trystero peers, or
+      // an emergency relay with no locally verified path - is retired below
+      // exactly as before, so lost-leave recovery is unchanged.
       const existing = this.connections.get(activeTransport);
-      const activeOwner = this.roomForTransport(activeTransport);
-      const roomPeerAlive = Boolean(activeOwner.room?.getPeers()[activeOwner.rawId]);
-      if (existing && roomPeerAlive && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
+      const routeLive = this.isTransportRouteLive(activeTransport);
+      if (existing && routeLive && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
         throw new DuplicateSignallingPeerError(identity.peerId);
       }
       this.retireIdentityRoute(activeTransport);
@@ -1993,7 +2011,8 @@ public improvablePeerIds(): string[] {
    * dual-path handshake in favour of the route that completed last.
    */
   private retireIdentityRoute(transportPeerId: string): void {
-    try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* best effort */ }
+    const owner = this.roomForTransport(transportPeerId);
+    try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* best effort */ }
     this.pendingHandshakes.delete(transportPeerId);
     this.takePendingInboundFrames(transportPeerId);
     const connection = this.connections.get(transportPeerId);

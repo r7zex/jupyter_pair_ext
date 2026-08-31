@@ -59,7 +59,12 @@ import {
   validateProjectName,
 } from '../src/core/types';
 import { decodeFrame, encodeFrame, MAX_WIRE_FRAME_BYTES, MAX_WIRE_HEADER_BYTES } from '../src/core/wire';
-import { MeshTransport, TRYSTERO_RELAY_URLS, TRYSTERO_TURN_SERVERS } from '../src/runtime/mesh';
+import {
+  DUPLICATE_HANDSHAKE_WINDOW_MS,
+  MeshTransport,
+  TRYSTERO_RELAY_URLS,
+  TRYSTERO_TURN_SERVERS,
+} from '../src/runtime/mesh';
 import { createInMemoryTrysteroFactory, resetInMemoryTrystero } from './support/in_memory_trystero';
 
 const notebook: NotebookSnapshot = {
@@ -944,6 +949,72 @@ describe('repair regressions', () => {
     assert.equal((transport as any).connections.has(candidateTransportId), false);
     assert.equal((transport as any).pendingHandshakes.has(candidateTransportId), false);
     assert.equal(candidateClosed, 1);
+  });
+
+  it('keeps a fresh emergency relay route during late duplicate signalling', () => {
+    const transport = new MeshTransport({
+      sessionId: 'relay-owner-live', token: 'relay-owner-live-token-that-is-long-enough',
+      localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+    });
+    const relayTransportId = 'relay:remote';
+    const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+    const connection = {
+      transportPeerId: relayTransportId, identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    };
+    let primaryRoomLookups = 0;
+    (transport as any).connections.set(relayTransportId, connection);
+    (transport as any).identityToTransport.set(identity.peerId, relayTransportId);
+    (transport as any).relay = { connectedRelayCount: 1 };
+    (transport as any).room = {
+      getPeers: () => {
+        primaryRoomLookups += 1;
+        return {};
+      },
+    };
+
+    assert.throws(
+      () => (transport as any).assertPeerCanJoin(identity, 'late-direct-peer'),
+      /already connected through another signalling family/i,
+    );
+    assert.equal((transport as any).identityToTransport.get(identity.peerId), relayTransportId);
+    assert.equal((transport as any).connections.get(relayTransportId), connection);
+    assert.equal(primaryRoomLookups, 0, 'relay liveness must not consult the primary Trystero room');
+  });
+
+  it('replaces a stale or locally unavailable relay route without closing a room peer', () => {
+    for (const scenario of [
+      { name: 'stale', connectedRelayCount: 1, lastSeen: Date.now() - DUPLICATE_HANDSHAKE_WINDOW_MS - 1 },
+      { name: 'unavailable', connectedRelayCount: 0, lastSeen: Date.now() },
+    ]) {
+      const transport = new MeshTransport({
+        sessionId: `relay-owner-${scenario.name}`,
+        token: `relay-owner-${scenario.name}-token-that-is-long-enough`,
+        localPeer: { peerId: 'self', displayName: 'Self', joinOrder: 0 },
+        hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'self' }), isHost: () => true,
+      });
+      const relayTransportId = 'relay:remote';
+      const identity = { peerId: 'remote', displayName: 'Remote', joinOrder: 1 };
+      let primaryRoomLookups = 0;
+      (transport as any).connections.set(relayTransportId, {
+        transportPeerId: relayTransportId, identity, purpose: 'runtime',
+        connectedAt: Date.now(), lastSeen: scenario.lastSeen, snapshotRequested: false,
+      });
+      (transport as any).identityToTransport.set(identity.peerId, relayTransportId);
+      (transport as any).relay = { connectedRelayCount: scenario.connectedRelayCount };
+      (transport as any).room = {
+        getPeers: () => {
+          primaryRoomLookups += 1;
+          return {};
+        },
+      };
+
+      assert.deepEqual((transport as any).assertPeerCanJoin(identity, 'replacement-direct-peer'), identity);
+      assert.equal((transport as any).identityToTransport.has(identity.peerId), false, scenario.name);
+      assert.equal((transport as any).connections.has(relayTransportId), false, scenario.name);
+      assert.equal(primaryRoomLookups, 0, `${scenario.name} relay retirement must not touch a room peer`);
+    }
   });
 
   it('ignores a retired queue rejection after the candidate transport id is reused', async () => {
