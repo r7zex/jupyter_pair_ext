@@ -93,7 +93,7 @@ Trystero topic strategy built on MQTT.js.
 | NET-P0-001 | P0 | BLOCKED | Architecture / connectivity | HIGH |
 | NET-P0-002 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / connectivity | CONFIRMED |
 | NET-P0-003 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / bootstrap | CONFIRMED |
-| NET-P1-001 | P1 | OPEN | Architecture / route coverage | CONFIRMED |
+| NET-P1-001 | P1 | BLOCKED | Architecture / route coverage | CONFIRMED |
 | NET-P1-002 | P1 | OPEN | Product bug / observability | CONFIRMED |
 | NET-P1-003 | P1 | INVESTIGATING | Product bug / reconnect | MEDIUM |
 | NET-P1-004 | P1 | OPEN | Product bug / compatibility UX | CONFIRMED |
@@ -373,7 +373,7 @@ Physical validation: NOT RUN
 
 ## NET-P1-001 — No built-in TURN route for restrictive NAT combinations
 
-Status: OPEN
+Status: BLOCKED
 
 Priority: P1
 
@@ -424,6 +424,19 @@ Make an explicit product decision: operate a credentialed production TURN servic
 safe credential rotation, or document TURN as optional only after NET-P0-001 supplies a
 reliable full-data route. Do not restore dead anonymous demo credentials.
 
+External blocker:
+
+- No product-owned TURN endpoint, credential issuer, TLS/port deployment, abuse control,
+  monitoring, budget, or rotation mechanism exists in the supplied repository or task
+  scope.
+- The current product text already declares TURN optional, `DEFAULT_TURN_URLS` and
+  `TRYSTERO_TURN_SERVERS` are empty, and custom passwords stay in VS Code secret storage.
+- Adding an anonymous public endpoint or embedding static credentials would create an
+  unowned availability/security dependency and violate the acceptance criteria.
+- Unblocking requires an explicit operator decision plus a deployed credentialed TURN
+  service and controlled two-network test environment. This authority and infrastructure
+  were not supplied.
+
 Regression test:
 
 With a controlled test TURN service, verify a relay candidate and data-channel round trip
@@ -437,7 +450,17 @@ Acceptance criteria:
 - direct WebRTC remains preferred;
 - physical restrictive-NAT coverage is recorded honestly.
 
-Fixed by commit:
+Software validation:
+
+- `npm test -- --grep TURN`: PASS, 13 tests on 2026-08-31; compile/bundle PASS in its
+  first phase.
+- Existing tests confirm empty built-in TURN, sanitized custom configuration, endpoint
+  parsing/probing, and direct-first ordering.
+- Controlled TURN relay-candidate/data-channel test: NOT RUN; no controlled service was
+  supplied.
+- No production code change was made for this externally blocked issue.
+
+Fixed by commit: NOT FIXED — external infrastructure/product decision required
 
 Physical validation: NOT RUN
 
@@ -865,36 +888,35 @@ Physical validation: NOT RUN
 
 ## NEXT ACTION
 
-Next issue: `NET-P1-001 — No built-in TURN route for restrictive NAT combinations`.
+Next issue: `NET-P1-002 — Signalling health is reported from object existence, not endpoint state`.
 
-Established root cause: TURN is currently an optional operator-supplied capability. The
-repository has no product-owned service, credentials, or rotation mechanism, and anonymous
-demo TURN credentials must not be restored. A code-only change cannot create a production
-TURN guarantee.
+Established root cause: `activeSignallingFamilies()` treats allocated Trystero/MQTT room
+objects as active signalling even when no endpoint has connected, subscribed, published,
+or discovered a peer. Secondary signalling errors are not retained as sanitized state.
 
 Files to inspect/change:
 
-- `src/runtime/turn.ts`
 - `src/runtime/mesh.ts`
-- `package.json`
-- current README/configuration text
+- `src/runtime/mqttRoom.ts`
+- `src/runtime/diagnostics.ts`
+- related network/diagnostics tests
 
 Required implementation shape:
 
-1. confirm that no deployable credentialed TURN service exists in the supplied scope;
-2. preserve direct-first behavior and reject dead anonymous credentials;
-3. record the external infrastructure/product-decision blocker precisely;
-4. if blocked, continue to the next fixable P1 without claiming TURN coverage.
+1. model bounded sanitized signalling lifecycle state per family;
+2. make `active` require evidence beyond room object existence;
+3. retain useful connection/subscription/publication/discovery failures without secrets;
+4. expose the state through diagnostics and add deterministic transition/redaction tests.
 
 Commands after the focused fix:
 
 ```text
-rg -n "DEFAULT_TURN_URLS|TRYSTERO_TURN_SERVERS|turnUrls|turnUsername" src package.json README.md
-npm test -- --grep "TURN"
+rg -n "activeSignallingFamilies|startSecondarySignalling|networkDiagnostics|onJoinError" src test
+npm test -- --grep "signalling|diagnostics"
 ```
 
-Do not add a public TURN endpoint or credentials without an operated service, rotation
-plan, and explicit user-provided authority.
+Keep endpoint URLs useful where already public configuration, but never expose room topics,
+session tokens, identity keys, credentials, raw SDP, or unsanitized exception text.
 
-Last safe pushed fix state: `0aac1f5` on
+Last safe pushed state: `04a1d15` on
 `origin/codex/networking-root-cause-repair`.
