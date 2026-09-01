@@ -95,6 +95,8 @@ Trystero topic strategy built on MQTT.js.
 | NET-P0-001 | P0 | BLOCKED | Architecture / connectivity | HIGH |
 | NET-P0-002 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / connectivity | CONFIRMED |
 | NET-P0-003 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / bootstrap | CONFIRMED |
+| NET-P0-004 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / relay handshake | CONFIRMED |
+| NET-P0-005 | P0 | NEEDS-PHYSICAL-VALIDATION | Product bug / relay ordering | CONFIRMED |
 | NET-P1-001 | P1 | BLOCKED | Architecture / route coverage | CONFIRMED |
 | NET-P1-002 | P1 | NEEDS-PHYSICAL-VALIDATION | Product bug / observability | CONFIRMED |
 | NET-P1-003 | P1 | NEEDS-PHYSICAL-VALIDATION | Product bug / reconnect | CONFIRMED |
@@ -370,6 +372,130 @@ Software validation:
 - Target two-physical-computer Host-on-VPN scenario: NOT RUN.
 
 Fixed by commits: `356df91`, `0aac1f5`
+
+Physical validation: NOT RUN
+
+## NET-P0-004 — Emergency relay admission can complete on only one peer
+
+Status: NEEDS-PHYSICAL-VALIDATION
+
+Priority: P0
+
+Observed symptom:
+
+One participant can report a live authenticated `relay:<peerId>` route while the other
+participant never reports the corresponding route, leaving discovery or route improvement
+waiting until a later negotiation retry.
+
+Evidence:
+
+- [A, pre-fix] Each side sent its signed relay handshake proof once, then deleted the
+  negotiation immediately after receiving and validating the remote proof. Receiving the
+  remote proof did not establish that the local proof reached the remote peer.
+- [B, pre-fix] The release gate reproduced asymmetric state: Host reported Guest online
+  through Relay while Guest had no Host route, and the make-before-break fixture timed out.
+- [A, fixed] The negotiation retains its exact local proof until admission. After validating
+  the remote proof, it replays the already transcript-bound proof once before deleting the
+  negotiation. The replay is best-effort and cannot revoke otherwise valid local admission.
+- [B] A deterministic regression deliberately withholds the first local proof, admits one
+  side with the remote proof, delivers only the post-admission replay, and proves that both
+  peers obtain authenticated routes.
+
+Relevant files and symbols:
+
+- `src/runtime/mesh.ts`: `RelayNegotiation`, `advanceRelayHandshake()`
+- `test/network.test.ts`: one-sided proof-loss regression
+- `test/routeOptimization.test.ts`: bounded relay/admission diagnostics
+
+Root cause:
+
+The two-round signed relay handshake had no final convergence step. A one-way loss of the
+last proof could therefore make admission asymmetric even though every accepted proof was
+cryptographically valid.
+
+Confidence: CONFIRMED
+
+Implemented fix:
+
+Retain and replay the exact signed local proof once after validating the remote proof. The
+protocol-version gate, transcript binding, identity-key verification, replay protection,
+and route ownership checks remain unchanged.
+
+Acceptance criteria:
+
+- dropping the first final proof does not leave admission permanently one-sided;
+- both sides still verify the complete protocol-v4 transcript and identity signature;
+- duplicate replayed proofs are harmless after negotiation state is released;
+- emergency relay and route-improvement tests remain bounded and stable.
+
+Software validation:
+
+- Deterministic one-sided proof-loss regression: PASS on 2026-09-01.
+- Make-before-break suite: PASS in three consecutive post-fix runs, 15/15 tests.
+- `npm run lint`: PASS on 2026-09-01.
+
+Fixed by commit: `e20fe7c` (`fix(network): replay relay proof after admission`)
+
+Physical validation: NOT RUN
+
+## NET-P0-005 — Emergency Nostr publication can reorder snapshot frames
+
+Status: NEEDS-PHYSICAL-VALIDATION
+
+Priority: P0
+
+Observed symptom:
+
+A relay-only snapshot can fail with a chunk arriving before its start frame, or with a
+manifest chunk arriving after the receiver has already processed the manifest end frame.
+
+Evidence:
+
+- [B, pre-fix] The full release gate reproduced both invalid orderings independently:
+  `Snapshot chunk arrived without a start frame` and
+  `Snapshot manifest chunk arrived outside a chunked manifest`.
+- [A, pre-fix] Sequential frames invoked asynchronous `publish()` calls without awaiting
+  the preceding call. Nostr event construction performs asynchronous Schnorr signing, so a
+  later event could be written to the relay socket first.
+- [A, fixed] A per-relay promise tail serializes event construction and publication in the
+  same order accepted by `send()`, including queued frames flushed after reconnect.
+- [B] A deterministic regression delays the first publication and verifies that the second
+  cannot overtake it.
+
+Relevant files and symbols:
+
+- `src/runtime/nostrRelay.ts`: `publishTail`, `queuePublish()`, `publish()`
+- `test/relay.test.ts`: asynchronous publication-order regression
+- `test/runtime.integration.test.ts`: relay-only complete snapshot bootstrap
+
+Root cause:
+
+Fire-and-forget event publication preserved call order but not completion order. Concurrent
+asynchronous signing therefore violated the ordered-frame assumption of the snapshot
+protocol even though each individual event was valid and authenticated.
+
+Confidence: CONFIRMED
+
+Implemented fix:
+
+Serialize Nostr data-event signing and socket publication while keeping failures isolated
+so one rejected event cannot poison the queue. Recheck relay availability after signing to
+avoid sending a completed stale event after shutdown or route loss.
+
+Acceptance criteria:
+
+- sequential frames are published in their original order despite unequal signing latency;
+- a single publication failure does not block later queued publications;
+- relay-only chunked snapshot bootstrap completes without protocol-order exceptions;
+- the existing Nostr relay security and lifecycle tests continue to pass.
+
+Software validation:
+
+- Emergency Nostr data-relay suite: PASS, 13/13 tests on 2026-09-01.
+- Relay-only complete snapshot bootstrap: PASS in five consecutive post-fix runs, 5/5.
+- `npm run lint`: PASS on 2026-09-01.
+
+Fixed by commit: `e8dd0a8` (`fix(network): preserve emergency relay frame order`)
 
 Physical validation: NOT RUN
 
@@ -997,6 +1123,6 @@ TUN, guest on the remote network, invoke Reconnect after a route change, confirm
 sanitized signalling-refresh diagnostic, and verify snapshot/runtime continuity plus
 bidirectional edits. Until that run, its physical validation remains NOT RUN.
 
-Last confirmed pushed state: `a67ec86` on
-`origin/codex/networking-root-cause-repair`. NET-P1-002 and NET-P1-003 commits remain local
-because exporting them to origin requires separate explicit authorization.
+Release target: Pair Notebook `0.5.7`. The NET-P1-002 and NET-P1-003 implementation and
+evidence commits are included in the release candidate; their exact two-computer physical
+validation remains pending as recorded above.

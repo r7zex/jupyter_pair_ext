@@ -1,10 +1,17 @@
 # Changelog
 
-## 0.5.7 - 2026-08-31 (paused-session control)
+## 0.5.7 - 2026-09-01 (network recovery and paused-session control)
 
 - Lets the current host transfer the role to another online participant while the session is paused for host-folder selection. The next host remains paused and must still materialize or verify a folder before normal collaboration resumes.
 - Lets the current host end the session without choosing a new shared folder. Final merged state and an authenticated termination marker are retained in the extension-owned working copies instead of forcing an arbitrary shared-folder choice.
 - Exposes **Transfer Host** and **End Session** directly in the host-folder prompt and pause card, while keeping persistence, invitations, and notebook execution blocked until storage is ready.
+- Preserves a fresh authenticated emergency-relay route when late or duplicate signalling arrives, while still allowing stale or unavailable relay routes to be replaced safely.
+- Replays the authenticated relay proof once after local admission so losing the first final proof cannot leave only one participant connected.
+- Serializes emergency Nostr event signing and publication so snapshot control frames and chunks cannot overtake one another on relay-only routes.
+- Resumes the initial project snapshot after an authenticated route replacement. Completed hash-verified files are retained, partial files restart under a new generation, and delayed frames from the old generation cannot complete or corrupt the transfer.
+- Reports Nostr and MQTT signalling health only after fresh protocol evidence (`EOSE`/`OK` and `SUBACK`/`PUBACK`) and exposes bounded, sanitized endpoint and failure state without revealing URLs, credentials, topics, identities, or SDP.
+- Makes **Reconnect** replace half-open Nostr/MQTT sockets through a bounded single-flight refresh while preserving live Trystero rooms, WebRTC routes, admitted identities, queues, and session state. Late acknowledgements from replaced socket generations are ignored.
+- Adds deterministic coverage for relay ownership, relay-only and route-replaced snapshot bootstrap, signalling health, stale acknowledgements, partial refresh, and session continuity. The exact two-computer Karing TUN scenario remains pending physical validation, and this release does not add product-owned TURN or rendezvous infrastructure.
 
 ## 0.5.6 - 2026-08-30 (security hardening and audited release)
 
