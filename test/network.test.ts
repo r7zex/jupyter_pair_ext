@@ -1073,6 +1073,88 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
+  it('replays the local relay proof after one-sided admission', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };
+    const host = new MeshTransport({
+      sessionId: 'relay-proof-replay', token: 'relay-proof-replay-token-that-is-long-enough',
+      localPeer: { peerId: 'a-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true,
+    });
+    const guest = new MeshTransport({
+      sessionId: 'relay-proof-replay', token: 'relay-proof-replay-token-that-is-long-enough',
+      localPeer: { peerId: 'z-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => clock, isHost: () => false,
+    });
+    type Handshake = {
+      peer: { peerId: string; displayName: string; joinOrder: number; identityKey?: string | undefined };
+    };
+    type Negotiation = { localHs: Handshake; localProof?: unknown; timeout: NodeJS.Timeout };
+    type RelayInternals = {
+      relay: unknown;
+      localHandshake: () => Handshake;
+      considerRelayFallback: (peerId: string) => void;
+      createSignedRelayEnvelope: (peerId: string, payload: Record<string, unknown>) => Buffer;
+      handleRelayData: (peerId: string, bytes: Buffer) => void;
+      relayNegotiations: Map<string, Negotiation>;
+    };
+    const hostInternals = host as unknown as RelayInternals;
+    const guestInternals = guest as unknown as RelayInternals;
+    const hostSends: Buffer[] = [];
+    const fakeRelay = (sends: Buffer[]) => ({
+      connectedRelayCount: 1,
+      onFrame: () => undefined,
+      onPeerAnnounce: () => undefined,
+      start: () => undefined,
+      stop: () => undefined,
+      sendAnnounce: () => undefined,
+      send: (bytes: Buffer) => sends.push(Buffer.from(bytes)),
+    });
+    const relayKind = (bytes: Buffer): string | undefined => {
+      const envelope = JSON.parse(bytes.toString('utf8')) as { payload?: { k?: string } };
+      return envelope.payload?.k;
+    };
+    hostInternals.relay = fakeRelay(hostSends);
+    guestInternals.relay = fakeRelay([]);
+    host.connect(guestInternals.localHandshake().peer);
+    guest.connect(hostInternals.localHandshake().peer);
+
+    try {
+      hostInternals.considerRelayFallback('z-guest');
+      guestInternals.considerRelayFallback('a-host');
+      const hostNegotiation = hostInternals.relayNegotiations.get('z-guest');
+      const guestNegotiation = guestInternals.relayNegotiations.get('a-host');
+      assert.ok(hostNegotiation);
+      assert.ok(guestNegotiation);
+      hostInternals.handleRelayData('z-guest', guestInternals.createSignedRelayEnvelope('a-host', {
+        k: 'hs', hs: guestNegotiation.localHs,
+      }));
+      guestInternals.handleRelayData('a-host', hostInternals.createSignedRelayEnvelope('z-guest', {
+        k: 'hs', hs: hostNegotiation.localHs,
+      }));
+      assert.ok(hostNegotiation?.localProof);
+      assert.ok(guestNegotiation?.localProof);
+      const proofsBeforeAdmission = hostSends.filter((bytes) => relayKind(bytes) === 'pr').length;
+
+      // Guest's proof reaches Host, but Host's first proof is deliberately not
+      // delivered. Host admission must emit one authenticated replay.
+      hostInternals.handleRelayData('z-guest', guestInternals.createSignedRelayEnvelope('a-host', {
+        k: 'pr', pr: guestNegotiation.localProof,
+      }));
+      assert.equal(host.hasRoute('z-guest'), true);
+      const proofSends = hostSends.filter((bytes) => relayKind(bytes) === 'pr');
+      assert.equal(proofSends.length, proofsBeforeAdmission + 1);
+
+      const replay = proofSends.at(-1);
+      assert.ok(replay);
+      guestInternals.handleRelayData('a-host', replay);
+      assert.equal(guest.hasRoute('a-host'), true);
+    } finally {
+      await host.stop();
+      await guest.stop();
+    }
+  });
+
   it('expires stale relay state after a lost handshake or proof and retries with a fresh nonce', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'a-host' };

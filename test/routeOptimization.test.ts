@@ -38,6 +38,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: () => string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message())), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 describe('make-before-break route optimization', function () {
   this.timeout(60_000);
 
@@ -139,7 +157,10 @@ describe('make-before-break route optimization', function () {
     (guest as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('host-mbb');
     await sleep(50);
     (host as unknown as { considerRelayFallback: (id: string) => void }).considerRelayFallback('guest-mbb');
-    await connected;
+    await withTimeout(connected, 20_000, () => (
+      `relay peers did not connect; host=${JSON.stringify(host.peerRuntime())}; `
+      + `guest=${JSON.stringify(guest.peerRuntime())}`
+    ));
 
     return {
       host,
@@ -197,7 +218,10 @@ describe('make-before-break route optimization', function () {
 
       // Wait out stability window + required pings (3s window, 1s ticks).
       const promoted = new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('promotion did not happen')), 25_000);
+        const timer = setTimeout(() => reject(new Error(
+          `promotion did not happen; statuses=${events.map((event) => event.status).join(',')}; `
+          + `active=${JSON.stringify(two.host.activeRouteUpgrades())}`,
+        )), 25_000);
         two.host.on('routeChanged', () => { clearTimeout(timer); resolve(); });
       });
       await promoted;
@@ -244,11 +268,19 @@ describe('make-before-break route optimization', function () {
 
   it('refuses to optimize an already-direct route', async () => {
     const two = await connectTwoPeersOverRelay(supportModule.createInMemoryTrysteroFactory());
+    const events: Array<{ status: string }> = [];
     try {
+      two.host.on('routeUpgradeStatus', (state: { status: string }) => events.push(state));
       assert.equal(two.host.tryImproveRoute('host-mbb'), false);
       assert.equal(two.host.improvablePeerIds().includes('guest-mbb'), true);
       // After a successful promotion there is nothing left to improve.
-      const promoted = new Promise<void>((resolve) => two.host.once('routeChanged', resolve));
+      const promoted = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(
+          `promotion did not happen; statuses=${events.map((event) => event.status).join(',')}; `
+          + `active=${JSON.stringify(two.host.activeRouteUpgrades())}`,
+        )), 25_000);
+        two.host.once('routeChanged', () => { clearTimeout(timer); resolve(); });
+      });
       two.host.tryImproveRoute('guest-mbb');
       await promoted;
       assert.equal(two.host.tryImproveRoute('guest-mbb'), false);

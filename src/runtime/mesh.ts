@@ -185,6 +185,7 @@ interface RelayNegotiation {
   localHs: HandshakeMessage;
   sentLocalHs: boolean;
   sentProof: boolean;
+  localProof?: HandshakeProof | undefined;
   remoteHs?: HandshakeMessage | undefined;
   remoteProof?: HandshakeProof | undefined;
   timeout: NodeJS.Timeout;
@@ -2128,9 +2129,14 @@ public improvablePeerIds(): string[] {
       const responder = negotiation.role === 'initiator' ? negotiation.remoteHs : negotiation.localHs;
       const transcript = handshakeTranscript(initiator, responder);
       const signature = signIdentityTranscript(this.identityPrivateKey, transcript);
+      negotiation.localProof = {
+        version: HANDSHAKE_VERSION,
+        signature,
+        transcriptId: handshakeTranscriptId(transcript),
+      };
       this.sendRelayEnvelope(fromPeerId, {
         k: 'pr',
-        pr: { version: HANDSHAKE_VERSION, signature, transcriptId: handshakeTranscriptId(transcript) },
+        pr: negotiation.localProof,
       });
     }
     // Finalize when the remote proof has also arrived.
@@ -2152,6 +2158,18 @@ public improvablePeerIds(): string[] {
     }
     const transportPeerId = RELAY_TRANSPORT_PREFIX + fromPeerId;
     const admittedPeer = this.assertPeerCanJoin(negotiation.remoteHs.peer, transportPeerId);
+    // The remote proof reaching us does not prove that our first proof reached
+    // the remote peer. Replay the exact authenticated proof once before
+    // deleting the negotiation so a one-sided final-packet loss cannot leave
+    // only one participant admitted indefinitely.
+    if (negotiation.localProof) {
+      try {
+        this.sendRelayEnvelope(fromPeerId, { k: 'pr', pr: negotiation.localProof });
+      } catch {
+        // The original proof was already queued successfully. A best-effort
+        // convergence replay must not revoke otherwise valid local admission.
+      }
+    }
     this.pendingHandshakes.set(transportPeerId, {
       version: HANDSHAKE_VERSION,
       sessionId: negotiation.remoteHs.sessionId,
