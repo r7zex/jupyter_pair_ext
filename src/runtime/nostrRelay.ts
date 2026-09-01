@@ -163,6 +163,8 @@ export class NostrFrameRelay implements FrameRelay {
   private readonly deliveredSeqs = new Map<string, number>();
   private readonly seenPacketIds = new Map<string, number>();
   private nextSeq = 1;
+  /** Async Schnorr signing must not reorder sequential relay frames. */
+  private publishTail: Promise<void> = Promise.resolve();
   private housekeepingTimer: NodeJS.Timeout | undefined;
   private readonly outbox: QueuedPayload[] = [];
   private outboxBytes = 0;
@@ -258,7 +260,7 @@ export class NostrFrameRelay implements FrameRelay {
   /** Publishes an announce so other session members can discover this peer via relay. */
   sendAnnounce(): void {
     this.announced = true;
-    void this.publish({
+    this.queuePublish({
       t: 'a',
       f: this.options.localPeerId,
       d: createRelayAnnounceProof(this.key, this.options.sessionId, this.options.localPeerId),
@@ -307,19 +309,27 @@ export class NostrFrameRelay implements FrameRelay {
       this.outboxBytes += addedBytes;
       return;
     }
-    for (const payload of payloads) void this.publish(payload);
+    for (const payload of payloads) this.queuePublish(payload);
   }
 
   private flushOutbox(): void {
     if (this.outbox.length === 0) return;
     const queued = this.outbox.splice(0);
     this.outboxBytes = 0;
-    for (const entry of queued) void this.publish(entry.payload);
+    for (const entry of queued) this.queuePublish(entry.payload);
+  }
+
+  private queuePublish(payload: unknown): void {
+    const publication = this.publishTail.then(() => this.publish(payload));
+    // Keep the queue usable after an isolated signing failure and ensure the
+    // fire-and-forget relay API never creates an unhandled rejection.
+    this.publishTail = publication.catch(() => undefined);
   }
 
   private async publish(payload: unknown): Promise<void> {
     if (this.stopped || this.openSockets.size === 0) return;
     const event = await buildEvent(payload, { topic: this.topic, kind: this.kind }, this.privateKey);
+    if (this.stopped || this.openSockets.size === 0) return;
     const wire = JSON.stringify(['EVENT', event]);
     for (const socket of this.openSockets) {
       try { socket.send(wire); } catch { /* reconnect logic handles it */ }

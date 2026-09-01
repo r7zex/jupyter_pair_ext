@@ -108,6 +108,29 @@ describe('emergency Nostr data relay', function () {
     b.stop();
   });
 
+  it('preserves publication order across asynchronous signing work', async () => {
+    const relay = buildRelay('publish-order');
+    const internals = relay as unknown as {
+      publish: (payload: unknown) => Promise<void>;
+      publishTail: Promise<void>;
+      queuePublish: (payload: unknown) => void;
+    };
+    const published: number[] = [];
+    internals.publish = async (payload: unknown) => {
+      const sequence = (payload as { sequence: number }).sequence;
+      if (sequence === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      published.push(sequence);
+    };
+
+    internals.queuePublish({ sequence: 1 });
+    internals.queuePublish({ sequence: 2 });
+    await internals.publishTail;
+
+    assert.deepEqual(published, [1, 2]);
+  });
+
   it('keeps payloads opaque: the hub never sees plaintext', async () => {
     seenEvents = [];
     const needle = 'TOPSECRET-PLAINTEXT-MARKER';
