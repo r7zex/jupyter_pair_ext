@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import * as Y from 'yjs';
 import { relativePathsNested } from './projectPath';
@@ -9,6 +10,11 @@ export interface TextChange {
   offset: number;
   deleteCount: number;
   insertText: string;
+}
+
+export interface CellTextState {
+  source: string;
+  revision: string;
 }
 
 export interface OutputItemSnapshot {
@@ -292,7 +298,10 @@ export class CollaborativeProject extends EventEmitter {
           const source = new Y.Text();
           if (cell.source) source.insert(0, cell.source);
           map.set('source', source);
+          map.set('textRevision', newId());
           data.set(cell.id, map);
+        } else if (!validCellTextRevision(map.get('textRevision'))) {
+          map.set('textRevision', newId());
         }
         map.set('id', cell.id);
         map.set('kind', cell.kind);
@@ -304,6 +313,7 @@ export class CollaborativeProject extends EventEmitter {
         if (source.toString() !== cell.source) {
           if (source.length) source.delete(0, source.length);
           if (cell.source) source.insert(0, cell.source);
+          map.set('textRevision', newId());
         }
       }
 
@@ -328,13 +338,21 @@ export class CollaborativeProject extends EventEmitter {
     changes: readonly TextChange[],
     origin = LOCAL_EDITOR_ORIGIN,
   ): void {
-    const source = this.cellSource(key, cellId);
+    const doc = this.ensureNotebook(key);
+    const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
+    const source = map?.get('source');
+    if (!map || !(source instanceof Y.Text)) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const ordered = validatedTextChanges(changes, source.toString(), MAX_CELL_SOURCE_BYTES, `${key} cell ${cellId}`);
-    source.doc?.transact(() => {
+    const changesText = ordered.some((change) => change.deleteCount > 0 || change.insertText.length > 0);
+    if (!changesText) return;
+    doc.transact(() => {
       for (const change of ordered) {
         if (change.deleteCount) source.delete(change.offset, change.deleteCount);
         if (change.insertText) source.insert(change.offset, change.insertText);
       }
+      // Canonical text revision is updated only with cell-text mutations.
+      // Output, execution and metadata transactions never touch it.
+      map.set('textRevision', newId());
     }, withScope(origin, { type: 'cellText', cellId }));
   }
 
@@ -344,6 +362,19 @@ export class CollaborativeProject extends EventEmitter {
     const source = map?.get('source');
     if (!(source instanceof Y.Text)) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     return source;
+  }
+
+  public cellTextState(key: string, cellId: string): CellTextState {
+    const doc = this.ensureNotebook(key);
+    const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
+    const source = map?.get('source');
+    if (!map || !(source instanceof Y.Text)) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
+    const value = source.toString();
+    const stored = map.get('textRevision');
+    const revision = validCellTextRevision(stored)
+      ? stored
+      : `legacy-${createHash('sha256').update(cellId, 'utf8').update('\0').update(value, 'utf8').digest('hex').slice(0, 32)}`;
+    return { source: value, revision };
   }
 
   public setCellOutputs(
@@ -771,6 +802,10 @@ function boundedSource(value: string): string {
     throw new Error('Notebook cell exceeds the source-size limit after collaborative merging.');
   }
   return value;
+}
+
+function validCellTextRevision(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 }
 
 function isValidCellId(value: unknown): value is string {

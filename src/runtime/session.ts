@@ -298,6 +298,15 @@ interface CompletedExecutionReceipt {
   timer: NodeJS.Timeout;
 }
 
+interface LightweightExecutionRequest {
+  notebookKey: string;
+  cellId: string;
+  executorId: string;
+  computeEpoch: number;
+  cellRevision: string;
+  cellDigest: string;
+}
+
 interface ExecutionManifest {
   documents: Record<string, string>;
   binaries: Record<string, BinaryFileVersion>;
@@ -1035,6 +1044,22 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (executorId === this.descriptor.localPeer.peerId) {
       return this.executeLocally(notebookKey, target, requestId, code, onEvent);
     }
+    if (executorId !== this.coordinator.clock.hostId) {
+      throw new Error('Guest execution is pinned to the current Session Host.');
+    }
+    if (!PEER_ID_PATTERN.test(cellId) || !this.project.hasNotebookCell(notebookKey, cellId)) {
+      throw new Error('The requested collaborative cell is not available in canonical CRDT state.');
+    }
+    const cellState = this.project.cellTextState(notebookKey, cellId);
+    const cellDigest = canonicalCellTextDigest(cellState.source);
+    const request: LightweightExecutionRequest = {
+      notebookKey,
+      cellId,
+      executorId,
+      computeEpoch: target.epoch,
+      cellRevision: cellState.revision,
+      cellDigest,
+    };
     this.transition('executing', `Requesting host execution for ${notebookKey} on ${executorId}.`);
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1060,18 +1085,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         executorId,
         {
           requestId,
-          notebookKey,
-          cellId,
-          target,
-          // The host is the sole executor. Live CRDT cell text is already sent
-          // independently of disk persistence, so a normal Run Cell request
-          // must not block behind a full project filesystem barrier.
+          ...request,
           fastPath: true,
-          documentManifest: {},
-          binaryManifest: {},
-          directoryManifest: [],
         },
-        Buffer.from(code, 'utf8'),
+        new Uint8Array(),
       ).catch((error) => {
         const pending = this.pendingExecutions.get(requestId);
         if (!pending) return;
@@ -4917,20 +4934,34 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.log.appendLine(`[debug] Could not reject execution ${requestId}: ${formatError(error)}`);
       }
     };
-    const target = normalizeComputeTarget(frame.meta.target, sourceId);
+
     const fastPath = frame.meta.fastPath === true;
-    const cellId = String(frame.meta.cellId ?? '');
-    const manifest = normalizeExecutionManifest({
+    const lightweight = fastPath ? normalizeLightweightExecutionRequest(frame.meta) : undefined;
+    const legacyTarget = fastPath ? undefined : normalizeComputeTarget(frame.meta.target, sourceId);
+    const legacyManifest = fastPath ? undefined : normalizeExecutionManifest({
       documents: frame.meta.documentManifest,
       binaries: frame.meta.binaryManifest,
       directories: frame.meta.directoryManifest,
     }, sourceId);
-    if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target || !manifest
-      || (fastPath && !PEER_ID_PATTERN.test(cellId))) {
+
+    if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey
+      || (fastPath
+        ? !lightweight
+          || lightweight.notebookKey !== notebookKey
+          || frame.payload.byteLength !== 0
+          || frame.meta.target !== undefined
+          || frame.meta.documentManifest !== undefined
+          || frame.meta.binaryManifest !== undefined
+          || frame.meta.directoryManifest !== undefined
+        : !legacyTarget || !legacyManifest)) {
       rejectRequest('InvalidExecutionRequest', 'The remote execution request is malformed.');
       return;
     }
-    const requestDigest = remoteExecutionRequestDigest(notebookKey, target, manifest, frame.payload);
+
+    const requestDigest = fastPath
+      ? lightweightExecutionRequestDigest(lightweight!)
+      : legacyRemoteExecutionRequestDigest(notebookKey, legacyTarget!, legacyManifest!, frame.payload);
+
     const completed = this.completedRemoteExecutions.get(requestId);
     if (completed) {
       if (completed.sourceId === sourceId && completed.requestDigest === requestDigest) {
@@ -4946,23 +4977,54 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (activeOwner.peerId === sourceId && activeOwner.requestDigest === requestDigest) {
         this.deliverActiveRemoteExecution(requestId);
       } else {
-        rejectRequest('ExecutionBusy', 'The execution request id is already active.');
+        rejectRequest('ExecutionBusy', 'The execution request id is already active with different request identity.');
       }
       return;
     }
+
     const expectedTarget = this.computeForNotebook(notebookKey);
-    if (target.executorId !== this.descriptor.localPeer.peerId || !sameComputeTarget(target, expectedTarget)) {
-      rejectRequest('ComputeTargetChanged', 'Compute target changed before the execution request arrived.');
-      return;
-    }
-    const targetError = this.computeTargetAvailabilityError(target);
-    if (targetError) {
-      rejectRequest(computeAvailabilityErrorName(targetError), targetError);
-      return;
-    }
-    const authorizationKey = barrierAuthorizationKey(sourceId, requestId);
-    const authorization = this.completedExecutionBarriers.get(authorizationKey);
-    if (!fastPath) {
+    let target: NotebookComputeTarget;
+    let code: string;
+    let materializeWorkspace: boolean;
+
+    if (fastPath) {
+      const request = lightweight!;
+      if (request.executorId !== this.descriptor.localPeer.peerId
+        || request.executorId !== this.coordinator.clock.hostId
+        || request.computeEpoch !== expectedTarget.epoch
+        || expectedTarget.executorId !== this.descriptor.localPeer.peerId) {
+        rejectRequest('ComputeTargetChanged', 'Compute target changed before the execution request arrived.');
+        return;
+      }
+      target = expectedTarget;
+      if (this.project.kindOf(notebookKey) !== 'notebook'
+        || !this.project.hasNotebookCell(notebookKey, request.cellId)) {
+        rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the host yet.');
+        return;
+      }
+      const canonical = this.project.cellTextState(notebookKey, request.cellId);
+      const hostDigest = canonicalCellTextDigest(canonical.source);
+      if (canonical.revision !== request.cellRevision || hostDigest !== request.cellDigest) {
+        rejectRequest('CellStateChanged', 'Canonical cell text changed before the execution request arrived.');
+        return;
+      }
+      if (Buffer.byteLength(canonical.source, 'utf8') > MAX_REMOTE_EXECUTION_CODE_BYTES) {
+        rejectRequest('InvalidExecutionRequest', 'The canonical remote code cell exceeds the execution-size limit.');
+        return;
+      }
+      // The host executes only its own canonical CRDT cell text. No guest code
+      // payload, filesystem mtime or editor-save state is an execution source.
+      code = canonical.source;
+      materializeWorkspace = false;
+    } else {
+      target = legacyTarget!;
+      const manifest = legacyManifest!;
+      if (target.executorId !== this.descriptor.localPeer.peerId || !sameComputeTarget(target, expectedTarget)) {
+        rejectRequest('ComputeTargetChanged', 'Compute target changed before the execution request arrived.');
+        return;
+      }
+      const authorizationKey = barrierAuthorizationKey(sourceId, requestId);
+      const authorization = this.completedExecutionBarriers.get(authorizationKey);
       if (!authorization || authorization.notebookKey !== notebookKey
         || !sameComputeTarget(authorization.target, target)
         || authorization.manifestDigest !== executionManifestDigest(manifest)) {
@@ -4971,20 +5033,59 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       clearTimeout(authorization.timer);
       this.completedExecutionBarriers.delete(authorizationKey);
+
+      if (this.project.kindOf(notebookKey) !== 'notebook') {
+        rejectRequest('InvalidExecutionRequest', 'The requested collaborative notebook does not exist.');
+        return;
+      }
+      if (frame.payload.byteLength > MAX_REMOTE_EXECUTION_CODE_BYTES) {
+        rejectRequest('InvalidExecutionRequest', 'The remote code cell exceeds the execution-size limit.');
+        return;
+      }
+      try {
+        code = new TextDecoder('utf-8', { fatal: true }).decode(frame.payload);
+      } catch {
+        rejectRequest('InvalidExecutionRequest', 'The remote code cell is not valid UTF-8.');
+        return;
+      }
+
+      const missingBinaries = Object.entries(manifest.binaries).filter(([relativePath, version]) => {
+        const local = this.binaryVersions.get(relativePath);
+        return !local || !sameBinaryVersion(local, version);
+      });
+      const extraBinaries = [...this.binaryVersions.keys()].filter((relativePath) => !(relativePath in manifest.binaries));
+      const missingDocuments = Object.entries(manifest.documents).filter(([key, hash]) =>
+        !this.project.has(key) || this.projectDocumentHash(key) !== hash);
+      const extraDocuments = this.project.keys().filter((key) => !(key in manifest.documents));
+      const directoryManifest = new Set(manifest.directories);
+      const missingDirectories = [...directoryManifest].filter((key) => !this.directories.has(key));
+      const extraDirectories = [...this.directories].filter((key) => !directoryManifest.has(key));
+      const mismatch = [
+        ...missingBinaries.map(([key]) => key),
+        ...extraBinaries,
+        ...missingDocuments.map(([key]) => key),
+        ...extraDocuments,
+        ...missingDirectories,
+        ...extraDirectories,
+      ];
+      if (mismatch.length) {
+        this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, {
+          requestId,
+          success: false,
+          content: {
+            status: 'error',
+            ename: 'FileVersionBarrier',
+            evalue: `Executor project barrier mismatch: ${mismatch.join(', ')}`,
+          },
+        });
+        return;
+      }
+      materializeWorkspace = true;
     }
-    if (this.project.kindOf(notebookKey) !== 'notebook') {
-      rejectRequest('InvalidExecutionRequest', 'The requested collaborative notebook does not exist.');
-      return;
-    }
-    if (frame.payload.byteLength > MAX_REMOTE_EXECUTION_CODE_BYTES) {
-      rejectRequest('InvalidExecutionRequest', 'The remote code cell exceeds the execution-size limit.');
-      return;
-    }
-    let code: string;
-    try {
-      code = new TextDecoder('utf-8', { fatal: true }).decode(frame.payload);
-    } catch {
-      rejectRequest('InvalidExecutionRequest', 'The remote code cell is not valid UTF-8.');
+
+    const targetError = this.computeTargetAvailabilityError(target);
+    if (targetError) {
+      rejectRequest(computeAvailabilityErrorName(targetError), targetError);
       return;
     }
     const remoteOwners = [...this.executionOwners.values()]
@@ -4994,42 +5095,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       rejectRequest('ExecutionBusy', 'The executor has reached its remote execution concurrency limit.');
       return;
     }
-    if (fastPath && !this.project.hasNotebookCell(notebookKey, cellId)) {
-      rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the host yet.');
-      return;
-    }
-    const missingBinaries = fastPath ? [] : Object.entries(manifest.binaries).filter(([relativePath, version]) => {
-      const local = this.binaryVersions.get(relativePath);
-      return !local || !sameBinaryVersion(local, version);
-    });
-    const extraBinaries = fastPath ? [] : [...this.binaryVersions.keys()].filter((relativePath) => !(relativePath in manifest.binaries));
-    const missingDocuments = fastPath ? [] : Object.entries(manifest.documents).filter(([key, hash]) =>
-      !this.project.has(key) || this.projectDocumentHash(key) !== hash);
-    const extraDocuments = fastPath ? [] : this.project.keys().filter((key) => !(key in manifest.documents));
-    const directoryManifest = new Set(manifest.directories);
-    const missingDirectories = fastPath ? [] : [...directoryManifest].filter((key) => !this.directories.has(key));
-    const extraDirectories = fastPath ? [] : [...this.directories].filter((key) => !directoryManifest.has(key));
 
-    const mismatch = [
-      ...missingBinaries.map(([key]) => key),
-      ...extraBinaries,
-      ...missingDocuments.map(([key]) => key),
-      ...extraDocuments,
-      ...missingDirectories,
-      ...extraDirectories,
-    ];
-    if (mismatch.length) {
-      this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, {
-        requestId,
-        success: false,
-        content: {
-          status: 'error',
-          ename: 'FileVersionBarrier',
-          evalue: `Executor project barrier mismatch: ${mismatch.join(', ')}`,
-        },
-      });
-      return;
-    }
     const executionOwner: ExecutionOwner = {
       peerId: sourceId,
       notebookKey,
@@ -5084,7 +5150,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             this.deliverActiveRemoteExecution(requestId);
           }
         },
-        !fastPath,
+        materializeWorkspace,
       );
       const timedOut = new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
@@ -6103,7 +6169,44 @@ function executionManifestDigest(manifest: ExecutionManifest): string {
   return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex');
 }
 
-function remoteExecutionRequestDigest(
+function canonicalCellTextDigest(source: string): string {
+  return createHash('sha256').update(source, 'utf8').digest('hex');
+}
+
+function normalizeLightweightExecutionRequest(meta: Record<string, unknown>): LightweightExecutionRequest | undefined {
+  const notebookKey = normalizedTrackedPath(String(meta.notebookKey ?? ''));
+  const cellId = String(meta.cellId ?? '');
+  const executorId = String(meta.executorId ?? '');
+  const computeEpoch = meta.computeEpoch;
+  const cellRevision = String(meta.cellRevision ?? '');
+  const cellDigest = String(meta.cellDigest ?? '');
+  if (!notebookKey || !PEER_ID_PATTERN.test(cellId) || !PEER_ID_PATTERN.test(executorId)
+    || !Number.isSafeInteger(computeEpoch) || (computeEpoch as number) < 0
+    || !PEER_ID_PATTERN.test(cellRevision) || !/^[a-f0-9]{64}$/.test(cellDigest)) {
+    return undefined;
+  }
+  return {
+    notebookKey,
+    cellId,
+    executorId,
+    computeEpoch: computeEpoch as number,
+    cellRevision,
+    cellDigest,
+  };
+}
+
+function lightweightExecutionRequestDigest(request: LightweightExecutionRequest): string {
+  return createHash('sha256').update(JSON.stringify([
+    request.notebookKey,
+    request.cellId,
+    request.executorId,
+    request.computeEpoch,
+    request.cellRevision,
+    request.cellDigest,
+  ]), 'utf8').digest('hex');
+}
+
+function legacyRemoteExecutionRequestDigest(
   notebookKey: string,
   target: NotebookComputeTarget,
   manifest: ExecutionManifest,

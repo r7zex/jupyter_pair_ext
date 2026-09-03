@@ -1421,13 +1421,14 @@ describe('compute and lifecycle regression coverage', () => {
     const folder = path.join(root, 'project');
     await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
     const runtime = new SessionRuntime(descriptor({
-      sessionId: 'send-failure', role: 'host', peerId: 'host', hostPeerId: 'host',
+      sessionId: 'send-failure', role: 'peer', peerId: 'guest', hostPeerId: 'peer-z',
       workingFolder: folder, pythonPath: process.execPath,
     }), 'send-failure-token-that-is-long-enough', context(extensionRoot), logger());
     try {
-      runtime.descriptor.notebookCompute = {
-        'work.ipynb': { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
-      };
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: '1+1', metadata: {}, outputs: [] }],
+      });
       (runtime as any).synchronizeExecutionFiles = async () => ({ documents: {}, binaries: {}, directories: [] });
       (runtime as any).transport = {
         sendTo: () => { throw new Error('send failed'); },
@@ -1458,23 +1459,41 @@ describe('compute and lifecycle regression coverage', () => {
     const folder = path.join(root, 'project');
     await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
     const runtime = new SessionRuntime(descriptor({
-      sessionId: 'exec-route-retry', role: 'host', peerId: 'host', hostPeerId: 'host',
+      sessionId: 'exec-route-retry', role: 'peer', peerId: 'guest', hostPeerId: 'peer-z',
       workingFolder: folder, pythonPath: process.execPath,
     }), 'exec-route-retry-token-that-is-long-enough', context(extensionRoot), logger());
     let attempts = 0;
     let routeWaits = 0;
     const sentTypes: string[] = [];
+    const requestIds: string[] = [];
+    const requestMetas: any[] = [];
     try {
-      runtime.descriptor.notebookCompute = {
-        'work.ipynb': { executorId: 'peer-z', device: 'cpu', epoch: 1, author: 'host' },
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: '1+1', metadata: {}, outputs: [] }],
+      });
+      let syncCalls = 0;
+      let prepareCalls = 0;
+      let flushCalls = 0;
+      let manifestCalls = 0;
+      (runtime as any).synchronizeExecutionFiles = async () => {
+        syncCalls += 1;
+        return { documents: {}, binaries: {}, directories: [] };
       };
-      (runtime as any).synchronizeExecutionFiles = async () => ({ documents: {}, binaries: {}, directories: [] });
+      (runtime as any).prepareWorkingCopy = async () => { prepareCalls += 1; };
+      (runtime as any).flush = async () => { flushCalls += 1; };
+      (runtime as any).executionManifest = () => {
+        manifestCalls += 1;
+        return { documents: {}, binaries: {}, directories: [] };
+      };
       (runtime as any).transport = {
         waitForRoute: async () => { routeWaits += 1; },
-        sendTo: (_peerId: string, type: string, meta: any) => {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array = new Uint8Array()) => {
           sentTypes.push(type);
           if (type !== 'executeRequest') return;
           attempts += 1;
+          requestIds.push(meta.requestId);
+          requestMetas.push({ ...meta, payloadBytes: payload.byteLength });
           if (attempts === 1) throw new Error('No route to peer peer-z.');
           queueMicrotask(() => {
             void (runtime as any).onMessage({
@@ -1493,7 +1512,24 @@ describe('compute and lifecycle regression coverage', () => {
       const result = await runtime.executeCell('work.ipynb', 'cell-a', '1+1', () => undefined);
       assert.equal(result.success, true);
       assert.equal(attempts, 2, 'the same request is retried after the route disappears');
+      assert.equal(new Set(requestIds).size, 1, 'route retry reuses the same request ID');
       assert.ok(routeWaits >= 2);
+      const request = requestMetas[0];
+      assert.equal(request.notebookKey, 'work.ipynb');
+      assert.equal(request.cellId, 'cell-a');
+      assert.equal(request.executorId, 'peer-z');
+      assert.equal(request.computeEpoch, runtime.computeForNotebook('work.ipynb').epoch);
+      assert.match(request.cellRevision, /^[A-Za-z0-9_-]{1,128}$/);
+      assert.match(request.cellDigest, /^[a-f0-9]{64}$/);
+      assert.equal(request.payloadBytes, 0, 'ordinary guest request carries no code payload');
+      assert.equal('documentManifest' in request, false);
+      assert.equal('binaryManifest' in request, false);
+      assert.equal('directoryManifest' in request, false);
+      assert.equal('target' in request, false);
+      assert.equal(syncCalls, 0, 'ordinary guest execution does not call synchronizeExecutionFiles');
+      assert.equal(prepareCalls, 0, 'ordinary guest execution does not call prepareWorkingCopy');
+      assert.equal(flushCalls, 0, 'ordinary guest execution does not call full flush');
+      assert.equal(manifestCalls, 0, 'ordinary guest execution does not build a project manifest');
       assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
@@ -1650,6 +1686,93 @@ describe('compute and lifecycle regression coverage', () => {
       assert.ok(manifest.documents['work.ipynb']);
       assert.equal(commits, 2);
       assert.equal((runtime as any).pendingBarrierReplies.size, 0);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('executes lightweight requests from host canonical CRDT text and rejects request-id digest mutation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-lightweight-exec-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'lightweight-exec', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'lightweight-exec-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let finishExecution: ((value: any) => void) | undefined;
+    let executionCount = 0;
+    let executedCode = '';
+    try {
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{
+          id: 'cell-a', kind: 2, language: 'python',
+          source: 'print("HOST CANONICAL")', metadata: {}, outputs: [],
+        }],
+      });
+      (runtime as any).updatePresence();
+      const target = runtime.computeForNotebook('work.ipynb');
+      const state = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      const digest = createHash('sha256').update(state.source, 'utf8').digest('hex');
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async (
+        _notebookKey: string,
+        _target: unknown,
+        _requestId: string,
+        code: string,
+      ) => {
+        executionCount += 1;
+        executedCode = code;
+        return new Promise((resolve) => { finishExecution = resolve; });
+      };
+      const requestId = 'lightweight-request';
+      const meta = {
+        requestId,
+        notebookKey: 'work.ipynb',
+        cellId: 'cell-a',
+        executorId: 'host',
+        computeEpoch: target.epoch,
+        cellRevision: state.revision,
+        cellDigest: digest,
+        fastPath: true,
+      };
+      const first = (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(executionCount, 1);
+      assert.equal(executedCode, 'print("HOST CANONICAL")', 'guest payload is never the canonical execution source');
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      assert.equal(executionCount, 1, 'same lightweight request retry must not launch a second kernel execution');
+
+      sent.length = 0;
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: { ...meta, cellDigest: '0'.repeat(64) },
+      }, 'peer-z');
+      assert.equal(executionCount, 1, 'same request ID with another digest never launches another kernel execution');
+      const rejection = sent.find((item) => item.type === 'executeResult');
+      assert.ok(rejection);
+      const rejectedResult = JSON.parse(Buffer.from(rejection.payload).toString('utf8'));
+      assert.equal(rejectedResult.success, false);
+      assert.equal(rejectedResult.content.ename, 'ExecutionBusy');
+
+      assert.ok(finishExecution);
+      finishExecution!({ requestId, success: true, content: { status: 'ok' } });
+      await first;
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });

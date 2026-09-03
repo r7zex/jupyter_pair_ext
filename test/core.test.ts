@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -85,6 +86,61 @@ const notebook: NotebookSnapshot = {
 };
 const execFileAsync = promisify(execFile);
 const TEST_IDENTITY_PUBLIC_KEY = generateIdentityCredentials().publicKey;
+
+describe('canonical notebook cell text revision', () => {
+  it('changes only with canonical cell text and gives a new stable cell a new revision lineage', () => {
+    const project = new CollaborativeProject();
+    try {
+      project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{
+          id: 'cell-a', kind: 2, language: 'python', source: 'same text',
+          metadata: {}, outputs: [],
+        }],
+      });
+      const before = project.cellTextState('work.ipynb', 'cell-a');
+      const digestBefore = createHash('sha256').update(before.source, 'utf8').digest('hex');
+
+      project.setCellMetadata('work.ipynb', 'cell-a', { owner: 'remote' });
+      project.setCellOutputs('work.ipynb', 'cell-a', [{
+        metadata: { outputType: 'stream' },
+        items: [{ mime: 'text/plain', dataBase64: Buffer.from('out').toString('base64') }],
+      }]);
+      project.setCellExecution('work.ipynb', 'cell-a', { executionOrder: 3, success: true });
+
+      const afterNonText = project.cellTextState('work.ipynb', 'cell-a');
+      const digestAfterNonText = createHash('sha256').update(afterNonText.source, 'utf8').digest('hex');
+      assert.equal(afterNonText.revision, before.revision);
+      assert.equal(digestAfterNonText, digestBefore);
+
+      project.applyCellTextChanges('work.ipynb', 'cell-a', [{
+        offset: 0, deleteCount: 4, insertText: 'DIFF',
+      }]);
+      const afterText = project.cellTextState('work.ipynb', 'cell-a');
+      assert.notEqual(afterText.revision, before.revision);
+      assert.notEqual(
+        createHash('sha256').update(afterText.source, 'utf8').digest('hex'),
+        digestBefore,
+      );
+
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [
+          ...snapshot.cells,
+          {
+            id: 'cell-b', kind: 2, language: 'python', source: afterText.source,
+            metadata: {}, outputs: [],
+          },
+        ],
+      });
+      const newCell = project.cellTextState('work.ipynb', 'cell-b');
+      assert.notEqual(newCell.revision, afterText.revision, 'new stable cell ID gets a new text revision lineage');
+    } finally {
+      project.destroy();
+    }
+  });
+});
 
 describe('notebook update scopes', () => {
   it('normalizes all six semantic scopes and requires stable IDs for cell scopes', () => {

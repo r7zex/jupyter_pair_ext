@@ -88,3 +88,15 @@ Audited at repository SHA `3165ce0216eac1c1f67c4e400748ab52581b551d`. This secti
 - Physical persistence is independently debounced by `StorageAdapter.schedule()` using the configured `persistenceDebounceMs` (default 750 ms). It serializes CRDT state and writes the durable backing copy before requesting a non-saving open-editor reconciliation; the editor hot path does not await this timer.
 - `applyNotebookSnapshot()` is no longer an initial-bind or routine-persistence operation. Initial bind and persistence use narrow unscoped reconciliation. The only production caller is `applyStructuralRecoveryIfNeeded()`, after `minimalNotebookSplice()` proves a real structural inconsistency; that path emits a `[structural-recovery]` diagnostic.
 - Text, metadata, output, and execution failures remain scope-specific. Output/execution renderer failures are logged separately and do not escalate into a generic full-notebook fallback.
+
+
+## Lightweight execution request contract (prompt 09)
+
+- Ordinary guest Run Cell uses `executeRequest` with no code payload and no project manifest. The request identity is `requestId + notebookKey + stable cellId + pinned host executorId + computeEpoch + cellRevision + cellDigest`.
+- `cellRevision` is a CRDT marker stored with the logical cell and changed only in the same transaction as canonical cell-text mutations. Output, execution and metadata transactions never change it. A new stable cell gets a new revision lineage.
+- `cellDigest` is SHA-256 over the canonical UTF-8 CRDT cell text. Filesystem mtime, editor save state, outputs, execution and metadata are excluded.
+- Guests compute revision/digest from their canonical CRDT state. The host recomputes both from its own canonical CRDT state and executes only that host-side source after an exact match.
+- Request retries reuse the same request ID and request identity. Active/completed dedupe stores a digest over the lightweight identity, so reusing one request ID with another revision/digest is rejected and cannot launch a second kernel execution.
+- Ordinary guest Run Cell does not call `synchronizeExecutionFiles()`, `executionManifest()`, `prepareWorkingCopy()` or full `flush()`. The legacy non-fast-path execution barrier is retained only for explicitly barrier-framed requests.
+- The lightweight framing intentionally omits the old `target` and manifest fields. A pre-prompt-09 fast-path peer is rejected as malformed rather than accidentally executing an empty payload; legacy barrier framing remains separately parseable.
+- Raw cell source is never included in request metadata or diagnostics.
