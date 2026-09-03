@@ -5,7 +5,6 @@ import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from './core/atomicFile';
 import { buildNetworkDiagnostics, type SignallingFamilyDiagnostic } from './runtime/diagnostics';
-import { GpuInfo } from './core/hardware';
 import {
   generateIdentityCredentials,
   publicKeyFromPrivate,
@@ -67,6 +66,10 @@ let statusTimer: NodeJS.Timeout | undefined;
 let output: vscode.OutputChannel;
 let hostFolderPromptOpen = false;
 let meshNetworkConfigurationGeneration = 0;
+let automaticNetworkRecovery: Promise<void> | undefined;
+let automaticNetworkRecoveryPending = false;
+let observedSystemProxyFingerprint: string | undefined;
+let systemProxyPollInFlight = false;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -107,6 +110,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
   );
+  if (process.platform === 'win32') {
+    const proxyWatchTimer = setInterval(() => {
+      void checkWindowsSystemProxyChange(context);
+    }, 2_000);
+    proxyWatchTimer.unref?.();
+    context.subscriptions.push({ dispose: () => clearInterval(proxyWatchTimer) });
+  }
 
   register(context, 'pairNotebook.startSession', () => startSession(context));
   register(context, 'pairNotebook.joinSession', () => joinSession(context));
@@ -177,7 +187,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   register(context, 'pairNotebook.showComputeResources', () => showComputeResources());
   register(context, 'pairNotebook.selectPythonEnvironment', () => selectPythonEnvironment());
-  register(context, 'pairNotebook.allowRemoteCompute', () => toggleRemoteCompute());
   register(context, 'pairNotebook.runActiveCell', async () => requireRuntime().executeActiveCell());
   register(context, 'pairNotebook.restartKernel', async () => notebookController.restartActive());
   register(context, 'pairNotebook.toggleShareMyCursor', () => toggleBooleanSetting('shareMyCursor', 'Мой курсор'));
@@ -338,8 +347,8 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     sessionId: invite.sessionId,
     projectId: invite.projectId,
     projectName: invite.projectName,
-    // Every 0.3 session supports deterministic host failover. Legacy invites
-    // may still carry the former host-only flag, but joining upgrades it.
+    // Keep the legacy wire value for compatible invites. Runtime authority is
+    // pinned to the host until that host explicitly transfers it.
     mode: 'resilient',
     role: 'peer',
     localPeer,
@@ -431,15 +440,6 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
         if (choice === 'Run All') await vscode.commands.executeCommand('notebook.execute');
       });
     });
-    runtime.on('computeUnavailable', (peer: PeerIdentity) => {
-      runUiBackground('Compute-unavailable notification', async () => {
-        const choice = await vscode.window.showWarningMessage(
-          `Compute unavailable: ${peer.displayName}. Editing remains active; select a replacement before running cells.`,
-          'Change Compute',
-        );
-        if (choice === 'Change Compute') await vscode.commands.executeCommand('pairNotebook.changeCompute');
-      });
-    });
     runtime.on('sessionEnding', () => {
       void vscode.window.showInformationMessage('Pair Notebook: хост завершает сессию и сохраняет последние изменения.');
     });
@@ -456,13 +456,20 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       void vscode.window.showInformationMessage('Pair Notebook: новый хост подготовил папку. Совместная сессия продолжена.');
     });
     runtime.on('sessionEnded', (peer: PeerIdentity, reason: 'explicit-end' | 'host-lost' = 'explicit-end') => {
-      void forgetWorkspaceSession(context, descriptor, true).then(() => {
-        if (reason === 'explicit-end') {
+      if (reason === 'explicit-end') {
+        void forgetWorkspaceSession(context, descriptor, true).then(() => {
           void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
-        }
-      }).catch((error) => {
-        output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
-      });
+        }).catch((error) => {
+          output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
+        });
+      } else {
+        void rememberProject(context, descriptor).catch((error) => {
+          output.appendLine(`[error] Could not retain disconnected session in recent projects: ${formatError(error)}`);
+        });
+      }
+    });
+    runtime.on('networkChanged', () => {
+      queueAutomaticNetworkRecovery(context, 'Network interface route changed');
     });
     runtime.on('closed', () => {
       if (statusTimer) clearInterval(statusTimer);
@@ -729,6 +736,7 @@ async function createAutosave(): Promise<void> {
 async function changeCompute(): Promise<void> {
   const active = requireRuntime();
   const snapshot = active.snapshot();
+  if (!snapshot.isHost) throw new Error('Only the current Session Host can configure shared compute.');
   const notebook = vscode.window.activeNotebookEditor?.notebook;
   if (!notebook) throw new Error('Open the notebook whose compute target you want to change.');
   const notebookKey = active.notebookKey(notebook.uri);
@@ -739,49 +747,34 @@ async function changeCompute(): Promise<void> {
     { label: '$(circuit-board) GPU', value: 'gpu' },
   ], { title: 'Compute workload', placeHolder: 'Filter suitable targets' });
   if (!workload) return;
-  const presence = new Map(snapshot.awareness.map((state) => [state.peer.peerId, state]));
   const current = active.computeForNotebook(notebookKey);
   const localPeerId = snapshot.descriptor.localPeer.peerId;
-  const options = snapshot.peers.flatMap((peer) => {
-      const local = peer.peerId === localPeerId;
-      const state = local ? active.localComputePresence() : presence.get(peer.peerId);
-      if (!peer.online || !state || (!local && !state.allowRemoteCompute)) return [];
-      const candidates: Array<{ device: `gpu:${number}` | 'cpu'; gpu?: GpuInfo }> = [];
-      const discoveredEnvironments = state.environments ?? [];
-      const cpuEnvironmentReady = !discoveredEnvironments.length || discoveredEnvironments.some((environment) => environment.jupyterReady);
-      const gpuEnvironmentReady = discoveredEnvironments.length
-        ? discoveredEnvironments.some((environment) => environment.jupyterReady && environment.cudaAvailable)
-        : state.hardware?.python.torchCudaAvailable === true;
-      if ((local || state.allowCpu) && workload.value !== 'gpu' && cpuEnvironmentReady) candidates.push({ device: 'cpu' });
-      if ((local || state.allowGpu) && workload.value !== 'cpu' && gpuEnvironmentReady) {
-        for (const gpu of state.hardware?.gpus ?? []) candidates.push({ device: `gpu:${gpu.index}`, gpu });
-      }
-      return candidates.map(({ device, gpu }) => {
-        const score = (gpu ? 100_000 : 0)
-        + (gpu?.vramMb ?? 0)
-        + (state?.hardware?.logicalThreads ?? 0) * 10
-        - (state?.resources?.cpuPercent ?? 0) * 5
-        - (state?.resources?.gpus.find((item) => item.index === gpu?.index)?.utilizationPercent ?? 0) * 10
-        - Math.max(0, peer.latency);
-        return {
-          label: `${peer.peerId === current.executorId && device === current.device ? '$(check) ' : ''}${state.peer.displayName} • ${device === 'cpu' ? 'CPU' : `GPU ${gpu?.index}`}`,
-          description: gpu ? `${gpu.model} • ${(gpu.vramMb / 1024).toFixed(1)} GB` : state.hardware?.cpuModel ?? 'Hardware pending',
-          detail: `${state.hardware?.logicalThreads ?? '?'} threads • ${peer.latency >= 0 ? `${peer.latency} ms` : 'measuring latency'} • Python ${state.hardware?.python.version ?? '?'}`,
-          peerId: peer.peerId,
-          device,
-          pythonPath: peer.peerId === current.executorId && device === current.device
-            ? current.pythonPath ?? state.hardware?.python.executable
-            : state.hardware?.python.executable,
-          score,
-        };
-      });
-    })
-    .sort((a, b) => b.score - a.score);
+  const state = active.localComputePresence();
+  if (!state) throw new Error('The Session Host compute environment is not available.');
+  const candidates: Array<{ device: `gpu:${number}` | 'cpu'; gpu?: NonNullable<typeof state.hardware>['gpus'][number] }> = [];
+  const discoveredEnvironments = state.environments ?? [];
+  const cpuEnvironmentReady = !discoveredEnvironments.length
+    || discoveredEnvironments.some((environment) => environment.jupyterReady);
+  const gpuEnvironmentReady = discoveredEnvironments.length
+    ? discoveredEnvironments.some((environment) => environment.jupyterReady && environment.cudaAvailable)
+    : state.hardware?.python.torchCudaAvailable === true;
+  if (workload.value !== 'gpu' && cpuEnvironmentReady) candidates.push({ device: 'cpu' });
+  if (workload.value !== 'cpu' && gpuEnvironmentReady) {
+    for (const gpu of state.hardware?.gpus ?? []) candidates.push({ device: `gpu:${gpu.index}`, gpu });
+  }
+  const options = candidates.map(({ device, gpu }) => ({
+    label: `${device === current.device ? '$(check) ' : ''}${state.peer.displayName} • ${device === 'cpu' ? 'CPU' : `GPU ${gpu?.index}`}`,
+    description: gpu ? `${gpu.model} • ${(gpu.vramMb / 1024).toFixed(1)} GB` : state.hardware?.cpuModel ?? 'Hardware pending',
+    detail: `${state.hardware?.logicalThreads ?? '?'} threads • Python ${state.hardware?.python.version ?? '?'}`,
+    peerId: localPeerId,
+    device,
+    pythonPath: device === current.device ? current.pythonPath ?? state.hardware?.python.executable : state.hardware?.python.executable,
+  }));
   if (!options.length) throw new Error(`No online ${workload.value === 'any' ? 'compute' : workload.value.toUpperCase()} target is available.`);
-  if (options[0]) options[0].label = `$(star-full) Recommended • ${options[0].label.replace(/^\$\(check\) /, '')}`;
+  if (options[0]) options[0].label = `$(star-full) Session Host • ${options[0].label.replace(/^\$\(check\) /, '')}`;
   const selected = await vscode.window.showQuickPick(options, { title: 'Select Compute', placeHolder: 'Choose CPU or GPU executor' });
   if (!selected) return;
-  const selectedState = selected.peerId === localPeerId ? active.localComputePresence() : presence.get(selected.peerId);
+  const selectedState = state;
   const gpuSelected = selected.device.startsWith('gpu:');
   const discovered = selectedState?.environments ?? [];
   const environments = discovered
@@ -881,6 +874,7 @@ async function applyMeshNetworkConfiguration(
     readWindowsSystemProxy(),
   ]);
   if (generation !== meshNetworkConfigurationGeneration) return;
+  observedSystemProxyFingerprint = systemProxyFingerprint(systemProxy);
   configureMeshNetwork({
     turnUrls: configuration.get<string[]>('turnUrls', []),
     turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
@@ -894,6 +888,58 @@ async function applyMeshNetworkConfiguration(
       systemProxy: systemProxy?.proxyUrl,
       systemNoProxy: systemProxy?.noProxy,
     },
+  });
+}
+
+function queueAutomaticNetworkRecovery(context: vscode.ExtensionContext, reason: string): void {
+  const affectedRuntime = runtime;
+  if (!affectedRuntime) return;
+  if (automaticNetworkRecovery) {
+    automaticNetworkRecoveryPending = true;
+    return;
+  }
+  automaticNetworkRecovery = (async () => {
+    output.appendLine(`[info] ${reason}; refreshing proxy settings, signalling, and remembered peer routes.`);
+    await applyMeshNetworkConfiguration(context);
+    if (runtime !== affectedRuntime || affectedRuntime.snapshot().closed) return;
+    const refreshed = await affectedRuntime.reconnect();
+    output.appendLine(`[info] Automatic network recovery completed with signalling status ${refreshed.status}.`);
+  })().catch((error) => {
+    output.appendLine(`[error] Automatic network recovery failed: ${formatError(error)}`);
+  }).finally(() => {
+    automaticNetworkRecovery = undefined;
+    if (automaticNetworkRecoveryPending) {
+      automaticNetworkRecoveryPending = false;
+      queueAutomaticNetworkRecovery(context, 'Network route changed again during recovery');
+    }
+  });
+}
+
+async function checkWindowsSystemProxyChange(context: vscode.ExtensionContext): Promise<void> {
+  if (systemProxyPollInFlight) return;
+  systemProxyPollInFlight = true;
+  try {
+    const current = await readWindowsSystemProxy();
+    const nextFingerprint = systemProxyFingerprint(current);
+    if (observedSystemProxyFingerprint === undefined) {
+      observedSystemProxyFingerprint = nextFingerprint;
+      return;
+    }
+    if (nextFingerprint === observedSystemProxyFingerprint) return;
+    observedSystemProxyFingerprint = nextFingerprint;
+    queueAutomaticNetworkRecovery(context, 'Windows system proxy changed');
+  } catch (error) {
+    output.appendLine(`[debug] Could not poll Windows system proxy: ${formatError(error)}`);
+  } finally {
+    systemProxyPollInFlight = false;
+  }
+}
+
+function systemProxyFingerprint(value: Awaited<ReturnType<typeof readWindowsSystemProxy>>): string {
+  return JSON.stringify({
+    proxyUrl: value?.proxyUrl ?? '',
+    noProxy: value?.noProxy ?? '',
+    autoConfigUrl: value?.autoConfigUrl ?? '',
   });
 }
 
@@ -1037,6 +1083,9 @@ async function showComputeResources(): Promise<void> {
 }
 
 async function selectPythonEnvironment(): Promise<void> {
+  if (runtime && !runtime.coordinator.isCurrentHost()) {
+    throw new Error('Only the current Session Host can select the shared Python environment.');
+  }
   const configuration = vscode.workspace.getConfiguration('pairNotebook');
   const current = configuration.get<string>('pythonPath', 'python');
   const root = runtime?.descriptor.workingFolder ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
@@ -1081,24 +1130,6 @@ async function selectPythonEnvironment(): Promise<void> {
   }
 }
 
-async function toggleRemoteCompute(): Promise<void> {
-  const active = requireRuntime();
-  const configuration = vscode.workspace.getConfiguration('pairNotebook');
-  const current = active.isRemoteComputeAllowed();
-  const enabled = !current;
-  if (enabled) {
-    const confirmation = await vscode.window.showWarningMessage(
-      'Разрешить удалённые вычисления? Любой участник текущей закрытой сессии сможет запускать Python-код на этом компьютере. Включайте это только для людей, которым доверяете.',
-      { modal: true },
-      'Разрешить удалённые вычисления',
-    );
-    if (confirmation !== 'Разрешить удалённые вычисления') return;
-  }
-  if (enabled) await configuration.update('allowCpu', true, vscode.ConfigurationTarget.Global);
-  active.setRemoteComputeAllowed(enabled);
-  void vscode.window.showInformationMessage(`Remote compute ${enabled ? 'enabled for this session' : 'disabled'}.`);
-}
-
 async function toggleBooleanSetting(key: string, label: string): Promise<void> {
   const configuration = vscode.workspace.getConfiguration('pairNotebook');
   const current = configuration.get<boolean>(key, true);
@@ -1129,7 +1160,23 @@ async function openRecentProject(context: vscode.ExtensionContext): Promise<void
     detail: item.workingFolder,
     item,
   })), { title: 'Recent Pair Notebook projects' });
-  if (picked) await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(picked.item.workingFolder), false);
+  if (!picked) return;
+  const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const selectedPath = path.resolve(picked.item.workingFolder);
+  const currentPath = currentFolder ? path.resolve(currentFolder) : undefined;
+  const sameFolder = currentPath !== undefined && (process.platform === 'win32'
+    ? currentPath.toLowerCase() === selectedPath.toLowerCase()
+    : currentPath === selectedPath);
+  if (sameFolder) {
+    if (runtime) {
+      void vscode.window.showInformationMessage('This Pair Notebook project is already open.');
+      return;
+    }
+    await applyMeshNetworkConfiguration(context);
+    await restoreWorkspaceSession(context);
+    return;
+  }
+  await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(selectedPath), false);
 }
 
 function startStatusUpdates(): void {

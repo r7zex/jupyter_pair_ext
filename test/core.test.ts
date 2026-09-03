@@ -1576,15 +1576,22 @@ describe('repair regressions', () => {
 
 describe('host coordination', () => {
   it('allows graceful manual transfer in Host Only mode', () => {
-    const coordinator = coordinatorFor('host-only');
+    const coordinator = coordinatorFor('host-only', 'host-a');
     const next = coordinator.manualTransfer('peer-b');
     assert.equal(next.hostId, 'peer-b');
     assert.equal(next.hostEpoch, 4);
   });
 
   it('allows graceful manual transfer in Resilient mode', () => {
-    const coordinator = coordinatorFor('resilient');
+    const coordinator = coordinatorFor('resilient', 'host-a');
     assert.equal(coordinator.manualTransfer('peer-b').hostId, 'peer-b');
+  });
+
+  it('rejects manual transfer initiated by a participant', () => {
+    const coordinator = coordinatorFor('resilient');
+    assert.throws(() => coordinator.manualTransfer('peer-c'), /Only the current Session Host/);
+    assert.equal(coordinator.clock.hostId, 'host-a');
+    assert.equal(coordinator.clock.hostEpoch, 3);
   });
 
   it('closes Host Only after hard host loss', () => {
@@ -1594,25 +1601,29 @@ describe('host coordination', () => {
     assert.equal(coordinator.closed, true);
   });
 
-  it('deterministically elects the earliest joined peer after hard loss', () => {
+  it('closes a resilient guest without electing a replacement after hard loss', () => {
     const coordinator = coordinatorFor('resilient');
     coordinator.markDisconnected('host-a');
     const next = coordinator.evaluate(Date.now() + 2000);
-    assert.equal(next?.hostId, 'peer-b');
+    assert.equal(next, undefined);
+    assert.equal(coordinator.closed, true);
+    assert.equal(coordinator.clock.hostId, 'host-a');
+    assert.equal(coordinator.clock.hostEpoch, 3);
   });
 
   it('rejects stale host epochs', () => {
     const coordinator = coordinatorFor('resilient');
-    assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 2, hostId: 'old' }), false);
+    assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 2, hostId: 'old' }, 'old'), false);
     assert.equal(coordinator.clock.hostId, 'host-a');
   });
 
-  it('bounds explicit reconciliation after several missed host epochs', () => {
+  it('rejects skipped and self-proclaimed host epochs', () => {
     const coordinator = coordinatorFor('resilient');
-    assert.equal(coordinator.applyReconciledAnnouncement({ sessionEpoch: 10, hostEpoch: 6, hostId: 'peer-b' }), true);
-    assert.equal(coordinator.clock.hostId, 'peer-b');
-    assert.equal(coordinator.applyReconciledAnnouncement({ sessionEpoch: 10, hostEpoch: 5000, hostId: 'peer-c' }), false);
-    assert.equal(coordinator.clock.hostEpoch, 6);
+    assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 6, hostId: 'peer-b' }, 'host-a'), false);
+    assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 4, hostId: 'peer-b' }, 'peer-b'), false);
+    assert.equal(coordinator.clock.hostId, 'host-a');
+    assert.equal(coordinator.clock.hostEpoch, 3);
+    assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 4, hostId: 'peer-b' }, 'host-a'), true);
   });
 });
 
@@ -1862,14 +1873,18 @@ describe('protocol and notebook compatibility', () => {
     );
   });
 
-  it('declares safe workspace and remote-compute defaults in the extension manifest', async () => {
+  it('declares safe workspace defaults and no remote-compute deny switches', async () => {
     const manifest = JSON.parse(await readFile(path.resolve(__dirname, '../../package.json'), 'utf8')) as any;
     assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
     assert.equal(manifest.capabilities.virtualWorkspaces.supported, false);
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
-    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'].default, false);
-    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'].default, false);
-    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowGpu'].default, false);
+    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);
+    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'], undefined);
+    assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowGpu'], undefined);
+    assert.equal(
+      manifest.contributes.commands.some((command: { command: string }) => command.command === 'pairNotebook.allowRemoteCompute'),
+      false,
+    );
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.pythonPath'].scope, 'machine');
     const proxySetting = manifest.contributes.configuration.properties['pairNotebook.proxyUrl'];
     const proxyPattern = new RegExp(proxySetting.pattern);
@@ -2363,9 +2378,9 @@ function peerRuntime(peerId: string, joinOrder: number, online = true): PeerRunt
   };
 }
 
-function coordinatorFor(mode: 'host-only' | 'resilient'): SessionCoordinator {
+function coordinatorFor(mode: 'host-only' | 'resilient', selfId = 'peer-b'): SessionCoordinator {
   const coordinator = new SessionCoordinator({
-    selfId: 'peer-b',
+    selfId,
     mode,
     clock: { sessionEpoch: 10, hostEpoch: 3, hostId: 'host-a' },
     heartbeatTimeoutMs: 1000,

@@ -49,7 +49,7 @@ export class NetworkChangeWatcher {
     if (this.timer) return;
     this.lastFingerprint = fingerprintInterfaces(this.interfaces());
     // The first check is delayed so session startup never races the probe.
-    this.timer = setInterval(() => this.check(), this.options.intervalMs ?? 30_000);
+    this.timer = setInterval(() => this.check(), this.options.intervalMs ?? 2_000);
     this.timer.unref?.();
   }
 

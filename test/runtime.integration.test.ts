@@ -39,8 +39,6 @@ const { PairNotebookController, decodeJupyterBase64 } = require('../src/vscode/j
   PairNotebookController: new (...args: any[]) => any;
   decodeJupyterBase64: (value: unknown) => Buffer | undefined;
 };
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { REMOTE_ORIGIN } = require('../src/core/types') as { REMOTE_ORIGIN: symbol };
 moduleWithLoader._load = originalLoad;
 
 const runtimeRoomFactory = createInMemoryTrysteroFactory();
@@ -285,7 +283,7 @@ describe('production SessionRuntime integration', () => {
     }
   });
 
-  it('converges through Trystero/Yjs, recovers offline changes, and enforces the file barrier', async function () {
+  it('converges through Trystero/Yjs and executes guest code only on the host', async function () {
     this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-runtime-'));
     const hostFolder = path.join(root, 'host');
@@ -402,52 +400,23 @@ describe('production SessionRuntime integration', () => {
       await host.onLocalDelete(fakeVscode.Uri.file(movedPath));
       await waitFor(() => !peer.project.has('moved.txt'), 3000, 'file deletion');
 
-      assert.throws(() => host.changeCompute('peer-z', 'work.ipynb', 'cpu'), /not available for remote compute/);
-      fakeVscode.__config.allowCpu = true;
-      peer.setRemoteComputeAllowed(true);
-      await waitFor(() => host.snapshot().awareness.some((state: any) =>
-        state.peer.peerId === 'peer-z' && state.allowRemoteCompute && state.allowCpu), 3000, 'explicit remote compute opt-in');
-      assert.throws(() => host.changeCompute('peer-z', 'work.ipynb', 'cpu', process.execPath), /cannot start a Jupyter kernel/);
-      host.changeCompute('peer-z', 'work.ipynb', 'cpu');
-      await waitFor(() => peer.computeForNotebook('work.ipynb').executorId === 'peer-z', 3000, 'compute selection propagation');
-
-      // Seed stale executor-only state without broadcasting it. The execution
-      // barrier must refuse the mismatch without treating absence as permission
-      // to delete files from the executor.
-      peer.project.ensureText('stale-only.py', 'STALE', REMOTE_ORIGIN);
-      await writeFile(path.join(peerFolder, 'stale-only.py'), 'STALE', 'utf8');
-      const staleBinary = Buffer.from('STALE_BINARY');
-      const staleBinaryHash = createHash('sha256').update(staleBinary).digest('hex');
-      (peer as any).binaryVersions.set('stale-only.bin', { hash: staleBinaryHash, version: 99, author: 'peer-z' });
-      await writeFile(path.join(peerFolder, 'stale-only.bin'), staleBinary);
-      (peer as any).directories.add('stale-dir');
-      await mkdir(path.join(peerFolder, 'stale-dir'));
-
-      let binaryAcks = 0;
-      host.on('binaryAck', () => { binaryAcks += 1; });
-      const events: any[] = [];
-      await assert.rejects(
-        host.executeCell('work.ipynb', 'a', 'read model', (event: any) => events.push(event)),
-        /missing local project entries|normal project synchronization/i,
+      assert.throws(
+        () => host.changeCompute('peer-z', 'work.ipynb', 'cpu'),
+        /always owned by the current Session Host/,
       );
-      assert.equal(peer.project.has('stale-only.py'), true, 'barrier refusal preserves executor document state');
-      assert.equal(await fileExists(path.join(peerFolder, 'stale-only.py')), true, 'barrier refusal preserves executor document bytes');
-      assert.equal((peer as any).binaryVersions.has('stale-only.bin'), true, 'barrier refusal preserves executor binary state');
-      assert.equal(await fileExists(path.join(peerFolder, 'stale-only.bin')), true, 'barrier refusal preserves executor binary bytes');
-      assert.equal((peer as any).directories.has('stale-dir'), true, 'barrier refusal preserves executor directory state');
-      assert.equal(await directoryExists(path.join(peerFolder, 'stale-dir')), true, 'barrier refusal preserves executor directory bytes');
+      assert.throws(
+        () => peer.changeCompute('peer-z', 'work.ipynb', 'cpu'),
+        /Only the current Session Host/,
+      );
+      host.changeCompute('host', 'work.ipynb', 'cpu');
+      const hostCompute = host.computeForNotebook('work.ipynb');
+      await waitFor(() => peer.computeForNotebook('work.ipynb').epoch === hostCompute.epoch, 3000, 'host compute selection propagation');
 
-      await (peer as any).applyLocalDeletion('stale-only.py');
-      await (peer as any).applyLocalDeletion('stale-only.bin');
-      await (peer as any).applyLocalDeletion('stale-dir');
-      const first = await host.executeCell('work.ipynb', 'a', 'read model', (event: any) => events.push(event));
+      const events: any[] = [];
+      const first = await peer.executeCell('work.ipynb', 'a', 'read model', (event: any) => events.push(event));
       assert.equal(first.success, true);
-      assert.equal(await readFile(path.join(peerFolder, 'model.bin'), 'utf8'), 'NEW_MODEL');
       assert.ok(events.some((event) => event.messageType === 'execute_result'
         && event.content?.data?.['text/plain'] === 'NEW_MODEL'));
-      const ackCountAfterFirstExecution = binaryAcks;
-      await host.executeCell('work.ipynb', 'a', 'read model again', () => undefined);
-      assert.equal(binaryAcks, ackCountAfterFirstExecution, 'an acknowledged unchanged binary must not be resent');
 
       // The standard controller publishes streaming/final outputs into the
       // notebook CRDT. A third participant therefore renders the result without
@@ -472,76 +441,7 @@ describe('production SessionRuntime integration', () => {
       );
       sharedController.dispose();
 
-      await waitFor(() => fileExists(path.join(peerFolder, 'notes.txt')), 3000, 'peer receives notes before disconnect');
-      useFastLogicalRecovery(host, peer);
-      const hostDisconnected = onceEvent(host, 'peerDisconnected');
-      const peerDisconnected = onceEvent(peer, 'peerDisconnected');
-      partitionInMemoryTrystero();
-      await Promise.all([hostDisconnected, peerDisconnected]);
-      await waitFor(() => !host.snapshot().awareness.some((state: any) => state.peer.peerId === 'peer-z'), 2000, 'presence removal');
-
-      peer.project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 5, deleteCount: 0, insertText: ' # peer offline' }]);
-      host.project.applyCellTextChanges('work.ipynb', 'b', [{ offset: 5, deleteCount: 0, insertText: ' # host online' }]);
-      const peerCreatedOffline = path.join(peerFolder, 'peer-created-offline.py');
-      await writeFile(peerCreatedOffline, 'print("created while disconnected")\n', 'utf8');
-      await peer.onLocalFile(fakeVscode.Uri.file(peerCreatedOffline), 'create');
-
-      await rm(path.join(hostFolder, 'notes.txt'));
-      await host.onLocalDelete(fakeVscode.Uri.file(path.join(hostFolder, 'notes.txt')));
-      await writeFile(path.join(hostFolder, 'model.bin'), 'OFFLINE_NEW_MODEL', 'utf8');
-      await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, 'model.bin')), 'change');
-      assert.equal(await fileExists(path.join(peerFolder, 'notes.txt')), true, 'offline peer still has the deleted file before reconciliation');
-      assert.equal(await readFile(path.join(peerFolder, 'model.bin'), 'utf8'), 'NEW_MODEL', 'offline peer still has the prior binary before reconciliation');
-
-      const reconnected = onceEvent(peer, 'peerConnected');
-      healInMemoryTrystero();
-      await reconnected;
-      await waitFor(() => {
-        const a = host.project.notebookSnapshot('work.ipynb');
-        const b = peer.project.notebookSnapshot('work.ipynb');
-        return JSON.stringify(a) === JSON.stringify(b)
-          && a.cells[0].source.includes('peer offline')
-          && a.cells[1].source.includes('host online');
-      }, 5000, 'bidirectional reconnect convergence');
-      await waitFor(() => host.snapshot().awareness.some((state: any) => state.peer.peerId === 'peer-z'), 3000, 'presence restoration');
-      await waitFor(() => host.project.has('peer-created-offline.py')
-        && host.project.text('peer-created-offline.py').toString() === 'print("created while disconnected")\n',
-      5000, 'participant-created file reconciliation');
-      await waitFor(async () => !peer.project.has('notes.txt')
-        && !await fileExists(path.join(peerFolder, 'notes.txt')), 5000, 'offline delete tombstone reconciliation');
-      await waitFor(async () => await readFile(path.join(peerFolder, 'model.bin'), 'utf8') === 'OFFLINE_NEW_MODEL', 5000, 'offline binary revision reconciliation');
-
-      // Concurrent same-version binary edits must converge independently of
-      // delivery order.  Both peers start from the same revision and therefore
-      // create revision N+1; author/hash provide the deterministic tie-break.
-      const hostDisconnectedAgain = onceEvent(host, 'peerDisconnected');
-      const peerDisconnectedAgain = onceEvent(peer, 'peerDisconnected');
-      partitionInMemoryTrystero();
-      await Promise.all([hostDisconnectedAgain, peerDisconnectedAgain]);
-      await writeFile(path.join(hostFolder, 'model.bin'), 'HOST_CONCURRENT', 'utf8');
-      await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, 'model.bin')), 'change');
-      await writeFile(path.join(peerFolder, 'model.bin'), 'PEER_CONCURRENT', 'utf8');
-      await peer.onLocalFile(fakeVscode.Uri.file(path.join(peerFolder, 'model.bin')), 'change');
-      const hostRevision = (host as any).binaryVersions.get('model.bin');
-      const peerRevision = (peer as any).binaryVersions.get('model.bin');
-      assert.equal(hostRevision.version, peerRevision.version, 'concurrent edits intentionally collide on numeric revision');
-      assert.notEqual(hostRevision.author, peerRevision.author);
-
-      const reconnectedAgain = onceEvent(peer, 'peerConnected');
-      healInMemoryTrystero();
-      await reconnectedAgain;
-      await waitFor(async () => {
-        const hostBytes = await readFile(path.join(hostFolder, 'model.bin'), 'utf8');
-        const peerBytes = await readFile(path.join(peerFolder, 'model.bin'), 'utf8');
-        const hostVersion = (host as any).binaryVersions.get('model.bin');
-        const peerVersion = (peer as any).binaryVersions.get('model.bin');
-        return hostBytes === 'PEER_CONCURRENT'
-          && peerBytes === 'PEER_CONCURRENT'
-          && JSON.stringify(hostVersion) === JSON.stringify(peerVersion);
-      }, 5000, 'deterministic concurrent binary convergence');
     } finally {
-      delete fakeVscode.__config.allowRemoteCompute;
-      delete fakeVscode.__config.allowCpu;
       fakeVscode.window.activeNotebookEditor = undefined;
       fakeVscode.window.activeTextEditor = undefined;
       host.descriptor.mode = 'host-only';
@@ -551,7 +451,7 @@ describe('production SessionRuntime integration', () => {
     }
   });
 
-  it('elects one resilient coordinator and rejects a returning stale host clock', async function () {
+  it('closes resilient guests after unrecoverable host loss without changing authority', async function () {
     this.timeout(40_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-failover-'));
     const extensionRoot = path.join(root, 'extension');
@@ -586,36 +486,14 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
       await waitFor(() => peerB.descriptor.localPeer.joinOrder === 1
         && peerC.descriptor.localPeer.joinOrder === 2, 2000, 'monotonic host-assigned participant order');
-      await host.flush();
-      const oldHostBacking = host.descriptor.backingFolder;
-
       await host.transport.stop();
-      await waitFor(() => peerB.snapshot().clock.hostId === 'peer-b' && peerC.snapshot().clock.hostId === 'peer-b', 6000, 'deterministic failover');
-      assert.equal(peerB.snapshot().clock.hostEpoch, 1);
-      assert.equal(peerC.snapshot().clock.hostEpoch, 1);
-      assert.equal(peerB.snapshot().waitingForHostFolder, true);
-      assert.equal(peerC.snapshot().waitingForHostFolder, true);
-      assert.equal(peerB.snapshot().runtimeState, 'waiting-for-host-folder');
-      assert.equal(peerC.snapshot().runtimeState, 'waiting-for-host-folder');
-      await assert.rejects(peerB.saveAsHost(), /choose a new host folder/i);
-      assert.equal(await fileExists(path.join(oldHostBacking, 'work.ipynb')), true, 'the old host retains its latest persisted copy');
-
-      const replacementBacking = path.join(root, 'peer-b-backing');
-      await peerB.setBackingFolder(replacementBacking);
-      await waitFor(() => !peerB.snapshot().waitingForHostFolder && !peerC.snapshot().waitingForHostFolder, 3000, 'host-folder pause resumes');
-      assert.equal(await fileExists(path.join(replacementBacking, 'work.ipynb')), true, 'the new host materializes the complete current project');
-      peerB.project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 9, deleteCount: 0, insertText: ' # newest' }]);
-      await waitFor(() => peerC.project.notebookSnapshot('work.ipynb').cells[0].source.includes('newest'), 3000, 'post-failover edit');
-
-      const staleEpoch = host.snapshot().clock.hostEpoch;
-      await host.transport.start();
-      const knownB = host.descriptor.knownPeers.find((peer: any) => peer.peerId === 'peer-b');
-      assert.ok(knownB);
-      host.transport.connect(knownB);
-      await waitFor(() => host.snapshot().clock.hostId === 'peer-b', 5000, 'stale host demotion');
-      assert.ok(host.snapshot().clock.hostEpoch > staleEpoch);
-      await waitFor(() => host.project.notebookSnapshot('work.ipynb').cells[0].source.includes('newest'), 5000, 'stale host state convergence');
-      assert.equal(host.project.notebookSnapshot('work.ipynb').cells[0].source, peerB.project.notebookSnapshot('work.ipynb').cells[0].source);
+      await waitFor(() => peerB.snapshot().closed && peerC.snapshot().closed, 6000, 'guest shutdown after host loss');
+      for (const peer of [peerB, peerC]) {
+        assert.equal(peer.snapshot().clock.hostId, 'host');
+        assert.equal(peer.snapshot().clock.hostEpoch, 0);
+        assert.equal(peer.snapshot().descriptor.role, 'peer');
+        assert.equal(peer.snapshot().waitingForHostFolder, false);
+      }
     } finally {
       for (const runtime of [host, peerB, peerC].filter(Boolean)) runtime.descriptor.mode = 'host-only';
       await Promise.allSettled([host.leave(), peerB?.leave?.(), peerC?.leave?.()]);
@@ -623,7 +501,7 @@ describe('production SessionRuntime integration', () => {
     }
   });
 
-  it('reconciles two hosts elected at the same epoch in isolated partitions', async function () {
+  it('never creates independent hosts in isolated guest partitions', async function () {
     this.timeout(35_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-equal-epoch-'));
     const extensionRoot = path.join(root, 'extension');
@@ -658,19 +536,15 @@ describe('production SessionRuntime integration', () => {
       useFastLogicalRecovery(alpha, beta);
 
       partitionInMemoryTrystero();
-      host.descriptor.mode = 'host-only';
-      await host.leave();
-      await waitFor(() => alpha.coordinator.clock.hostId === 'alpha'
-        && beta.coordinator.clock.hostId === 'beta'
-        && alpha.coordinator.clock.hostEpoch === beta.coordinator.clock.hostEpoch, 5000, 'independent equal-epoch elections');
-
-      healInMemoryTrystero();
-      await waitFor(() => alpha.coordinator.clock.hostId === 'alpha'
-        && beta.coordinator.clock.hostId === 'alpha', 5000, 'equal-epoch host convergence');
-      assert.equal(alpha.coordinator.clock.hostEpoch, beta.coordinator.clock.hostEpoch);
-      assert.equal(alpha.snapshot().waitingForHostFolder, true);
-      assert.equal(beta.snapshot().waitingForHostFolder, true);
+      await host.transport.stop();
+      await waitFor(() => alpha.snapshot().closed && beta.snapshot().closed, 5000, 'isolated guest shutdown');
+      for (const peer of [alpha, beta]) {
+        assert.equal(peer.coordinator.clock.hostId, 'host');
+        assert.equal(peer.coordinator.clock.hostEpoch, 0);
+        assert.equal(peer.snapshot().descriptor.role, 'peer');
+      }
     } finally {
+      healInMemoryTrystero();
       if (!host.snapshot().closed) {
         host.descriptor.mode = 'host-only';
         await host.leave().catch(() => undefined);
@@ -723,7 +597,7 @@ describe('runtime repair invariants', () => {
     }
   });
 
-  it('restores persisted compute epochs and resolves same-epoch compute changes deterministically', async () => {
+  it('restores compute epochs, pins targets to the host, and rejects participant announcements', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-compute-clock-'));
     const extensionRoot = path.join(root, 'extension');
     await mkdir(extensionRoot, { recursive: true });
@@ -742,10 +616,9 @@ describe('runtime repair invariants', () => {
     const first = await makeRuntime('first');
     const second = await makeRuntime('second');
     try {
-      (first as any).computeTargetAvailabilityError = () => undefined;
-      (second as any).computeTargetAvailabilityError = () => undefined;
       assert.equal((first as any).computeEpoch, 9, 'constructor restores the maximum persisted epoch');
       assert.equal((second as any).computeEpoch, 9, 'every restarted peer restores the same persisted epoch floor');
+      first.project.ensureNotebook('work.ipynb');
       const peerB = {
         type: 'computeChanged', payload: new Uint8Array(),
         meta: {
@@ -764,10 +637,16 @@ describe('runtime repair invariants', () => {
       await (first as any).onMessage(peerZ, 'peer-z');
       await (second as any).onMessage(peerZ, 'peer-z');
       await (second as any).onMessage(peerB, 'peer-b');
-      assert.deepEqual(first.computeForNotebook('work.ipynb'), second.computeForNotebook('work.ipynb'));
-      assert.equal(first.computeForNotebook('work.ipynb').executorId, 'peer-z', 'same-epoch tie is independent of arrival order');
-      assert.equal((first as any).computeEpoch, 10);
-      assert.equal((second as any).computeEpoch, 10);
+      assert.equal(first.computeForNotebook('work.ipynb').epoch, second.computeForNotebook('work.ipynb').epoch);
+      assert.equal(first.computeForNotebook('work.ipynb').executorId, 'first');
+      assert.equal(second.computeForNotebook('work.ipynb').executorId, 'second');
+      assert.equal((first as any).computeEpoch, 9);
+      assert.equal((second as any).computeEpoch, 9);
+
+      (first as any).updatePresence();
+      first.changeCompute('first', 'work.ipynb', 'cpu');
+      assert.equal(first.computeForNotebook('work.ipynb').epoch, 10);
+      assert.equal(first.computeForNotebook('work.ipynb').author, 'first');
 
       await (first as any).onMessage({
         type: 'computeChanged', payload: new Uint8Array(),
@@ -776,7 +655,7 @@ describe('runtime repair invariants', () => {
           target: { executorId: 'peer-b', device: 'cpu', epoch: 999_999, author: 'peer-b' },
         },
       }, 'peer-b');
-      assert.equal((first as any).computeEpoch, 10, 'a peer cannot poison the compute epoch with an arbitrary jump');
+      assert.equal((first as any).computeEpoch, 10, 'a participant cannot poison the compute epoch with an arbitrary jump');
     } finally {
       first.descriptor.mode = 'host-only';
       second.descriptor.mode = 'host-only';
@@ -861,7 +740,7 @@ describe('runtime repair invariants', () => {
     assert.equal(runtime.pendingSnapshotRequests, 0);
   });
 
-  it('keeps remote compute disabled until each session explicitly opts in', async () => {
+  it('advertises compute hardware only from the current host', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-private-hardware-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -878,25 +757,23 @@ describe('runtime repair invariants', () => {
           torchVersion: '', torchCudaAvailable: false, torchCudaVersion: '', cudaDeviceNames: [] },
       };
       (runtime as any).resources = { cpuPercent: 10, ramUsedMb: 100, ramTotalMb: 200, gpus: [], sampledAt: Date.now() };
-      fakeVscode.__config.allowRemoteCompute = true;
       (runtime as any).updatePresence();
       const advertised = runtime.awareness.getLocalState();
-      assert.equal(advertised.hardware, undefined);
-      assert.equal(advertised.resources, undefined);
-      assert.equal(runtime.isRemoteComputeAllowed(), false, 'legacy global setting must be ignored');
+      assert.equal(advertised.hardware.python.executable, 'C:\\Users\\private\\python.exe');
+      assert.equal(advertised.resources.cpuPercent, 10);
       assert.equal(runtime.localComputePresence()?.hardware?.python.executable, 'C:\\Users\\private\\python.exe');
 
-      runtime.setRemoteComputeAllowed(true);
-      assert.equal(runtime.awareness.getLocalState()?.hardware?.python.executable, 'C:\\Users\\private\\python.exe');
-
       const nextRuntime = new SessionRuntime(descriptor({
-        sessionId: 'private-hardware-next', role: 'host', peerId: 'next-host', hostPeerId: 'next-host',
+        sessionId: 'private-hardware-next', role: 'peer', peerId: 'participant', hostPeerId: 'host',
         workingFolder: path.join(root, 'next-project'), pythonPath: process.execPath,
       }), 'private-hardware-next-token-that-is-long-enough', context(extensionRoot), logger());
-      assert.equal(nextRuntime.isRemoteComputeAllowed(), false, 'a later session must require fresh consent');
+      (nextRuntime as any).hardware = (runtime as any).hardware;
+      (nextRuntime as any).resources = (runtime as any).resources;
+      (nextRuntime as any).updatePresence();
+      assert.equal(nextRuntime.awareness.getLocalState()?.hardware, undefined);
+      assert.equal(nextRuntime.localComputePresence()?.hardware, undefined);
       await (nextRuntime as any).disposeAsync();
     } finally {
-      delete fakeVscode.__config.allowRemoteCompute;
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
@@ -1053,6 +930,7 @@ describe('runtime repair invariants', () => {
       const accepted = runtime.awareness.getStates().get(remoteAwareness.clientID) as any;
       assert.deepEqual(accepted.peer, { peerId: 'peer-a', displayName: 'Alice', joinOrder: 1, online: true });
       assert.equal(accepted.activeFile, undefined);
+      assert.equal(accepted.allowRemoteCompute, undefined, 'obsolete participant compute flags are stripped');
       assert.throws(() => (runtime as any).acceptAwarenessUpdate(payload, 'peer-b'), /already owned/i);
       assert.throws(() => (runtime as any).acceptAwarenessUpdate(Uint8Array.of(1), 'peer-a'), /awareness/i);
     } finally {
@@ -1148,7 +1026,7 @@ describe('runtime repair invariants', () => {
 
 
 describe('compute and lifecycle regression coverage', () => {
-  it('accepts a selected PythonEnvironment by executable and permits a CUDA-ready non-default environment', async () => {
+  it('accepts a host PythonEnvironment by executable and permits a CUDA-ready non-default environment', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-env-selection-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -1159,15 +1037,7 @@ describe('compute and lifecycle regression coverage', () => {
     }), 'env-selection-token-that-is-long-enough', context(extensionRoot), logger());
     try {
       runtime.project.ensureNotebook('work.ipynb');
-      runtime.awareness.getStates().set(99, {
-        peer: { peerId: 'peer-z', displayName: 'peer-z', joinOrder: 1 },
-        allowRemoteCompute: true,
-        allowCpu: true,
-        allowGpu: true,
-        shareCursor: true,
-        cursorColor: '#ffffff',
-        kernelStatus: 'Offline',
-        hardware: {
+      (runtime as any).hardware = {
           cpuModel: 'CPU', logicalThreads: 8, totalRamMb: 16000, availableRamMb: 8000, discoveredAt: Date.now(),
           gpus: [{
             index: 0, vendor: 'NVIDIA', model: 'GPU', vramMb: 8192, driver: '1', cudaVersion: '12',
@@ -1177,8 +1047,8 @@ describe('compute and lifecycle regression coverage', () => {
             executable: '/default/python', version: '3.13', torchInstalled: false, torchVersion: '',
             torchCudaAvailable: false, torchCudaVersion: '', cudaDeviceNames: [],
           },
-        },
-        environments: [
+        };
+      (runtime as any).environments = [
           {
             executable: '/default/python', version: '3.13', environment: 'default', jupyterReady: true,
             torchVersion: '', cudaAvailable: false, source: 'PATH',
@@ -1187,18 +1057,18 @@ describe('compute and lifecycle regression coverage', () => {
             executable: '/cuda/python', version: '3.12', environment: 'cuda-env', jupyterReady: true,
             torchVersion: '2.x', cudaAvailable: true, source: 'Conda',
           },
-        ],
-      });
-      assert.doesNotThrow(() => runtime.changeCompute('peer-z', 'work.ipynb', 'cpu', '/cuda/python'));
+        ];
+      (runtime as any).updatePresence();
+      assert.doesNotThrow(() => runtime.changeCompute('host', 'work.ipynb', 'cpu', '/cuda/python'));
       assert.equal(runtime.computeForNotebook('work.ipynb').pythonPath, '/cuda/python');
-      assert.doesNotThrow(() => runtime.changeCompute('peer-z', 'work.ipynb', 'gpu:0', '/cuda/python'));
+      assert.doesNotThrow(() => runtime.changeCompute('host', 'work.ipynb', 'gpu:0', '/cuda/python'));
       assert.equal(runtime.computeForNotebook('work.ipynb').device, 'gpu:0');
-      assert.throws(() => runtime.changeCompute('peer-z', 'work.ipynb', 'cpu', '/missing/python'), /cannot start a Jupyter kernel/);
-      assert.throws(() => runtime.changeCompute('peer-z', 'work.ipynb', 'gpu:0', '/default/python'), /does not expose CUDA/);
-      const remotePresence = runtime.awareness.getStates().get(99) as { environments?: unknown[] };
-      remotePresence.environments = [];
+      assert.throws(() => runtime.changeCompute('host', 'work.ipynb', 'cpu', '/missing/python'), /cannot start a Jupyter kernel/);
+      assert.throws(() => runtime.changeCompute('host', 'work.ipynb', 'gpu:0', '/default/python'), /does not expose CUDA/);
+      (runtime as any).environments = [];
+      (runtime as any).updatePresence();
       assert.throws(
-        () => runtime.changeCompute('peer-z', 'work.ipynb', 'cpu', '/default/python'),
+        () => runtime.changeCompute('host', 'work.ipynb', 'cpu', '/default/python'),
         /cannot start a Jupyter kernel/,
       );
     } finally {
@@ -1207,7 +1077,7 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
-  it('keeps local CPU/GPU selectable when remote compute advertisement is disabled', async () => {
+  it('keeps host CPU/GPU selectable without a remote-compute permission flag', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-local-compute-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -1232,24 +1102,21 @@ describe('compute and lifecycle regression coverage', () => {
       }];
       runtime.awareness.setLocalState({
         peer: runtime.descriptor.localPeer, shareCursor: true, cursorColor: '#fff', kernelStatus: 'Offline',
-        allowRemoteCompute: false, allowCpu: false, allowGpu: false,
         hardware: { ...(runtime as any).hardware, gpus: [] }, environments: (runtime as any).environments,
       });
       const local = runtime.localComputePresence();
-      assert.equal(local?.allowRemoteCompute, true);
       assert.equal(local?.hardware?.gpus.length, 1);
       assert.doesNotThrow(() => runtime.changeCompute('host', 'work.ipynb', 'cpu', '/cuda/python'));
       assert.doesNotThrow(() => runtime.changeCompute('host', 'work.ipynb', 'gpu:0', '/cuda/python'));
       assert.equal(runtime.computeForNotebook('work.ipynb').device, 'gpu:0');
     } finally {
+      assert.equal(runtime.computeForNotebook('work.ipynb').device, 'gpu:0');
       await (runtime as any).disposeAsync();
-      const saved = JSON.parse(await readFile(path.join(folder, '.pair-notebook-session.json'), 'utf8'));
-      assert.equal(saved.notebookCompute['work.ipynb'].device, 'gpu:0', 'shutdown drains the latest queued descriptor write');
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('returns immediate execution errors when remote compute is disabled or the target is stale', async () => {
+  it('accepts host compute without opt-in and rejects stale or malformed targets', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-reject-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -1274,7 +1141,7 @@ describe('compute and lifecycle regression coverage', () => {
       await (runtime as any).handleExecutionRequest({
         type: 'executeRequest', payload: Buffer.from('1+1'),
         meta: {
-          requestId: 'disabled', notebookKey: 'work.ipynb',
+          requestId: 'without-opt-in', notebookKey: 'work.ipynb',
           target: { executorId: 'host', device: 'cpu', epoch: 0, author: 'host' },
           documentManifest: {}, binaryManifest: {}, directoryManifest: [],
         },
@@ -1283,19 +1150,18 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(sent[0].type, 'executeResult');
       const rejectedResult = JSON.parse(Buffer.from(sent[0].payload).toString('utf8'));
       assert.equal(rejectedResult.success, false);
-      assert.equal(rejectedResult.content.ename, 'RemoteComputeDisabled');
+      assert.equal(rejectedResult.content.ename, 'FileVersionBarrier');
 
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
         type: 'kernelCommand', payload: new Uint8Array(),
-        meta: { requestId: 'kernel-disabled', notebookKey: 'work.ipynb', command: 'interrupt', target: runtime.computeForNotebook('work.ipynb') },
+        meta: { requestId: 'kernel-without-opt-in', notebookKey: 'work.ipynb', command: 'interrupt', target: runtime.computeForNotebook('work.ipynb') },
       }, 'peer-z');
       assert.equal(sent.length, 1);
       assert.equal(sent[0].type, 'kernelCommandResult');
       assert.equal(sent[0].meta.success, false);
-      assert.match(sent[0].meta.message, /remote compute/i);
+      assert.match(sent[0].meta.message, /No running kernel/);
 
-      runtime.setRemoteComputeAllowed(true);
       sent.length = 0;
       await (runtime as any).handleExecutionRequest({
         type: 'executeRequest', payload: Buffer.from('1+1'),
@@ -1308,30 +1174,18 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(sent.length, 1);
       assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'ComputeTargetChanged');
 
-      // Turning off an advertised device must be enforced on the executor,
-      // even if a peer still holds a previously selected target.
-      const currentTarget = runtime.computeForNotebook('work.ipynb');
-      fakeVscode.__config.allowCpu = false;
-      sent.length = 0;
-      await (runtime as any).handleExecutionRequest({
-        type: 'executeRequest', payload: Buffer.from('1+1'),
-        meta: {
-          requestId: 'cpu-disabled', notebookKey: 'work.ipynb', target: currentTarget,
-          documentManifest: {}, binaryManifest: {}, directoryManifest: [],
-        },
-      }, 'peer-z');
-      assert.equal(JSON.parse(Buffer.from(sent[0].payload).toString('utf8')).content.ename, 'CpuComputeDisabled');
-
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
         type: 'kernelCommand', payload: new Uint8Array(),
-        meta: { requestId: 'kernel-cpu-disabled', notebookKey: 'work.ipynb', command: 'interrupt', target: currentTarget },
+        meta: {
+          requestId: 'kernel-forged-executor', notebookKey: 'work.ipynb', command: 'interrupt',
+          target: { executorId: 'peer-z', device: 'cpu', epoch: 123, author: 'peer-z' },
+        },
       }, 'peer-z');
       assert.equal(sent[0].type, 'kernelCommandResult');
       assert.equal(sent[0].meta.success, false);
-      assert.match(sent[0].meta.message, /CPU sharing is disabled/);
+      assert.match(sent[0].meta.message, /changed or names a different executor/);
 
-      fakeVscode.__config.allowCpu = true;
       sent.length = 0;
       await (runtime as any).handleKernelCommand({
         type: 'kernelCommand', payload: new Uint8Array(),
@@ -1341,8 +1195,6 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(sent[0].meta.success, false);
       assert.match(sent[0].meta.message, /malformed/);
     } finally {
-      delete fakeVscode.__config.allowRemoteCompute;
-      delete fakeVscode.__config.allowCpu;
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
@@ -1616,8 +1468,6 @@ describe('compute and lifecycle regression coverage', () => {
     let finishExecution: ((value: any) => void) | undefined;
     let executionCount = 0;
     try {
-      fakeVscode.__config.allowCpu = true;
-      runtime.setRemoteComputeAllowed(true);
       runtime.project.ensureNotebook('work.ipynb');
       (runtime as any).updatePresence();
       const target = runtime.computeForNotebook('work.ipynb');
@@ -1693,8 +1543,6 @@ describe('compute and lifecycle regression coverage', () => {
       }, 'peer-z');
       assert.equal((runtime as any).completedRemoteExecutions.size, 0);
     } finally {
-      delete fakeVscode.__config.allowRemoteCompute;
-      delete fakeVscode.__config.allowCpu;
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
@@ -2082,7 +1930,7 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
-  it('recovers through a bounded clock jump after missing multiple host changes', async () => {
+  it('rejects skipped host clocks and accepts only the current host exact transfer', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-clock-reconcile-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -2092,14 +1940,12 @@ describe('compute and lifecycle regression coverage', () => {
       workingFolder: folder, pythonPath: process.execPath,
       knownPeers: [{ peerId: 'new-host', displayName: 'New Host', joinOrder: 1 }],
     }), 'clock-reconcile-token-that-is-long-enough', context(extensionRoot), logger());
-    const broadcasts: Array<{ type: string; meta: any }> = [];
-    (runtime as any).clockReconciliationRequired = true;
     (runtime as any).transport = {
       peerRuntime: () => [{
         peerId: 'new-host', displayName: 'New Host', joinOrder: 1, online: true,
         latency: 1, latencyEma: 1, lastHeartbeat: Date.now(), missedHeartbeats: 0, route: 'Direct',
       }],
-      broadcast: (type: string, meta: any) => broadcasts.push({ type, meta }),
+      broadcast: () => undefined,
       stop: async () => undefined,
     };
     try {
@@ -2107,10 +1953,22 @@ describe('compute and lifecycle regression coverage', () => {
         type: 'helloAck', payload: new Uint8Array(),
         meta: { clock: { sessionEpoch: 10, hostEpoch: 3, hostId: 'new-host' }, hostStorageReady: true },
       }, 'new-host');
+      assert.equal(runtime.coordinator.clock.hostId, 'old-host');
+      assert.equal(runtime.coordinator.clock.hostEpoch, 0);
+
+      await (runtime as any).onMessage({
+        type: 'hostAnnouncement', payload: new Uint8Array(),
+        meta: { clock: { sessionEpoch: 10, hostEpoch: 3, hostId: 'new-host' } },
+      }, 'old-host');
+      assert.equal(runtime.coordinator.clock.hostId, 'old-host', 'the current host cannot skip transfer epochs');
+
+      await (runtime as any).onMessage({
+        type: 'hostAnnouncement', payload: new Uint8Array(),
+        meta: { clock: { sessionEpoch: 10, hostEpoch: 1, hostId: 'new-host' } },
+      }, 'old-host');
       assert.equal(runtime.coordinator.clock.hostId, 'new-host');
-      assert.equal(runtime.coordinator.clock.hostEpoch, 3);
+      assert.equal(runtime.coordinator.clock.hostEpoch, 1);
       assert.equal(runtime.descriptor.role, 'peer');
-      assert.ok(broadcasts.some((item) => item.type === 'hostAnnouncement'));
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
@@ -2417,10 +2275,10 @@ describe('binary transfer protocol hardening', () => {
 });
 
 describe('compute state convergence', () => {
-  it('merges missed per-notebook compute state and ignores an older replay', async () => {
+  it('accepts missed host compute state and ignores participant or older replays', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-compute-state-'));
     const saved = descriptor({
-      sessionId: 'compute-state', role: 'host', peerId: 'host', hostPeerId: 'host',
+      sessionId: 'compute-state', role: 'peer', peerId: 'participant', hostPeerId: 'host',
       workingFolder: root, pythonPath: process.execPath,
     });
     const runtime = new SessionRuntime(
@@ -2435,21 +2293,29 @@ describe('compute state convergence', () => {
       await (runtime as any).onMessage({
         type: 'computeState', payload: new Uint8Array(), meta: {
           targets: {
-            'work.ipynb': { executorId: 'peer-b', device: 'cpu', epoch: 5, author: 'peer-b' },
+            'work.ipynb': { executorId: 'host', device: 'cpu', epoch: 5, author: 'host' },
           },
         },
-      }, 'peer-b');
+      }, 'host');
       assert.deepEqual(runtime.computeForNotebook('work.ipynb'), {
-        executorId: 'peer-b', device: 'cpu', epoch: 5, author: 'peer-b', pythonPath: undefined,
+        executorId: 'host', device: 'cpu', epoch: 5, author: 'host', pythonPath: undefined,
       });
       await (runtime as any).onMessage({
         type: 'computeState', payload: new Uint8Array(), meta: {
           targets: {
-            'work.ipynb': { executorId: 'peer-a', device: 'cpu', epoch: 4, author: 'peer-a' },
+            'work.ipynb': { executorId: 'peer-a', device: 'cpu', epoch: 6, author: 'peer-a' },
           },
         },
       }, 'peer-a');
-      assert.equal(runtime.computeForNotebook('work.ipynb').executorId, 'peer-b');
+      assert.equal(runtime.computeForNotebook('work.ipynb').epoch, 5);
+      await (runtime as any).onMessage({
+        type: 'computeState', payload: new Uint8Array(), meta: {
+          targets: {
+            'work.ipynb': { executorId: 'host', device: 'cpu', epoch: 4, author: 'host' },
+          },
+        },
+      }, 'host');
+      assert.equal(runtime.computeForNotebook('work.ipynb').epoch, 5);
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
@@ -2484,9 +2350,6 @@ describe('compute state convergence', () => {
       runtime.awareness.setLocalState({
         peer: saved.localPeer,
         shareCursor: true,
-        allowRemoteCompute: false,
-        allowCpu: false,
-        allowGpu: false,
       });
       runtime.changeCompute('host', 'work.ipynb', 'cpu');
       assert.equal(announcement.computeEpoch, 3);
@@ -2559,7 +2422,7 @@ describe('identity and lifecycle regressions', () => {
     }
   });
 
-  it('completes teardown when the pre-leave host transfer fails', async function () {
+  it('does not transfer host authority when the host simply leaves', async function () {
     this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-leave-failure-'));
     const extensionRoot = path.join(root, 'extension');
@@ -2588,14 +2451,15 @@ describe('identity and lifecycle regressions', () => {
       await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'peer connection');
       const transport: any = (host as any).transport;
       const originalSendTo = transport.sendTo.bind(transport);
+      let transferAttempts = 0;
       transport.sendTo = (targetId: string, type: string, meta?: unknown, payload?: Uint8Array) => {
-        if (type === 'hostTransferPrepare') throw new Error('prepare transport failed');
+        if (type === 'hostTransferPrepare') transferAttempts += 1;
         return originalSendTo(targetId, type, meta, payload);
       };
-      // Leaving must resolve and fully dispose even though the courtesy
-      // handover failed; a rejected leave() would keep the session alive.
       await host.leave();
       assert.equal(host.snapshot().closed, true);
+      assert.equal(transferAttempts, 0);
+      assert.equal(peer.snapshot().clock.hostId, 'host');
     } finally {
       if (peer) peer.descriptor.mode = 'host-only';
       await Promise.allSettled([peer?.leave?.()]);

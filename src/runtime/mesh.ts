@@ -143,7 +143,9 @@ export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
  * alive long enough to replace a failed route before SessionCoordinator may
  * interpret it as a host loss.
  */
-export const LOGICAL_PEER_RECOVERY_MS = 30_000;
+export const LOGICAL_PEER_RECOVERY_MS = 60_000;
+const ROUTE_PING_FAILURE_LIMIT = 3;
+const ROUTE_PING_STALE_MS = 3_000;
 
 export type RouteUpgradeStatus =
   | 'requesting'
@@ -318,6 +320,7 @@ interface ConnectedPeer {
   purpose: PeerConnectionPurpose;
   connectedAt: number;
   lastSeen: number;
+  pingFailures: number;
   snapshotRequested: boolean;
 }
 
@@ -1214,7 +1217,7 @@ export class MeshTransport extends EventEmitter {
     }
   }
 
-  /** Assigns the host-authoritative, stable order used by deterministic failover. */
+  /** Publishes the host-authoritative, stable participant order. */
   public setPeerJoinOrder(peerId: string, joinOrder: number): PeerIdentity {
     if (!this.options.isHost()) throw new Error('Only the current host may assign participant order.');
     if (!Number.isSafeInteger(joinOrder) || joinOrder < 0) {
@@ -1668,6 +1671,7 @@ public improvablePeerIds(): string[] {
       purpose: handshake.purpose,
       connectedAt: upgrade.connectedAt,
       lastSeen: Date.now(),
+      pingFailures: 0,
       snapshotRequested: false,
     });
     this.emitRouteUpgradeEvent(upgrade);
@@ -2375,7 +2379,7 @@ public improvablePeerIds(): string[] {
       if (!this.options.isHost()) {
         throw new Error(`Peer identity ${identity.peerId} presented a different host-assigned order.`);
       }
-      // The current host owns canonical failover order. Parallel Nostr/MQTT
+      // The current host owns canonical participant order. Parallel Nostr/MQTT
       // handshakes can both be signed before the first admitted route delivers
       // peerAdmission, leaving the second route with the guest's provisional
       // order. The already-pinned key proves this is the same identity; use the
@@ -2474,6 +2478,7 @@ public improvablePeerIds(): string[] {
       purpose: handshake.purpose,
       connectedAt: Date.now(),
       lastSeen: Date.now(),
+      pingFailures: 0,
       snapshotRequested: false,
     };
     this.connections.set(transportPeerId, connection);
@@ -2776,6 +2781,7 @@ public improvablePeerIds(): string[] {
       if (data.byteLength > MAX_WIRE_FRAME_BYTES) throw new Error('Inbound Pair Notebook frame exceeds the wire size limit.');
       this.acceptInboundRate(transportPeerId, data.byteLength);
       connection.lastSeen = Date.now();
+      connection.pingFailures = 0;
       const bytes = Buffer.from(data);
       this.receivedWindow += bytes.byteLength;
       this.totalReceived += bytes.byteLength;
@@ -2905,7 +2911,7 @@ public improvablePeerIds(): string[] {
     const activeTransport = this.identityToTransport.get(identity.peerId);
     const active = activeTransport ? this.connections.get(activeTransport) : undefined;
     if (active) {
-      // A directory from the authenticated host owns failover order, while a
+      // A directory from the authenticated host owns participant order, while a
       // peer's authenticated connection continues to own its name and key.
       if (identity.joinOrder !== active.identity.joinOrder) {
         active.identity = { ...active.identity, joinOrder: identity.joinOrder };
@@ -2987,13 +2993,22 @@ public improvablePeerIds(): string[] {
           const room = owner.room;
           if (!room) return;
           const current = await room.ping(owner.rawId);
-          if (!Number.isFinite(current) || current < 0) return;
+          if (!Number.isFinite(current) || current < 0) throw new Error('Route ping returned an invalid latency.');
           const bounded = Math.min(60_000, current);
           const previous = this.latency.get(connection.identity.peerId)?.ema ?? bounded;
           this.latency.set(connection.identity.peerId, { current: bounded, ema: previous * 0.7 + bounded * 0.3 });
           connection.lastSeen = Date.now();
+          connection.pingFailures = 0;
         } catch {
-          // Trystero emits onPeerLeave when the connection is conclusively gone.
+          if (this.connections.get(connection.transportPeerId) !== connection) return;
+          connection.pingFailures += 1;
+          if (connection.pingFailures >= ROUTE_PING_FAILURE_LIMIT
+            && Date.now() - connection.lastSeen >= ROUTE_PING_STALE_MS) {
+            // VPN/TUN changes can leave a DataChannel half-open without a
+            // Trystero leave callback. Retire only after repeated failed
+            // probes, then preserve the logical peer during the recovery lease.
+            this.onPeerLeave(connection.transportPeerId);
+          }
         }
       }));
     } finally {

@@ -33,7 +33,7 @@ import {
   MAX_TEXT_DOCUMENT_BYTES,
   ProjectUpdate,
 } from '../core/crdt';
-import { MAX_HOST_RECONCILIATION_ADVANCE, SessionCoordinator } from '../core/election';
+import { SessionCoordinator } from '../core/election';
 import { CpuSnapshot, discoverHardware, HardwareInfo, ResourceSample, sampleResources } from '../core/hardware';
 import { JupyterExecutionResult, JupyterKernel, JupyterKernelEvent } from '../core/pythonKernel';
 import { validateIdentityPublicKey } from '../core/identity';
@@ -112,9 +112,6 @@ export interface PresenceState {
   hardware?: HardwareInfo | undefined;
   environments?: PythonEnvironment[] | undefined;
   resources?: ResourceSample | undefined;
-  allowRemoteCompute: boolean;
-  allowCpu: boolean;
-  allowGpu: boolean;
   kernelStatus: 'Idle' | 'Busy' | 'Offline';
   kernelStatuses?: Record<string, 'Idle' | 'Busy' | 'Offline'> | undefined;
 }
@@ -481,11 +478,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly notebookActiveExecutions = new Map<string, number>();
   private activeExecutions = 0;
   private computeEpoch = 0;
-  /** Explicit consent is scoped to this runtime and never restored from settings. */
-  private remoteComputeAllowedForSession = false;
   private closed = false;
-  /** A stale former host may adopt exactly one deterministic epoch after proven isolation. */
-  private clockReconciliationRequired = false;
   private endingSession = false;
   private terminationCheckInFlight = false;
   private lastDisplayNameWarning = '';
@@ -570,9 +563,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.binaryVersions.set(key, normalized);
     }
     assertPortablePathUniqueness([...this.fileStates.keys(), ...this.binaryVersions.keys()]);
-    descriptor.computeExecutorId = validPeerId(descriptor.computeExecutorId)
-      ? descriptor.computeExecutorId
-      : descriptor.hostPeerId;
+    descriptor.computeExecutorId = descriptor.hostPeerId;
     if (isPlainRecord(descriptor.notebookCompute)) {
       const computeEntries = Object.entries(descriptor.notebookCompute);
       if (computeEntries.length > MAX_TRACKED_PROJECT_ENTRIES) {
@@ -586,7 +577,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         const portableKey = key === '*' ? '*' : key ? portablePathComparisonKey(key) : undefined;
         if (key && target && portableKey && !portableKeys.has(portableKey)) {
           portableKeys.add(portableKey);
-          targets[key] = target;
+          targets[key] = {
+            ...target,
+            executorId: descriptor.hostPeerId,
+            author: descriptor.hostPeerId,
+          };
         }
       }
       descriptor.notebookCompute = targets;
@@ -595,10 +590,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     if (!descriptor.notebookCompute['*']) {
       descriptor.notebookCompute['*'] = {
-        executorId: descriptor.computeExecutorId,
+        executorId: descriptor.hostPeerId,
         device: 'cpu',
         epoch: 0,
-        author: descriptor.computeExecutorId,
+        author: descriptor.hostPeerId,
       };
     }
     descriptor.notebookPythonPaths = normalizeNotebookPythonPaths(descriptor.notebookPythonPaths);
@@ -791,26 +786,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!local) return undefined;
     return {
       ...local,
-      hardware: this.hardware,
-      environments: this.environments,
-      // These flags control what is advertised to *remote* participants.
-      // Local compute must remain selectable even when sharing is disabled.
-      allowRemoteCompute: true,
-      allowCpu: true,
-      allowGpu: true,
+      hardware: this.coordinator.isCurrentHost() ? this.hardware : undefined,
+      environments: this.coordinator.isCurrentHost() ? this.environments : [],
+      resources: this.coordinator.isCurrentHost() ? this.resources : undefined,
     };
-  }
-
-  /** Remote Python execution always starts disabled for every new/restored session. */
-  public isRemoteComputeAllowed(): boolean {
-    return this.remoteComputeAllowedForSession;
-  }
-
-  public setRemoteComputeAllowed(allowed: boolean): void {
-    if (this.closed) throw new Error('The Pair Notebook session is closed.');
-    if (this.remoteComputeAllowedForSession === allowed) return;
-    this.remoteComputeAllowedForSession = allowed;
-    this.updatePresence();
   }
 
   public computeForNotebook(notebookKey: string): NotebookComputeTarget {
@@ -826,7 +805,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await this.storage?.flush();
   }
 
-  /** Only the elected host may publish an explicit save to the shared backing folder. */
+  /** Only the current host may publish an explicit save to the shared backing folder. */
   public async saveAsHost(): Promise<void> {
     if (!this.coordinator.isCurrentHost()) {
       throw new Error('Only the current Session Host can save the shared project. Your edits are already sent to the host.');
@@ -865,9 +844,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const host = resolveHostIdentity(this.descriptor, this.coordinator.clock.hostId);
       candidates.set(host.peerId, host);
     }
-    // A resilient participant may have promoted itself while it was isolated.
-    // Reconnecting to every remembered peer lets the higher host clock heal
-    // that split instead of leaving two permanent, disconnected hosts.
+    // Reconnect to every remembered participant without changing authority.
+    // Only an authenticated transfer announcement from the current host can
+    // ever replace the session host.
     for (const peer of candidates.values()) this.transport.connect(peer);
     const refreshed = await this.transport.refreshSignalling();
     this.log.appendLine(
@@ -909,7 +888,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // host, so a failed prepare/commit never strands the old host without its
     // backing folder and there is no dual-writer window.
     this.storage?.setBackingRoot(undefined);
-    this.coordinator.applyAnnouncement(committed);
+    this.coordinator.applyAnnouncement(committed, this.descriptor.localPeer.peerId);
     await this.onHostChanged();
     this.transport.broadcast('hostAnnouncement', { clock: committed });
     try {
@@ -921,16 +900,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public changeCompute(executorId: string, notebookKey?: string, device: NotebookComputeTarget['device'] = 'cpu', pythonPath?: string): void {
-    const localExecutor = executorId === this.descriptor.localPeer.peerId;
-    const state = localExecutor
-      ? this.localComputePresence()
-      : this.snapshot().awareness.find((candidate) => candidate.peer.peerId === executorId);
-    if (!state || (!localExecutor && !state.allowRemoteCompute)) {
-      throw new Error('The selected participant is not available for remote compute.');
+    if (!this.coordinator.isCurrentHost()) {
+      throw new Error('Only the current Session Host can configure shared compute.');
     }
-    if (!localExecutor && device === 'cpu' && !state.allowCpu) {
-      throw new Error('The selected participant does not allow CPU execution.');
+    if (executorId !== this.descriptor.localPeer.peerId || executorId !== this.coordinator.clock.hostId) {
+      throw new Error('Shared code execution is always owned by the current Session Host.');
     }
+    const state = this.localComputePresence();
+    if (!state) throw new Error('The Session Host compute environment is not available.');
     const gpuMatch = /^gpu:(\d+)$/.exec(device);
     const environments = state.environments ?? [];
     if (gpuMatch) {
@@ -938,17 +915,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const hasCudaEnvironment = environments.length
         ? environments.some((environment) => environment.jupyterReady && environment.cudaAvailable)
         : state.hardware?.python.torchCudaAvailable === true;
-      const advertised = (localExecutor || state.allowGpu) && hasCudaEnvironment
+      const advertised = hasCudaEnvironment
         && state.hardware?.gpus.some((gpu) => gpu.index === gpuIndex);
-      if (!advertised) throw new Error(`GPU ${gpuIndex} is not advertised by the selected executor.`);
+      if (!advertised) throw new Error(`GPU ${gpuIndex} is not available on the Session Host.`);
     }
     if (pythonPath) {
       const environment = environments.find((candidate) => candidate.executable === pythonPath);
       if (!environment || !environment.jupyterReady) {
-        throw new Error('The selected Python environment cannot start a Jupyter kernel.');
+        throw new Error('The selected Session Host Python environment cannot start a Jupyter kernel.');
       }
       if (gpuMatch && !environment.cudaAvailable) {
-        throw new Error('The selected Python environment does not expose CUDA for this GPU target.');
+        throw new Error('The selected Session Host Python environment does not expose CUDA for this GPU target.');
       }
     }
     const key = notebookKey === undefined ? '*' : normalizedTrackedPath(notebookKey);
@@ -1671,22 +1648,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async leave(): Promise<void> {
     if (this.closed) return;
-    if (this.coordinator.isCurrentHost() && this.descriptor.mode === 'resilient') {
-      const candidate = this.transport.peerRuntime()
-        .filter((peer) => peer.peerId !== this.descriptor.localPeer.peerId && peer.online)
-        .sort((a, b) => a.joinOrder - b.joinOrder || a.peerId.localeCompare(b.peerId))[0];
-      if (candidate) {
-        // The courtesy handover is best effort: a vanished target, a commit
-        // timeout or a failed flush must never skip the teardown below,
-        // otherwise the session would stay alive after the user confirmed
-        // leaving (and deactivate() would surface an unhandled rejection).
-        try {
-          await this.transferHost(candidate.peerId);
-        } catch (error) {
-          this.log.appendLine(`[debug] Pre-leave host transfer failed; leaving without handover: ${formatError(error)}`);
-        }
-      }
-    }
     await this.disposeAsync();
   }
 
@@ -1898,8 +1859,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.persistDescriptorInBackground();
       try {
         this.sendFilesystemState(peer.peerId);
-        this.sendComputeState(peer.peerId);
         if (this.coordinator.isCurrentHost()) {
+          this.sendComputeState(peer.peerId);
           void this.sendProjectState(peer.peerId).catch((error) => {
             this.log.appendLine(`[error] Failed to send initial project state to ${peer.displayName}: ${formatError(error)}`);
           });
@@ -1937,19 +1898,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.updatePresence();
       this.emit('identityChanged', { ...this.descriptor.localPeer });
     });
-    this.transport.on('restarted', () => {
-      if (this.descriptor.mode === 'resilient' && this.coordinator.isCurrentHost()
-        && (this.descriptor.knownPeers ?? []).some((peer) => peer.peerId !== this.descriptor.localPeer.peerId)) {
-        this.clockReconciliationRequired = true;
-      }
-    });
     this.transport.on('peerDisconnected', (peer: PeerIdentity) => {
       this.coordinator.markDisconnected(peer.peerId);
-      if (this.descriptor.mode === 'resilient' && this.coordinator.isCurrentHost()
-        && [...this.coordinator.peers.values()].every((candidate) =>
-          candidate.peerId === this.descriptor.localPeer.peerId || !candidate.online)) {
-        this.clockReconciliationRequired = true;
-      }
       this.kernelCommandWindows.delete(peer.peerId);
       this.binaryAcknowledgements.delete(peer.peerId);
       this.rejectSnapshotCheckpoints(
@@ -1999,7 +1949,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         for (const notebookKey of affected) this.setKernelStatus(notebookKey, 'Offline');
         if (peer.peerId === this.descriptor.computeExecutorId) this.setKernelStatus('*', 'Offline');
         this.cancelExecutorRequests(peer.peerId, `Compute executor ${peer.displayName} disconnected.`);
-        this.emit('computeUnavailable', peer, affected);
       }
       if (peer.peerId === this.coordinator.clock.hostId) {
         this.transition(
@@ -2023,9 +1972,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transport.on('connectionError', (peer, error) => {
       const detail = `Connection to ${peer.displayName} failed: ${formatError(error)}`;
       this.log.appendLine(`[debug] ${detail}`);
-      // A late RTC error for the former host can arrive after deterministic
-      // failover has already entered the host-folder pause. Likewise, losing an
-      // unrelated participant must not make a healthy session look offline.
+      // A late RTC error for a former host can arrive after a voluntary host
+      // transfer. Likewise, losing an unrelated participant must not make a
+      // healthy session look offline.
       // Only a current-host failure (or initial connection failure) owns the
       // global reconnecting state.
       const currentHostFailed = !this.coordinator.isCurrentHost()
@@ -2050,6 +1999,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transport.on('networkChanged', () => {
       this.log.appendLine('[debug] Network interfaces changed; re-evaluating routes (make-before-break).');
       this.emit('connectionUpdated', { kind: 'network-changed' });
+      this.emit('networkChanged');
     });
   }
 
@@ -2204,16 +2154,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         case 'helloAck': {
           const peer = this.transport.peerRuntime().find((candidate) => candidate.peerId === sourceId);
           if (peer) this.coordinator.upsertPeer(peer);
-          if (clock && this.canReconcileHostClock(sourceId, clock)) {
-            if (this.coordinator.applyReconciledAnnouncement(clock)) {
-              this.clockReconciliationRequired = false;
-              await this.onHostChanged();
-              if (frame.meta.hostStorageReady === true) await this.onHostStorageReady(sourceId);
-              // A participant that still trusts this former host can follow the
-              // same bounded clock update without waiting for another outage.
-              this.transport.broadcast('hostAnnouncement', { clock });
-            }
-          }
           break;
         }
         case 'hostHeartbeat':
@@ -2502,10 +2442,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
                 this.preparedHostTransfers.delete(transferId);
               }
             }
-            const advance = clock.hostEpoch - this.coordinator.clock.hostEpoch;
-            const accepted = advance === 1
-              ? this.coordinator.applyAnnouncement(clock)
-              : this.coordinator.applyReconciledAnnouncement(clock);
+            const accepted = this.coordinator.applyAnnouncement(clock, sourceId);
             if (accepted) await this.onHostChanged();
           }
           break;
@@ -2550,10 +2487,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           if (!incoming || !prepared || prepared.sourceId !== sourceId || !sameClock(prepared.nextClock, incoming)) break;
           clearTimeout(prepared.timer);
           this.preparedHostTransfers.delete(transferId);
-          if (this.coordinator.applyAnnouncement(incoming)) await this.onHostChanged();
+          if (this.coordinator.applyAnnouncement(incoming, sourceId)) await this.onHostChanged();
           break;
         }
         case 'computeChanged': {
+          if (sourceId !== this.coordinator.clock.hostId) break;
           const announcedEpoch = Number(frame.meta.computeEpoch);
           const rawNotebookKey = String(frame.meta.notebookKey ?? '*');
           const notebookKey = rawNotebookKey === '*' ? '*' : normalizedTrackedPath(rawNotebookKey);
@@ -2564,6 +2502,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             sourceId,
           );
           if (!notebookKey || !target || target.author !== sourceId
+            || target.executorId !== this.coordinator.clock.hostId
             || !Number.isSafeInteger(announcedEpoch) || announcedEpoch !== target.epoch) break;
           const current = this.computeForNotebook(notebookKey);
           const epochAdvance = target.epoch - current.epoch;
@@ -2575,6 +2514,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           break;
         }
         case 'computeState': {
+          if (sourceId !== this.coordinator.clock.hostId) break;
           const rawTargets = frame.meta.targets;
           if (!isPlainRecord(rawTargets)) break;
           const entries = Object.entries(rawTargets);
@@ -2585,7 +2525,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           for (const [rawKey, rawTarget] of entries) {
             const notebookKey = rawKey === '*' ? '*' : normalizedTrackedPath(rawKey);
             const target = normalizeComputeTarget(rawTarget, sourceId);
-            if (!notebookKey || !target) continue;
+            if (!notebookKey || !target || target.author !== sourceId
+              || target.executorId !== this.coordinator.clock.hostId) continue;
             const current = this.computeForNotebook(notebookKey);
             const advance = target.epoch - current.epoch;
             if (advance < 0 || advance > MAX_REMOTE_REVISION_ADVANCE
@@ -2914,19 +2855,20 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.storage?.setBackingRoot(undefined);
     if (!isHost || (hostChanged && becameHost)) {
       // A backing path is local to one computer and must never follow the role
-      // to a different host (or be silently reused after a later re-election).
+      // to a different host (or be silently reused after a later transfer).
       this.descriptor.backingFolder = '';
     }
     this.descriptor.role = isHost ? 'host' : 'peer';
     this.descriptor.hostPeerId = this.coordinator.clock.hostId;
     this.descriptor.hostEpoch = this.coordinator.clock.hostEpoch;
+    this.normalizeComputeTargetsForHost();
     if (hostChanged || becameHost) this.waitingForHostFolder = true;
     const pauseDetail = this.waitingForHostFolder
       ? isHost
         ? 'You are the new host. The session is paused until you choose a folder on this computer.'
         : 'The session is paused until the new host chooses a folder on their computer.'
       : undefined;
-    // The elected clock becomes observable immediately. Publish the matching
+    // The transferred clock becomes observable immediately. Publish the matching
     // pause state before marker/autosave I/O so the UI can never briefly show a
     // reconnecting or ready session under a host that has no backing folder.
     if (pauseDetail) this.transition('waiting-for-host-folder', pauseDetail);
@@ -2943,26 +2885,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transition('ready', `Coordinator is ${this.coordinator.clock.hostId} at epoch ${this.coordinator.clock.hostEpoch}.`);
   }
 
-  private canReconcileHostClock(sourceId: string, incoming: HostClock): boolean {
-    const advance = incoming.hostEpoch - this.coordinator.clock.hostEpoch;
-    if (this.descriptor.mode !== 'resilient' || incoming.hostId !== sourceId
-      || advance < 0 || advance > MAX_HOST_RECONCILIATION_ADVANCE) return false;
-    if (advance === 0) {
-      if (incoming.hostId === this.coordinator.clock.hostId) return false;
-      // Two isolated partitions can legitimately elect different hosts at the
-      // same epoch. Once they reconnect, every participant sees the same live
-      // candidate set and deterministically keeps its earliest member.
-      const winner = this.transport.peerRuntime()
-        .filter((peer) => peer.online)
-        .sort((left, right) => left.joinOrder - right.joinOrder || left.peerId.localeCompare(right.peerId))[0];
-      return winner?.peerId === sourceId;
+  private normalizeComputeTargetsForHost(): void {
+    const currentTargets = this.descriptor.notebookCompute ?? {};
+    const nextTargets: Record<string, NotebookComputeTarget> = {};
+    for (const notebookKey of Object.keys(currentTargets)) {
+      nextTargets[notebookKey] = {
+        executorId: this.coordinator.clock.hostId,
+        device: 'cpu',
+        epoch: 0,
+        author: this.coordinator.clock.hostId,
+      };
     }
-    const connectedCandidates = this.transport.peerRuntime()
-      .filter((peer) => peer.online && peer.peerId !== this.descriptor.localPeer.peerId)
-      .sort((left, right) => left.joinOrder - right.joinOrder || left.peerId.localeCompare(right.peerId));
-    if (connectedCandidates[0]?.peerId !== sourceId) return false;
-    if (this.coordinator.isCurrentHost()) return this.clockReconciliationRequired;
-    return !connectedCandidates.some((peer) => peer.peerId === this.coordinator.clock.hostId);
+    if (!nextTargets['*']) {
+      nextTargets['*'] = {
+        executorId: this.coordinator.clock.hostId,
+        device: 'cpu',
+        epoch: 0,
+        author: this.coordinator.clock.hostId,
+      };
+    }
+    this.computeEpoch = 0;
+    this.descriptor.notebookCompute = nextTargets;
+    this.descriptor.computeExecutorId = this.coordinator.clock.hostId;
+    this.cancelNotebookExecutions('*', 'Host transferred; stale execution request discarded.');
+    for (const key of this.kernels.keys()) {
+      this.kernels.get(key)?.stop();
+      this.setKernelStatus(key, 'Offline');
+    }
+    this.kernels.clear();
+    this.kernelLastUsed.clear();
   }
 
   private async onHostStorageReady(sourceId: string): Promise<void> {
@@ -3135,21 +3086,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.coordinator.upsertPeer(peer);
       this.assignedJoinOrders.set(peer.peerId, peer.joinOrder);
     }
-    const elected = this.coordinator.evaluate();
-    if (elected) {
-      if (elected.hostId === this.descriptor.localPeer.peerId) {
-        this.waitingForHostFolder = true;
-        this.transition('waiting-for-host-folder', 'You are the new host. The session is paused until you choose a folder on this computer.');
-        this.transport.broadcast('hostAnnouncement', { clock: elected });
-      }
-      void this.onHostChanged().catch((error) => {
-        this.log.appendLine(`[error] Host failover transition failed: ${formatError(error)}`);
-        this.emit('storageError', error);
-      });
-    }
+    this.coordinator.evaluate();
     if (this.coordinator.closed && !this.closed) {
       this.runBackground('Host-loss notification', () => vscode.window.showErrorMessage(
-        'Pair Notebook host connection was lost. This Host Only session is closed.',
+        'Pair Notebook could not restore the host connection. The active session was closed; reopen it from Recent Projects to try again.',
       ));
       const host = this.transport.peerRuntime().find((peer) => peer.peerId === this.coordinator.clock.hostId)
         ?? (this.descriptor.knownPeers ?? []).find((peer) => peer.peerId === this.coordinator.clock.hostId);
@@ -3218,9 +3158,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.lastDisplayNameWarning = warning;
       }
     }
-    const allowRemoteCompute = this.remoteComputeAllowedForSession;
-    const allowCpu = allowRemoteCompute && configuration.get<boolean>('allowCpu', false);
-    const allowGpu = allowRemoteCompute && configuration.get<boolean>('allowGpu', false);
+    const advertisesCompute = this.coordinator.isCurrentHost();
     const shareCursor = configuration.get<boolean>('shareMyCursor', true);
     const configuredColor = configuration.get<string>('myCursorColor', '#4FC3F7');
     const cursorColor = /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor : '#4FC3F7';
@@ -3276,20 +3214,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       shareCursor,
       cursorColor,
       typing: false,
-      hardware: allowRemoteCompute && this.hardware ? {
-        ...this.hardware,
-        gpus: allowGpu ? this.hardware.gpus : [],
-        python: allowGpu ? this.hardware.python : {
-          ...this.hardware.python,
-          torchCudaAvailable: false,
-          cudaDeviceNames: [],
-        },
-      } : undefined,
-      environments: allowRemoteCompute ? this.environments : [],
-      resources: allowRemoteCompute ? this.resources : undefined,
-      allowRemoteCompute,
-      allowCpu,
-      allowGpu,
+      hardware: advertisesCompute ? this.hardware : undefined,
+      environments: advertisesCompute ? this.environments : [],
+      resources: advertisesCompute ? this.resources : undefined,
       kernelStatus: this.kernelStatus,
       kernelStatuses: Object.fromEntries(this.kernelStatuses),
     } satisfies PresenceState);
@@ -4116,36 +4043,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       || !sameComputeTarget(target, this.computeForNotebook(notebookKey))) {
       return 'The shared compute target changed or names a different executor.';
     }
-    return this.computeTargetAvailabilityError(target, false);
+    return this.computeTargetAvailabilityError(target);
   }
 
-  private computeTargetAvailabilityError(target: NotebookComputeTarget, localSelection: boolean): string | undefined {
+  private computeTargetAvailabilityError(target: NotebookComputeTarget): string | undefined {
+    if (target.executorId !== this.coordinator.clock.hostId) {
+      return 'The shared compute target does not name the current Session Host.';
+    }
     const localExecutor = target.executorId === this.descriptor.localPeer.peerId;
-    const configuration = vscode.workspace.getConfiguration('pairNotebook');
     const presence = localExecutor
       ? this.localComputePresence()
       : this.snapshot().awareness.find((state) => state.peer.peerId === target.executorId);
     const online = localExecutor || this.transport.peerRuntime()
       .some((peer) => peer.peerId === target.executorId && peer.online);
-    if (!presence || !online) return 'The selected compute executor is offline.';
-    if ((!localExecutor || !localSelection) && !presence.allowRemoteCompute) {
-      return 'The selected executor does not allow remote compute.';
-    }
-    if (localExecutor && !localSelection && !this.remoteComputeAllowedForSession) {
-      return 'Remote compute is disabled on this computer.';
-    }
-    if (target.device === 'cpu') {
-      const allowed = localExecutor
-        ? (localSelection || configuration.get<boolean>('allowCpu', false))
-        : presence.allowCpu;
-      if (!allowed) return 'CPU sharing is disabled on the selected computer.';
-    } else {
-      const allowed = localExecutor
-        ? (localSelection || configuration.get<boolean>('allowGpu', false))
-        : presence.allowGpu;
-      if (!allowed) return 'GPU sharing is disabled on the selected computer.';
+    if (!presence || !online) return 'The Session Host compute executor is offline.';
+    if (target.device !== 'cpu') {
       const gpuIndex = Number(target.device.slice(4));
-      if (!presence.hardware?.gpus.some((gpu) => gpu.index === gpuIndex)) return 'The requested GPU is not available.';
+      if (!presence.hardware?.gpus.some((gpu) => gpu.index === gpuIndex)) return 'The requested GPU is not available on the Session Host.';
     }
     if (target.pythonPath) {
       const environment = presence.environments?.find((candidate) => candidate.executable === target.pythonPath);
@@ -4901,7 +4815,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       rejectRequest('ComputeTargetChanged', 'Compute target changed before the execution request arrived.');
       return;
     }
-    const targetError = this.computeTargetAvailabilityError(target, false);
+    const targetError = this.computeTargetAvailabilityError(target);
     if (targetError) {
       rejectRequest(computeAvailabilityErrorName(targetError), targetError);
       return;
@@ -5645,9 +5559,6 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     hardware,
     environments,
     resources,
-    allowRemoteCompute: raw.allowRemoteCompute === true,
-    allowCpu: raw.allowRemoteCompute === true && raw.allowCpu === true,
-    allowGpu: raw.allowRemoteCompute === true && raw.allowGpu === true,
     kernelStatus,
     kernelStatuses,
   };
@@ -6075,9 +5986,9 @@ function inputReplyKey(requestId: string, eventSequence: number): string {
 }
 
 function computeAvailabilityErrorName(message: string): string {
-  if (/CPU/i.test(message)) return 'CpuComputeDisabled';
-  if (/GPU|CUDA/i.test(message)) return 'GpuComputeDisabled';
-  return 'RemoteComputeDisabled';
+  if (/GPU|CUDA/i.test(message)) return 'GpuComputeUnavailable';
+  if (/offline/i.test(message)) return 'HostComputeOffline';
+  return 'ComputeUnavailable';
 }
 
 function sameClock(a: HostClock, b: HostClock): boolean {

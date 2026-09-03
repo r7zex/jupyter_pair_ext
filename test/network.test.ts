@@ -687,6 +687,44 @@ describe('signalling socket refresh', () => {
 });
 
 describe('mesh relay fallback integration', function () {
+  it('retires a half-open direct route after repeated failed VPN-era probes', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host' };
+    const transport = new MeshTransport({
+      sessionId: 'half-open-route', token: 'half-open-route-token-that-is-long-enough',
+      localPeer: { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => clock, isHost: () => true, logicalPeerRecoveryMs: 60_000,
+    });
+    const peer = { peerId: 'guest', displayName: 'Guest', joinOrder: 1 };
+    let recovering = 0;
+    transport.on('peerRecovering', () => { recovering += 1; });
+    const fakeRoom = {
+      getPeers: () => ({ guest: { close: () => undefined } }),
+      ping: async () => { throw new Error('stale DataChannel'); },
+      leave: async () => undefined,
+    };
+    const internals = transport as any;
+    internals.room = fakeRoom;
+    internals.directory.set('guest', peer);
+    internals.connections.set('guest', {
+      transportPeerId: 'guest', identity: peer, purpose: 'runtime',
+      connectedAt: Date.now() - 10_000, lastSeen: Date.now() - 10_000,
+      pingFailures: 0, snapshotRequested: false,
+    });
+    internals.identityToTransport.set('guest', 'guest');
+    try {
+      await internals.pingTick();
+      await internals.pingTick();
+      assert.equal(transport.hasRoute('guest'), true, 'one or two probe failures do not tear down a route');
+      await internals.pingTick();
+      assert.equal(transport.hasRoute('guest'), false);
+      assert.equal(transport.isPeerRecovering('guest'), true, 'logical identity remains recoverable');
+      assert.equal(recovering, 1);
+    } finally {
+      await transport.stop();
+    }
+  });
+
   this.timeout(30_000);
 
   it('does not call allocated signalling rooms active without endpoint or peer evidence', async () => {

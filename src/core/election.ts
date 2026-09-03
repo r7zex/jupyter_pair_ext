@@ -6,9 +6,6 @@ import { HostClock, PeerRuntime, SessionMode, compareClock, normalizeHostClock }
  * before the gap is attributed to a local stall rather than to a lost Host.
  */
 const STALL_FACTOR = 4;
-/** Bounds recovery after a participant missed many legitimate host transitions. */
-export const MAX_HOST_RECONCILIATION_ADVANCE = 1024;
-
 export interface CoordinatorOptions {
 
   selfId: string;
@@ -24,7 +21,7 @@ export class SessionCoordinator extends EventEmitter {
   private readonly heartbeatTimeoutMs: number;
   /** Wall-clock time of the previous `evaluate` call, used to detect a stall. */
   private lastEvaluateAt = 0;
-  /** No election may run before this instant after a detected local stall. */
+  /** Guest shutdown is deferred until this instant after a detected local stall. */
   private graceUntil = 0;
   /** First instant at which the host lease was observed as expired. */
   private hostSuspectSince: number | undefined;
@@ -63,7 +60,7 @@ export class SessionCoordinator extends EventEmitter {
     // sleep) delays both this timer and the inbound heartbeat processing.  In
     // that case every lease looks expired although the Host is perfectly
     // alive, so the observed stall grants a fresh grace period instead of
-    // triggering a failover.
+    // closing the guest session.
     const sinceLastEvaluation = this.lastEvaluateAt ? now - this.lastEvaluateAt : 0;
     this.lastEvaluateAt = now;
     // `evaluate` runs on a sub-second timer, so a gap several times longer than
@@ -77,9 +74,8 @@ export class SessionCoordinator extends EventEmitter {
     if (now < this.graceUntil) return undefined;
 
     const host = this.peers.get(this.clock.hostId);
-    // A WebRTC disconnect can be transient. Election starts only after the
-    // heartbeat lease expires, which gives reconnect/state-vector recovery a
-    // chance and avoids incrementing the host epoch for a brief network flap.
+    // A WebRTC disconnect can be transient. Guest shutdown starts only after
+    // the heartbeat lease expires, which gives route recovery a chance.
     const leaseExpired = !host || now - host.lastHeartbeat > this.heartbeatTimeoutMs;
     if (!leaseExpired) {
       this.hostSuspectSince = undefined;
@@ -94,26 +90,18 @@ export class SessionCoordinator extends EventEmitter {
     }
     this.hostSuspectSince = undefined;
 
-    if (this.options.mode === 'host-only') {
-      this.closed = true;
-      this.emit('closed', 'host-lost');
-      return undefined;
-    }
-    const candidates = [...this.peers.values()]
-      .filter((peer) => peer.online && now - peer.lastHeartbeat <= this.heartbeatTimeoutMs)
-      .sort((a, b) => a.joinOrder - b.joinOrder || a.peerId.localeCompare(b.peerId));
-    const self = this.peers.get(this.options.selfId);
-    if (self && !candidates.some((candidate) => candidate.peerId === self.peerId)) candidates.push(self);
-    candidates.sort((a, b) => a.joinOrder - b.joinOrder || a.peerId.localeCompare(b.peerId));
-    const winner = candidates[0];
-    if (!winner) return undefined;
-    const next = { ...this.clock, hostEpoch: this.clock.hostEpoch + 1, hostId: winner.peerId };
-    this.clock = next;
-    this.emit('hostChanged', next, 'election');
-    return next;
+    // Host authority is never inferred from reachability. A partitioned guest
+    // cannot distinguish its own isolation from a failed host, so promoting a
+    // locally visible candidate would create two hosts. Only manualTransfer()
+    // and an authenticated announcement from the currently trusted host may
+    // advance the host clock.
+    this.closed = true;
+    this.emit('closed', 'host-lost');
+    return undefined;
   }
 
   public manualTransfer(targetPeerId: string): HostClock {
+    if (!this.isCurrentHost()) throw new Error('Only the current Session Host can transfer the host role.');
     const target = this.peers.get(targetPeerId);
     if (!target?.online) throw new Error('The selected participant is offline.');
     const next = { ...this.clock, hostEpoch: this.clock.hostEpoch + 1, hostId: targetPeerId };
@@ -122,33 +110,14 @@ export class SessionCoordinator extends EventEmitter {
     return next;
   }
 
-  public applyAnnouncement(incoming: HostClock): boolean {
+  public applyAnnouncement(incoming: HostClock, announcedByPeerId: string): boolean {
     const normalized = normalizeHostClock(incoming, this.clock.sessionEpoch);
-    if (!normalized
+    if (announcedByPeerId !== this.clock.hostId
+      || !normalized
       || normalized.hostEpoch !== this.clock.hostEpoch + 1
       || compareClock(normalized, this.clock) <= 0) return false;
     this.clock = normalized;
     this.emit('hostChanged', this.clock, 'remote');
-    return true;
-  }
-
-  /**
-   * Applies a newer clock only after the runtime has independently established
-   * a trusted reconciliation path (the old host, or a deterministic candidate
-   * after the old host is unavailable). Ordinary announcements still advance
-   * exactly one epoch through `applyAnnouncement`.
-   */
-  public applyReconciledAnnouncement(incoming: HostClock): boolean {
-    const normalized = normalizeHostClock(incoming, this.clock.sessionEpoch);
-    const advance = normalized ? normalized.hostEpoch - this.clock.hostEpoch : 0;
-    const equalEpochConflict = Boolean(normalized
-      && advance === 0
-      && normalized.hostId !== this.clock.hostId);
-    if (!normalized || (!equalEpochConflict && (advance <= 0 || advance > MAX_HOST_RECONCILIATION_ADVANCE))) {
-      return false;
-    }
-    this.clock = normalized;
-    this.emit('hostChanged', this.clock, 'reconciliation');
     return true;
   }
 

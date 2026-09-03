@@ -193,7 +193,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
     live: true,
     isHost: snapshot.isHost,
     projectName: snapshot.descriptor.projectName,
-    mode: snapshot.descriptor.mode === 'resilient' ? 'Устойчивый режим' : 'Только хост',
+    mode: snapshot.descriptor.mode === 'resilient' ? 'Закреплённый хост' : 'Только хост',
     durationSeconds: Math.floor((Date.now() - snapshot.startedAt) / 1000),
     hostName: host?.peer.displayName ?? snapshot.peers.find((peer) => peer.peerId === snapshot.clock.hostId)?.displayName ?? 'Недоступно',
     participants: snapshot.peers.map((peer) => {
@@ -481,7 +481,7 @@ function html(): string {
       const cursorActions = '<div class="actions">'+toggle('cursorShare',state.cursors?.share,'Мой курсор')+toggle('cursors',state.cursors?.remote,'Чужие курсоры')+toggle('cursorNames',state.cursors?.names,'Имена')+action('cursorColor','Цвет',colorName(state.cursors?.color),{title:'Текущий цвет: '+colorName(state.cursors?.color)+' ('+state.cursors?.color+')'})+action('cursorPeople','Участники','НАСТРОИТЬ')+'</div>';
       const autosaveFolder = state.autosave?.folder || 'Папка не выбрана';
       const paused = Boolean(state.waitingForHostFolder);
-      const quickActions = '<div class="actions">'+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.compute?.device,{disabled:paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
+      const quickActions = '<div class="actions">'+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.isHost?state.compute?.device:'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
       const transferAction = state.isHost && paused ? '' : action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost});
       const endAction = state.isHost && !paused ? action('end','Завершить сессию','ДЛЯ ВСЕХ',{danger:true,title:'Завершить сессию для всех участников'}) : '';
       const pauseAction = paused && state.isHost ? '<div class="actions">'+action('backingFolder','Настроить папку нового хоста','ПРОДОЛЖИТЬ',{secondary:false,wide:true})+action('transfer','Передать хоста','ДРУГОМУ УЧАСТНИКУ',{secondary:true,wide:true})+action('end','Завершить сессию','БЕЗ НОВОЙ ПАПКИ',{danger:true,wide:true,title:'Завершить сессию и сохранить состояние в локальных рабочих копиях'})+'</div>' : '';

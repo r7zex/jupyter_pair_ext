@@ -161,7 +161,7 @@ describe('audit regressions', () => {
       assert.equal(coordinator.clock.hostEpoch, 1);
     });
 
-    it('still elects a new host when the host connection is really lost', () => {
+    it('closes the guest without self-promotion when the host connection is really lost', () => {
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
       const coordinator = new SessionCoordinator({
         selfId: 'self',
@@ -176,11 +176,13 @@ describe('audit regressions', () => {
       coordinator.markDisconnected('host');
       coordinator.markHeartbeat('self', start + 900);
       const next = coordinator.evaluate(start + 1200);
-      assert.equal(next?.hostId, 'self');
-      assert.equal(next?.hostEpoch, 2);
+      assert.equal(next, undefined);
+      assert.equal(coordinator.closed, true);
+      assert.equal(coordinator.clock.hostId, 'host');
+      assert.equal(coordinator.clock.hostEpoch, 1);
     });
 
-    it('elects after a sustained heartbeat loss without a connection close', () => {
+    it('closes after a sustained heartbeat loss without a connection close', () => {
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
       const coordinator = new SessionCoordinator({
         selfId: 'self',
@@ -196,7 +198,9 @@ describe('audit regressions', () => {
       assert.equal(coordinator.evaluate(start + 1500), undefined);
       coordinator.markHeartbeat('self', start + 2000);
       const next = coordinator.evaluate(start + 2600);
-      assert.equal(next?.hostId, 'self');
+      assert.equal(next, undefined);
+      assert.equal(coordinator.closed, true);
+      assert.equal(coordinator.clock.hostId, 'host');
     });
   });
 
