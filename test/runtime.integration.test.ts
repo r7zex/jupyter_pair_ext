@@ -7,6 +7,7 @@ import path from 'node:path';
 import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
+import { CollaborativeProject } from '../src/core/crdt';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
@@ -1749,8 +1750,9 @@ describe('compute and lifecycle regression coverage', () => {
         type: 'executeRequest', payload: new Uint8Array(), meta,
       }, 'peer-z');
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(executionCount, 1);
+      assert.equal(executionCount, 1, 'matching revision/digest executes immediately');
       assert.equal(executedCode, 'print("HOST CANONICAL")', 'guest payload is never the canonical execution source');
+      assert.ok(sent.some((item) => item.type === 'executeAccepted'), 'accept is sent only after authoritative validation');
 
       await (runtime as any).handleExecutionRequest({
         type: 'executeRequest', payload: new Uint8Array(), meta,
@@ -1773,6 +1775,323 @@ describe('compute and lifecycle regression coverage', () => {
       assert.ok(finishExecution);
       finishExecution!({ requestId, success: true, content: { status: 'ok' } });
       await first;
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('waits only for lagging target-cell CRDT convergence and executes without a project barrier', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-target-cell-wait-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'target-cell-wait', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'target-cell-wait-token-that-is-long-enough', context(extensionRoot), logger());
+    const guestProject = new CollaborativeProject();
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let executionCount = 0;
+    let executedCode = '';
+    let syncCalls = 0;
+    let prepareCalls = 0;
+    let flushCalls = 0;
+    let manifestCalls = 0;
+    try {
+      guestProject.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{
+          id: 'cell-a', kind: 2, language: 'python', source: 'print("OLD")',
+          metadata: {}, outputs: [],
+        }],
+      });
+      runtime.project.ensureNotebook('work.ipynb');
+      runtime.project.applyRemoteUpdate(
+        'work.ipynb',
+        'notebook',
+        guestProject.encodeUpdate('work.ipynb'),
+        { type: 'structure' },
+      );
+      (runtime as any).updatePresence();
+      const hostVector = runtime.project.encodeStateVector('work.ipynb');
+      guestProject.applyCellTextChanges('work.ipynb', 'cell-a', [{
+        offset: 7, deleteCount: 3, insertText: 'NEW',
+      }]);
+      const requested = guestProject.cellTextState('work.ipynb', 'cell-a');
+      const requestedDigest = createHash('sha256').update(requested.source, 'utf8').digest('hex');
+      const targetUpdate = guestProject.encodeUpdate('work.ipynb', hostVector);
+      const target = runtime.computeForNotebook('work.ipynb');
+
+      (runtime as any).synchronizeExecutionFiles = async () => {
+        syncCalls += 1;
+        return { documents: {}, binaries: {}, directories: [] };
+      };
+      (runtime as any).prepareWorkingCopy = async () => { prepareCalls += 1; };
+      (runtime as any).flush = async () => { flushCalls += 1; };
+      (runtime as any).executionManifest = () => {
+        manifestCalls += 1;
+        return { documents: {}, binaries: {}, directories: [] };
+      };
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async (
+        _notebookKey: string,
+        _target: unknown,
+        requestId: string,
+        code: string,
+      ) => {
+        executionCount += 1;
+        executedCode = code;
+        return { requestId, success: true, content: { status: 'ok' } };
+      };
+
+      const pending = (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: {
+          requestId: 'target-cell-wait-request',
+          notebookKey: 'work.ipynb',
+          cellId: 'cell-a',
+          executorId: 'host',
+          computeEpoch: target.epoch,
+          cellRevision: requested.revision,
+          cellDigest: requestedDigest,
+          fastPath: true,
+        },
+      }, 'peer-z');
+
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(executionCount, 0, 'lagging host must wait instead of executing stale text');
+      runtime.project.ensureText('unrelated.py', 'UNRELATED = 1');
+      runtime.project.setCellMetadata('work.ipynb', 'cell-a', { unrelated: true });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(executionCount, 0, 'unrelated project and metadata changes must not satisfy the target-cell wait');
+
+      runtime.project.applyRemoteUpdate(
+        'work.ipynb',
+        'notebook',
+        targetUpdate,
+        { type: 'cellText', cellId: 'cell-a' },
+      );
+      await pending;
+
+      assert.equal(executionCount, 1);
+      assert.equal(executedCode, requested.source, 'converged host canonical target text is executed');
+      assert.ok(sent.some((item) => item.type === 'executeAccepted'));
+      assert.equal(syncCalls, 0);
+      assert.equal(prepareCalls, 0);
+      assert.equal(flushCalls, 0);
+      assert.equal(manifestCalls, 0);
+    } finally {
+      guestProject.destroy();
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('times out a lagging target cell without execution or guest-payload fallback', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-target-cell-timeout-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'target-cell-timeout', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'target-cell-timeout-token-that-is-long-enough', context(extensionRoot), logger());
+    const guestProject = new CollaborativeProject();
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let executionCount = 0;
+    try {
+      guestProject.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{
+          id: 'cell-a', kind: 2, language: 'python', source: 'print("OLD")',
+          metadata: {}, outputs: [],
+        }],
+      });
+      runtime.project.ensureNotebook('work.ipynb');
+      runtime.project.applyRemoteUpdate(
+        'work.ipynb', 'notebook', guestProject.encodeUpdate('work.ipynb'), { type: 'structure' },
+      );
+      (runtime as any).updatePresence();
+      guestProject.applyCellTextChanges('work.ipynb', 'cell-a', [{
+        offset: 7, deleteCount: 3, insertText: 'FUTURE',
+      }]);
+      const requested = guestProject.cellTextState('work.ipynb', 'cell-a');
+      const target = runtime.computeForNotebook('work.ipynb');
+      (runtime as any).targetCellConvergenceTimeoutMs = 25;
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async () => {
+        executionCount += 1;
+        throw new Error('must not execute');
+      };
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: {
+          requestId: 'target-cell-timeout-request',
+          notebookKey: 'work.ipynb',
+          cellId: 'cell-a',
+          executorId: 'host',
+          computeEpoch: target.epoch,
+          cellRevision: requested.revision,
+          cellDigest: createHash('sha256').update(requested.source, 'utf8').digest('hex'),
+          fastPath: true,
+        },
+      }, 'peer-z');
+
+      assert.equal(executionCount, 0);
+      assert.equal(sent.some((item) => item.type === 'executeAccepted'), false);
+      const failure = sent.find((item) => item.type === 'executeResult');
+      assert.ok(failure);
+      const result = JSON.parse(Buffer.from(failure.payload).toString('utf8'));
+      assert.equal(result.content.ename, 'CellStateUnavailable');
+      assert.equal(runtime.project.cellTextState('work.ipynb', 'cell-a').source, 'print("OLD")');
+    } finally {
+      guestProject.destroy();
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects stale guest revision without rolling back host-ahead canonical state', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-stale-cell-revision-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'stale-cell-revision', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'stale-cell-revision-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let executionCount = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{
+          id: 'cell-a', kind: 2, language: 'python', source: 'print("OLD")',
+          metadata: {}, outputs: [],
+        }],
+      });
+      (runtime as any).updatePresence();
+      const stale = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      runtime.project.applyCellTextChanges('work.ipynb', 'cell-a', [{
+        offset: 7, deleteCount: 3, insertText: 'HOST_NEW',
+      }]);
+      const hostAhead = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      const target = runtime.computeForNotebook('work.ipynb');
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async () => {
+        executionCount += 1;
+        throw new Error('stale request must not execute');
+      };
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: {
+          requestId: 'stale-cell-revision-request',
+          notebookKey: 'work.ipynb',
+          cellId: 'cell-a',
+          executorId: 'host',
+          computeEpoch: target.epoch,
+          cellRevision: stale.revision,
+          cellDigest: createHash('sha256').update(stale.source, 'utf8').digest('hex'),
+          fastPath: true,
+        },
+      }, 'peer-z');
+
+      assert.equal(executionCount, 0);
+      const failure = sent.find((item) => item.type === 'executeResult');
+      assert.ok(failure);
+      const result = JSON.parse(Buffer.from(failure.payload).toString('utf8'));
+      assert.equal(result.content.ename, 'StaleCellRevision');
+      assert.equal(runtime.project.cellTextState('work.ipynb', 'cell-a').revision, hostAhead.revision);
+      assert.equal(runtime.project.cellTextState('work.ipynb', 'cell-a').source, hostAhead.source);
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects lightweight compute-epoch mismatch, wrong executor and invalid source before acceptance', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-authority-reject-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'authority-reject', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'authority-reject-token-that-is-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ peerId: string; type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let executionCount = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: '1+1', metadata: {}, outputs: [] }],
+      });
+      (runtime as any).updatePresence();
+      const state = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      const target = runtime.computeForNotebook('work.ipynb');
+      const baseMeta = {
+        notebookKey: 'work.ipynb',
+        cellId: 'cell-a',
+        executorId: 'host',
+        computeEpoch: target.epoch,
+        cellRevision: state.revision,
+        cellDigest: createHash('sha256').update(state.source, 'utf8').digest('hex'),
+        fastPath: true,
+      };
+      (runtime as any).transport = {
+        sendTo: (peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ peerId, type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async () => {
+        executionCount += 1;
+        throw new Error('invalid authority request must not execute');
+      };
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(),
+        meta: { ...baseMeta, requestId: 'epoch-mismatch', computeEpoch: target.epoch + 1 },
+      }, 'peer-z');
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(),
+        meta: { ...baseMeta, requestId: 'wrong-executor', executorId: 'peer-z' },
+      }, 'peer-z');
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(),
+        meta: { ...baseMeta, requestId: 'invalid-source' },
+      }, 'bad source!');
+
+      assert.equal(executionCount, 0);
+      assert.equal(sent.some((item) => item.type === 'executeAccepted'), false);
+      const decoded = sent.filter((item) => item.type === 'executeResult')
+        .map((item) => JSON.parse(Buffer.from(item.payload).toString('utf8')).content.ename);
+      assert.ok(decoded.includes('ComputeTargetChanged'));
+      assert.ok(decoded.includes('InvalidExecutionRequest'));
     } finally {
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });

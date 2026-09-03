@@ -100,3 +100,15 @@ Audited at repository SHA `3165ce0216eac1c1f67c4e400748ab52581b551d`. This secti
 - Ordinary guest Run Cell does not call `synchronizeExecutionFiles()`, `executionManifest()`, `prepareWorkingCopy()` or full `flush()`. The legacy non-fast-path execution barrier is retained only for explicitly barrier-framed requests.
 - The lightweight framing intentionally omits the old `target` and manifest fields. A pre-prompt-09 fast-path peer is rejected as malformed rather than accidentally executing an empty payload; legacy barrier framing remains separately parseable.
 - Raw cell source is never included in request metadata or diagnostics.
+
+
+## Host-authoritative target-cell convergence contract (prompt 10)
+
+- A lightweight execution request is accepted only after the private runtime handler receives a valid authenticated MeshTransport source identity, validates request ID/notebook/stable cell/executor/host/compute epoch, and proves an exact host-side canonical CRDT revision+digest match.
+- Cell text revisions are now ordered markers of the form `r<sequence>_<id>`. A new stable cell starts at revision 1; a canonical cell-text mutation advances the sequence. Metadata, outputs, execution state, filesystem mtime and editor save state never advance it.
+- If host revision+digest already match, execution proceeds immediately. If the host sequence is behind the request, the host waits up to `TARGET_CELL_CONVERGENCE_TIMEOUT_MS` for only that notebook's target-cell text update. Unrelated documents, metadata/output/execution updates, binaries and directories do not satisfy the wait.
+- The target-cell wait subscribes only to scoped `cellText` updates for the requested stable cell (plus unscoped bootstrap/state-vector updates that may contain it). It recalculates host canonical revision+digest after each relevant update.
+- If host sequence is already ahead of the request, the request is rejected as `StaleCellRevision`; host CRDT state is never rolled back. If convergence does not arrive before the bounded timeout, the request is rejected as `CellStateUnavailable`. Neither case executes stale host text or falls back to guest payload.
+- `executeAccepted` is emitted only after authority and canonical-state validation has completed. The kernel receives only host canonical CRDT text.
+- Ordinary guest Run Cell never invokes project-wide `synchronizeExecutionFiles()`, `executionManifest()`, `prepareWorkingCopy()` or full `flush()`. Full materialization remains explicit for host save, host transfer, final session save and the retained legacy/manual project barrier.
+- Project-import semantics are therefore deliberate: the target cell itself is exact host-canonical CRDT text, while Python imports read the host physical working copy maintained asynchronously by normal persistence. A caller that requires an exact project-wide filesystem barrier must use an explicit save/transfer/manual synchronization path; ordinary guest Run Cell does not silently reintroduce that global barrier.

@@ -203,6 +203,8 @@ const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
 const REMOTE_EXECUTION_TIMEOUT_MS = 4 * 60 * 60_000;
 /** A routed request must be acknowledged before VS Code leaves the cell in a running state. */
 const EXECUTION_ACCEPT_TIMEOUT_MS = 45_000;
+/** Host waits only this long for the requested target-cell CRDT state to arrive. */
+const TARGET_CELL_CONVERGENCE_TIMEOUT_MS = 5_000;
 const EXECUTION_REQUEST_RETRY_MS = 1_500;
 const EXECUTION_RESULT_RETRY_MS = 1_500;
 /** Keep terminal results long enough to replay them after a route replacement. */
@@ -305,6 +307,20 @@ interface LightweightExecutionRequest {
   computeEpoch: number;
   cellRevision: string;
   cellDigest: string;
+}
+
+class CellStateUnavailableError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'CellStateUnavailableError';
+  }
+}
+
+class StaleCellRevisionError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'StaleCellRevisionError';
+  }
 }
 
 interface ExecutionManifest {
@@ -488,6 +504,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly completedRemoteExecutions = new Map<string, CompletedRemoteExecution>();
   private completedRemoteExecutionBytes = 0;
   private readonly completedExecutionReceipts = new Map<string, CompletedExecutionReceipt>();
+  private targetCellConvergenceTimeoutMs = TARGET_CELL_CONVERGENCE_TIMEOUT_MS;
   private readonly pendingTransfers = new Map<string, PendingHostTransfer>();
   private readonly pendingSnapshotCheckpoints = new Map<string, PendingSnapshotCheckpoint>();
   private readonly sentSnapshotTransfers = new Map<string, SentSnapshotTransfer>();
@@ -4915,6 +4932,96 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private async waitForAuthoritativeCellState(
+    request: LightweightExecutionRequest,
+  ): Promise<{ source: string; revision: string; digest: string }> {
+    const inspect = (): { source: string; revision: string; digest: string } | undefined => {
+      if (this.project.kindOf(request.notebookKey) !== 'notebook'
+        || !this.project.hasNotebookCell(request.notebookKey, request.cellId)) {
+        return undefined;
+      }
+      const state = this.project.cellTextState(request.notebookKey, request.cellId);
+      return {
+        source: state.source,
+        revision: state.revision,
+        digest: canonicalCellTextDigest(state.source),
+      };
+    };
+    const classify = (
+      state: { source: string; revision: string; digest: string } | undefined,
+    ): 'match' | 'host-ahead' | 'wait' => {
+      if (!state) return 'wait';
+      if (state.revision === request.cellRevision && state.digest === request.cellDigest) return 'match';
+      const hostSequence = cellTextRevisionSequence(state.revision);
+      const requestSequence = cellTextRevisionSequence(request.cellRevision);
+      if (hostSequence !== undefined && requestSequence !== undefined && hostSequence > requestSequence) {
+        return 'host-ahead';
+      }
+      return 'wait';
+    };
+
+    const initial = inspect();
+    const initialClass = classify(initial);
+    if (initialClass === 'match') return initial!;
+    if (initialClass === 'host-ahead') {
+      throw new StaleCellRevisionError('The host canonical cell is newer than the requested guest revision.');
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.project.off('update', onUpdate);
+        this.off('closed', onClosed);
+      };
+      const finishResolve = (state: { source: string; revision: string; digest: string }): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(state);
+      };
+      const finishReject = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const check = (): void => {
+        const state = inspect();
+        const classification = classify(state);
+        if (classification === 'match') {
+          finishResolve(state!);
+        } else if (classification === 'host-ahead') {
+          finishReject(new StaleCellRevisionError(
+            'The host canonical cell advanced beyond the requested guest revision while waiting.',
+          ));
+        }
+      };
+      const onUpdate = (event: ProjectUpdate): void => {
+        if (event.kind !== 'notebook' || event.key !== request.notebookKey) return;
+        // Targeted cell-text updates are the normal wake-up path. An unscoped
+        // bootstrap/state-vector update is also checked because it can contain
+        // the requested cell state; metadata/output/other-cell updates are ignored.
+        if (event.scope !== undefined
+          && (event.scope.type !== 'cellText' || event.scope.cellId !== request.cellId)) {
+          return;
+        }
+        check();
+      };
+      const onClosed = (): void => finishReject(this.sessionClosedError());
+      const timer = setTimeout(() => {
+        finishReject(new CellStateUnavailableError(
+          'Timed out waiting for the requested target-cell CRDT state on the Session Host.',
+        ));
+      }, Math.max(1, this.targetCellConvergenceTimeoutMs));
+      this.project.on('update', onUpdate);
+      this.once('closed', onClosed);
+      // Re-check after subscribing so an update racing the initial inspection
+      // cannot be missed.
+      check();
+    });
+  }
+
   private async handleExecutionRequest(frame: WireFrame, sourceId: string): Promise<void> {
     const requestId = String(frame.meta.requestId ?? '');
     const notebookKey = normalizedTrackedPath(String(frame.meta.notebookKey ?? ''));
@@ -4934,6 +5041,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.log.appendLine(`[debug] Could not reject execution ${requestId}: ${formatError(error)}`);
       }
     };
+
+    // MeshTransport authenticates and binds sourceId before onMessage dispatches
+    // here; this private boundary additionally rejects malformed/self identities.
+    if (!PEER_ID_PATTERN.test(sourceId) || sourceId === this.descriptor.localPeer.peerId) {
+      rejectRequest('InvalidExecutionRequest', 'The execution request source is not a valid authenticated remote peer.');
+      return;
+    }
 
     const fastPath = frame.meta.fastPath === true;
     const lightweight = fastPath ? normalizeLightweightExecutionRequest(frame.meta) : undefined;
@@ -4997,23 +5111,33 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         return;
       }
       target = expectedTarget;
-      if (this.project.kindOf(notebookKey) !== 'notebook'
-        || !this.project.hasNotebookCell(notebookKey, request.cellId)) {
-        rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the host yet.');
+      if (this.project.kindOf(notebookKey) !== 'notebook') {
+        rejectRequest('CellStateUnavailable', 'The requested collaborative notebook is not available on the Session Host.');
         return;
       }
-      const canonical = this.project.cellTextState(notebookKey, request.cellId);
-      const hostDigest = canonicalCellTextDigest(canonical.source);
-      if (canonical.revision !== request.cellRevision || hostDigest !== request.cellDigest) {
-        rejectRequest('CellStateChanged', 'Canonical cell text changed before the execution request arrived.');
+      if (!this.project.hasNotebookCell(notebookKey, request.cellId)) {
+        rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the Session Host.');
+        return;
+      }
+      let canonical: { source: string; revision: string; digest: string };
+      try {
+        canonical = await this.waitForAuthoritativeCellState(request);
+      } catch (error) {
+        if (error instanceof StaleCellRevisionError) {
+          rejectRequest('StaleCellRevision', error.message);
+        } else if (error instanceof CellStateUnavailableError) {
+          rejectRequest('CellStateUnavailable', error.message);
+        } else {
+          throw error;
+        }
         return;
       }
       if (Buffer.byteLength(canonical.source, 'utf8') > MAX_REMOTE_EXECUTION_CODE_BYTES) {
         rejectRequest('InvalidExecutionRequest', 'The canonical remote code cell exceeds the execution-size limit.');
         return;
       }
-      // The host executes only its own canonical CRDT cell text. No guest code
-      // payload, filesystem mtime or editor-save state is an execution source.
+      // The host executes only its own canonical CRDT cell text after exact
+      // revision+digest convergence. Guest payload is never a code source.
       code = canonical.source;
       materializeWorkspace = false;
     } else {
@@ -5096,6 +5220,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       return;
     }
 
+    // A new request reaches this point only after authority checks and, for
+    // lightweight framing, exact host-canonical target-cell convergence.
     const executionOwner: ExecutionOwner = {
       peerId: sourceId,
       notebookKey,
@@ -5311,8 +5437,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
-    // This is the execution barrier, not part of the editor hot path: Python
-    // imports must see the already-received CRDT state in the physical copy.
+    // Local execution and the explicit legacy barrier materialize the whole
+    // working copy before Python imports. Ordinary guest Run Cell passes
+    // materializeWorkspace=false: the target cell executes directly from
+    // host-canonical CRDT text, while imports observe the host physical working
+    // copy maintained by normal persistence. Exact project-wide filesystem
+    // convergence remains an explicit save/transfer/manual-barrier operation.
     if (materializeWorkspace) {
       await this.prepareWorkingCopy?.();
       await this.flush();
@@ -6167,6 +6297,13 @@ function executionManifestDigest(manifest: ExecutionManifest): string {
     directories: [...manifest.directories].sort(),
   };
   return createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex');
+}
+
+function cellTextRevisionSequence(revision: string): number | undefined {
+  const match = /^r([1-9][0-9]*)_[A-Za-z0-9_-]{1,96}$/.exec(revision);
+  if (!match) return undefined;
+  const sequence = Number(match[1]);
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : undefined;
 }
 
 function canonicalCellTextDigest(source: string): string {

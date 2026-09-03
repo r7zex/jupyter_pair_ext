@@ -298,10 +298,8 @@ export class CollaborativeProject extends EventEmitter {
           const source = new Y.Text();
           if (cell.source) source.insert(0, cell.source);
           map.set('source', source);
-          map.set('textRevision', newId());
+          map.set('textRevision', nextCellTextRevision());
           data.set(cell.id, map);
-        } else if (!validCellTextRevision(map.get('textRevision'))) {
-          map.set('textRevision', newId());
         }
         map.set('id', cell.id);
         map.set('kind', cell.kind);
@@ -313,7 +311,7 @@ export class CollaborativeProject extends EventEmitter {
         if (source.toString() !== cell.source) {
           if (source.length) source.delete(0, source.length);
           if (cell.source) source.insert(0, cell.source);
-          map.set('textRevision', newId());
+          map.set('textRevision', nextCellTextRevision(map.get('textRevision')));
         }
       }
 
@@ -352,7 +350,7 @@ export class CollaborativeProject extends EventEmitter {
       }
       // Canonical text revision is updated only with cell-text mutations.
       // Output, execution and metadata transactions never touch it.
-      map.set('textRevision', newId());
+      map.set('textRevision', nextCellTextRevision(map.get('textRevision')));
     }, withScope(origin, { type: 'cellText', cellId }));
   }
 
@@ -371,8 +369,8 @@ export class CollaborativeProject extends EventEmitter {
     if (!map || !(source instanceof Y.Text)) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const value = source.toString();
     const stored = map.get('textRevision');
-    const revision = validCellTextRevision(stored)
-      ? stored
+    const revision = cellTextRevisionSequence(stored) !== undefined
+      ? String(stored)
       : `legacy-${createHash('sha256').update(cellId, 'utf8').update('\0').update(value, 'utf8').digest('hex').slice(0, 32)}`;
     return { source: value, revision };
   }
@@ -804,8 +802,20 @@ function boundedSource(value: string): string {
   return value;
 }
 
-function validCellTextRevision(value: unknown): value is string {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+function cellTextRevisionSequence(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /^r([1-9][0-9]*)_[A-Za-z0-9_-]{1,96}$/.exec(value);
+  if (!match) return undefined;
+  const sequence = Number(match[1]);
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : undefined;
+}
+
+function nextCellTextRevision(previous?: unknown): string {
+  const sequence = (cellTextRevisionSequence(previous) ?? 0) + 1;
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+    throw new Error('Notebook cell text revision reached its supported limit.');
+  }
+  return `r${sequence}_${newId()}`;
 }
 
 function isValidCellId(value: unknown): value is string {

@@ -100,6 +100,7 @@ describe('canonical notebook cell text revision', () => {
       });
       const before = project.cellTextState('work.ipynb', 'cell-a');
       const digestBefore = createHash('sha256').update(before.source, 'utf8').digest('hex');
+      assert.match(before.revision, /^r1_[A-Za-z0-9_-]+$/, 'new cell starts an ordered revision lineage');
 
       project.setCellMetadata('work.ipynb', 'cell-a', { owner: 'remote' });
       project.setCellOutputs('work.ipynb', 'cell-a', [{
@@ -118,6 +119,7 @@ describe('canonical notebook cell text revision', () => {
       }]);
       const afterText = project.cellTextState('work.ipynb', 'cell-a');
       assert.notEqual(afterText.revision, before.revision);
+      assert.match(afterText.revision, /^r2_[A-Za-z0-9_-]+$/, 'text edit advances the ordered revision');
       assert.notEqual(
         createHash('sha256').update(afterText.source, 'utf8').digest('hex'),
         digestBefore,
