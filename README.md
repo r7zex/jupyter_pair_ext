@@ -9,7 +9,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 ## What it provides
 
 - Live text, notebook structure, outputs, files, directories, renames, deletions, and participant cursors.
-- Host-owned durable storage with folderless joins, deterministic failover, and explicit safe folder selection after host transfer.
+- Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
 - Direct WebRTC for the normal low-latency path, optional user-configured TURN, and two independent encrypted emergency relay families.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
 - A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
@@ -24,7 +24,7 @@ code --install-extension ".\path\to\pair-notebook-<version>.vsix" --force
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
 
-VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are only required on a computer selected to execute notebook cells; text and notebook collaboration itself does not require them.
+VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are required only on the session host, because every participant's notebook cells execute there. Text and notebook collaboration on guest computers does not require Python.
 
 ## How Pair Notebook connects
 
@@ -38,9 +38,19 @@ Signalling runs over TWO independent families concurrently — multiple health-c
 
 Start and Join include a strict relay-readiness barrier: Pair Notebook requires an encrypted publish-to-receive self-check through at least one complete emergency family (Nostr or MQTT) before it declares the local transport ready. A merely open WebSocket, rejected subscription, or write-only relay cannot pass. Both families are attempted, established paths are periodically revalidated, and a later publication rejection retires that path and triggers recovery. Join is reported as connected only after the two computers complete the signed end-to-end handshake. With a common working outbound WSS route, Flowseal/zapret and Karing therefore retain independently tested full-data paths even when WebRTC and TURN are unavailable.
 
-A lost physical route now enters a bounded logical recovery lease instead of immediately removing the participant or electing a new host. Cell requests, file-version barriers, ordered Jupyter events, terminal results, stdin replies, Interrupt, and Restart all wait for or reconcile across the replacement authenticated route. An accepted cell is keyed by one idempotent request ID, so recovery cannot execute it twice.
+A lost physical route enters a 60-second logical recovery lease instead of immediately removing the participant or changing the host. Pair Notebook checks network adapters every two seconds; after a VPN/TUN or proxy-route change it reloads the Windows system proxy, refreshes signalling sockets, reannounces remembered peers, and retires a half-open data channel only after repeated failed probes. Cell requests, file-version barriers, ordered Jupyter events, terminal results, stdin replies, Interrupt, and Restart wait for or reconcile across the replacement authenticated route. An accepted cell is keyed by one idempotent request ID, so recovery cannot execute it twice.
 
-On Windows, Karing TUN needs no special setup because it transparently routes application traffic. Karing's **Auto Set System Proxy** mode is detected from the current user's WinINet settings; Pair Notebook refreshes that value before Start, Join and Reconnect. If another client uses PAC only or does not register its listener as the Windows system proxy, set `pairNotebook.proxyUrl` to its local HTTP/SOCKS URL, for example `http://127.0.0.1:10809`. Password-bearing URLs from older versions are migrated once on activation; newly entered embedded passwords are removed and rejected with guidance to use the secret-storage command.
+## Windows VPN setup: Karing or Happ
+
+Use these steps on every computer whose provider or network blocks the normal Pair Notebook paths. Download only from the official projects: [Karing releases](https://github.com/KaringX/karing/releases) / [Karing site](https://karing.app/) or [Happ Desktop releases](https://github.com/Happ-proxy/happ-desktop/releases).
+
+1. Add a working profile to Karing or Happ and connect it before starting or joining Pair Notebook.
+2. Prefer **TUN mode**. It routes VS Code and its extension-host process without per-application proxy support. Do not run two TUN/VPN clients at the same time; Karing documents that another VPN can conflict with its TUN interface.
+3. If TUN is unavailable, enable the client's Windows system-proxy mode. Pair Notebook reads the current user's WinINet proxy before Start, Join, Reconnect, and automatic VPN-route recovery.
+4. If the client exposes a local proxy but does not register it as the Windows system proxy, copy the exact listener shown by the client into the VS Code setting `pairNotebook.proxyUrl`. Typical examples are `http://127.0.0.1:10809` and `socks5h://127.0.0.1:10808`; verify the actual protocol and port in your client. Happ's [local connections guide](https://github.com/HappDev/happ_su/blob/main/faq/local-network-connections.md) shows its HTTP/SOCKS listener and Windows proxy controls.
+5. Run **Pair Notebook: Reconnect**, then open **Pair Notebook: Advanced Diagnostics**. The usable readiness signal is at least one verified encrypted Nostr or MQTT family followed by the signed peer handshake; a merely open proxy socket is not enough.
+
+Keep a local proxy bound to `127.0.0.1` unless other devices deliberately need it. Do not enable **Allow LAN connections** or expose the proxy port to the local network just for Pair Notebook. Password-bearing proxy URLs are rejected; store an authenticated proxy password with **Pair Notebook: Set Proxy Password** so it remains in VS Code SecretStorage. No VPN vendor or public relay can guarantee availability on every provider, but TUN plus the verified emergency-relay check gives an observable end-to-end result.
 
 ## The Connection section
 
@@ -83,14 +93,16 @@ The host is the only participant that writes the canonical backing folder. A Dro
 
 A joining participant is never asked for a project folder. Pair Notebook creates an isolated working copy under the local application-data directory, opens it, and keeps it synchronized with the session. The participant name is validated and must be unique within the live room.
 
-## Host transfer and failover
+## Host authority, transfer, and reconnect
 
-Every new session is resilient:
+The original host remains the host across heartbeat delays, signalling failures, VPN switches, partitions, and process stalls. No participant can elect or proclaim itself host.
 
-- A graceful host departure first drains peer traffic and flushes the latest state to the old host folder.
-- An abrupt departure is covered by continuous atomic host persistence, which uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
-- The earliest eligible connected participant becomes the new host deterministically.
-- Every participant sees a paused state. Persistence, invitations, and notebook execution remain disabled during the pause, while the current host can still transfer the role or end the session.
+- Host authority changes only when the current host selects **Transfer Host** and the selected participant completes the authenticated prepare/commit/finalize transfer.
+- If the host route disappears, guests keep the current runtime during the bounded route-recovery window. If the host is still unreachable afterwards, guests leave the active runtime without deleting their isolated working copy, credentials, or Recent Projects entry.
+- Opening that entry from **Recent Projects** retries the same pinned host identity. If its folder is already open, Pair Notebook reconnects in place without requiring a VS Code reload or another invite.
+- Simply choosing **Leave Session** never transfers authority. Guests cannot replace an absent host; after a host-route loss they can only retry the same pinned host from Recent Projects.
+- Continuous atomic host persistence uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
+- During an explicit transfer, every participant sees a paused state. Persistence, invitations, and notebook execution remain disabled until the new host prepares storage.
 - The new host has a persistent **Choose host folder** action even after cancelling a dialog. They explicitly choose either an empty folder that receives the current session, or an existing synchronized folder (for example Dropbox) that is fully hash-checked and attached without rewriting when it matches.
 - The pause card and initial prompt also expose **Transfer Host** and **End Session**. Ending before a new shared folder is selected keeps the final merged state and authenticated termination marker in the participants' isolated working copies.
 - A non-empty mismatched folder is never changed implicitly. The new host must explicitly write the current session into it or choose another folder; cancelling keeps the session paused and the retry action visible.
@@ -110,9 +122,9 @@ The host also maintains rotating local recovery snapshots every five minutes and
 
 Trystero uses public Nostr and MQTT services for encrypted discovery. Project data normally travels through encrypted WebRTC data channels; when ICE cannot form a path, both emergency families encrypt the complete Pair Notebook frame with AES-256-GCM before publishing it through Nostr relays and MQTT brokers. Duplicate deliveries are removed before the signed participant handshake. Public operators cannot read project frames or the token, but can observe the stable session topic, sender/recipient routing identifiers, timing, packet sizes, and chunk counts. The invite token is used as the Trystero room password and is stored in VS Code SecretStorage.
 
-Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and failover. This prevents another invite holder from impersonating a known offline participant. Protocol v4, first released in Pair Notebook 0.5.6, signs every emergency-relay envelope and intentionally rejects protocol-v3 and older clients; all participants must install 0.5.6 or another explicitly protocol-v4-compatible release.
+Each participant also owns an Ed25519 identity key. The private key remains in VS Code SecretStorage; the invite pins the host public key, and authenticated peer keys remain pinned across disconnects and voluntary transfer. This prevents another invite holder from impersonating a known offline participant. Protocol v4, first released in Pair Notebook 0.5.6, signs every emergency-relay envelope and intentionally rejects protocol-v3 and older clients; all participants must install 0.5.6 or another explicitly protocol-v4-compatible release.
 
-The invite is a bearer secret: anyone who receives it can attempt to join. Remote notebook execution can run code on a selected participant's computer, so sessions must contain only trusted people. Beginning with Pair Notebook 0.5.6, remote-compute consent starts disabled for every new or restored session and must be enabled again locally for that active session. The invite-derived emergency-relay key does not provide forward secrecy: someone who records relay ciphertext and later obtains the invite may decrypt that recorded traffic. If an invite may have leaked, end the session and create a new one with a fresh invite; reconnecting the old session does not rotate its key.
+The invite is a bearer secret: anyone who receives it can attempt to join. Every authenticated participant can run notebook code on the host, and there is deliberately no per-participant execution-deny flag, so sessions must contain only people the host trusts with code execution. Guests cannot redirect execution to their own computers or select a different executor. The invite-derived emergency-relay key does not provide forward secrecy: someone who records relay ciphertext and later obtains the invite may decrypt that recorded traffic. If an invite may have leaked, end the session and create a new one with a fresh invite; reconnecting the old session does not rotate its key.
 
 Most consumer and office networks connect directly or through STUN alone. Where they cannot, Pair Notebook can use a custom TURN relay (`pairNotebook.turnUrls` + secret-stored password, for users who operate or trust one) and independently falls back to the built-in encrypted Nostr + MQTT emergency route, which needs nothing from the user. There is no built-in TURN service: the former Open Relay demo is not sent to Trystero, probed, or advertised because it is no longer operational anonymously. Direct peer-to-peer connections are always preferred when the network allows them; relays only carry already-encrypted traffic as a last resort.
 
@@ -126,7 +138,7 @@ npm run test:live
 npm run artifacts
 ```
 
-`npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport and failover tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies eight-by-64-KiB direct-to-system-proxy bursts across all seven compatible ordered Nostr-only, MQTT-only, and redundant-family combinations.
+`npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport, pinned-host authority, and route-recovery tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies eight-by-64-KiB direct-to-system-proxy bursts across all seven compatible ordered Nostr-only, MQTT-only, and redundant-family combinations.
 
 The public GitHub Release intentionally has one uploaded asset:
 

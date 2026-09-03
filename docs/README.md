@@ -4,7 +4,7 @@
 
 - [Project README](../README.md) — installation, connection paths, workflows, security, and development commands.
 - [Architecture](architecture.md) — current components, data flow, storage ownership, compatibility boundary, and execution recovery.
-- [Protocol](protocol.md) — current admission, delivery, synchronization, execution, failover, and session-end contracts.
+- [Protocol](protocol.md) — current admission, delivery, synchronization, execution, host-authority, and session-end contracts.
 
 ## Release records
 

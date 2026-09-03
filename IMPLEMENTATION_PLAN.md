@@ -1,6 +1,6 @@
 # Pair Notebook Host Authority and VPN Continuity Plan
 
-Status: approved for implementation; implementation changes are not yet published.
+Status: completed and validated for release candidate `0.5.8`.
 
 Target: the next release candidate after `0.5.7`.
 
@@ -63,7 +63,7 @@ Target: the next release candidate after `0.5.7`.
 2. Run the full TypeScript test suite, lint, compile, Python bridge tests, production dependency audit, artifact preflight, VSIX inspection, and source-archive inspection.
 3. Build the next local release candidate and verify that packaged behavior and documentation match the source.
 4. Update this plan with completed status and concrete validation evidence.
-5. Delete `docs/known-networking-issues.md` and remove all live documentation references to it only after every implementation and validation item above is complete.
+5. Delete the obsolete problem collection and remove its live documentation references only after every implementation and validation item above is complete.
 6. Publish the complete implementation in one final GitHub push. Do not publish intermediate implementation commits.
 
 ## Publication boundary
@@ -73,3 +73,14 @@ Target: the next release candidate after `0.5.7`.
 - Final GitHub push: all completed implementation commits, validation evidence, versioned release-candidate metadata, and deletion of the obsolete problem collection.
 - No tag, GitHub Release, Marketplace publication, or modification of Trusted Access/TAC without a separate explicit request.
 
+## Completion evidence
+
+- P0 host authority: automatic election and clock reconciliation were removed. The current host is retained through stalls, route loss, signalling loss, and partitions; only an exact next clock announced by the current host can complete an explicit transfer.
+- P0 host execution: restored and live compute targets are pinned to the current host. Authenticated guests can execute, interrupt, and restart there without consent or CPU/GPU sharing flags; only the host selects its local interpreter and device.
+- P0 VPN continuity: adapter and Windows system-proxy changes trigger coalesced proxy reload, signalling refresh, and remembered-peer reannouncement. Repeated failed probes retire half-open routes into the 60-second logical recovery lease without changing host authority.
+- P1 reconnect and documentation: host-loss closure retains the isolated working copy, credentials, marker, and Recent Projects entry; an already-open working folder can reconnect in place. The Marketplace README contains the Karing/Happ TUN and proxy guide.
+- `npm test`: PASS, 320 tests.
+- `npm run artifacts`: PASS, including lint, TypeScript/esbuild compilation, Python bridge regression tests, source preflight, VSIX inspection, and complete ZIP inspection.
+- `npm audit --omit=dev`: PASS, 0 production vulnerabilities.
+- The exact two-physical-computer VPN-switch acceptance remains **NOT RUN** in this environment. Deterministic route-loss, half-open-channel, proxy, transport-matrix, partition, execution, and reconnect tests passed; the physical check must not be represented as completed until the final VSIX is installed on both target computers.
+- The obsolete problem collection was removed only after the implementation and automated artifact gates passed.

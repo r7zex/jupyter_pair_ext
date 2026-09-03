@@ -26,7 +26,7 @@ The emergency relay encrypts frame content, not traffic metadata. Nostr relay an
 
 Each target has ordered realtime and bulk queues. Realtime edits can overtake queued bulk snapshot/file chunks, while an in-flight item remains ordered. Queue accounting includes in-flight bytes and enforces 128 MiB per peer plus 512 MiB per session, with separate frame-count and inbound-rate limits. Trystero action promises provide the send-completion barrier.
 
-A physical `onPeerLeave` starts a 30-second logical recovery lease. The participant remains logically online while signed replacement routes are attempted immediately through direct discovery and the encrypted relay families. Host election and execution availability change only if every route misses that lease; admission of a replacement route cancels the logical disconnect and starts state reconciliation.
+A physical `onPeerLeave` starts a 60-second logical recovery lease. The participant remains logically online while signed replacement routes are attempted immediately through direct discovery and the encrypted relay families. A network-interface change also refreshes proxy configuration and signalling without tearing down a healthy route. Repeated ping failures retire half-open channels whose leave callback was lost. Host authority never changes because of route loss; admission of a replacement route cancels the logical disconnect and starts state reconciliation.
 
 ## Initial join
 
@@ -40,7 +40,7 @@ Runtime peers exchange Yjs state vectors and only missing document updates. File
 
 ## Notebook execution
 
-Beginning with Pair Notebook 0.5.6, remote-compute consent is local, session-scoped policy rather than a persisted wire capability. Every new or restored session starts with remote execution disabled on each participant; a participant must opt in again for that active session before advertising an execution environment or accepting remote execution and kernel-control requests.
+The current host is the only compute executor. Every authenticated session participant may submit notebook execution and kernel-control requests to it without a separate consent or CPU/GPU sharing flag. Only the host advertises compute hardware and Python environments, and only the host may select its local CPU/GPU device or interpreter. Restored and received compute targets naming a participant are rejected or normalized back to the current host.
 
 Before remote execution, the requester and executor complete an idempotent document/binary/directory manifest barrier. Barrier check and commit frames retry across route replacement. The execution request is keyed by a random request ID: the executor acknowledges acceptance, rejects reuse with different content, and returns the cached terminal result for an identical duplicate instead of launching another kernel request.
 
@@ -50,7 +50,7 @@ The Python bridge, Mesh payload filter, and execution replay queue accept a boun
 
 ## Host clock and pause barrier
 
-The host clock is `(sessionEpoch, hostEpoch, hostId)`. Stale clocks are rejected. A graceful transfer uses prepare, commit, acknowledgement, announcement, and finalize messages. Abrupt loss uses deterministic election among online peers.
+The host clock is `(sessionEpoch, hostEpoch, hostId)`. Stale, skipped, equal-epoch, and self-proclaimed clocks are rejected. A voluntary transfer initiated by the current host uses prepare, commit, acknowledgement, announcement, and finalize messages. Heartbeats, hello metadata, route loss, partitions, VPN changes, and ordinary Leave never transfer authority. If every host route misses the recovery lease, a guest closes its active runtime but retains its working copy, credentials, marker, and Recent Projects entry for reconnection to the same pinned host.
 
 Any host-clock change disables persistence on all peers and enters a visible pause. The new host has no inherited backing path. Persistent pause-card commands remain available after every cancelled prompt: configure storage, transfer the role to another online participant, or end the session. A repeated transfer advances the host clock and keeps every peer paused under the next host. Storage setup explicitly chooses either an empty directory to receive the authoritative project or an existing synchronized directory whose complete tracked manifest must match before it is bound without writes. A mismatched directory remains untouched unless the user explicitly confirms replacement. Only successful materialization or exact verification permits `hostStorageReady`; peers also recover a missed ready notification from authoritative host heartbeats.
 

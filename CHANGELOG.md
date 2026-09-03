@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.8 - 2026-09-03 (pinned host authority and VPN continuity)
+
+- Pins session authority to the current host. Heartbeat loss, signalling failure, VPN changes, partitions, ordinary Leave, and higher clocks announced by non-hosts cannot promote a participant; only the authenticated explicit host-transfer protocol can advance the host clock.
+- Closes a guest runtime after the 60-second host-route recovery lease is exhausted while retaining its isolated working copy, session credentials, marker, and Recent Projects entry for retrying the same pinned host.
+- Routes every authenticated participant's notebook execution, Interrupt, and Restart to the current host without remote-compute, CPU-sharing, or GPU-sharing permission switches. Only the host can select its local interpreter and CPU/GPU device.
+- Normalizes restored and transferred compute state to the current host and rejects compute announcements or targets authored by participants.
+- Detects network-interface and Windows system-proxy changes, automatically reloads proxy settings, refreshes both signalling families, reannounces remembered peers, and keeps authenticated routes during the make-before-break recovery attempt.
+- Detects half-open direct channels through repeated failed probes and moves them into logical route recovery even when Trystero never emits a leave event.
+- Reconnects a disconnected session in place from Recent Projects when its working folder is already open.
+- Adds a Marketplace README guide for official Karing and Happ installations, preferred TUN setup, system/explicit proxy fallback, diagnostics, and safe loopback listener configuration.
+
 ## 0.5.7 - 2026-09-01 (network recovery and paused-session control)
 
 - Lets the current host transfer the role to another online participant while the session is paused for host-folder selection. The next host remains paused and must still materialize or verify a folder before normal collaboration resumes.
