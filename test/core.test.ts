@@ -1625,6 +1625,17 @@ describe('host coordination', () => {
     assert.equal(coordinator.clock.hostEpoch, 3);
     assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 4, hostId: 'peer-b' }, 'host-a'), true);
   });
+
+  it('keeps the pinned host authority while the mesh is recovering a route', () => {
+    const coordinator = coordinatorFor('resilient');
+    const host = coordinator.peers.get('host-a')!;
+    host.online = false;
+    host.connectionState = 'recovering';
+    host.lastHeartbeat = 0;
+    coordinator.evaluate(Date.now() + 20_000);
+    assert.equal(coordinator.closed, false);
+    assert.equal(coordinator.clock.hostId, 'host-a');
+  });
 });
 
 describe('filesystem persistence', () => {

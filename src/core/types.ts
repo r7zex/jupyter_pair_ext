@@ -104,6 +104,8 @@ export interface PeerRuntime extends PeerIdentity {
   missedHeartbeats: number;
   route: ConnectionRoute;
   online: boolean;
+  /** A peer can be authenticated but temporarily lack a usable data route. */
+  connectionState?: 'connected' | 'recovering' | 'disconnected';
 }
 
 export interface HostClock {

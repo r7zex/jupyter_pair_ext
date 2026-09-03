@@ -143,7 +143,8 @@ export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
  * alive long enough to replace a failed route before SessionCoordinator may
  * interpret it as a host loss.
  */
-export const LOGICAL_PEER_RECOVERY_MS = 60_000;
+/** Route changes (including VPN/TUN switches) get one bounded recovery window. */
+export const LOGICAL_PEER_RECOVERY_MS = 30_000;
 const ROUTE_PING_FAILURE_LIMIT = 3;
 const ROUTE_PING_STALE_MS = 3_000;
 
@@ -2236,13 +2237,18 @@ public improvablePeerIds(): string[] {
           ...peer,
           latency: latency?.current ?? (local ? 0 : -1),
           latencyEma: latency?.ema ?? (local ? 0 : -1),
-          // SessionCoordinator polls this projection. Refreshing the logical
-          // lease while route recovery is bounded prevents its much shorter
-          // heartbeat lease from racing the replacement route.
+          // SessionCoordinator polls this projection. Recovery is a distinct
+          // state, not an online route: the coordinator defers host-loss while
+          // this bounded lease is active, whereas the UI can report the truth.
           lastHeartbeat: connection?.lastSeen ?? (local || recovering ? Date.now() : 0),
           missedHeartbeats: 0,
           route: local ? 'Direct' : this.routes.get(peer.peerId) ?? 'Direct',
-          online: local || Boolean(connection) || recovering,
+          online: local || Boolean(connection),
+          connectionState: local || Boolean(connection)
+            ? 'connected'
+            : recovering
+              ? 'recovering'
+              : 'disconnected',
         };
       });
   }

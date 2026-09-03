@@ -5199,6 +5199,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       missedHeartbeats: 0,
       route: peer.peerId === this.descriptor.localPeer.peerId ? 'Direct' : 'Unknown',
       online,
+      connectionState: online ? 'connected' : 'disconnected',
     };
   }
 

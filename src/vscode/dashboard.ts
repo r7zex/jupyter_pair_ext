@@ -19,6 +19,7 @@ interface DashboardState {
     hardware: string;
     load: string;
     online: boolean;
+    connectionState?: 'connected' | 'recovering' | 'disconnected';
   }>;
   autosave?: {
     folder: string;
@@ -215,6 +216,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
           ? `CPU ${resources.cpuPercent.toFixed(0)}%${resources.gpus[0] ? ` • GPU ${resources.gpus[0].utilizationPercent}%` : ''}`
           : '',
         online: peer.online,
+        ...(peer.connectionState ? { connectionState: peer.connectionState } : {}),
       };
     }),
     autosave: {
@@ -448,8 +450,14 @@ function html(): string {
       }
       const detailsOpen = document.getElementById('moreActions')?.open ?? false;
       const focusedId = document.activeElement?.id || '';
-      const onlineParticipants = (state.participants || []).filter(p => p.online);
-      const people = onlineParticipants.map(p => '<div class="card participant"><div class="row"><strong>🟢 '+esc(p.name)+'</strong><span>'+ (p.latency >= 0 ? p.latency+' мс' : '—') +'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>').join('') || '<div class="tiny">Нет подключённых участников</div>';
+      const visibleParticipants = (state.participants || []).filter(p => p.online || p.connectionState === 'recovering');
+      const onlineParticipants = visibleParticipants.filter(p => p.online);
+      const people = visibleParticipants.map(p => {
+        const recovering = p.connectionState === 'recovering';
+        const indicator = recovering ? '🟡' : '🟢';
+        const stateLine = recovering ? '<div class="tiny q-warn">↻ Восстанавливает соединение</div>' : '';
+        return '<div class="card participant"><div class="row"><strong>'+indicator+' '+esc(p.name)+'</strong><span>'+ (p.latency >= 0 ? p.latency+' мс' : '—') +'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>';
+      }).join('') || '<div class="tiny">Нет подключённых участников</div>';
       const connectionState = connection();
       const conn = state.connection;
       const remoteStatusLines = { 'checking-better-route': 'проверяет лучший маршрут…', 'switching-path': 'переключает сетевой путь…', 'switched-path': 'сменил(а) сетевой путь' };

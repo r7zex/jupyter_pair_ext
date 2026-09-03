@@ -929,7 +929,9 @@ describe('mesh relay fallback integration', function () {
       internals.onPeerLeave('direct-route');
       assert.equal(disconnects, 0, 'physical leave became an immediate logical disconnect');
       assert.equal(transport.isPeerRecovering(identity.peerId), true);
-      assert.equal(transport.peerRuntime().find((peer) => peer.peerId === identity.peerId)?.online, true);
+      const recoveringPeer = transport.peerRuntime().find((peer) => peer.peerId === identity.peerId);
+      assert.equal(recoveringPeer?.online, false, 'a recovering route is not displayed as online');
+      assert.equal(recoveringPeer?.connectionState, 'recovering');
       assert.ok(relaySends >= 2, 'relay fallback was not started immediately');
 
       const routed = transport.waitForRoute(identity.peerId, 100);

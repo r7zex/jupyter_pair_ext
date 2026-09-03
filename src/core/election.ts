@@ -74,6 +74,13 @@ export class SessionCoordinator extends EventEmitter {
     if (now < this.graceUntil) return undefined;
 
     const host = this.peers.get(this.clock.hostId);
+    // The mesh has already retired the physical route and is trying the
+    // authenticated alternatives.  Do not race its bounded recovery window:
+    // a guest can never infer a replacement host from a local partition.
+    if (host?.connectionState === 'recovering') {
+      this.hostSuspectSince = undefined;
+      return undefined;
+    }
     // A WebRTC disconnect can be transient. Guest shutdown starts only after
     // the heartbeat lease expires, which gives route recovery a chance.
     const leaseExpired = !host || now - host.lastHeartbeat > this.heartbeatTimeoutMs;
@@ -83,7 +90,7 @@ export class SessionCoordinator extends EventEmitter {
     }
     // An observed socket close is authoritative; a merely late heartbeat has to
     // stay expired across a confirmation window before the role is taken away.
-    const hardLoss = !host || host.online === false;
+    const hardLoss = !host || host.connectionState === 'disconnected' || host.online === false;
     if (!hardLoss) {
       this.hostSuspectSince ??= now;
       if (now - this.hostSuspectSince < this.heartbeatTimeoutMs) return undefined;
