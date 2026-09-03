@@ -970,15 +970,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (executorId === this.descriptor.localPeer.peerId) {
       return this.executeLocally(notebookKey, target, requestId, code, onEvent);
     }
-    this.transition('syncing', `Verifying project versions on executor ${executorId}.`);
-    let manifest: ExecutionManifest;
-    try {
-      manifest = await this.synchronizeExecutionFiles(executorId, requestId, notebookKey, target);
-    } catch (error) {
-      this.transition('file-synchronization-failed', formatError(error));
-      throw error;
-    }
-    this.transition('executing', `Executing ${notebookKey} on ${executorId}.`);
+    this.transition('executing', `Requesting host execution for ${notebookKey} on ${executorId}.`);
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingExecutions.delete(requestId);
@@ -1006,9 +998,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           notebookKey,
           cellId,
           target,
-          documentManifest: manifest.documents,
-          binaryManifest: manifest.binaries,
-          directoryManifest: manifest.directories,
+          // The host is the sole executor. Live CRDT cell text is already sent
+          // independently of disk persistence, so a normal Run Cell request
+          // must not block behind a full project filesystem barrier.
+          fastPath: true,
+          documentManifest: {},
+          binaryManifest: {},
+          directoryManifest: [],
         },
         Buffer.from(code, 'utf8'),
       ).catch((error) => {
@@ -3821,7 +3817,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await this.persistDescriptor();
   }
 
-  private async synchronizeExecutionFiles(
+  /** Retained for protocol-compatible peers that still explicitly request a file barrier. */
+  public async synchronizeExecutionFiles(
     executorId: string,
     requestId: string,
     notebookKey: string,
@@ -4783,12 +4780,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     };
     const target = normalizeComputeTarget(frame.meta.target, sourceId);
+    const fastPath = frame.meta.fastPath === true;
+    const cellId = String(frame.meta.cellId ?? '');
     const manifest = normalizeExecutionManifest({
       documents: frame.meta.documentManifest,
       binaries: frame.meta.binaryManifest,
       directories: frame.meta.directoryManifest,
     }, sourceId);
-    if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target || !manifest) {
+    if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target || !manifest
+      || (fastPath && !PEER_ID_PATTERN.test(cellId))) {
       rejectRequest('InvalidExecutionRequest', 'The remote execution request is malformed.');
       return;
     }
@@ -4824,14 +4824,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     const authorizationKey = barrierAuthorizationKey(sourceId, requestId);
     const authorization = this.completedExecutionBarriers.get(authorizationKey);
-    if (!authorization || authorization.notebookKey !== notebookKey
-      || !sameComputeTarget(authorization.target, target)
-      || authorization.manifestDigest !== executionManifestDigest(manifest)) {
-      rejectRequest('FileVersionBarrier', 'Execution request has no matching completed file barrier.');
-      return;
+    if (!fastPath) {
+      if (!authorization || authorization.notebookKey !== notebookKey
+        || !sameComputeTarget(authorization.target, target)
+        || authorization.manifestDigest !== executionManifestDigest(manifest)) {
+        rejectRequest('FileVersionBarrier', 'Execution request has no matching completed file barrier.');
+        return;
+      }
+      clearTimeout(authorization.timer);
+      this.completedExecutionBarriers.delete(authorizationKey);
     }
-    clearTimeout(authorization.timer);
-    this.completedExecutionBarriers.delete(authorizationKey);
     if (this.project.kindOf(notebookKey) !== 'notebook') {
       rejectRequest('InvalidExecutionRequest', 'The requested collaborative notebook does not exist.');
       return;
@@ -4854,17 +4856,21 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       rejectRequest('ExecutionBusy', 'The executor has reached its remote execution concurrency limit.');
       return;
     }
-    const missingBinaries = Object.entries(manifest.binaries).filter(([relativePath, version]) => {
+    if (fastPath && !this.project.hasNotebookCell(notebookKey, cellId)) {
+      rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the host yet.');
+      return;
+    }
+    const missingBinaries = fastPath ? [] : Object.entries(manifest.binaries).filter(([relativePath, version]) => {
       const local = this.binaryVersions.get(relativePath);
       return !local || !sameBinaryVersion(local, version);
     });
-    const extraBinaries = [...this.binaryVersions.keys()].filter((relativePath) => !(relativePath in manifest.binaries));
-    const missingDocuments = Object.entries(manifest.documents).filter(([key, hash]) =>
+    const extraBinaries = fastPath ? [] : [...this.binaryVersions.keys()].filter((relativePath) => !(relativePath in manifest.binaries));
+    const missingDocuments = fastPath ? [] : Object.entries(manifest.documents).filter(([key, hash]) =>
       !this.project.has(key) || this.projectDocumentHash(key) !== hash);
-    const extraDocuments = this.project.keys().filter((key) => !(key in manifest.documents));
+    const extraDocuments = fastPath ? [] : this.project.keys().filter((key) => !(key in manifest.documents));
     const directoryManifest = new Set(manifest.directories);
-    const missingDirectories = [...directoryManifest].filter((key) => !this.directories.has(key));
-    const extraDirectories = [...this.directories].filter((key) => !directoryManifest.has(key));
+    const missingDirectories = fastPath ? [] : [...directoryManifest].filter((key) => !this.directories.has(key));
+    const extraDirectories = fastPath ? [] : [...this.directories].filter((key) => !directoryManifest.has(key));
 
     const mismatch = [
       ...missingBinaries.map(([key]) => key),
@@ -4940,6 +4946,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             this.deliverActiveRemoteExecution(requestId);
           }
         },
+        !fastPath,
       );
       const timedOut = new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
@@ -5098,11 +5105,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     requestId: string,
     code: string,
     onEvent: (event: JupyterKernelEvent) => void,
+    materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
     // This is the execution barrier, not part of the editor hot path: Python
     // imports must see the already-received CRDT state in the physical copy.
-    await this.prepareWorkingCopy?.();
-    await this.flush();
+    if (materializeWorkspace) {
+      await this.prepareWorkingCopy?.();
+      await this.flush();
+    }
     let kernel = this.kernels.get(notebookKey);
     if (!kernel) {
       if (this.kernels.size >= MAX_LIVE_KERNELS) {
