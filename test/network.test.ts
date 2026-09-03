@@ -964,6 +964,9 @@ describe('mesh relay fallback integration', function () {
       assert.equal(disconnects, 0);
       assert.equal(transport.hasRoute(identity.peerId), true);
       assert.equal(transport.isPeerRecovering(identity.peerId), false);
+      const logicalParticipants = transport.peerRuntime().filter((peer) => peer.peerId === identity.peerId);
+      assert.equal(logicalParticipants.length, 1, 'route replacement must not duplicate the logical participant');
+      assert.equal(logicalParticipants[0]?.connectionState, 'connected');
     } finally {
       await transport.stop();
     }

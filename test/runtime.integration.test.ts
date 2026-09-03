@@ -946,6 +946,92 @@ describe('runtime repair invariants', () => {
     }
   });
 
+  it('retains awareness during recovery, accepts recovered state, and clears terminal ownership idempotently', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-awareness-lifecycle-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'awareness-lifecycle', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'awareness-lifecycle-token-that-is-long-enough', context(extensionRoot), logger());
+    const remoteDocument = new Y.Doc();
+    const remoteAwareness = new Awareness(remoteDocument);
+    const peer = {
+      peerId: 'peer-a', displayName: 'Alice', joinOrder: 1,
+      online: true, connectionState: 'connected',
+    };
+    try {
+      (runtime as any).transport.peerRuntime = () => [peer];
+      (runtime as any).installTransportHandlers();
+      (runtime as any).installAwarenessHandlers();
+
+      remoteAwareness.setLocalState({
+        peer,
+        activeFile: 'main.py',
+        activeLine: 2,
+        shareCursor: true,
+        cursorColor: '#123456',
+      });
+      const clientId = remoteAwareness.clientID;
+      (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(remoteAwareness, [clientId]), peer.peerId);
+      assert.equal((runtime.awareness.getStates().get(clientId) as any)?.activeLine, 2);
+      assert.equal((runtime as any).awarenessOwnerByClientId.get(clientId), peer.peerId);
+      assert.equal((runtime as any).awarenessClientsByPeer.get(peer.peerId)?.has(clientId), true);
+
+      (runtime as any).transport.emit('peerRecovering', peer);
+      assert.equal(runtime.awareness.getStates().has(clientId), true, 'recovering must retain remote awareness');
+      assert.equal((runtime as any).awarenessOwnerByClientId.get(clientId), peer.peerId);
+
+      peer.online = true;
+      peer.connectionState = 'connected';
+      remoteAwareness.setLocalState({
+        peer,
+        activeFile: 'main.py',
+        activeLine: 7,
+        shareCursor: true,
+        cursorColor: '#123456',
+      });
+      (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(remoteAwareness, [clientId]), peer.peerId);
+      assert.equal((runtime.awareness.getStates().get(clientId) as any)?.activeLine, 7, 'recovered authenticated awareness is accepted');
+
+      remoteAwareness.setLocalState(null);
+      (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(remoteAwareness, [clientId]), peer.peerId);
+      assert.equal(runtime.awareness.getStates().has(clientId), false);
+      assert.equal((runtime as any).awarenessOwnerByClientId.has(clientId), false, 'explicit remote removal clears reverse ownership');
+      assert.equal((runtime as any).awarenessClientsByPeer.has(peer.peerId), false, 'explicit remote removal clears peer ownership');
+
+      remoteAwareness.setLocalState({
+        peer,
+        activeFile: 'main.py',
+        activeLine: 9,
+        shareCursor: true,
+        cursorColor: '#123456',
+      });
+      (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(remoteAwareness, [clientId]), peer.peerId);
+      assert.equal((runtime.awareness.getStates().get(clientId) as any)?.activeLine, 9, 'the same authenticated peer may publish again after cleanup');
+
+      // Simulate partially stale peer-to-client bookkeeping: terminal cleanup
+      // must still discover the reverse owner and remove the actual Yjs state.
+      (runtime as any).awarenessClientsByPeer.delete(peer.peerId);
+      assert.equal((runtime as any).awarenessOwnerByClientId.get(clientId), peer.peerId);
+      (runtime as any).transport.emit('peerDisconnected', peer);
+      assert.equal(runtime.awareness.getStates().has(clientId), false, 'terminal disconnect removes remote awareness');
+      assert.equal((runtime as any).awarenessOwnerByClientId.has(clientId), false);
+      assert.equal((runtime as any).awarenessClientsByPeer.has(peer.peerId), false);
+
+      (runtime as any).transport.emit('peerDisconnected', peer);
+      assert.equal(runtime.awareness.getStates().has(clientId), false, 'terminal cleanup is idempotent');
+      assert.equal((runtime as any).awarenessOwnerByClientId.has(clientId), false);
+      assert.equal((runtime as any).awarenessClientsByPeer.has(peer.peerId), false);
+    } finally {
+      remoteAwareness.destroy();
+      remoteDocument.destroy();
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsolicited execution barrier commit without deleting local work', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-barrier-auth-'));
     const extensionRoot = path.join(root, 'extension');

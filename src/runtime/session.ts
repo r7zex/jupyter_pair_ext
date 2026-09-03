@@ -754,7 +754,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           peerId: peer.peerId,
           displayName: peer.displayName,
           routeType: peer.route === 'Relay' ? 'relay' as const : 'direct' as const,
-          latencyMs: peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
+          latencyMs: peer.connectionState === 'recovering'
+            ? -1
+            : peer.latencyEma >= 0 ? Math.round(peer.latencyEma) : -1,
           ...(upgradeStatus !== undefined ? { upgradeStatus } : {}),
           ...(remoteStatus !== undefined ? { remoteStatus } : {}),
         };
@@ -1925,10 +1927,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         clearTimeout(authorization.timer);
         this.completedExecutionBarriers.delete(key);
       }
-      const awarenessClients = [...(this.awarenessClientsByPeer.get(peer.peerId) ?? [])];
-      if (awarenessClients.length) removeAwarenessStates(this.awareness, awarenessClients, REMOTE_ORIGIN);
-      for (const clientId of awarenessClients) this.awarenessOwnerByClientId.delete(clientId);
-      this.awarenessClientsByPeer.delete(peer.peerId);
+      this.clearPeerAwareness(peer.peerId);
       for (const [requestId, owner] of [...this.executionOwners]) {
         if (owner.peerId !== peer.peerId) continue;
         void this.kernels.get(owner.notebookKey)?.interrupt().catch(() => undefined);
@@ -2105,12 +2104,39 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
     applyAwarenessUpdate(this.awareness, sanitized, REMOTE_ORIGIN);
     for (const record of records) {
-      if (record.state === null) continue;
+      if (record.state === null) {
+        if (this.awarenessOwnerByClientId.get(record.clientId) === sourceId) {
+          this.awarenessOwnerByClientId.delete(record.clientId);
+        }
+        const clients = this.awarenessClientsByPeer.get(sourceId);
+        clients?.delete(record.clientId);
+        if (clients && !clients.size) this.awarenessClientsByPeer.delete(sourceId);
+        continue;
+      }
       this.awarenessOwnerByClientId.set(record.clientId, sourceId);
       const clients = this.awarenessClientsByPeer.get(sourceId) ?? new Set<number>();
       clients.add(record.clientId);
       this.awarenessClientsByPeer.set(sourceId, clients);
     }
+  }
+
+  /**
+   * Terminal logical disconnect cleanup. Recovery intentionally does not call
+   * this helper: awareness remains visible until the bounded route recovery
+   * either succeeds or emits one terminal peerDisconnected event.
+   */
+  private clearPeerAwareness(peerId: string): void {
+    const clients = new Set(this.awarenessClientsByPeer.get(peerId) ?? []);
+    for (const [clientId, owner] of this.awarenessOwnerByClientId) {
+      if (owner === peerId) clients.add(clientId);
+    }
+    if (clients.size) removeAwarenessStates(this.awareness, [...clients], REMOTE_ORIGIN);
+    for (const clientId of clients) {
+      if (this.awarenessOwnerByClientId.get(clientId) === peerId) {
+        this.awarenessOwnerByClientId.delete(clientId);
+      }
+    }
+    this.awarenessClientsByPeer.delete(peerId);
   }
 
   private installPresenceTracking(): void {

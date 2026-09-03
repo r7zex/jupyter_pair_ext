@@ -73,6 +73,11 @@ describe('dashboard webview startup', () => {
     assert.match(assignedHtml, /Настроить папку нового хоста/);
     assert.match(assignedHtml, /Передать хоста','ДРУГОМУ УЧАСТНИКУ/);
     assert.match(assignedHtml, /Завершить сессию','БЕЗ НОВОЙ ПАПКИ/);
+    assert.match(assignedHtml, /p\.online \|\| p\.connectionState === 'recovering'/, 'connected and recovering participants remain visible');
+    assert.match(assignedHtml, /const recovering = p\.connectionState === 'recovering'/);
+    assert.match(assignedHtml, /Восстанавливает соединение/);
+    assert.match(assignedHtml, /indicator = recovering \? '🟡' : '🟢'/, 'recovering is not rendered with the green online indicator');
+    assert.match(assignedHtml, /const latency = recovering \|\| p\.latency < 0 \? '—' : p\.latency\+' мс'/, 'recovering hides stale latency');
     assert.doesNotMatch(assignedHtml, /action\('transfer'[^\n]+disabled:!state\.isHost\|\|paused/);
     assert.doesNotMatch(assignedHtml, /action\('end'[^\n]+disabled:paused/);
     assert.doesNotMatch(assignedHtml, new RegExp(['Tail', 'scale'].join(''), 'i'));

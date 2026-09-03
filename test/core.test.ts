@@ -1626,15 +1626,40 @@ describe('host coordination', () => {
     assert.equal(coordinator.applyAnnouncement({ sessionEpoch: 10, hostEpoch: 4, hostId: 'peer-b' }, 'host-a'), true);
   });
 
-  it('keeps the pinned host authority while the mesh is recovering a route', () => {
+  it('keeps pinned host id and epoch unchanged throughout route recovery', () => {
     const coordinator = coordinatorFor('resilient');
+    const before = { ...coordinator.clock };
+    let hostChanges = 0;
+    coordinator.on('hostChanged', () => { hostChanges += 1; });
     const host = coordinator.peers.get('host-a')!;
     host.online = false;
     host.connectionState = 'recovering';
     host.lastHeartbeat = 0;
+
     coordinator.evaluate(Date.now() + 20_000);
+    coordinator.evaluate(Date.now() + 60_000);
     assert.equal(coordinator.closed, false);
-    assert.equal(coordinator.clock.hostId, 'host-a');
+    assert.deepEqual(coordinator.clock, before);
+    assert.equal(hostChanges, 0, 'route recovery must never emit a host transfer');
+
+    assert.equal(
+      coordinator.applyAnnouncement(
+        { sessionEpoch: before.sessionEpoch, hostEpoch: before.hostEpoch + 1, hostId: 'peer-c' },
+        'peer-c',
+      ),
+      false,
+      'a substitute peer cannot claim the pinned host identity',
+    );
+    assert.deepEqual(coordinator.clock, before);
+  });
+
+  it('still allows an explicit current-host transfer after adding the recovery guard', () => {
+    const coordinator = coordinatorFor('resilient', 'host-a');
+    const before = { ...coordinator.clock };
+    const next = coordinator.manualTransfer('peer-b');
+    assert.equal(next.hostId, 'peer-b');
+    assert.equal(next.hostEpoch, before.hostEpoch + 1);
+    assert.deepEqual(coordinator.clock, next);
   });
 });
 

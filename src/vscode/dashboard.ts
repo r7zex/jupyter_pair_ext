@@ -208,7 +208,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
         active: state?.activeFile
           ? `${state.activeFile}${state.activeNotebookCell !== undefined ? ` • ячейка ${state.activeNotebookCell + 1}` : ''}`
           : 'Нет активного файла',
-        latency: peer.latency,
+        latency: peer.connectionState === 'recovering' ? -1 : peer.latency,
         hardware: gpu
           ? `${gpu.model} • ${(gpu.vramMb / 1024).toFixed(0)} GB`
           : state?.hardware?.cpuModel ?? 'Ожидание данных об устройстве',
@@ -456,7 +456,8 @@ function html(): string {
         const recovering = p.connectionState === 'recovering';
         const indicator = recovering ? '🟡' : '🟢';
         const stateLine = recovering ? '<div class="tiny q-warn">↻ Восстанавливает соединение</div>' : '';
-        return '<div class="card participant"><div class="row"><strong>'+indicator+' '+esc(p.name)+'</strong><span>'+ (p.latency >= 0 ? p.latency+' мс' : '—') +'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>';
+        const latency = recovering || p.latency < 0 ? '—' : p.latency+' мс';
+        return '<div class="card participant"><div class="row"><strong>'+indicator+' '+esc(p.name)+'</strong><span>'+latency+'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>';
       }).join('') || '<div class="tiny">Нет подключённых участников</div>';
       const connectionState = connection();
       const conn = state.connection;
