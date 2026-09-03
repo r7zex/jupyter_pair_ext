@@ -25,6 +25,8 @@ import { safeRelativePath } from '../core/persistence';
 import { classifyFile, normalizeNotebookMetadata, shouldTrackProjectPath } from '../core/projectFiles';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
 
+const NOTEBOOK_CELL_STATE_COALESCE_MS = 75;
+
 export interface NotebookCellRenderRequest {
   outputs: readonly vscode.NotebookCellOutput[];
   execution: CellExecutionSnapshot | undefined;
@@ -132,8 +134,11 @@ export class EditorSynchronizer implements vscode.Disposable {
     const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === relativePath);
     if (notebook) {
       await this.whenNotebookReady(notebook);
-      await (this.notebookApplyQueues.get(relativePath) ?? Promise.resolve());
-      await this.applyNotebookSnapshot(notebook, this.project.notebookSnapshot(relativePath));
+      await this.drainPendingNotebookCellStates(relativePath);
+      // Persistence never invokes a full notebook snapshot merely because a
+      // flush happened. Reconcile fields narrowly; full snapshot is reachable
+      // only if this proves an actual structural mismatch.
+      await this.applyUnscopedNotebookReconciliation(notebook, relativePath);
       await this.ensureStableCellIds(notebook);
       if (forceSave && !await notebook.save()) {
         throw new Error(`VS Code could not save ${relativePath}.`);
@@ -221,16 +226,34 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (this.notebookCellStateTimers.has(key)) return;
     const timer = setTimeout(() => {
       this.notebookCellStateTimers.delete(key);
-      const pending = this.pendingNotebookCellStates.get(key);
-      this.pendingNotebookCellStates.delete(key);
-      if (!pending?.size) return;
-      this.enqueueNotebookApply(key, async () => {
-        const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
-        if (!notebook) return;
-        for (const pendingCellId of pending) await this.applyNotebookCellState(notebook, key, pendingCellId);
-      });
-    }, 75);
+      this.flushPendingNotebookCellStates(key);
+    }, NOTEBOOK_CELL_STATE_COALESCE_MS);
     this.notebookCellStateTimers.set(key, timer);
+  }
+
+  private flushPendingNotebookCellStates(key: string): void {
+    const pending = this.pendingNotebookCellStates.get(key);
+    this.pendingNotebookCellStates.delete(key);
+    if (!pending?.size) return;
+    this.enqueueNotebookApply(key, async () => {
+      const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
+      if (!notebook) return;
+      // Read canonical CRDT state only now, after the burst has collapsed. No
+      // obsolete intermediate iopub/output/execution snapshot is replayed.
+      for (const pendingCellId of pending) {
+        await this.applyNotebookCellState(notebook, key, pendingCellId);
+      }
+    });
+  }
+
+  private async drainPendingNotebookCellStates(key: string): Promise<void> {
+    const timer = this.notebookCellStateTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      this.notebookCellStateTimers.delete(key);
+    }
+    this.flushPendingNotebookCellStates(key);
+    await (this.notebookApplyQueues.get(key) ?? Promise.resolve());
   }
 
   private async applyNotebookCellState(
@@ -247,21 +270,41 @@ export class EditorSynchronizer implements vscode.Disposable {
     const executionChanged = !sameJson(executionFromCell(current), target.execution);
     if (!outputsChanged && !executionChanged) return;
     if (!this.cellStateRenderer) {
-      this.log.appendLine(
-        `[error] Cannot render notebook outputs/execution for ${key} cell ${cellId}: NotebookController renderer is unavailable.`,
-      );
+      if (outputsChanged) {
+        this.log.appendLine(
+          `[error] Cannot render remote notebook outputs for ${key} cell ${cellId}: NotebookController renderer is unavailable.`,
+        );
+      }
+      if (executionChanged) {
+        this.log.appendLine(
+          `[error] Cannot render remote notebook execution for ${key} cell ${cellId}: NotebookController renderer is unavailable.`,
+        );
+      }
       return;
     }
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
-      await this.cellStateRenderer.renderRemoteCellState(current, {
-        outputs: target.outputs.map(toNotebookOutput),
-        execution: target.execution,
-        outputsChanged,
-        executionChanged,
-        executionMode,
-      });
+      try {
+        await this.cellStateRenderer.renderRemoteCellState(current, {
+          outputs: target.outputs.map(toNotebookOutput),
+          execution: target.execution,
+          outputsChanged,
+          executionChanged,
+          executionMode,
+        });
+      } catch (error) {
+        if (outputsChanged) {
+          this.log.appendLine(
+            `[error] Failed to render remote notebook outputs for ${key} cell ${cellId}: ${formatError(error)}`,
+          );
+        }
+        if (executionChanged) {
+          this.log.appendLine(
+            `[error] Failed to render remote notebook execution for ${key} cell ${cellId}: ${formatError(error)}`,
+          );
+        }
+      }
     } finally {
       this.applyingNotebooks.delete(uri);
     }
@@ -555,7 +598,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const cell = notebook.cellAt(index);
         this.cellIds.seed(cell, metadataCellId(cell.metadata), matches[index]);
       }
-      await this.applyNotebookSnapshot(notebook, snapshot);
+      await this.applyUnscopedNotebookReconciliation(notebook, key);
     }
     await this.ensureStableCellIds(notebook);
   }

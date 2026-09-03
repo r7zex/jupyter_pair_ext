@@ -76,3 +76,15 @@ Audited at repository SHA `3165ce0216eac1c1f67c4e400748ab52581b551d`. This secti
 3. A notebook execution update touches only the executed cell and does not replace unrelated cells or move the active viewport.
 4. A guest cell run reaches the host without a full manifest/file barrier, executes exactly once, and publishes one authoritative result for every participant.
 5. Presence shows an active line/cell only, never a fabricated first-line cursor after a cell disappears.
+
+
+## Notebook persistence hot-path contract (prompt 08)
+
+- Output/execution coalescing uses one named `NOTEBOOK_CELL_STATE_COALESCE_MS = 75` window per notebook. Pending work is a `Set` of stable cell IDs, so duplicate events for one cell collapse to one render.
+- The coalescing timer never stores output/execution payload snapshots. On expiry (or explicit persistence drain), it reads the latest canonical CRDT cell state, so obsolete intermediate iopub states are not replayed and a terminal execution update supersedes an earlier running state.
+- `dispose()` clears every notebook coalescing timer and pending stable-cell set.
+- Production editor `.save()` calls are intentionally limited to exactly two guarded calls in `EditorSynchronizer.persistOpenWorkingCopy()`: `notebook.save()` and `document.save()`, both only when `forceSave === true`.
+- Ordinary CRDT text, notebook output/execution, metadata, presence, and debounced persistence never call editor `save()`. `prepareWorkingCopy()` is the explicit filesystem barrier used by local execution, final host save/session end, and host transfer.
+- Physical persistence is independently debounced by `StorageAdapter.schedule()` using the configured `persistenceDebounceMs` (default 750 ms). It serializes CRDT state and writes the durable backing copy before requesting a non-saving open-editor reconciliation; the editor hot path does not await this timer.
+- `applyNotebookSnapshot()` is no longer an initial-bind or routine-persistence operation. Initial bind and persistence use narrow unscoped reconciliation. The only production caller is `applyStructuralRecoveryIfNeeded()`, after `minimalNotebookSplice()` proves a real structural inconsistency; that path emits a `[structural-recovery]` diagnostic.
+- Text, metadata, output, and execution failures remain scope-specific. Output/execution renderer failures are logged separately and do not escalate into a generic full-notebook fallback.

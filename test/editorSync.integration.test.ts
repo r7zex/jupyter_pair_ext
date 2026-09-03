@@ -256,6 +256,72 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
+  it('coalesces a remote output burst into one render and the last canonical output wins', async () => {
+    const root = path.resolve('/tmp/pair-editor-output-coalesce');
+    const target = fakeCell('TARGET', 'target');
+    const notebook = fakeNotebook(root, [target]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const calls: any[] = [];
+    const synchronizer = new EditorSynchronizer(
+      project, root, logger(), undefined, recordingCellStateRenderer(calls),
+    );
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      for (const value of ['first', 'second', 'third']) {
+        project.setCellOutputs('work.ipynb', 'target', [{
+          metadata: { outputType: 'stream' },
+          items: [{ mime: 'text/plain', dataBase64: Buffer.from(value).toString('base64') }],
+        }], REMOTE_ORIGIN);
+      }
+      assert.equal((synchronizer as any).notebookCellStateTimers.size, 1);
+      assert.equal((synchronizer as any).pendingNotebookCellStates.get('work.ipynb').size, 1);
+      await waitFor(() => calls.length === 1, 1000, 'coalesced output burst');
+      assert.equal(calls.length, 1);
+      assert.equal(
+        Buffer.from(calls[0].outputs[0].items[0].data).toString('utf8'),
+        'third',
+      );
+      assert.equal((synchronizer as any).notebookCellStateTimers.size, 0);
+      assert.equal((synchronizer as any).pendingNotebookCellStates.size, 0);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('does not lose a terminal execution update that arrives inside the coalescing window', async () => {
+    const root = path.resolve('/tmp/pair-editor-execution-terminal-coalesce');
+    const target = fakeCell('TARGET', 'target');
+    const notebook = fakeNotebook(root, [target]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const calls: any[] = [];
+    const synchronizer = new EditorSynchronizer(
+      project, root, logger(), undefined, recordingCellStateRenderer(calls),
+    );
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      project.setCellExecution('work.ipynb', 'target', { executionOrder: 4 }, REMOTE_ORIGIN);
+      project.setCellExecution('work.ipynb', 'target', {
+        executionOrder: 4,
+        success: true,
+        timing: { startTime: 10, endTime: 20 },
+      }, REMOTE_ORIGIN);
+      await waitFor(() => calls.length === 1, 1000, 'terminal execution coalescing');
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].execution, {
+        executionOrder: 4,
+        success: true,
+        timing: { startTime: 10, endTime: 20 },
+      });
+      assert.equal(target.executionSummary.success, true);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
   it('applies an outputs-only remote update through the renderer with zero replaceCells and no neighbor mutation', async () => {
     const root = path.resolve('/tmp/pair-editor-output-only');
     const target = fakeCell('TARGET', 'target');
@@ -273,6 +339,12 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       await synchronizer.whenNotebookReady(notebook);
       const targetSource = target.document.getText();
       const targetMetadata = { ...target.metadata };
+      let fullSnapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        fullSnapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
       vscodeBoundary.__notebookEdits = [];
 
       project.setCellOutputs('work.ipynb', 'target', [{
@@ -293,6 +365,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       );
       assert.equal(neighbor.outputs, neighborOutputs);
       assert.equal(neighbor.executionSummary, neighborSummary);
+      assert.equal(fullSnapshotCalls, 0, 'ordinary output updates never enter full snapshot recovery');
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -316,6 +389,12 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       await synchronizer.whenNotebookReady(notebook);
       const targetSource = target.document.getText();
       const targetMetadata = { ...target.metadata };
+      let fullSnapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        fullSnapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
       vscodeBoundary.__notebookEdits = [];
 
       project.setCellExecution('work.ipynb', 'target', {
@@ -339,6 +418,39 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       assert.deepEqual(neighbor.metadata, neighborMetadata);
       assert.equal(neighbor.outputs, neighborOutputs);
       assert.equal(neighbor.executionSummary, undefined);
+      assert.equal(fullSnapshotCalls, 0, 'ordinary execution updates never enter full snapshot recovery');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('allows full snapshot only after a proven structural inconsistency', async () => {
+    const root = path.resolve('/tmp/pair-editor-structural-fallback');
+    const notebook = fakeNotebook(root, [fakeCell('A', 'a')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(
+      project, root, logger(), undefined, fakeCellStateRenderer(),
+    );
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      let snapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        snapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [
+          snapshot.cells[0]!,
+          { id: 'new', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] },
+        ],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.length === 2, 1000, 'structural recovery snapshot');
+      assert.equal(snapshotCalls, 1);
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -534,6 +646,26 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       assert.equal(notebook.saveCount, 0, 'background persistence never save-spams an open notebook');
       await synchronizer.prepareWorkingCopy();
       assert.equal(notebook.saveCount, 1, 'an explicit filesystem barrier may save the open notebook');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('keeps background text persistence unsaved and saves only at an explicit filesystem barrier', async () => {
+    const root = path.resolve('/tmp/pair-editor-text-save');
+    const document = fakeTextDocument(path.join(root, 'notes.txt'), 'before');
+    vscodeBoundary.__resetText(document);
+    const project = new CollaborativeProject();
+    project.ensureText('notes.txt', 'before');
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      project.replaceText('notes.txt', 'after', REMOTE_ORIGIN);
+      assert.equal(await synchronizer.persistWorkingCopy('notes.txt', Buffer.from('ignored')), true);
+      assert.equal(document.text, 'after');
+      assert.equal(document.saveCount, 0, 'background text persistence never calls document.save()');
+      await synchronizer.prepareWorkingCopy();
+      assert.equal(document.saveCount, 1, 'explicit filesystem barrier calls document.save() exactly once');
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -742,9 +874,10 @@ function fakeTextDocument(absolutePath: string, source: string): any {
   return {
     uri: vscodeBoundary.Uri.file(absolutePath),
     text: source,
+    saveCount: 0,
     getText() { return this.text; },
     positionAt(offset: number) { return offset; },
-    async save() { return true; },
+    async save() { this.saveCount += 1; return true; },
   };
 }
 
@@ -893,6 +1026,31 @@ function createNotebookVscodeBoundary(): any {
     },
   };
   return boundary;
+}
+
+function recordingCellStateRenderer(calls: any[]): any {
+  return {
+    renderRemoteCellState: async (cell: any, request: any) => {
+      calls.push({
+        cellId: cell.metadata.pairNotebookCellId,
+        outputs: request.outputs,
+        execution: request.execution,
+        outputsChanged: request.outputsChanged,
+        executionChanged: request.executionChanged,
+        executionMode: request.executionMode,
+      });
+      if (request.outputsChanged) cell.outputs = [...request.outputs];
+      if (request.executionChanged) {
+        cell.executionSummary = request.execution
+          ? {
+            executionOrder: request.execution.executionOrder,
+            success: request.execution.success,
+            timing: request.execution.timing ? { ...request.execution.timing } : undefined,
+          }
+          : undefined;
+      }
+    },
+  };
 }
 
 function fakeCellStateRenderer(): any {
