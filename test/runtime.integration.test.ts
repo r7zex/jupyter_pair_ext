@@ -359,8 +359,11 @@ describe('production SessionRuntime integration', () => {
         state.peer.peerId === 'peer-z' && state.activeNotebookCellId === 'b'), 3000, 'stable cursor cell identity');
       fakeVscode.window.activeNotebookEditor.selection.start = 0;
       peer.updatePresence();
-      await waitFor(() => host.snapshot().awareness.some((state: any) =>
-        state.peer.peerId === 'peer-z' && state.activeNotebookCell === 0 && state.activeNotebookCellId === 'b'), 3000, 'cursor after cell move');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const movedCellPresence = host.snapshot().awareness.find((state: any) => state.peer.peerId === 'peer-z');
+      assert.equal(movedCellPresence?.activeNotebookCellId, 'b');
+      assert.equal(movedCellPresence?.activeNotebookCell, undefined,
+        'stable cell identity survives a numeric cell move without publishing the legacy cell index');
       fakeVscode.window.activeNotebookEditor = undefined;
       fakeVscode.window.activeTextEditor = undefined;
 
@@ -693,7 +696,8 @@ describe('runtime repair invariants', () => {
       (runtime as any).setKernelStatus('A.ipynb', 'Busy');
       (runtime as any).setKernelStatus('B.ipynb', 'Idle');
       const local = (runtime as any).awareness.getLocalState();
-      assert.deepEqual(local.kernelStatuses, { 'A.ipynb': 'Busy', 'B.ipynb': 'Idle' });
+      assert.equal(local.kernelStatuses, undefined, 'semantic awareness excludes kernel telemetry');
+      assert.deepEqual(runtime.localComputePresence()?.kernelStatuses, { 'A.ipynb': 'Busy', 'B.ipynb': 'Idle' });
 
       fakeVscode.window.activeNotebookEditor = { notebook: { uri: fakeVscode.Uri.file(path.join(folder, 'A.ipynb')) } };
       assert.equal(runtime.snapshot().kernelStatus, 'Busy');
@@ -775,9 +779,10 @@ describe('runtime repair invariants', () => {
       (runtime as any).resources = { cpuPercent: 10, ramUsedMb: 100, ramTotalMb: 200, gpus: [], sampledAt: Date.now() };
       (runtime as any).updatePresence();
       const advertised = runtime.awareness.getLocalState();
-      assert.equal(advertised.hardware.python.executable, 'C:\\Users\\private\\python.exe');
-      assert.equal(advertised.resources.cpuPercent, 10);
+      assert.equal(advertised.hardware, undefined, 'semantic awareness excludes hardware telemetry');
+      assert.equal(advertised.resources, undefined, 'semantic awareness excludes resource telemetry');
       assert.equal(runtime.localComputePresence()?.hardware?.python.executable, 'C:\\Users\\private\\python.exe');
+      assert.equal(runtime.localComputePresence()?.resources?.cpuPercent, 10);
 
       const nextRuntime = new SessionRuntime(descriptor({
         sessionId: 'private-hardware-next', role: 'peer', peerId: 'participant', hostPeerId: 'host',

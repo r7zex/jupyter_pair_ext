@@ -140,10 +140,12 @@ export class SessionClosedError extends Error {
 export interface PresenceState {
   peer: PeerIdentity;
   activeFile?: string | undefined;
+  /** Legacy receive-only compatibility for peers that still publish a numeric notebook index. */
   activeNotebookCell?: number | undefined;
   activeNotebookCellId?: string | undefined;
   /** Line-only presence avoids unstable cursor offsets during notebook edits. */
   activeLine?: number | undefined;
+  /** Legacy receive-only compatibility. New local packets never publish exact offsets. */
   cursor?: SharedCursorPosition | undefined;
   shareCursor: boolean;
   cursorColor: string;
@@ -153,6 +155,14 @@ export interface PresenceState {
   environments?: PythonEnvironment[] | undefined;
   resources?: ResourceSample | undefined;
   kernelStatus: 'Idle' | 'Busy' | 'Offline';
+  kernelStatuses?: Record<string, 'Idle' | 'Busy' | 'Offline'> | undefined;
+}
+
+interface RuntimePresenceMetadata {
+  hardware?: HardwareInfo | undefined;
+  environments?: PythonEnvironment[] | undefined;
+  resources?: ResourceSample | undefined;
+  kernelStatus?: 'Idle' | 'Busy' | 'Offline' | undefined;
   kernelStatuses?: Record<string, 'Idle' | 'Busy' | 'Offline'> | undefined;
 }
 
@@ -536,6 +546,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private resources: ResourceSample | undefined;
   private cpuUsage: CpuSnapshot | undefined;
   private resourceSampleInFlight = false;
+  private lastResourcePublishedAt = 0;
+  private semanticPresencePublished = false;
+  private lastPublishedActiveFile: string | undefined;
+  private lastPublishedActiveNotebookCellId: string | undefined;
+  private lastPublishedActiveLine: number | undefined;
+  private lastPublishedShareCursor = true;
+  private lastPublishedCursorColor = '#4FC3F7';
+  private lastPublishedDisplayName = '';
+  private readonly remoteRuntimePresence = new Map<string, RuntimePresenceMetadata>();
   private meshMetrics: MeshMetrics = {
     bytesSentPerSecond: 0,
     bytesReceivedPerSecond: 0,
@@ -793,7 +812,20 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const states: PresenceState[] = [];
     for (const value of this.awareness.getStates().values()) {
       const state = normalizeStoredPresence(value);
-      if (state) states.push(state);
+      if (!state) continue;
+      const runtimePresence = this.remoteRuntimePresence.get(state.peer.peerId);
+      if (!runtimePresence) {
+        states.push(state);
+        continue;
+      }
+      states.push({
+        ...state,
+        ...(runtimePresence.hardware !== undefined ? { hardware: runtimePresence.hardware } : {}),
+        ...(runtimePresence.environments !== undefined ? { environments: runtimePresence.environments } : {}),
+        ...(runtimePresence.resources !== undefined ? { resources: runtimePresence.resources } : {}),
+        ...(runtimePresence.kernelStatus !== undefined ? { kernelStatus: runtimePresence.kernelStatus } : {}),
+        ...(runtimePresence.kernelStatuses !== undefined ? { kernelStatuses: runtimePresence.kernelStatuses } : {}),
+      });
     }
     const activeNotebookKey = vscode.window.activeNotebookEditor
       ? this.relativeKey(vscode.window.activeNotebookEditor.notebook.uri)
@@ -876,15 +908,22 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public localComputePresence(): PresenceState | undefined {
-    const local = [...this.awareness.getStates().values()]
+    const stored = [...this.awareness.getStates().values()]
       .map(normalizeStoredPresence)
       .find((value) => value?.peer.peerId === this.descriptor.localPeer.peerId);
-    if (!local) return undefined;
+    const local: PresenceState = stored ?? {
+      peer: this.descriptor.localPeer,
+      shareCursor: this.lastPublishedShareCursor,
+      cursorColor: this.lastPublishedCursorColor,
+      kernelStatus: this.kernelStatus,
+    };
     return {
       ...local,
       hardware: this.coordinator.isCurrentHost() ? this.hardware : undefined,
       environments: this.coordinator.isCurrentHost() ? this.environments : [],
       resources: this.coordinator.isCurrentHost() ? this.resources : undefined,
+      kernelStatus: this.coordinator.isCurrentHost() ? this.kernelStatus : local.kernelStatus,
+      kernelStatuses: this.coordinator.isCurrentHost() ? Object.fromEntries(this.kernelStatuses) : local.kernelStatuses,
     };
   }
 
@@ -1441,7 +1480,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       discoverHardware(pythonPath),
       discoverPythonEnvironments(this.descriptor.workingFolder, pythonPath),
     ]);
-    this.updatePresence();
+    this.publishHardwarePresence();
     this.emit('hardware', this.hardware);
   }
 
@@ -2036,6 +2075,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (this.awareness.getLocalState()) {
           this.transport.sendTo(peer.peerId, 'awareness', {}, encodeAwarenessUpdate(this.awareness, [this.awareness.clientID]));
         }
+        this.sendRuntimePresence(peer.peerId);
         this.replayRemoteExecutionsForPeer(peer.peerId);
       } catch (error) {
         this.log.appendLine(`[error] Failed to initialize peer ${peer.displayName}: ${formatError(error)}`);
@@ -2066,6 +2106,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.coordinator.markDisconnected(peer.peerId);
       this.kernelCommandWindows.delete(peer.peerId);
       this.binaryAcknowledgements.delete(peer.peerId);
+      this.remoteRuntimePresence.delete(peer.peerId);
       this.rejectSnapshotCheckpoints(
         peer.peerId,
         `Peer ${peer.displayName} disconnected during project snapshot transfer.`,
@@ -2434,6 +2475,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           break;
         case 'awareness':
           this.acceptAwarenessUpdate(frame.payload, sourceId);
+          break;
+        case 'hardwarePresence':
+          this.acceptHardwarePresence(frame, sourceId);
+          break;
+        case 'resourcePresence':
+          this.acceptResourcePresence(frame, sourceId);
+          break;
+        case 'kernelPresence':
+          this.acceptKernelPresence(frame, sourceId);
           break;
         case 'sessionEnding': {
           if (sourceId !== this.coordinator.clock.hostId) break;
@@ -3073,7 +3123,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (pauseDetail) this.transition('waiting-for-host-folder', pauseDetail);
     await this.persistDescriptor();
     await this.refreshAutosaveManager();
-    this.updatePresence();
+    this.remoteRuntimePresence.clear();
+    this.sendRuntimePresenceToAll();
     this.emit('hostChanged', this.coordinator.clock);
     if (pauseDetail) {
       this.emit('hostPaused', this.coordinator.clock);
@@ -3125,7 +3176,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         : undefined,
     );
     await this.refreshAutosaveManager();
-    this.updatePresence();
+    this.sendRuntimePresenceToAll();
     this.transition('ready', `Host storage is ready at epoch ${this.coordinator.clock.hostEpoch}.`);
     this.emit('hostResumed', this.coordinator.clock);
   }
@@ -3200,7 +3251,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the autosave disk.');
     const resolved = await this.assertAutosaveFolder(folder);
     await this.refreshAutosaveManager(resolved);
-    this.updatePresence();
   }
 
   public async createAutosaveNow(): Promise<string> {
@@ -3325,12 +3375,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const result = await sampleResources(this.cpuUsage);
       this.cpuUsage = result.cpu;
       this.resources = result.sample;
-      this.updatePresence();
+      this.publishResourcePresence();
     } finally {
       this.resourceSampleInFlight = false;
     }
   }
 
+  /** Publishes only semantic file/cell/line presence plus renderer metadata. */
   private updatePresence(): void {
     const configuration = vscode.workspace.getConfiguration('pairNotebook');
     const requestedDisplayName = configuration.get<string>('displayName', '').trim()
@@ -3353,18 +3404,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.lastDisplayNameWarning = warning;
       }
     }
-    const advertisesCompute = this.coordinator.isCurrentHost();
     const shareCursor = configuration.get<boolean>('shareMyCursor', true);
     const configuredColor = configuration.get<string>('myCursorColor', '#4FC3F7');
-    const cursorColor = /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor : '#4FC3F7';
+    const cursorColor = /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor.toUpperCase() : '#4FC3F7';
     const activeText = vscode.window.activeTextEditor;
     const activeNotebook = vscode.window.activeNotebookEditor;
     let activeFile: string | undefined;
-    let activeNotebookCell: number | undefined;
     let activeNotebookCellId: string | undefined;
     let activeLine: number | undefined;
-    if (activeNotebook) {
-      activeFile = this.relativeKey(activeNotebook.notebook.uri);
+    const notebookKey = activeNotebook ? this.relativeKey(activeNotebook.notebook.uri) : undefined;
+    if (activeNotebook && notebookKey) {
+      activeFile = notebookKey;
       const selectedIndex = activeNotebook.selection.start;
       const focusedCell = activeText?.document.uri.scheme === 'vscode-notebook-cell'
         ? activeNotebook.notebook.getCells?.().find((cell) =>
@@ -3375,34 +3425,110 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         && (typeof activeNotebook.notebook.cellCount !== 'number' || selectedIndex < activeNotebook.notebook.cellCount);
       const selectedCell = focusedCell
         ?? (selectedIndexIsValid ? activeNotebook.notebook.cellAt(selectedIndex) : undefined);
-      if (selectedCell) {
-        activeNotebookCell = selectedCell.index ?? selectedIndex;
-        activeNotebookCellId = this.notebookCellId(selectedCell);
-      }
+      if (selectedCell) activeNotebookCellId = this.notebookCellId(selectedCell);
       if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString() && shareCursor) {
         activeLine = lineFromSelection(activeText.selection.active);
       }
     } else if (activeText) {
-      activeFile = this.relativeKey(activeText.document.uri);
-      if (shareCursor) {
-        activeLine = lineFromSelection(activeText.selection.active);
+      const textKey = this.relativeKey(activeText.document.uri);
+      if (textKey) {
+        activeFile = textKey;
+        if (shareCursor) activeLine = lineFromSelection(activeText.selection.active);
       }
     }
+    const displayName = this.descriptor.localPeer.displayName;
+    if (this.semanticPresencePublished
+      && this.lastPublishedActiveFile === activeFile
+      && this.lastPublishedActiveNotebookCellId === activeNotebookCellId
+      && this.lastPublishedActiveLine === activeLine
+      && this.lastPublishedShareCursor === shareCursor
+      && this.lastPublishedCursorColor === cursorColor
+      && this.lastPublishedDisplayName === displayName) return;
+    this.semanticPresencePublished = true;
+    this.lastPublishedActiveFile = activeFile;
+    this.lastPublishedActiveNotebookCellId = activeNotebookCellId;
+    this.lastPublishedActiveLine = activeLine;
+    this.lastPublishedShareCursor = shareCursor;
+    this.lastPublishedCursorColor = cursorColor;
+    this.lastPublishedDisplayName = displayName;
+    // Deliberately no cursor offsets/anchors/columns/selections and no compute telemetry.
     this.awareness.setLocalState({
       peer: this.descriptor.localPeer,
       activeFile,
-      activeNotebookCell,
       activeNotebookCellId,
       activeLine,
       shareCursor,
       cursorColor,
       typing: false,
-      hardware: advertisesCompute ? this.hardware : undefined,
-      environments: advertisesCompute ? this.environments : [],
-      resources: advertisesCompute ? this.resources : undefined,
-      kernelStatus: this.kernelStatus,
-      kernelStatuses: Object.fromEntries(this.kernelStatuses),
-    } satisfies PresenceState);
+    });
+  }
+
+  private publishResourcePresence(peerId?: string): void {
+    const now = Date.now();
+    if (!peerId && now - this.lastResourcePublishedAt < RESOURCE_SAMPLE_INTERVAL_MS) return;
+    if (!peerId) this.lastResourcePublishedAt = now;
+    const meta = { resources: this.coordinator.isCurrentHost() ? this.resources ?? null : null };
+    if (peerId) this.transport.sendTo(peerId, 'resourcePresence', meta);
+    else this.transport.broadcast('resourcePresence', meta);
+    this.emit('resources', this.resources);
+  }
+
+  private publishHardwarePresence(peerId?: string): void {
+    const meta = this.coordinator.isCurrentHost()
+      ? { hardware: this.hardware ?? null, environments: this.environments }
+      : { hardware: null, environments: [] };
+    if (peerId) this.transport.sendTo(peerId, 'hardwarePresence', meta);
+    else this.transport.broadcast('hardwarePresence', meta);
+  }
+
+  private publishKernelPresence(peerId?: string): void {
+    const meta = this.coordinator.isCurrentHost()
+      ? { kernelStatus: this.kernelStatus, kernelStatuses: Object.fromEntries(this.kernelStatuses) }
+      : { kernelStatus: 'Offline' as const, kernelStatuses: {} };
+    if (peerId) this.transport.sendTo(peerId, 'kernelPresence', meta);
+    else this.transport.broadcast('kernelPresence', meta);
+  }
+
+  private sendRuntimePresence(peerId: string): void {
+    this.publishHardwarePresence(peerId);
+    this.publishResourcePresence(peerId);
+    this.publishKernelPresence(peerId);
+  }
+
+  private sendRuntimePresenceToAll(): void {
+    this.publishHardwarePresence();
+    this.lastResourcePublishedAt = 0;
+    this.publishResourcePresence();
+    this.publishKernelPresence();
+  }
+
+  private acceptHardwarePresence(frame: WireFrame, sourceId: string): void {
+    if (sourceId !== this.coordinator.clock.hostId) return;
+    const hardware = frame.meta.hardware === null ? undefined : sanitizeHardware(frame.meta.hardware);
+    const environments = sanitizeEnvironments(frame.meta.environments) ?? [];
+    if (frame.meta.hardware !== null && !hardware) throw new Error('Peer sent malformed hardware presence.');
+    const previous = this.remoteRuntimePresence.get(sourceId) ?? {};
+    this.remoteRuntimePresence.set(sourceId, { ...previous, hardware, environments });
+    this.emit('hardware', hardware);
+  }
+
+  private acceptResourcePresence(frame: WireFrame, sourceId: string): void {
+    if (sourceId !== this.coordinator.clock.hostId) return;
+    const resources = frame.meta.resources === null ? undefined : sanitizeResources(frame.meta.resources);
+    if (frame.meta.resources !== null && !resources) throw new Error('Peer sent malformed resource presence.');
+    const previous = this.remoteRuntimePresence.get(sourceId) ?? {};
+    this.remoteRuntimePresence.set(sourceId, { ...previous, resources });
+    this.emit('resources', resources);
+  }
+
+  private acceptKernelPresence(frame: WireFrame, sourceId: string): void {
+    if (sourceId !== this.coordinator.clock.hostId) return;
+    const kernelStatus = normalizeKernelStatus(frame.meta.kernelStatus);
+    if (!kernelStatus) throw new Error('Peer sent malformed kernel presence.');
+    const kernelStatuses = sanitizeKernelStatuses(frame.meta.kernelStatuses);
+    const previous = this.remoteRuntimePresence.get(sourceId) ?? {};
+    this.remoteRuntimePresence.set(sourceId, { ...previous, kernelStatus, kernelStatuses });
+    this.emit('kernel', kernelStatus, '*');
   }
 
   private presenceText(key: string, cellId?: string): Y.Text | undefined {
@@ -5629,7 +5755,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const values = [...this.kernelStatuses.values()];
     this.kernelStatus = values.includes('Busy') ? 'Busy' : values.includes('Idle') ? 'Idle' : 'Offline';
     this.emit('kernel', status, notebookKey);
-    this.updatePresence();
+    this.publishKernelPresence();
   }
 
   private relativeKey(uri: vscode.Uri, includeIgnored = false): string | undefined {
@@ -6002,6 +6128,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     && /^[A-Za-z0-9_-]{1,128}$/.test(raw.activeNotebookCellId)
     ? raw.activeNotebookCellId
     : undefined;
+  const activeLine = boundedNumber(raw.activeLine, 0, 1_000_000, true);
   const cursor = sanitizeCursor(raw.cursor);
   const hardware = sanitizeHardware(raw.hardware);
   const environments = sanitizeEnvironments(raw.environments);
@@ -6013,6 +6140,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     activeFile,
     activeNotebookCell,
     activeNotebookCellId,
+    activeLine,
     cursor,
     shareCursor: raw.shareCursor === true,
     cursorColor: typeof raw.cursorColor === 'string' && /^#[0-9a-f]{6}$/i.test(raw.cursorColor)
