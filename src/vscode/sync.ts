@@ -10,6 +10,7 @@ import {
   MAX_NOTEBOOK_CELLS,
   MAX_OUTPUT_ITEMS_PER_CELL,
   NotebookSnapshot,
+  NotebookUpdateScope,
   OutputSnapshot,
   ProjectUpdate,
   TextChange,
@@ -146,36 +147,45 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.enqueueNotebookApply(event.key, async () => {
       const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === event.key);
       if (!notebook) return;
-      if (event.scope?.type === 'cellText' && event.scope.cellId) {
-        const cellId = event.scope.cellId;
-        const open = notebook.getCells().find((cell) =>
-          this.cellIds.knownId(cell, metadataCellId(cell.metadata)) === cellId);
-        if (!open) return;
-        // Only the edited cell's source is needed; serializing the whole
-        // notebook (JSON-parsing every output) on each remote keystroke would
-        // add avoidable latency to the editor hot path.
-        let source: string;
-        try {
-          source = this.project.cellSource(event.key, cellId).toString();
-        } catch {
+      const scope: NotebookUpdateScope | undefined = event.scope;
+      if (!scope) {
+        // State-vector/bootstrap reconciliation can merge historical scopes.
+        // Apply fields narrowly when structure already matches; a full snapshot
+        // is allowed only if stable-id structure proves an inconsistency.
+        await this.applyUnscopedNotebookReconciliation(notebook, event.key);
+        return;
+      }
+      switch (scope.type) {
+        case 'cellText': {
+          const located = this.findNotebookCellByStableId(notebook, scope.cellId);
+          if (!located) return;
+          // Canonical source is the Y.Text for this stable cell ID. No notebook
+          // snapshot, cell index identity, or replaceCells path participates.
+          let source: string;
+          try {
+            source = this.project.cellSource(event.key, scope.cellId).toString();
+          } catch {
+            return;
+          }
+          await this.applyText(located.cell.document, source);
           return;
         }
-        await this.applyText(open.document, source);
-        return;
+        case 'cellOutputs':
+        case 'cellExecution':
+          this.scheduleNotebookCellStateApply(event.key, scope.cellId);
+          return;
+        case 'cellMetadata':
+          await this.applyNotebookCellMetadata(notebook, event.key, scope.cellId);
+          return;
+        case 'notebookMetadata':
+          await this.applyNotebookMetadata(notebook, event.key);
+          return;
+        case 'structure':
+          await this.applyStructuralRecoveryIfNeeded(notebook, event.key, 'remote structure scope');
+          return;
+        default:
+          assertNeverNotebookScope(scope);
       }
-      if ((event.scope?.type === 'cellOutputs' || event.scope?.type === 'cellExecution') && event.scope.cellId) {
-        this.scheduleNotebookCellStateApply(event.key, event.scope.cellId);
-        return;
-      }
-      if (event.scope?.type === 'cellMetadata' && event.scope.cellId) {
-        await this.applyNotebookCellMetadata(notebook, event.key, event.scope.cellId);
-        return;
-      }
-      if (event.scope?.type === 'notebookMetadata') {
-        await this.applyNotebookMetadata(notebook, event.key);
-        return;
-      }
-      await this.applyNotebookSnapshot(notebook, this.project.notebookSnapshot(event.key));
     });
   };
 
@@ -211,30 +221,30 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookCellState(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
-    let snapshot: NotebookSnapshot;
-    try {
-      snapshot = this.project.notebookSnapshot(key);
-    } catch {
-      return;
-    }
-    const index = snapshot.cells.findIndex((cell) => cell.id === cellId);
-    if (index < 0 || index >= notebook.cellCount) return;
-    const target = snapshot.cells[index]!;
-    const current = notebook.cellAt(index);
-    if (this.cellIds.knownId(current, metadataCellId(current.metadata)) !== cellId) return;
-    const outputsChanged = JSON.stringify(outputsFromCell(current)) !== JSON.stringify(target.outputs);
-    const executionChanged = JSON.stringify(executionFromCell(current)) !== JSON.stringify(target.execution);
+    const target = this.project.notebookCellSnapshot(key, cellId);
+    const located = this.findNotebookCellByStableId(notebook, cellId);
+    if (!target || !located) return;
+    const { cell: current, index } = located;
+    const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
+    const executionChanged = !sameJson(executionFromCell(current), target.execution);
     if (!outputsChanged && !executionChanged) return;
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
       const edit = new vscode.WorkspaceEdit();
       // VS Code exposes no direct NotebookEdit for outputs/execution. Replacing
-      // this one cell is the narrowest supported mutation and keeps every other
-      // cell, its editor, and its viewport state intact.
+      // this one cell is the narrowest public API. Preserve source, metadata,
+      // kind and language from the current editor so these scopes cannot
+      // incidentally mutate unrelated cell fields.
       edit.set(notebook.uri, [vscode.NotebookEdit.replaceCells(
         new vscode.NotebookRange(index, index + 1),
-        [toNotebookCellData({ ...target, source: current.document.getText() })],
+        [toNotebookCellData({
+          ...target,
+          kind: current.kind,
+          language: current.document.languageId,
+          source: current.document.getText(),
+          metadata: stripCollaborationMetadata(current.metadata),
+        })],
       )]);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook cell output update.');
     } finally {
@@ -243,19 +253,19 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookCellMetadata(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
-    const snapshot = this.project.notebookSnapshot(key);
-    const index = snapshot.cells.findIndex((cell) => cell.id === cellId);
-    if (index < 0 || index >= notebook.cellCount) return;
-    const current = notebook.cellAt(index);
-    if (this.cellIds.knownId(current, metadataCellId(current.metadata)) !== cellId) return;
-    const target = snapshot.cells[index]!;
-    const metadata = { ...target.metadata, pairNotebookCellId: target.id };
-    if (JSON.stringify(current.metadata) === JSON.stringify(metadata)) return;
+    const target = this.project.notebookCellSnapshot(key, cellId);
+    const located = this.findNotebookCellByStableId(notebook, cellId);
+    if (!target || !located) return;
+    const currentCanonical = canonicalJsonObject(stripCollaborationMetadata(located.cell.metadata));
+    const targetCanonical = canonicalJsonObject(target.metadata);
+    if (sameJson(currentCanonical, targetCanonical)
+      && metadataCellId(located.cell.metadata) === cellId) return;
+    const metadata = { ...targetCanonical, pairNotebookCellId: cellId };
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
       const edit = new vscode.WorkspaceEdit();
-      edit.set(notebook.uri, [vscode.NotebookEdit.updateCellMetadata(index, metadata)]);
+      edit.set(notebook.uri, [vscode.NotebookEdit.updateCellMetadata(located.index, metadata)]);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook cell metadata update.');
     } finally {
       this.applyingNotebooks.delete(uri);
@@ -263,19 +273,66 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookMetadata(notebook: vscode.NotebookDocument, key: string): Promise<void> {
-    const metadata = this.project.notebookSnapshot(key).metadata;
-    if (JSON.stringify(normalizeNotebookMetadata(notebook.metadata)) === JSON.stringify(metadata)) return;
+    const current = normalizeNotebookMetadata(notebook.metadata);
+    const target = normalizeNotebookMetadata(this.project.notebookMetadata(key));
+    if (sameJson(current, target)) return;
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
       const edit = new vscode.WorkspaceEdit();
       edit.set(notebook.uri, [vscode.NotebookEdit.updateNotebookMetadata(
-        toVscodeNotebookMetadata(metadata, notebook.metadata),
+        toVscodeNotebookMetadata(target, notebook.metadata),
       )]);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook metadata update.');
     } finally {
       this.applyingNotebooks.delete(uri);
     }
+  }
+
+  private findNotebookCellByStableId(
+    notebook: vscode.NotebookDocument,
+    cellId: string,
+  ): { cell: vscode.NotebookCell; index: number } | undefined {
+    for (let index = 0; index < notebook.cellCount; index += 1) {
+      const cell = notebook.cellAt(index);
+      if (this.cellIds.knownId(cell, metadataCellId(cell.metadata)) === cellId) {
+        return { cell, index };
+      }
+    }
+    return undefined;
+  }
+
+  private async applyStructuralRecoveryIfNeeded(
+    notebook: vscode.NotebookDocument,
+    key: string,
+    reason: string,
+  ): Promise<boolean> {
+    const snapshot = this.project.notebookSnapshot(key);
+    const currentStructure = notebook.getCells().map((cell) => ({
+      id: this.cellIds.knownId(cell, metadataCellId(cell.metadata)) ?? '',
+      kind: cell.kind,
+      language: cell.document.languageId,
+    }));
+    if (!minimalNotebookSplice(currentStructure, snapshot.cells)) return false;
+    this.log.appendLine(`[structural-recovery] ${key}: ${reason}; applying canonical notebook snapshot.`);
+    await this.applyNotebookSnapshot(notebook, snapshot);
+    return true;
+  }
+
+  private async applyUnscopedNotebookReconciliation(
+    notebook: vscode.NotebookDocument,
+    key: string,
+  ): Promise<void> {
+    if (await this.applyStructuralRecoveryIfNeeded(notebook, key, 'unscoped state-vector reconciliation')) return;
+    const snapshot = this.project.notebookSnapshot(key);
+    for (const target of snapshot.cells) {
+      const located = this.findNotebookCellByStableId(notebook, target.id);
+      if (!located) continue;
+      await this.applyText(located.cell.document, target.source);
+      await this.applyNotebookCellMetadata(notebook, key, target.id);
+      await this.applyNotebookCellState(notebook, key, target.id);
+    }
+    await this.applyNotebookMetadata(notebook, key);
   }
 
   private enqueueTextApply(key: string, task: () => Promise<void>): void {
@@ -404,38 +461,71 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private onNotebookChanged(event: vscode.NotebookDocumentChangeEvent): void {
-    let key: string | undefined;
-    try {
-      key = this.keyForUri(event.notebook.uri);
-      if (!key || this.applyingNotebooks.has(event.notebook.uri.toString())) return;
-      if (event.contentChanges.length) {
+    const key = this.keyForUri(event.notebook.uri);
+    if (!key || this.applyingNotebooks.has(event.notebook.uri.toString())) return;
+
+    if (event.contentChanges.length) {
+      try {
         this.project.reconcileNotebook(key, this.snapshotFromNotebook(event.notebook), LOCAL_EDITOR_ORIGIN);
         void this.ensureStableCellIds(event.notebook).catch((error) => {
           this.log.appendLine(`[error] Failed to persist notebook cell identities: ${formatError(error)}`);
         });
+      } catch (error) {
+        const detail = `Rejected unsafe notebook structural update: ${formatError(error)}`;
+        this.log.appendLine(`[error] ${detail}`);
+        this.log.appendLine(`[structural-recovery] ${key}: local structural validation failed; restoring canonical structure.`);
+        this.enqueueNotebookApply(key, () => this.applyStructuralRecoveryIfNeeded(
+          event.notebook,
+          key,
+          'local structural validation failed',
+        ).then(() => undefined));
+        this.warnRejectedEditorUpdate(detail);
       }
-      if (event.metadata) {
+    }
+
+    if (event.metadata) {
+      try {
         this.project.setNotebookMetadata(key, normalizeNotebookMetadata(event.notebook.metadata), LOCAL_EDITOR_ORIGIN);
+      } catch (error) {
+        const detail = `Rejected unsafe notebook metadata update: ${formatError(error)}`;
+        this.log.appendLine(`[error] ${detail}`);
+        this.enqueueNotebookApply(key, () => this.applyNotebookMetadata(event.notebook, key));
+        this.warnRejectedEditorUpdate(detail);
       }
-      for (const change of event.cellChanges) {
-        const cellId = this.cellIds.idFor(change.cell, metadataCellId(change.cell.metadata));
-        if (change.metadata) {
+    }
+
+    for (const change of event.cellChanges) {
+      const cellId = this.cellIds.idFor(change.cell, metadataCellId(change.cell.metadata));
+      if (change.metadata) {
+        try {
           this.project.setCellMetadata(key, cellId, stripCollaborationMetadata(change.metadata), LOCAL_EDITOR_ORIGIN);
+        } catch (error) {
+          const detail = `Rejected unsafe notebook cell metadata update: ${formatError(error)}`;
+          this.log.appendLine(`[error] ${detail}`);
+          this.enqueueNotebookApply(key, () => this.applyNotebookCellMetadata(event.notebook, key, cellId));
+          this.warnRejectedEditorUpdate(detail);
         }
-        if (change.outputs) {
+      }
+      if (change.outputs) {
+        try {
           this.project.setCellOutputs(key, cellId, outputsFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
+        } catch (error) {
+          const detail = `Rejected unsafe notebook cell output update: ${formatError(error)}`;
+          this.log.appendLine(`[error] ${detail}`);
+          this.scheduleNotebookCellStateApply(key, cellId);
+          this.warnRejectedEditorUpdate(detail);
         }
-        if (change.executionSummary) {
+      }
+      if (change.executionSummary) {
+        try {
           this.project.setCellExecution(key, cellId, executionFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
+        } catch (error) {
+          const detail = `Rejected unsafe notebook cell execution update: ${formatError(error)}`;
+          this.log.appendLine(`[error] ${detail}`);
+          this.scheduleNotebookCellStateApply(key, cellId);
+          this.warnRejectedEditorUpdate(detail);
         }
       }
-    } catch (error) {
-      const detail = `Rejected unsafe notebook editor update: ${formatError(error)}`;
-      this.log.appendLine(`[error] ${detail}`);
-      if (key && this.project.kindOf(key) === 'notebook') {
-        this.enqueueNotebookApply(key, () => this.applyNotebookSnapshot(event.notebook, this.project.notebookSnapshot(key!)));
-      }
-      this.warnRejectedEditorUpdate(detail);
     }
   }
 
@@ -509,31 +599,30 @@ export class EditorSynchronizer implements vscode.Disposable {
         if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook structure.');
       }
 
-      for (let index = 0; index < snapshot.cells.length; index += 1) {
-        const target = snapshot.cells[index];
-        if (!target) continue;
-        const current = notebook.cellAt(index);
-        await this.applyText(current.document, target.source);
+      for (const target of snapshot.cells) {
+        const located = this.findNotebookCellByStableId(notebook, target.id);
+        if (!located) continue;
+        await this.applyText(located.cell.document, target.source);
       }
       const notebookEdits: vscode.NotebookEdit[] = [];
-      for (let index = 0; index < snapshot.cells.length; index += 1) {
-        const target = snapshot.cells[index];
-        if (!target) continue;
-        const current = notebook.cellAt(index);
-        const desiredMetadata = { ...target.metadata, pairNotebookCellId: target.id };
-        const outputChanged = JSON.stringify(outputsFromCell(current)) !== JSON.stringify(target.outputs);
-        const executionChanged = JSON.stringify(executionFromCell(current)) !== JSON.stringify(target.execution);
+      for (const target of snapshot.cells) {
+        const located = this.findNotebookCellByStableId(notebook, target.id);
+        if (!located) continue;
+        const current = located.cell;
+        const desiredMetadata = { ...canonicalJsonObject(target.metadata), pairNotebookCellId: target.id };
+        const outputChanged = !sameJson(outputsFromCell(current), target.outputs);
+        const executionChanged = !sameJson(executionFromCell(current), target.execution);
         if (outputChanged || executionChanged) {
           notebookEdits.push(vscode.NotebookEdit.replaceCells(
-            new vscode.NotebookRange(index, index + 1),
+            new vscode.NotebookRange(located.index, located.index + 1),
             [toNotebookCellData(target)],
           ));
-        } else if (JSON.stringify(current.metadata) !== JSON.stringify(desiredMetadata)) {
-          notebookEdits.push(vscode.NotebookEdit.updateCellMetadata(index, desiredMetadata));
+        } else if (!sameJson(current.metadata, desiredMetadata)) {
+          notebookEdits.push(vscode.NotebookEdit.updateCellMetadata(located.index, desiredMetadata));
         }
       }
       const currentMetadata = normalizeNotebookMetadata(notebook.metadata);
-      if (JSON.stringify(currentMetadata) !== JSON.stringify(snapshot.metadata)) {
+      if (!sameJson(currentMetadata, normalizeNotebookMetadata(snapshot.metadata))) {
         notebookEdits.push(vscode.NotebookEdit.updateNotebookMetadata(
           toVscodeNotebookMetadata(snapshot.metadata, notebook.metadata),
         ));
@@ -649,6 +738,29 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+function canonicalJsonObject(value: Record<string, unknown>): Record<string, unknown> {
+  return canonicalJsonValue(value) as Record<string, unknown>;
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(record).sort().map((key) => [key, canonicalJsonValue(record[key])]),
+    );
+  }
+  return value;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalJsonValue(left)) === JSON.stringify(canonicalJsonValue(right));
+}
+
+function assertNeverNotebookScope(scope: never): never {
+  throw new Error(`Unhandled notebook update scope: ${JSON.stringify(scope)}`);
 }
 
 function minimalEdit(current: string, target: string): TextChange {

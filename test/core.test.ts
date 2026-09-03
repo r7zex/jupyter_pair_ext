@@ -13,6 +13,7 @@ import {
   MAX_TEXT_DOCUMENT_BYTES,
   NotebookSnapshot,
   ProjectUpdate,
+  normalizeNotebookUpdateScope,
 } from '../src/core/crdt';
 import { SessionCoordinator } from '../src/core/election';
 import { PerNotebookExecutionQueue } from '../src/core/executionQueue';
@@ -84,6 +85,22 @@ const notebook: NotebookSnapshot = {
 };
 const execFileAsync = promisify(execFile);
 const TEST_IDENTITY_PUBLIC_KEY = generateIdentityCredentials().publicKey;
+
+describe('notebook update scopes', () => {
+  it('normalizes all six semantic scopes and requires stable IDs for cell scopes', () => {
+    assert.deepEqual(normalizeNotebookUpdateScope({ type: 'structure' }), { type: 'structure' });
+    assert.deepEqual(normalizeNotebookUpdateScope({ type: 'notebookMetadata' }), { type: 'notebookMetadata' });
+    for (const type of ['cellText', 'cellMetadata', 'cellOutputs', 'cellExecution'] as const) {
+      assert.deepEqual(normalizeNotebookUpdateScope({ type, cellId: 'stable-cell' }), {
+        type,
+        cellId: 'stable-cell',
+      });
+      assert.equal(normalizeNotebookUpdateScope({ type }), undefined);
+      assert.equal(normalizeNotebookUpdateScope({ type, cellId: 'invalid cell id!' }), undefined);
+    }
+    assert.equal(normalizeNotebookUpdateScope({ type: 'genericNotebookChanged' }), undefined);
+  });
+});
 
 describe('participant display names', () => {
   it('cleans names and compares normalized case-insensitive forms', () => {

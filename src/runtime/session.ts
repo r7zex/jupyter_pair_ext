@@ -31,6 +31,7 @@ import {
   DocumentKind,
   MAX_TEXT_DOCUMENT_BYTES,
   ProjectUpdate,
+  normalizeNotebookUpdateScope,
 } from '../core/crdt';
 import { SessionCoordinator } from '../core/election';
 import { CpuSnapshot, discoverHardware, HardwareInfo, ResourceSample, sampleResources } from '../core/hardware';
@@ -2317,7 +2318,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             const incomingState = normalizeFileState(frame.meta.fileState, sourceId, kind);
             if (!incomingState || !await this.acceptFileState(key, incomingState, sourceId)) break;
             if (this.effectiveFileState(key)?.deleted) break;
-            this.project.applyRemoteUpdate(key, kind, frame.payload, frame.meta.scope as ProjectUpdate['scope']);
+            let scope: ProjectUpdate['scope'] = undefined;
+            if (kind === 'notebook') {
+              scope = normalizeNotebookUpdateScope(frame.meta.scope);
+              if (frame.meta.scope !== undefined && !scope) {
+                throw new Error(`Peer ${sourceId} sent an invalid notebook update scope.`);
+              }
+              if (frame.type === 'projectUpdate' && !scope) {
+                throw new Error(`Peer ${sourceId} sent an unscoped notebook project update.`);
+              }
+            }
+            this.project.applyRemoteUpdate(key, kind, frame.payload, scope);
           }
           break;
         }

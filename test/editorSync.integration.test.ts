@@ -114,6 +114,150 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
+  it('applies cellText by stable ID with one minimal text edit, zero replaceCells and no full snapshot', async () => {
+    const root = path.resolve('/tmp/pair-editor-cell-text-scope');
+    const left = fakeCell('LEFT', 'left');
+    const target = fakeCell('abcXYZdef', 'target');
+    target.metadata = { pairNotebookCellId: 'target', keep: 'metadata' };
+    target.outputs = [{ metadata: { keep: true }, items: [] }];
+    target.executionSummary = { executionOrder: 4, success: true };
+    const right = fakeCell('RIGHT', 'right');
+    const notebook = fakeNotebook(root, [left, target, right]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const leftRef = notebook.cells[0];
+      const targetRef = notebook.cells[1];
+      const rightRef = notebook.cells[2];
+      const metadataBefore = { ...target.metadata };
+      const outputsBefore = target.outputs;
+      const executionBefore = target.executionSummary;
+      let fullSnapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        fullSnapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
+      vscodeBoundary.__notebookEdits = [];
+      vscodeBoundary.__textEdits = [];
+
+      project.applyCellTextChanges('work.ipynb', 'target', [
+        { offset: 3, deleteCount: 3, insertText: '++' },
+      ], REMOTE_ORIGIN);
+      await waitFor(() => target.document.getText() === 'abc++def', 1000, 'scoped cell text edit');
+
+      assert.equal(fullSnapshotCalls, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length, 0);
+      assert.equal(vscodeBoundary.__textEdits.length, 1);
+      assert.equal(vscodeBoundary.__textEdits[0].range.start, 3);
+      assert.equal(vscodeBoundary.__textEdits[0].range.end, 6);
+      assert.equal(vscodeBoundary.__textEdits[0].text, '++');
+      assert.equal(notebook.cells[0], leftRef);
+      assert.equal(notebook.cells[1], targetRef);
+      assert.equal(notebook.cells[2], rightRef);
+      assert.deepEqual(target.metadata, metadataBefore);
+      assert.equal(target.outputs, outputsBefore);
+      assert.equal(target.executionSummary, executionBefore);
+      assert.equal(target.metadata.pairNotebookCellId, 'target');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('applies cellMetadata by stable ID with updateCellMetadata only and preserves source/output/execution', async () => {
+    const root = path.resolve('/tmp/pair-editor-cell-metadata-scope');
+    const moved = fakeCell('TARGET SOURCE', 'target');
+    moved.outputs = [{ metadata: { x: 1 }, items: [] }];
+    moved.executionSummary = { executionOrder: 9, success: false };
+    const notebook = fakeNotebook(root, [fakeCell('OTHER', 'other'), moved]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const sourceBefore = moved.document.getText();
+      const outputsBefore = moved.outputs;
+      const executionBefore = moved.executionSummary;
+      let fullSnapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        fullSnapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
+      vscodeBoundary.__notebookEdits = [];
+      project.setCellMetadata('work.ipynb', 'target', { z: 2, a: 1 }, REMOTE_ORIGIN);
+      await waitFor(() => moved.metadata.a === 1 && moved.metadata.z === 2, 1000, 'scoped cell metadata');
+
+      assert.equal(fullSnapshotCalls, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'cellMetadata').length, 1);
+      assert.equal(moved.document.getText(), sourceBefore);
+      assert.equal(moved.outputs, outputsBefore);
+      assert.equal(moved.executionSummary, executionBefore);
+      assert.equal(moved.metadata.pairNotebookCellId, 'target');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('applies notebookMetadata without replacing cells and preserves every cell object', async () => {
+    const root = path.resolve('/tmp/pair-editor-notebook-metadata-scope');
+    const first = fakeCell('A', 'a');
+    const second = fakeCell('B', 'b');
+    const notebook = fakeNotebook(root, [first, second]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      let fullSnapshotCalls = 0;
+      const originalSnapshot = (synchronizer as any).applyNotebookSnapshot.bind(synchronizer);
+      (synchronizer as any).applyNotebookSnapshot = async (...args: unknown[]) => {
+        fullSnapshotCalls += 1;
+        return originalSnapshot(...args);
+      };
+      vscodeBoundary.__notebookEdits = [];
+      project.setNotebookMetadata('work.ipynb', { language_info: { name: 'python' }, owner: 'remote' }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.metadata.owner === 'remote', 1000, 'scoped notebook metadata');
+
+      assert.equal(fullSnapshotCalls, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'notebookMetadata').length, 1);
+      assert.equal(notebook.cells[0], first);
+      assert.equal(notebook.cells[1], second);
+      assert.equal(first.metadata.pairNotebookCellId, 'a');
+      assert.equal(second.metadata.pairNotebookCellId, 'b');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('does not escalate a cell metadata apply failure to a full notebook snapshot', async () => {
+    const root = path.resolve('/tmp/pair-editor-metadata-failure');
+    const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      let fullSnapshotCalls = 0;
+      (synchronizer as any).applyNotebookSnapshot = async () => { fullSnapshotCalls += 1; };
+      vscodeBoundary.__rejectEdits = true;
+      project.setCellMetadata('work.ipynb', 'b', { owner: 'remote' }, REMOTE_ORIGIN);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(fullSnapshotCalls, 0);
+      assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length, 0);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
   it('keeps background persistence out of the open notebook save hot path', async () => {
     const root = path.resolve('/tmp/pair-editor-save');
     const notebook = fakeNotebook(root, [fakeCell('before', 'stable')]);
@@ -404,6 +548,7 @@ function createNotebookVscodeBoundary(): any {
         await boundary.__beforeApplyEdit?.(edit);
         for (const operation of edit.operations) {
           if (operation.type === 'text') {
+            boundary.__textEdits.push(operation);
             const cell = boundary.workspace.notebookDocuments.flatMap((item: any) => item.cells)
               .find((item: any) => item.document.uri.toString() === operation.uri.toString());
             const document = cell?.document ?? boundary.workspace.textDocuments
@@ -439,12 +584,14 @@ function createNotebookVscodeBoundary(): any {
       showWarningMessage: async () => undefined,
     },
     __notebookEdits: [] as any[],
+    __textEdits: [] as any[],
     __rejectEdits: false,
     __beforeApplyEdit: undefined as undefined | ((edit: WorkspaceEdit) => Promise<void>),
     __reset: (notebook: any) => {
       boundary.workspace.notebookDocuments = [notebook];
       boundary.workspace.textDocuments = [];
       boundary.__notebookEdits = [];
+      boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
     },
@@ -452,6 +599,7 @@ function createNotebookVscodeBoundary(): any {
       boundary.workspace.notebookDocuments = [];
       boundary.workspace.textDocuments = [document];
       boundary.__notebookEdits = [];
+      boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
     },

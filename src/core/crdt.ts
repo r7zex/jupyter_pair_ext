@@ -60,12 +60,43 @@ interface ProjectDocument {
   doc: Y.Doc;
 }
 
+export type NotebookUpdateScope =
+  | { type: 'structure' }
+  | { type: 'cellText'; cellId: string }
+  | { type: 'cellOutputs'; cellId: string }
+  | { type: 'cellMetadata'; cellId: string }
+  | { type: 'cellExecution'; cellId: string }
+  | { type: 'notebookMetadata' };
+
 export interface ProjectUpdate {
   key: string;
   kind: DocumentKind;
   update: Uint8Array;
   origin: unknown;
-  scope?: { type: 'cellText' | 'cellOutputs' | 'cellMetadata' | 'cellExecution' | 'notebookMetadata' | 'structure'; cellId?: string } | undefined;
+  /**
+   * Notebook mutations carry a semantic scope. It is optional only for
+   * state-vector/bootstrap reconciliation where one Yjs update can contain
+   * several historical scopes.
+   */
+  scope?: NotebookUpdateScope | undefined;
+}
+
+export function normalizeNotebookUpdateScope(value: unknown): NotebookUpdateScope | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as { type?: unknown; cellId?: unknown };
+  switch (raw.type) {
+    case 'structure':
+      return { type: 'structure' };
+    case 'notebookMetadata':
+      return { type: 'notebookMetadata' };
+    case 'cellText':
+    case 'cellOutputs':
+    case 'cellMetadata':
+    case 'cellExecution':
+      return isValidCellId(raw.cellId) ? { type: raw.type, cellId: raw.cellId } : undefined;
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -338,7 +369,9 @@ export class CollaborativeProject extends EventEmitter {
     const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
     if (!map) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const normalized = normalizeMetadata(metadata, 'Cell metadata');
-    doc.transact(() => map.set('metadata', JSON.stringify(normalized)), withScope(origin, { type: 'cellMetadata', cellId }));
+    const serialized = JSON.stringify(normalized);
+    if (map.get('metadata') === serialized) return;
+    doc.transact(() => map.set('metadata', serialized), withScope(origin, { type: 'cellMetadata', cellId }));
   }
 
   public setCellExecution(
@@ -364,7 +397,34 @@ export class CollaborativeProject extends EventEmitter {
   ): void {
     const normalized = normalizeMetadata(metadata, 'Notebook metadata');
     const doc = this.ensureNotebook(key);
-    doc.transact(() => doc.getMap<string>('notebook').set('metadata', JSON.stringify(normalized)), withScope(origin, { type: 'notebookMetadata' }));
+    const serialized = JSON.stringify(normalized);
+    const notebook = doc.getMap<string>('notebook');
+    if (notebook.get('metadata') === serialized) return;
+    doc.transact(() => notebook.set('metadata', serialized), withScope(origin, { type: 'notebookMetadata' }));
+  }
+
+  /** Returns only one live logical cell; no whole-notebook snapshot is built. */
+  public notebookCellSnapshot(key: string, cellId: string): CellSnapshot | undefined {
+    if (!this.hasNotebookCell(key, cellId)) return undefined;
+    const doc = this.ensureNotebook(key);
+    const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
+    const source = map?.get('source');
+    if (!map || !(source instanceof Y.Text)) return undefined;
+    return {
+      id: cellId,
+      kind: map.get('kind') === 1 ? 1 : 2,
+      language: boundedLanguage(map.get('language')),
+      source: boundedSource(source.toString()),
+      metadata: parseObject(map.get('metadata'), MAX_NOTEBOOK_METADATA_JSON_BYTES),
+      outputs: parseOutputs(map.get('outputs')),
+      execution: parseExecution(map.get('execution')),
+    };
+  }
+
+  /** Returns canonical notebook metadata without serializing cell payloads. */
+  public notebookMetadata(key: string): Record<string, unknown> {
+    const doc = this.ensureNotebook(key);
+    return parseObject(doc.getMap<string>('notebook').get('metadata'), MAX_NOTEBOOK_METADATA_JSON_BYTES);
   }
 
   /**
