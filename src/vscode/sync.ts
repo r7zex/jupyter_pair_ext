@@ -267,7 +267,10 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (!target || !located) return;
     const current = located.cell;
     const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
-    const executionChanged = !sameJson(executionFromCell(current), target.execution);
+    const executionChanged = !sameJson(
+      executionFromCell(current),
+      editorVisibleExecution(target.execution),
+    );
     if (!outputsChanged && !executionChanged) return;
     if (!this.cellStateRenderer) {
       if (outputsChanged) {
@@ -762,7 +765,10 @@ export class EditorSynchronizer implements vscode.Disposable {
         const current = located.cell;
         const desiredMetadata = { ...canonicalJsonObject(target.metadata), pairNotebookCellId: target.id };
         const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
-        const executionChanged = !sameJson(executionFromCell(current), target.execution);
+        const executionChanged = !sameJson(
+      executionFromCell(current),
+      editorVisibleExecution(target.execution),
+    );
 
         if (!sameJson(current.metadata, desiredMetadata)) {
           notebookEdits.push(vscode.NotebookEdit.updateCellMetadata(located.index, desiredMetadata));
@@ -986,6 +992,18 @@ function outputsFromCell(cell: vscode.NotebookCell): OutputSnapshot[] {
     }),
   }));
   return outputs;
+}
+
+function editorVisibleExecution(
+  execution: CellExecutionSnapshot | undefined,
+): CellExecutionSnapshot | undefined {
+  if (!execution) return undefined;
+  const { executionOrder, success, timing } = execution;
+  return {
+    ...(executionOrder !== undefined ? { executionOrder } : {}),
+    ...(success !== undefined ? { success } : {}),
+    ...(timing !== undefined ? { timing: { ...timing } } : {}),
+  };
 }
 
 function executionFromCell(cell: vscode.NotebookCell): CellExecutionSnapshot | undefined {

@@ -144,6 +144,34 @@ describe('canonical notebook cell text revision', () => {
   });
 });
 
+describe('cell execution request identity', () => {
+  it('round-trips a bounded request ID and rejects malformed identities', () => {
+    const project = new CollaborativeProject();
+    try {
+      project.ensureNotebook('exec-id.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: '1+1', metadata: {}, outputs: [] }],
+      });
+      project.setCellExecution('exec-id.ipynb', 'cell-a', {
+        requestId: 'request_123',
+        executionOrder: 4,
+        success: true,
+      });
+      assert.deepEqual(project.notebookCellSnapshot('exec-id.ipynb', 'cell-a')?.execution, {
+        requestId: 'request_123',
+        executionOrder: 4,
+        success: true,
+      });
+      assert.throws(
+        () => project.setCellExecution('exec-id.ipynb', 'cell-a', { requestId: 'bad request id!' }),
+        /request identity/i,
+      );
+    } finally {
+      project.destroy();
+    }
+  });
+});
+
 describe('notebook update scopes', () => {
   it('normalizes all six semantic scopes and requires stable IDs for cell scopes', () => {
     assert.deepEqual(normalizeNotebookUpdateScope({ type: 'structure' }), { type: 'structure' });

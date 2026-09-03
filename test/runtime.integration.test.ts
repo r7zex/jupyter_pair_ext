@@ -1454,7 +1454,7 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
-  it('retries one idempotent execution request after a route replacement and acknowledges its result', async () => {
+  it('retries one idempotent execution request after route loss before acceptance and acknowledges its result', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-route-retry-'));
     const extensionRoot = path.join(root, 'extension');
     const folder = path.join(root, 'project');
@@ -1531,6 +1531,8 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(prepareCalls, 0, 'ordinary guest execution does not call prepareWorkingCopy');
       assert.equal(flushCalls, 0, 'ordinary guest execution does not call full flush');
       assert.equal(manifestCalls, 0, 'ordinary guest execution does not build a project manifest');
+      assert.equal(syncCalls + prepareCalls + flushCalls + manifestCalls, 0,
+        'ordinary Run Cell never invokes any explicit full-sync function');
       assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
@@ -1765,17 +1767,108 @@ describe('compute and lifecycle regression coverage', () => {
         payload: new Uint8Array(),
         meta: { ...meta, cellDigest: '0'.repeat(64) },
       }, 'peer-z');
-      assert.equal(executionCount, 1, 'same request ID with another digest never launches another kernel execution');
-      const rejection = sent.find((item) => item.type === 'executeResult');
-      assert.ok(rejection);
-      const rejectedResult = JSON.parse(Buffer.from(rejection.payload).toString('utf8'));
-      assert.equal(rejectedResult.success, false);
-      assert.equal(rejectedResult.content.ename, 'ExecutionBusy');
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: { ...meta, cellId: 'cell-b' },
+      }, 'peer-z');
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest',
+        payload: new Uint8Array(),
+        meta: { ...meta, computeEpoch: target.epoch + 1 },
+      }, 'peer-z');
+      assert.equal(executionCount, 1, 'same request ID with changed identity never launches another kernel execution');
+      const rejections = sent.filter((item) => item.type === 'executeResult')
+        .map((item) => JSON.parse(Buffer.from(item.payload).toString('utf8')).content.ename);
+      assert.ok(rejections.includes('ExecutionBusy'));
+      assert.ok(rejections.length >= 3, 'digest, cell ID and compute epoch mutations are all rejected');
 
       assert.ok(finishExecution);
       finishExecution!({ requestId, success: true, content: { status: 'ok' } });
       await first;
     } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates a duplicate lightweight request before acceptance and starts one kernel execution', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-duplicate-before-accept-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'duplicate-before-accept', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'duplicate-before-accept-token-that-is-long-enough', context(extensionRoot), logger());
+    const guestProject = new CollaborativeProject();
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let executionCount = 0;
+    try {
+      guestProject.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: 'print("OLD")', metadata: {}, outputs: [] }],
+      });
+      runtime.project.ensureNotebook('work.ipynb');
+      runtime.project.applyRemoteUpdate(
+        'work.ipynb', 'notebook', guestProject.encodeUpdate('work.ipynb'), { type: 'structure' },
+      );
+      (runtime as any).updatePresence();
+      const hostVector = runtime.project.encodeStateVector('work.ipynb');
+      guestProject.applyCellTextChanges('work.ipynb', 'cell-a', [{
+        offset: 7, deleteCount: 3, insertText: 'NEW',
+      }]);
+      const requested = guestProject.cellTextState('work.ipynb', 'cell-a');
+      const targetUpdate = guestProject.encodeUpdate('work.ipynb', hostVector);
+      const target = runtime.computeForNotebook('work.ipynb');
+      const meta = {
+        requestId: 'duplicate-before-accept-request',
+        notebookKey: 'work.ipynb',
+        cellId: 'cell-a',
+        executorId: 'host',
+        computeEpoch: target.epoch,
+        cellRevision: requested.revision,
+        cellDigest: createHash('sha256').update(requested.source, 'utf8').digest('hex'),
+        fastPath: true,
+      };
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, responseMeta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          sent.push({ type, meta: responseMeta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async (
+        _key: string, _target: unknown, requestId: string,
+      ) => {
+        executionCount += 1;
+        return { requestId, success: true, content: { status: 'ok' } };
+      };
+
+      const first = (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const duplicate = (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(executionCount, 0, 'both copies remain reserved while host canonical cell is behind');
+      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 0,
+        'pre-validation duplicate must not fabricate acceptance');
+      assert.equal((runtime as any).executionOwners.size, 1, 'one request ID owns one pre-start reservation');
+
+      runtime.project.applyRemoteUpdate(
+        'work.ipynb', 'notebook', targetUpdate, { type: 'cellText', cellId: 'cell-a' },
+      );
+      await Promise.all([first, duplicate]);
+
+      assert.equal(executionCount, 1);
+      assert.equal(sent.filter((item) => item.type === 'executeAccepted').length, 1,
+        'one authoritative acceptance is enough for identical duplicates');
+    } finally {
+      guestProject.destroy();
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
@@ -2205,6 +2298,96 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('keeps lightweight execution ownership across route loss after acceptance and replays without re-execution', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-lightweight-route-after-accept-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'lightweight-route-after-accept', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'lightweight-route-after-accept-token-long-enough', context(extensionRoot), logger());
+    const sent: Array<{ type: string; meta: any; payload: Uint8Array<ArrayBufferLike> }> = [];
+    let routeAvailable = false;
+    let finishExecution: ((value: any) => void) | undefined;
+    let executionCount = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: 'print("once")', metadata: {}, outputs: [] }],
+      });
+      (runtime as any).updatePresence();
+      const state = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      const target = runtime.computeForNotebook('work.ipynb');
+      (runtime as any).transport = {
+        sendTo: (_peerId: string, type: string, meta: any, payload: Uint8Array<ArrayBufferLike> = new Uint8Array()) => {
+          if (type === 'executionEvent' && !routeAvailable) throw new Error('No route to peer peer-z.');
+          sent.push({ type, meta, payload });
+        },
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async (
+        _key: string, _target: unknown, requestId: string, _code: string, onEvent: (event: any) => void,
+      ) => {
+        executionCount += 1;
+        onEvent({
+          type: 'iopub', requestId, messageType: 'stream',
+          content: { name: 'stdout', text: 'ONE\n' },
+        });
+        return new Promise((resolve) => { finishExecution = resolve; });
+      };
+      const meta = {
+        requestId: 'route-after-accept-request',
+        notebookKey: 'work.ipynb',
+        cellId: 'cell-a',
+        executorId: 'host',
+        computeEpoch: target.epoch,
+        cellRevision: state.revision,
+        cellDigest: createHash('sha256').update(state.source, 'utf8').digest('hex'),
+        fastPath: true,
+      };
+      const first = (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(executionCount, 1);
+      assert.equal((runtime as any).executionOwners.size, 1);
+      assert.ok(sent.some((item) => item.type === 'executeAccepted'));
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      assert.equal(executionCount, 1, 'route retry after acceptance reuses the active owner');
+
+      routeAvailable = true;
+      (runtime as any).replayRemoteExecutionsForPeer('peer-z');
+      assert.ok(sent.some((item) => item.type === 'executionEvent'), 'cached event replays after route recovery');
+      assert.equal(executionCount, 1);
+
+      assert.ok(finishExecution);
+      finishExecution!({ requestId: meta.requestId, success: true, content: { status: 'ok' } });
+      await first;
+      const resultCountBeforeDuplicate = sent.filter((item) => item.type === 'executeResult').length;
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(), meta,
+      }, 'peer-z');
+      assert.equal(executionCount, 1, 'completed lightweight duplicate replays without re-execution');
+      assert.ok(
+        sent.filter((item) => item.type === 'executeResult').length > resultCountBeforeDuplicate,
+        'completed lightweight duplicate replays the cached terminal result',
+      );
+      await (runtime as any).onMessage({
+        type: 'executeResultAck', payload: new Uint8Array(), meta: { requestId: meta.requestId },
+      }, 'peer-z');
+      assert.equal((runtime as any).completedRemoteExecutions.size, 0,
+        'result acknowledgement ends completed replay lifecycle');
+    } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('orders and deduplicates replayed execution events before resolving the result', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-exec-event-order-'));
     const extensionRoot = path.join(root, 'extension');
@@ -2265,6 +2448,97 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal((resolved as { success: boolean } | undefined)?.success, true);
       assert.ok(sentTypes.includes('executeResultAck'));
     } finally {
+      await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes one authoritative host CRDT output/execution state that reaches a third participant', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-authoritative-output-'));
+    const extensionRoot = path.join(root, 'extension');
+    const folder = path.join(root, 'project');
+    await Promise.all([mkdir(extensionRoot, { recursive: true }), mkdir(folder, { recursive: true })]);
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'authoritative-output', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: folder, pythonPath: process.execPath,
+    }), 'authoritative-output-token-that-is-long-enough', context(extensionRoot), logger());
+    const third = new CollaborativeProject();
+    let outputScopeUpdates = 0;
+    let executionScopeUpdates = 0;
+    let executionCount = 0;
+    try {
+      runtime.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: 'print("AUTHORITATIVE")', metadata: {}, outputs: [] }],
+      });
+      third.ensureNotebook('work.ipynb');
+      third.applyRemoteUpdate('work.ipynb', 'notebook', runtime.project.encodeUpdate('work.ipynb'), { type: 'structure' });
+      (runtime as any).updatePresence();
+      runtime.project.on('update', (event: any) => {
+        if (event.key !== 'work.ipynb' || event.kind !== 'notebook') return;
+        if (event.scope?.type === 'cellOutputs') outputScopeUpdates += 1;
+        if (event.scope?.type === 'cellExecution') executionScopeUpdates += 1;
+        third.applyRemoteUpdate(event.key, event.kind, event.update, event.scope);
+      });
+      const state = runtime.project.cellTextState('work.ipynb', 'cell-a');
+      const target = runtime.computeForNotebook('work.ipynb');
+      (runtime as any).transport = {
+        sendTo: () => undefined,
+        peerRuntime: () => [],
+        stop: async () => undefined,
+      };
+      (runtime as any).executeLocally = async (
+        _key: string, _target: unknown, requestId: string, code: string, onEvent: (event: any) => void,
+      ) => {
+        executionCount += 1;
+        assert.equal(code, 'print("AUTHORITATIVE")');
+        onEvent({
+          type: 'iopub', requestId, messageType: 'execute_input',
+          content: { execution_count: 9 },
+        });
+        onEvent({
+          type: 'iopub', requestId, messageType: 'stream',
+          content: { name: 'stdout', text: 'AUTHORITATIVE OUTPUT\n' },
+        });
+        return { requestId, success: true, content: { status: 'ok', execution_count: 9 } };
+      };
+
+      await (runtime as any).handleExecutionRequest({
+        type: 'executeRequest', payload: new Uint8Array(),
+        meta: {
+          requestId: 'authoritative-output-request',
+          notebookKey: 'work.ipynb',
+          cellId: 'cell-a',
+          executorId: 'host',
+          computeEpoch: target.epoch,
+          cellRevision: state.revision,
+          cellDigest: createHash('sha256').update(state.source, 'utf8').digest('hex'),
+          fastPath: true,
+        },
+      }, 'peer-z');
+
+      assert.equal(executionCount, 1);
+      const hostCell = runtime.project.notebookCellSnapshot('work.ipynb', 'cell-a');
+      const thirdCell = third.notebookCellSnapshot('work.ipynb', 'cell-a');
+      assert.ok(hostCell && thirdCell);
+      assert.deepEqual(thirdCell.outputs, hostCell.outputs);
+      assert.deepEqual(thirdCell.execution, hostCell.execution);
+      assert.equal(
+        Buffer.from(thirdCell.outputs[0]!.items[0]!.dataBase64, 'base64').toString('utf8'),
+        'AUTHORITATIVE OUTPUT\n',
+      );
+      assert.equal(thirdCell.execution?.requestId, 'authoritative-output-request');
+      assert.equal(thirdCell.execution?.executionOrder, 9);
+      assert.equal(thirdCell.execution?.success, true);
+      assert.ok(outputScopeUpdates >= 1, 'host publishes authoritative output state from kernel events');
+      assert.ok(executionScopeUpdates >= 2, 'host publishes running/order/final execution state');
+
+      const beforeReplay = JSON.stringify(thirdCell.outputs);
+      (runtime as any).replayRemoteExecutionsForPeer('peer-z');
+      assert.equal(JSON.stringify(third.notebookCellSnapshot('work.ipynb', 'cell-a')?.outputs), beforeReplay,
+        'recovery replay never mutates authoritative CRDT outputs');
+    } finally {
+      third.destroy();
       await (runtime as any).disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
@@ -2698,9 +2972,14 @@ describe('standard VS Code NotebookController production path', () => {
     const calls: string[] = [];
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let computeExecutorId = 'guest';
+    let outputPublishCount = 0;
+    let executionPublishCount = 0;
     const runtime: any = {
+      descriptor: { localPeer: { peerId: 'guest' } },
       notebookKey: (uri: any) => uri.fsPath,
       notebookCellId: (cell: any) => cell.id,
+      computeForNotebook: () => ({ executorId: computeExecutorId, device: 'cpu', epoch: 1, author: 'host' }),
       executeCell: async (key: string, id: string) => {
         calls.push(`${key}:${id}:start`);
         if (key === 'A' && id === '1') await firstGate;
@@ -2713,7 +2992,10 @@ describe('standard VS Code NotebookController production path', () => {
       reportInputResolved: (key: string) => { calls.push(`${key}:input-resolved`); },
       replyToInput: (requestId: string, value: string) => { calls.push(`${requestId}:reply:${value}`); },
       cancelInput: async (requestId: string) => { calls.push(`${requestId}:cancel`); },
-      project: { setCellOutputs: () => undefined, setCellExecution: () => undefined },
+      project: {
+        setCellOutputs: () => { outputPublishCount += 1; },
+        setCellExecution: () => { executionPublishCount += 1; },
+      },
     };
     controller.setRuntime(runtime);
     const productionController = fakeVscode.__controllers.at(-1);
@@ -2806,6 +3088,67 @@ describe('standard VS Code NotebookController production path', () => {
     assert.equal(limitedOutputs.length, 1_024);
     assert.match(Buffer.from(limitedOutputs.at(-1).items[0].data).toString('utf8'), /Output was truncated/);
     assert.ok(calls.includes('B:interrupt'), 'an unrenderable output backlog interrupts the kernel');
+
+    computeExecutorId = 'host';
+    outputPublishCount = 0;
+    executionPublishCount = 0;
+    let finishRemote!: (value: any) => void;
+    runtime.executeCell = async (
+      _key: string,
+      _id: string,
+      _code: string,
+      onEvent: (event: any) => void,
+      onRequestId?: (requestId: string) => void,
+    ) => {
+      onRequestId?.('remote-request-id');
+      onEvent({
+        type: 'iopub', requestId: 'remote-request-id', messageType: 'stream',
+        content: { name: 'stdout', text: 'LIVE REMOTE\n' },
+      });
+      return new Promise((resolve) => { finishRemote = resolve; });
+    };
+    const remoteCell = fakeCell('remote-no-echo', notebookB);
+    const remoteExecutionIndex = fakeVscode.__executions.length;
+    const remoteRun = productionController.executeHandler([remoteCell], notebookB);
+    await waitFor(
+      () => fakeVscode.__executions[remoteExecutionIndex]?.outputs?.length === 1,
+      2000,
+      'remote live output render',
+    );
+    const remoteExecution = fakeVscode.__executions[remoteExecutionIndex];
+    assert.equal(
+      Buffer.from(remoteExecution.outputs[0].items[0].data).toString('utf8'),
+      'LIVE REMOTE\n',
+      'initiator still renders remote live events',
+    );
+    const executionHandlesBeforeEcho = fakeVscode.__executions.length;
+    await controller.renderRemoteCellState(remoteCell, {
+      outputs: [...remoteExecution.outputs],
+      execution: { requestId: 'remote-request-id', success: undefined },
+      outputsChanged: true,
+      executionChanged: true,
+      executionMode: 'live',
+    });
+    assert.equal(fakeVscode.__executions.length, executionHandlesBeforeEcho,
+      'same request identity suppresses the authoritative CRDT echo without a second execution handle');
+    assert.equal(remoteExecution.outputs.length, 1, 'same request identity does not append the final output twice');
+    assert.equal(outputPublishCount, 0, 'remote initiator never republishes authoritative outputs into CRDT');
+    assert.equal(executionPublishCount, 0, 'remote initiator never republishes authoritative execution into CRDT');
+    finishRemote({ requestId: 'remote-request-id', success: true, content: { status: 'ok' } });
+    await remoteRun;
+    const handlesAfterRemoteCompletion = fakeVscode.__executions.length;
+    await controller.renderRemoteCellState(remoteCell, {
+      outputs: [...remoteExecution.outputs],
+      execution: { requestId: 'remote-request-id', executionOrder: 1, success: true },
+      outputsChanged: true,
+      executionChanged: true,
+      executionMode: 'live',
+    });
+    assert.equal(fakeVscode.__executions.length, handlesAfterRemoteCompletion,
+      'late final CRDT echo for the completed remote request does not create a second execution handle');
+    assert.equal(remoteExecution.outputs.length, 1,
+      'late final CRDT echo for the completed remote request does not apply output twice');
+    computeExecutorId = 'guest';
 
     fakeVscode.window.activeNotebookEditor = { notebook: notebookA };
     await controller.restartActive();

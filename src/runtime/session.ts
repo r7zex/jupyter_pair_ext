@@ -33,6 +33,13 @@ import {
   ProjectUpdate,
   normalizeNotebookUpdateScope,
 } from '../core/crdt';
+import {
+  appendJupyterFailureToState,
+  applyJupyterEventToState,
+  createJupyterRenderState,
+  snapshotJupyterOutputs,
+  type JupyterRenderState,
+} from '../vscode/jupyterOutputState';
 import { SessionCoordinator } from '../core/election';
 import { CpuSnapshot, discoverHardware, HardwareInfo, ResourceSample, sampleResources } from '../core/hardware';
 import { JupyterExecutionResult, JupyterKernel, JupyterKernelEvent } from '../core/pythonKernel';
@@ -276,6 +283,10 @@ interface ExecutionOwner {
   peerId: string;
   notebookKey: string;
   requestDigest?: string | undefined;
+  accepted: boolean;
+  cellId?: string | undefined;
+  outputState?: JupyterRenderState | undefined;
+  startedAt?: number | undefined;
   events?: RemoteExecutionEventRecord[] | undefined;
   eventBytes?: number | undefined;
   eventOverflow?: Error | undefined;
@@ -1051,11 +1062,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     cellId: string,
     code: string,
     onEvent: (event: JupyterKernelEvent) => void,
+    onRequestId?: (requestId: string) => void,
   ): Promise<JupyterExecutionResult> {
     if (this.waitingForHostFolder) {
       throw new Error('The session is paused until the new host chooses a folder.');
     }
     const requestId = newId();
+    onRequestId?.(requestId);
     const target = this.computeForNotebook(notebookKey);
     const executorId = target.executorId;
     if (executorId === this.descriptor.localPeer.peerId) {
@@ -4752,6 +4765,34 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private reserveRemoteExecutionOwner(
+    requestId: string,
+    sourceId: string,
+    notebookKey: string,
+    requestDigest: string,
+    cellId?: string,
+  ): ExecutionOwner | undefined {
+    const remoteOwners = [...this.executionOwners.values()]
+      .filter((owner) => owner.peerId !== this.descriptor.localPeer.peerId);
+    if (remoteOwners.length >= MAX_REMOTE_EXECUTIONS
+      || remoteOwners.filter((owner) => owner.peerId === sourceId).length >= MAX_REMOTE_EXECUTIONS_PER_PEER) {
+      return undefined;
+    }
+    const owner: ExecutionOwner = {
+      peerId: sourceId,
+      notebookKey,
+      requestDigest,
+      accepted: false,
+      cellId,
+      events: [],
+      eventBytes: 0,
+      inputRequestSequences: new Set(),
+      inputReplyDigests: new Map(),
+    };
+    this.executionOwners.set(requestId, owner);
+    return owner;
+  }
+
   private sendExecutionAccepted(peerId: string, requestId: string): void {
     try {
       this.transport.sendTo(peerId, 'executeAccepted', { requestId });
@@ -4772,7 +4813,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private deliverActiveRemoteExecution(requestId: string): void {
     const owner = this.executionOwners.get(requestId);
-    if (!owner || !owner.events || this.closed) return;
+    if (!owner || !owner.events || this.closed || !owner.accepted) return;
     if (owner.replayTimer) {
       clearTimeout(owner.replayTimer);
       owner.replayTimer = undefined;
@@ -5100,6 +5141,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     let target: NotebookComputeTarget;
     let code: string;
     let materializeWorkspace: boolean;
+    let executionOwner: ExecutionOwner | undefined;
 
     if (fastPath) {
       const request = lightweight!;
@@ -5110,7 +5152,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         rejectRequest('ComputeTargetChanged', 'Compute target changed before the execution request arrived.');
         return;
       }
-      target = expectedTarget;
       if (this.project.kindOf(notebookKey) !== 'notebook') {
         rejectRequest('CellStateUnavailable', 'The requested collaborative notebook is not available on the Session Host.');
         return;
@@ -5119,10 +5160,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         rejectRequest('CellStateUnavailable', 'The requested shared cell is not available on the Session Host.');
         return;
       }
+      // Reserve exactly-once ownership before any asynchronous convergence
+      // wait. Identical duplicates observe this reservation instead of
+      // creating a second waiter/kernel execution.
+      executionOwner = this.reserveRemoteExecutionOwner(
+        requestId, sourceId, notebookKey, requestDigest, request.cellId,
+      );
+      if (!executionOwner) {
+        rejectRequest('ExecutionBusy', 'The executor has reached its remote execution concurrency limit.');
+        return;
+      }
       let canonical: { source: string; revision: string; digest: string };
       try {
         canonical = await this.waitForAuthoritativeCellState(request);
       } catch (error) {
+        if (this.executionOwners.get(requestId) === executionOwner) {
+          this.executionOwners.delete(requestId);
+        }
         if (error instanceof StaleCellRevisionError) {
           rejectRequest('StaleCellRevision', error.message);
         } else if (error instanceof CellStateUnavailableError) {
@@ -5132,7 +5186,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }
         return;
       }
+      const currentTarget = this.computeForNotebook(notebookKey);
+      if (request.executorId !== this.coordinator.clock.hostId
+        || request.executorId !== this.descriptor.localPeer.peerId
+        || request.computeEpoch !== currentTarget.epoch
+        || currentTarget.executorId !== this.descriptor.localPeer.peerId) {
+        if (this.executionOwners.get(requestId) === executionOwner) this.executionOwners.delete(requestId);
+        rejectRequest('ComputeTargetChanged', 'Compute target changed while waiting for canonical cell state.');
+        return;
+      }
+      target = currentTarget;
       if (Buffer.byteLength(canonical.source, 'utf8') > MAX_REMOTE_EXECUTION_CODE_BYTES) {
+        if (this.executionOwners.get(requestId) === executionOwner) this.executionOwners.delete(requestId);
         rejectRequest('InvalidExecutionRequest', 'The canonical remote code cell exceeds the execution-size limit.');
         return;
       }
@@ -5209,29 +5274,31 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
     const targetError = this.computeTargetAvailabilityError(target);
     if (targetError) {
+      if (executionOwner && this.executionOwners.get(requestId) === executionOwner) {
+        this.executionOwners.delete(requestId);
+      }
       rejectRequest(computeAvailabilityErrorName(targetError), targetError);
       return;
     }
-    const remoteOwners = [...this.executionOwners.values()]
-      .filter((owner) => owner.peerId !== this.descriptor.localPeer.peerId);
-    if (remoteOwners.length >= MAX_REMOTE_EXECUTIONS
-      || remoteOwners.filter((owner) => owner.peerId === sourceId).length >= MAX_REMOTE_EXECUTIONS_PER_PEER) {
-      rejectRequest('ExecutionBusy', 'The executor has reached its remote execution concurrency limit.');
-      return;
+    if (!executionOwner) {
+      executionOwner = this.reserveRemoteExecutionOwner(
+        requestId, sourceId, notebookKey, requestDigest,
+      );
+      if (!executionOwner) {
+        rejectRequest('ExecutionBusy', 'The executor has reached its remote execution concurrency limit.');
+        return;
+      }
     }
 
     // A new request reaches this point only after authority checks and, for
     // lightweight framing, exact host-canonical target-cell convergence.
-    const executionOwner: ExecutionOwner = {
-      peerId: sourceId,
-      notebookKey,
-      requestDigest,
-      events: [],
-      eventBytes: 0,
-      inputRequestSequences: new Set(),
-      inputReplyDigests: new Map(),
-    };
-    this.executionOwners.set(requestId, executionOwner);
+    if (fastPath && executionOwner.cellId) {
+      executionOwner.outputState = createJupyterRenderState();
+      executionOwner.startedAt = Date.now();
+      this.project.setCellExecution(notebookKey, executionOwner.cellId, { requestId });
+      this.project.setCellOutputs(notebookKey, executionOwner.cellId, []);
+    }
+    executionOwner.accepted = true;
     this.sendExecutionAccepted(sourceId, requestId);
     let timeout: NodeJS.Timeout | undefined;
     let result: JupyterExecutionResult;
@@ -5266,6 +5333,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           executionOwner.events = events;
           executionOwner.eventBytes = nextBytes;
           if (event.type === 'inputRequest') executionOwner.inputRequestSequences?.add(record.sequence);
+
+          if (executionOwner.outputState && executionOwner.cellId) {
+            const authoritative = applyJupyterEventToState(executionOwner.outputState, event);
+            if (authoritative.executionOrder !== undefined) {
+              this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+                requestId,
+                executionOrder: authoritative.executionOrder,
+              });
+            }
+            if (authoritative.outputsChanged) {
+              this.project.setCellOutputs(
+                notebookKey,
+                executionOwner.cellId,
+                snapshotJupyterOutputs(executionOwner.outputState),
+              );
+            }
+          }
           try {
             this.transport.sendTo(sourceId, 'executionEvent', {
               requestId,
@@ -5306,6 +5390,26 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           evalue: executionOwner.eventOverflow.message,
         },
       };
+    }
+    if (executionOwner.outputState && executionOwner.cellId) {
+      appendJupyterFailureToState(executionOwner.outputState, result);
+      this.project.setCellOutputs(
+        notebookKey,
+        executionOwner.cellId,
+        snapshotJupyterOutputs(executionOwner.outputState),
+      );
+      const resultCount = Number(result.content.execution_count);
+      const executionOrder = executionOwner.outputState.executionOrder
+        ?? (Number.isFinite(resultCount) ? resultCount : undefined);
+      this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+        requestId,
+        ...(executionOrder !== undefined ? { executionOrder } : {}),
+        success: result.success,
+        timing: {
+          startTime: executionOwner.startedAt ?? Date.now(),
+          endTime: Date.now(),
+        },
+      });
     }
     this.rememberCompletedRemoteExecution(
       sourceId,
@@ -5488,6 +5592,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.executionOwners.set(requestId, this.executionOwners.get(requestId) ?? {
       peerId: this.descriptor.localPeer.peerId,
       notebookKey,
+      accepted: true,
     });
     this.activeExecutions += 1;
     this.notebookActiveExecutions.set(notebookKey, (this.notebookActiveExecutions.get(notebookKey) ?? 0) + 1);

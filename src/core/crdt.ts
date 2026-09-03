@@ -28,6 +28,8 @@ export interface OutputSnapshot {
 }
 
 export interface CellExecutionSnapshot {
+  /** Stable execution identity used to suppress initiator CRDT echo for the same request. */
+  requestId?: string | undefined;
   executionOrder?: number | undefined;
   success?: boolean | undefined;
   timing?: { startTime: number; endTime: number } | undefined;
@@ -766,9 +768,14 @@ function parseExecution(value: unknown): CellExecutionSnapshot | undefined {
 function normalizeExecutionSnapshot(value: unknown): CellExecutionSnapshot | undefined {
   if (value === undefined || value === null) return undefined;
   if (!isPlainRecord(value)) throw new Error('Cell execution summary is malformed.');
+  const requestId = value.requestId;
   const executionOrder = value.executionOrder;
   const success = value.success;
   const timing = value.timing;
+  if (requestId !== undefined
+    && (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId))) {
+    throw new Error('Cell execution request identity is malformed.');
+  }
   if (executionOrder !== undefined && (!Number.isSafeInteger(executionOrder) || Number(executionOrder) < 0)) {
     throw new Error('Cell execution order is malformed.');
   }
@@ -782,6 +789,7 @@ function normalizeExecutionSnapshot(value: unknown): CellExecutionSnapshot | und
     normalizedTiming = { startTime: Number(timing.startTime), endTime: Number(timing.endTime) };
   }
   return {
+    ...(requestId === undefined ? {} : { requestId }),
     ...(executionOrder === undefined ? {} : { executionOrder: Number(executionOrder) }),
     ...(success === undefined ? {} : { success }),
     ...(normalizedTiming ? { timing: normalizedTiming } : {}),
