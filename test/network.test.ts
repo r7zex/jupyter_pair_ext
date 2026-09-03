@@ -873,7 +873,7 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
-  it('keeps a logical peer online while immediately replacing a failed physical route', async () => {
+  it('keeps recovery timing separate from heartbeat freshness and reconnects before the deadline', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const identity = { peerId: 'recovering-host', displayName: 'Recovering Host', joinOrder: 0 };
     const transport = new MeshTransport({
@@ -893,6 +893,12 @@ describe('mesh relay fallback integration', function () {
         snapshotRequested: boolean;
       }>;
       identityToTransport: Map<string, string>;
+      recoveringPeers: Map<string, {
+        startedAt: number;
+        deadlineAt: number;
+        lastHeartbeat: number;
+        timer: NodeJS.Timeout;
+      }>;
       relay: {
         connectedRelayCount: number;
         onFrame: () => void;
@@ -918,9 +924,10 @@ describe('mesh relay fallback integration', function () {
       sendAnnounce: () => { relaySends += 1; },
       send: () => { relaySends += 1; },
     };
+    const lastSeen = Date.now() - 5_000;
     internals.connections.set('direct-route', {
       transportPeerId: 'direct-route', identity, purpose: 'runtime',
-      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      connectedAt: Date.now(), lastSeen, snapshotRequested: false,
     });
     internals.identityToTransport.set(identity.peerId, 'direct-route');
     transport.on('peerDisconnected', () => { disconnects += 1; });
@@ -929,9 +936,20 @@ describe('mesh relay fallback integration', function () {
       internals.onPeerLeave('direct-route');
       assert.equal(disconnects, 0, 'physical leave became an immediate logical disconnect');
       assert.equal(transport.isPeerRecovering(identity.peerId), true);
+      const recovery = internals.recoveringPeers.get(identity.peerId);
+      assert.ok(recovery);
+      assert.equal(recovery.deadlineAt - recovery.startedAt, 100, 'recovery owns one explicit bounded deadline');
+      assert.equal(recovery.lastHeartbeat, lastSeen, 'recovery keeps the last real route evidence');
       const recoveringPeer = transport.peerRuntime().find((peer) => peer.peerId === identity.peerId);
       assert.equal(recoveringPeer?.online, false, 'a recovering route is not displayed as online');
       assert.equal(recoveringPeer?.connectionState, 'recovering');
+      assert.equal(recoveringPeer?.lastHeartbeat, lastSeen, 'recovery must not fabricate heartbeat freshness');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(
+        transport.peerRuntime().find((peer) => peer.peerId === identity.peerId)?.lastHeartbeat,
+        lastSeen,
+        'wall-clock time must not advance a disconnected peer heartbeat',
+      );
       assert.ok(relaySends >= 2, 'relay fallback was not started immediately');
 
       const routed = transport.waitForRoute(identity.peerId, 100);
@@ -945,6 +963,164 @@ describe('mesh relay fallback integration', function () {
       await new Promise((resolve) => setTimeout(resolve, 120));
       assert.equal(disconnects, 0);
       assert.equal(transport.hasRoute(identity.peerId), true);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('cancels terminal disconnect when authenticated recovery completes near the deadline', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'near-deadline-host', displayName: 'Near Deadline Host', joinOrder: 0 };
+    const transport = new MeshTransport({
+      sessionId: 'logical-route-near-deadline', token: 'logical-route-near-deadline-token-is-long-enough',
+      localPeer: { peerId: 'near-deadline-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: identity.peerId }),
+      isHost: () => false,
+      logicalPeerRecoveryMs: 200,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string; identity: typeof identity; purpose: 'runtime';
+        connectedAt: number; lastSeen: number; snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      recoveringPeers: Map<string, { deadlineAt: number }>;
+      onPeerLeave: (transportPeerId: string) => void;
+      finishLogicalRecovery: (peerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    transport.connect(identity);
+    const lastSeen = Date.now();
+    internals.connections.set('near-old-route', {
+      transportPeerId: 'near-old-route', identity, purpose: 'runtime',
+      connectedAt: lastSeen, lastSeen, snapshotRequested: false,
+    });
+    internals.identityToTransport.set(identity.peerId, 'near-old-route');
+    let disconnects = 0;
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      internals.onPeerLeave('near-old-route');
+      const cycle = internals.recoveringPeers.get(identity.peerId);
+      assert.ok(cycle);
+      const waitMs = Math.max(0, cycle.deadlineAt - Date.now() - 50);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      internals.connections.set('near-new-route', {
+        transportPeerId: 'near-new-route', identity, purpose: 'runtime',
+        connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      internals.identityToTransport.set(identity.peerId, 'near-new-route');
+      internals.finishLogicalRecovery(identity.peerId);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(disconnects, 0);
+      assert.equal(transport.hasRoute(identity.peerId), true);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('ignores a late leave event from the retired route after replacement admission', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'late-route-host', displayName: 'Late Route Host', joinOrder: 0 };
+    const transport = new MeshTransport({
+      sessionId: 'logical-route-late-old-event', token: 'logical-route-late-old-event-token-is-long-enough',
+      localPeer: { peerId: 'late-route-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: identity.peerId }),
+      isHost: () => false,
+      logicalPeerRecoveryMs: 100,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string; identity: typeof identity; purpose: 'runtime';
+        connectedAt: number; lastSeen: number; snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      onPeerLeave: (transportPeerId: string) => void;
+      finishLogicalRecovery: (peerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    transport.connect(identity);
+    internals.connections.set('late-old-route', {
+      transportPeerId: 'late-old-route', identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    internals.identityToTransport.set(identity.peerId, 'late-old-route');
+    let disconnects = 0;
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      internals.onPeerLeave('late-old-route');
+      internals.connections.set('late-new-route', {
+        transportPeerId: 'late-new-route', identity, purpose: 'runtime',
+        connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      internals.identityToTransport.set(identity.peerId, 'late-new-route');
+      internals.finishLogicalRecovery(identity.peerId);
+
+      internals.onPeerLeave('late-old-route');
+      assert.equal(internals.identityToTransport.get(identity.peerId), 'late-new-route');
+      assert.equal(transport.hasRoute(identity.peerId), true);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.equal(disconnects, 0);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('starts a fresh recovery cycle after a successful previous recovery', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'repeat-recovery-host', displayName: 'Repeat Recovery Host', joinOrder: 0 };
+    const transport = new MeshTransport({
+      sessionId: 'logical-route-repeat-cycle', token: 'logical-route-repeat-cycle-token-is-long-enough',
+      localPeer: { peerId: 'repeat-recovery-guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: identity.peerId }),
+      isHost: () => false,
+      logicalPeerRecoveryMs: 40,
+    });
+    type Cycle = { startedAt: number; deadlineAt: number; timer: NodeJS.Timeout };
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string; identity: typeof identity; purpose: 'runtime';
+        connectedAt: number; lastSeen: number; snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      recoveringPeers: Map<string, Cycle>;
+      onPeerLeave: (transportPeerId: string) => void;
+      finishLogicalRecovery: (peerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    transport.connect(identity);
+    internals.connections.set('cycle-route-1', {
+      transportPeerId: 'cycle-route-1', identity, purpose: 'runtime',
+      connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+    });
+    internals.identityToTransport.set(identity.peerId, 'cycle-route-1');
+    let disconnects = 0;
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      internals.onPeerLeave('cycle-route-1');
+      const firstCycle = internals.recoveringPeers.get(identity.peerId);
+      assert.ok(firstCycle);
+      internals.connections.set('cycle-route-2', {
+        transportPeerId: 'cycle-route-2', identity, purpose: 'runtime',
+        connectedAt: Date.now(), lastSeen: Date.now(), snapshotRequested: false,
+      });
+      internals.identityToTransport.set(identity.peerId, 'cycle-route-2');
+      internals.finishLogicalRecovery(identity.peerId);
+      assert.equal(transport.isPeerRecovering(identity.peerId), false);
+
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      internals.onPeerLeave('cycle-route-2');
+      const secondCycle = internals.recoveringPeers.get(identity.peerId);
+      assert.ok(secondCycle);
+      assert.notStrictEqual(secondCycle, firstCycle, 'a new route loss must create a fresh recovery cycle');
+      assert.ok(secondCycle.deadlineAt > firstCycle.startedAt);
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      assert.equal(disconnects, 1, 'only the second exhausted cycle becomes terminal');
       assert.equal(transport.isPeerRecovering(identity.peerId), false);
     } finally {
       await transport.stop();

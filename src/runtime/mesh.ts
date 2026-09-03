@@ -328,7 +328,12 @@ interface ConnectedPeer {
 interface RecoveringPeer {
   identity: PeerIdentity;
   purpose: PeerConnectionPurpose;
+  /** Start of this logical recovery cycle; never reused as heartbeat freshness. */
   startedAt: number;
+  /** Absolute wall-clock deadline for this recovery cycle. */
+  deadlineAt: number;
+  /** Last real inbound/ping evidence observed before the active route was retired. */
+  lastHeartbeat: number;
   timer: NodeJS.Timeout;
 }
 
@@ -2232,7 +2237,8 @@ public improvablePeerIds(): string[] {
         const connection = transportPeerId ? this.connections.get(transportPeerId) : undefined;
         const latency = this.latency.get(peer.peerId);
         const local = peer.peerId === this.options.localPeer.peerId;
-        const recovering = this.recoveringPeers.get(peer.peerId)?.purpose === 'runtime';
+        const recovery = this.recoveringPeers.get(peer.peerId);
+        const recovering = recovery?.purpose === 'runtime';
         return {
           ...peer,
           latency: latency?.current ?? (local ? 0 : -1),
@@ -2240,7 +2246,7 @@ public improvablePeerIds(): string[] {
           // SessionCoordinator polls this projection. Recovery is a distinct
           // state, not an online route: the coordinator defers host-loss while
           // this bounded lease is active, whereas the UI can report the truth.
-          lastHeartbeat: connection?.lastSeen ?? (local || recovering ? Date.now() : 0),
+          lastHeartbeat: connection?.lastSeen ?? (local ? Date.now() : recovery?.lastHeartbeat ?? 0),
           missedHeartbeats: 0,
           route: local ? 'Direct' : this.routes.get(peer.peerId) ?? 'Direct',
           online: local || Boolean(connection),
@@ -2540,16 +2546,22 @@ public improvablePeerIds(): string[] {
       this.identityToTransport.delete(connection.identity.peerId);
     }
     if (!this.stopped && wasActiveIdentityRoute) {
-      this.beginLogicalRecovery(connection.identity, connection.purpose);
+      this.beginLogicalRecovery(connection.identity, connection.purpose, connection.lastSeen);
     }
   }
 
-  private beginLogicalRecovery(identity: PeerIdentity, purpose: PeerConnectionPurpose): void {
+  private beginLogicalRecovery(
+    identity: PeerIdentity,
+    purpose: PeerConnectionPurpose,
+    lastHeartbeat = 0,
+  ): void {
     if (this.stopped || this.hasRoute(identity.peerId) || this.recoveringPeers.has(identity.peerId)) return;
     const startedAt = Date.now();
+    const recoveryMs = this.options.logicalPeerRecoveryMs ?? LOGICAL_PEER_RECOVERY_MS;
+    const deadlineAt = startedAt + recoveryMs;
     const timer = setTimeout(() => {
       const recovery = this.recoveringPeers.get(identity.peerId);
-      if (!recovery || recovery.startedAt !== startedAt) return;
+      if (!recovery || recovery.startedAt !== startedAt || recovery.deadlineAt !== deadlineAt) return;
       if (this.hasRoute(identity.peerId)) {
         this.finishLogicalRecovery(identity.peerId);
         return;
@@ -2559,9 +2571,16 @@ public improvablePeerIds(): string[] {
         recovery.purpose === 'bootstrap' ? 'bootstrapDisconnected' : 'peerDisconnected',
         recovery.identity,
       );
-    }, this.options.logicalPeerRecoveryMs ?? LOGICAL_PEER_RECOVERY_MS);
+    }, Math.max(0, deadlineAt - Date.now()));
     timer.unref?.();
-    this.recoveringPeers.set(identity.peerId, { identity: { ...identity }, purpose, startedAt, timer });
+    this.recoveringPeers.set(identity.peerId, {
+      identity: { ...identity },
+      purpose,
+      startedAt,
+      deadlineAt,
+      lastHeartbeat,
+      timer,
+    });
     this.emit('peerRecovering', { ...identity });
 
     // Do not wait for the periodic 20-second sweep. The already-verified full
