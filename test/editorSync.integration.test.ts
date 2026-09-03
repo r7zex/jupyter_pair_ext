@@ -76,9 +76,10 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       applyUpdates(local, updates.splice(0));
       await waitFor(() => notebook.cells.length === 3, 1000, 'remote structural edit');
       assert.deepEqual(notebook.cells.map((cell: any) => cell.metadata.pairNotebookCellId), ['a', 'remote-new', 'b']);
-      assert.ok(vscodeBoundary.__notebookEdits.some((edit: any) =>
-        edit.type === 'replaceCells' && edit.range.start === 1 && edit.range.end === 1 && edit.cells.length === 1));
+       assert.ok(vscodeBoundary.__notebookEdits.some((edit: any) =>
+         edit.type === 'replaceCells' && edit.range.start === 1 && edit.range.end === 1 && edit.cells.length === 1));
 
+      vscodeBoundary.__notebookEdits = [];
       remote.applyCellTextChanges('work.ipynb', 'b', [{ offset: 1, deleteCount: 0, insertText: '-REMOTE' }]);
       remote.setCellMetadata('work.ipynb', 'b', { owner: 'remote' });
       remote.setCellOutputs('work.ipynb', 'b', [{
@@ -102,6 +103,10 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
         success: true,
         timing: { startTime: 100, endTime: 200 },
       });
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1, 'output and execution updates coalesce into one targeted cell replacement');
+      assert.equal(replacements[0].range.start, 2);
+      assert.equal(replacements[0].range.end, 3);
     } finally {
       synchronizer.dispose();
       local.destroy();
@@ -109,7 +114,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
-  it('saves an open notebook through the VS Code document API after queued CRDT edits settle', async () => {
+  it('keeps background persistence out of the open notebook save hot path', async () => {
     const root = path.resolve('/tmp/pair-editor-save');
     const notebook = fakeNotebook(root, [fakeCell('before', 'stable')]);
     vscodeBoundary.__reset(notebook);
@@ -120,7 +125,9 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       project.applyCellTextChanges('work.ipynb', 'stable', [{ offset: 0, deleteCount: 6, insertText: 'after' }], REMOTE_ORIGIN);
       assert.equal(await synchronizer.persistWorkingCopy('work.ipynb', Buffer.from('ignored')), true);
       assert.equal(notebook.cells[0].document.getText(), 'after');
-      assert.equal(notebook.saveCount, 1, 'native notebook.save owns the physical write');
+      assert.equal(notebook.saveCount, 0, 'background persistence never save-spams an open notebook');
+      await synchronizer.prepareWorkingCopy();
+      assert.equal(notebook.saveCount, 1, 'an explicit filesystem barrier may save the open notebook');
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -162,7 +169,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     const notebook = fakeNotebook(root, [fakeCell('before', 'stable')]);
     vscodeBoundary.__reset(notebook);
     const project = new CollaborativeProject();
-    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, () => false);
+    const synchronizer = new EditorSynchronizer(project, root, logger());
     try {
       await synchronizer.whenNotebookReady(notebook);
       project.applyCellTextChanges('work.ipynb', 'stable', [{ offset: 0, deleteCount: 6, insertText: 'after' }], REMOTE_ORIGIN);

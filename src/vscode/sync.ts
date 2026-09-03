@@ -31,6 +31,8 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly textObservers = new Map<string, (event: Y.YTextEvent) => void>();
   private readonly textApplyQueues = new Map<string, Promise<void>>();
   private readonly notebookApplyQueues = new Map<string, Promise<void>>();
+  private readonly pendingNotebookCellStates = new Map<string, Set<string>>();
+  private readonly notebookCellStateTimers = new Map<string, NodeJS.Timeout>();
   private readonly notebookBindings = new WeakMap<vscode.NotebookDocument, Promise<void>>();
   private readonly boundNotebooks = new WeakSet<vscode.NotebookDocument>();
   private lastRejectedEditorWarningAt = 0;
@@ -40,7 +42,6 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly root: string,
     private readonly log: vscode.OutputChannel,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
-    private readonly canSaveOpenDocuments: () => boolean = () => true,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
@@ -69,6 +70,9 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.project.off('documentDeleted', this.onDocumentDeleted);
     for (const [key, observer] of this.textObservers) this.project.text(key).unobserve(observer);
     this.textObservers.clear();
+    for (const timer of this.notebookCellStateTimers.values()) clearTimeout(timer);
+    this.notebookCellStateTimers.clear();
+    this.pendingNotebookCellStates.clear();
     for (const disposable of this.disposables) disposable.dispose();
   }
 
@@ -117,7 +121,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       await (this.notebookApplyQueues.get(relativePath) ?? Promise.resolve());
       await this.applyNotebookSnapshot(notebook, this.project.notebookSnapshot(relativePath));
       await this.ensureStableCellIds(notebook);
-      if ((forceSave || this.canSaveOpenDocuments()) && !await notebook.save()) {
+      if (forceSave && !await notebook.save()) {
         throw new Error(`VS Code could not save ${relativePath}.`);
       }
       return true;
@@ -129,7 +133,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (document) {
       await (this.textApplyQueues.get(relativePath) ?? Promise.resolve());
       await this.applyText(document, this.project.text(relativePath).toString());
-      if ((forceSave || this.canSaveOpenDocuments()) && !await document.save()) {
+      if (forceSave && !await document.save()) {
         throw new Error(`VS Code could not save ${relativePath}.`);
       }
       return true;
@@ -159,6 +163,18 @@ export class EditorSynchronizer implements vscode.Disposable {
         await this.applyText(open.document, source);
         return;
       }
+      if ((event.scope?.type === 'cellOutputs' || event.scope?.type === 'cellExecution') && event.scope.cellId) {
+        this.scheduleNotebookCellStateApply(event.key, event.scope.cellId);
+        return;
+      }
+      if (event.scope?.type === 'cellMetadata' && event.scope.cellId) {
+        await this.applyNotebookCellMetadata(notebook, event.key, event.scope.cellId);
+        return;
+      }
+      if (event.scope?.type === 'notebookMetadata') {
+        await this.applyNotebookMetadata(notebook, event.key);
+        return;
+      }
       await this.applyNotebookSnapshot(notebook, this.project.notebookSnapshot(event.key));
     });
   };
@@ -172,6 +188,94 @@ export class EditorSynchronizer implements vscode.Disposable {
     void next.finally(() => {
       if (this.notebookApplyQueues.get(key) === next) this.notebookApplyQueues.delete(key);
     });
+  }
+
+  /** Output events can arrive many times per kernel message. Render only the newest cell state. */
+  private scheduleNotebookCellStateApply(key: string, cellId: string): void {
+    const cells = this.pendingNotebookCellStates.get(key) ?? new Set<string>();
+    cells.add(cellId);
+    this.pendingNotebookCellStates.set(key, cells);
+    if (this.notebookCellStateTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      this.notebookCellStateTimers.delete(key);
+      const pending = this.pendingNotebookCellStates.get(key);
+      this.pendingNotebookCellStates.delete(key);
+      if (!pending?.size) return;
+      this.enqueueNotebookApply(key, async () => {
+        const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
+        if (!notebook) return;
+        for (const pendingCellId of pending) await this.applyNotebookCellState(notebook, key, pendingCellId);
+      });
+    }, 75);
+    this.notebookCellStateTimers.set(key, timer);
+  }
+
+  private async applyNotebookCellState(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
+    let snapshot: NotebookSnapshot;
+    try {
+      snapshot = this.project.notebookSnapshot(key);
+    } catch {
+      return;
+    }
+    const index = snapshot.cells.findIndex((cell) => cell.id === cellId);
+    if (index < 0 || index >= notebook.cellCount) return;
+    const target = snapshot.cells[index]!;
+    const current = notebook.cellAt(index);
+    if (this.cellIds.knownId(current, metadataCellId(current.metadata)) !== cellId) return;
+    const outputsChanged = JSON.stringify(outputsFromCell(current)) !== JSON.stringify(target.outputs);
+    const executionChanged = JSON.stringify(executionFromCell(current)) !== JSON.stringify(target.execution);
+    if (!outputsChanged && !executionChanged) return;
+    const uri = notebook.uri.toString();
+    this.applyingNotebooks.add(uri);
+    try {
+      const edit = new vscode.WorkspaceEdit();
+      // VS Code exposes no direct NotebookEdit for outputs/execution. Replacing
+      // this one cell is the narrowest supported mutation and keeps every other
+      // cell, its editor, and its viewport state intact.
+      edit.set(notebook.uri, [vscode.NotebookEdit.replaceCells(
+        new vscode.NotebookRange(index, index + 1),
+        [toNotebookCellData({ ...target, source: current.document.getText() })],
+      )]);
+      if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook cell output update.');
+    } finally {
+      this.applyingNotebooks.delete(uri);
+    }
+  }
+
+  private async applyNotebookCellMetadata(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
+    const snapshot = this.project.notebookSnapshot(key);
+    const index = snapshot.cells.findIndex((cell) => cell.id === cellId);
+    if (index < 0 || index >= notebook.cellCount) return;
+    const current = notebook.cellAt(index);
+    if (this.cellIds.knownId(current, metadataCellId(current.metadata)) !== cellId) return;
+    const target = snapshot.cells[index]!;
+    const metadata = { ...target.metadata, pairNotebookCellId: target.id };
+    if (JSON.stringify(current.metadata) === JSON.stringify(metadata)) return;
+    const uri = notebook.uri.toString();
+    this.applyingNotebooks.add(uri);
+    try {
+      const edit = new vscode.WorkspaceEdit();
+      edit.set(notebook.uri, [vscode.NotebookEdit.updateCellMetadata(index, metadata)]);
+      if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook cell metadata update.');
+    } finally {
+      this.applyingNotebooks.delete(uri);
+    }
+  }
+
+  private async applyNotebookMetadata(notebook: vscode.NotebookDocument, key: string): Promise<void> {
+    const metadata = this.project.notebookSnapshot(key).metadata;
+    if (JSON.stringify(normalizeNotebookMetadata(notebook.metadata)) === JSON.stringify(metadata)) return;
+    const uri = notebook.uri.toString();
+    this.applyingNotebooks.add(uri);
+    try {
+      const edit = new vscode.WorkspaceEdit();
+      edit.set(notebook.uri, [vscode.NotebookEdit.updateNotebookMetadata(
+        toVscodeNotebookMetadata(metadata, notebook.metadata),
+      )]);
+      if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook metadata update.');
+    } finally {
+      this.applyingNotebooks.delete(uri);
+    }
   }
 
   private enqueueTextApply(key: string, task: () => Promise<void>): void {

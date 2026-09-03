@@ -419,9 +419,6 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       descriptor.workingFolder,
       output,
       runtime.notebookCellIds,
-      // The canonical backing copy is serialized directly from CRDT state.
-      // Background persistence must not trigger format-on-save after every edit.
-      () => false,
     );
     runtime.setWorkingCopyWriter(
       (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),

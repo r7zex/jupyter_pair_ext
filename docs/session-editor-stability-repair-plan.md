@@ -15,7 +15,7 @@ Status: in progress. Each completed checkpoint is tested, committed, and pushed 
 
 - [x] **1. Route-recovery state contract.** Model `connected`, `recovering`, and `disconnected` separately; use a 30-second bounded recovery lease; do not report recovery as online; coordinator retains the pinned host while recovery is active.
 - [x] **2. Deterministic guest termination.** Emit one close reason, persist the reconnectable recent session, clear collaboration state, notify the user, and close only tabs under the isolated Pair working copy.
-- [ ] **3. Targeted notebook synchronization.** Apply structural, text, metadata, output, and execution changes independently; preserve viewport/selection; coalesce output updates; eliminate background editor saves.
+- [x] **3. Targeted notebook synchronization.** Apply structural, text, metadata, output, and execution changes independently; preserve viewport/selection; coalesce output updates; eliminate background editor saves.
 - [ ] **4. Fast host-only execution.** Send a revision-checked cell request directly to the pinned host, wait only for the cell CRDT state when necessary, and retain output/event idempotency.
 - [ ] **5. Line presence.** Publish and render the active line rather than offsets, throttle semantic changes, and clear invalid focus/cell state instead of falling back to line one.
 - [ ] **6. Evidence and release hygiene.** Add lifecycle diagnostics and regression coverage, run the package-quality checks, and keep the work source-only without a version/tag/release change.
