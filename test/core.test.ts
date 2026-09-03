@@ -38,7 +38,15 @@ import {
   serializeIpynb,
   shouldTrackProjectPath,
 } from '../src/core/projectFiles';
-import { accessibleRecentProjects, normalizeRecentProjects, rememberRecentProject } from '../src/core/recentProjects';
+import {
+  accessibleRecentProjects,
+  assertRecentReconnectMatchesDescriptor,
+  clearRecentReconnect,
+  forgetRecentProject,
+  normalizeRecentProjects,
+  reconnectIdentityFromDescriptor,
+  rememberRecentProject,
+} from '../src/core/recentProjects';
 import {
   MAX_SESSION_TERMINATION_BYTES,
   readSessionTermination,
@@ -2476,3 +2484,105 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+
+describe('reconnectable Recent Sessions', () => {
+  it('persists session and original host identity without storing reconnect secrets', () => {
+    const hostKey = generateIdentityCredentials().publicKey;
+    const descriptor: any = {
+      sessionId: 'recent-session',
+      projectId: 'project',
+      projectName: 'Recent project',
+      mode: 'resilient',
+      role: 'peer',
+      localPeer: { peerId: 'guest', displayName: 'Guest', joinOrder: 1 },
+      hostPeerId: 'original-host',
+      backingFolder: '',
+      workingFolder: path.join(os.tmpdir(), 'pair-recent-session'),
+      createdAt: 1,
+      sessionEpoch: 42,
+      hostEpoch: 7,
+      computeExecutorId: 'original-host',
+      pythonPath: 'python',
+      knownPeers: [{
+        peerId: 'original-host', displayName: 'Host', joinOrder: 0, identityKey: hostKey,
+      }],
+    };
+    const reconnect = reconnectIdentityFromDescriptor(descriptor);
+    assert.deepEqual(reconnect, {
+      sessionId: 'recent-session',
+      localPeerId: 'guest',
+      hostPeerId: 'original-host',
+      hostIdentityKey: hostKey,
+      role: 'peer',
+      sessionEpoch: 42,
+      hostEpoch: 7,
+    });
+
+    const normalized = normalizeRecentProjects([{
+      name: 'Recent project',
+      workingFolder: descriptor.workingFolder,
+      at: 123,
+      reconnect,
+      token: 'must-not-survive',
+      identityPrivateKey: 'must-not-survive',
+      transportPeerId: 'must-not-survive',
+    }]);
+    assert.equal(normalized.length, 1);
+    assert.deepEqual(normalized[0]?.reconnect, reconnect);
+    assert.equal('token' in (normalized[0] as any), false);
+    assert.equal('identityPrivateKey' in (normalized[0] as any), false);
+    assert.equal('transportPeerId' in (normalized[0] as any), false);
+    assertRecentReconnectMatchesDescriptor(reconnect!, descriptor);
+
+    const remembered = rememberRecentProject([], normalized[0]!);
+    assert.equal(remembered[0]?.reconnect?.sessionId, 'recent-session');
+    assert.equal(remembered[0]?.reconnect?.hostPeerId, 'original-host');
+    assert.equal(remembered[0]?.reconnect?.hostEpoch, 7);
+    const leftProject = clearRecentReconnect(remembered, descriptor.workingFolder);
+    assert.equal(leftProject.length, 1, 'explicit Leave keeps the Recent Project entry');
+    assert.equal(leftProject[0]?.reconnect, undefined, 'explicit Leave removes reconnect semantics');
+    assert.equal(forgetRecentProject(remembered, descriptor.workingFolder).length, 0);
+  });
+
+  it('rejects a Recent Session marker whose pinned host identity changed', () => {
+    const original = generateIdentityCredentials().publicKey;
+    const substitute = generateIdentityCredentials().publicKey;
+    const descriptor: any = {
+      sessionId: 'recent-substitute',
+      role: 'peer',
+      localPeer: { peerId: 'guest', displayName: 'Guest', joinOrder: 1 },
+      hostPeerId: 'host',
+      sessionEpoch: 9,
+      hostEpoch: 3,
+      knownPeers: [{ peerId: 'host', displayName: 'Host', joinOrder: 0, identityKey: substitute }],
+    };
+    assert.throws(() => assertRecentReconnectMatchesDescriptor({
+      sessionId: 'recent-substitute',
+      localPeerId: 'guest',
+      hostPeerId: 'host',
+      hostIdentityKey: original,
+      role: 'peer',
+      sessionEpoch: 9,
+      hostEpoch: 3,
+    }, descriptor), /pinned original host identity/i);
+  });
+
+  it('rejects a substitute key for an already pinned logical host inside MeshTransport', () => {
+    const original = generateIdentityCredentials();
+    const substitute = generateIdentityCredentials();
+    const transport = new MeshTransport({
+      sessionId: 'pinned-host-reconnect',
+      token: 'pinned-host-reconnect-token-that-is-long-enough',
+      localPeer: { peerId: 'guest', displayName: 'Guest', joinOrder: 1 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'host' }),
+      isHost: () => false,
+    });
+    transport.updateDirectory([{
+      peerId: 'host', displayName: 'Host', joinOrder: 0, identityKey: original.publicKey,
+    }]);
+    assert.throws(() => (transport as any).assertPeerCanJoin({
+      peerId: 'host', displayName: 'Fake Host', joinOrder: 0, identityKey: substitute.publicKey,
+    }, 'transport-host'), /different identity key/i);
+  });
+});

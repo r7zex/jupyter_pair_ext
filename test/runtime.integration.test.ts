@@ -7,6 +7,7 @@ import path from 'node:path';
 import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
+import { generateIdentityCredentials } from '../src/core/identity';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
 import { NostrFrameRelay } from '../src/runtime/nostrRelay';
@@ -2687,6 +2688,99 @@ describe('identity and lifecycle regressions', () => {
     } finally {
       if (peer) peer.descriptor.mode = 'host-only';
       await Promise.allSettled([peer?.leave?.()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('pinned host reconnect', () => {
+  const refresh = {
+    requestedAt: 1,
+    completedAt: 2,
+    status: 'verified' as const,
+    nostr: { requestedSockets: 1, verifiedEndpoints: 1 },
+    mqtt: { requestedSockets: 0, verifiedEndpoints: 0 },
+  };
+
+  it('reconnects a guest only to the original authenticated host without role or epoch mutation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-pinned-reconnect-'));
+    const hostKey = generateIdentityCredentials().publicKey;
+    const saved = descriptor({
+      sessionId: 'pinned-reconnect', role: 'peer', peerId: 'guest', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+      knownPeers: [
+        { peerId: 'host', displayName: 'Original Host', joinOrder: 0, identityKey: hostKey },
+        { peerId: 'other', displayName: 'Other Peer', joinOrder: 2, identityKey: generateIdentityCredentials().publicKey },
+      ],
+    });
+    saved.hostEpoch = 7;
+    const runtime = new SessionRuntime(saved, 'pinned-reconnect-token-that-is-long-enough',
+      context(path.join(root, 'extension')), logger());
+    const connected: string[] = [];
+    const waited: string[] = [];
+    (runtime as any).transport = {
+      connect: (peer: any) => connected.push(peer.peerId),
+      refreshSignalling: async () => refresh,
+      waitForRoute: async (peerId: string) => { waited.push(peerId); },
+    };
+    const beforeRole = runtime.descriptor.role;
+    const beforeClock = { ...runtime.coordinator.clock };
+    const beforeSessionId = runtime.descriptor.sessionId;
+    try {
+      await runtime.reconnect();
+      assert.deepEqual(connected, ['host']);
+      assert.deepEqual(waited, ['host']);
+      assert.equal(runtime.descriptor.sessionId, beforeSessionId);
+      assert.equal(runtime.descriptor.role, beforeRole);
+      assert.deepEqual(runtime.coordinator.clock, beforeClock);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails when the original host has no route and never self-assigns authority', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-pinned-reconnect-missing-'));
+    const hostKey = generateIdentityCredentials().publicKey;
+    const saved = descriptor({
+      sessionId: 'pinned-reconnect-missing', role: 'peer', peerId: 'guest', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+      knownPeers: [{ peerId: 'host', displayName: 'Original Host', joinOrder: 0, identityKey: hostKey }],
+    });
+    saved.hostEpoch = 11;
+    const runtime = new SessionRuntime(saved, 'pinned-reconnect-missing-token-that-is-long-enough',
+      context(path.join(root, 'extension')), logger());
+    const connected: string[] = [];
+    (runtime as any).transport = {
+      connect: (peer: any) => connected.push(peer.peerId),
+      refreshSignalling: async () => refresh,
+      waitForRoute: async () => { throw new Error('No authenticated route to peer host after route recovery.'); },
+    };
+    const beforeClock = { ...runtime.coordinator.clock };
+    try {
+      await assert.rejects(runtime.reconnect(), /No authenticated route to peer host/);
+      assert.deepEqual(connected, ['host']);
+      assert.equal(runtime.descriptor.role, 'peer');
+      assert.deepEqual(runtime.coordinator.clock, beforeClock);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses reconnect when the stored original host has no pinned public identity', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-pinned-reconnect-untrusted-'));
+    const saved = descriptor({
+      sessionId: 'pinned-reconnect-untrusted', role: 'peer', peerId: 'guest', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+      knownPeers: [{ peerId: 'host', displayName: 'Host', joinOrder: 0 }],
+    });
+    const runtime = new SessionRuntime(saved, 'pinned-reconnect-untrusted-token-that-is-long-enough',
+      context(path.join(root, 'extension')), logger());
+    try {
+      await assert.rejects(runtime.reconnect(), /authenticated public identity of the pinned original host/i);
+      assert.equal(runtime.descriptor.role, 'peer');
+      assert.equal(runtime.coordinator.clock.hostId, 'host');
+      assert.equal(runtime.coordinator.clock.hostEpoch, 0);
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

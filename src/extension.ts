@@ -15,7 +15,12 @@ import { discoverPythonEnvironments } from './core/pythonEnvironments';
 import { copyProject } from './core/projectFiles';
 import {
   accessibleRecentProjects,
+  assertRecentReconnectMatchesDescriptor,
+  clearRecentReconnect,
+  forgetRecentProject,
   normalizeRecentProjects,
+  recentProjectForFolder,
+  reconnectIdentityFromDescriptor,
   rememberRecentProject,
 } from './core/recentProjects';
 import { SessionTerminatedError } from './core/sessionTermination';
@@ -43,6 +48,7 @@ import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
+import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
 import {
   PROXY_CREDENTIAL_MIGRATION_KEY,
   PROXY_CREDENTIAL_MIGRATION_VERSION,
@@ -388,6 +394,15 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
   try {
     const markerBytes = await readBoundedRegularFile(marker, MAX_SESSION_MARKER_BYTES);
     descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), folder.uri.fsPath);
+    if (descriptor.role === 'peer') {
+      const reconnectIdentity = reconnectIdentityFromDescriptor(descriptor);
+      if (!reconnectIdentity) {
+        throw new Error('Stored guest session has no authenticated pinned host identity; rejoin using a fresh invite.');
+      }
+      const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+      const remembered = recentProjectForFolder(recent, descriptor.workingFolder);
+      if (remembered?.reconnect) assertRecentReconnectMatchesDescriptor(remembered.reconnect, descriptor);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       output.appendLine(`[error] Invalid session marker: ${formatError(error)}`);
@@ -453,7 +468,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       void vscode.window.showInformationMessage('Pair Notebook: новый хост подготовил папку. Совместная сессия продолжена.');
     });
     runtime.on('sessionEnded', (peer: PeerIdentity) => {
-      void forgetWorkspaceSession(context, descriptor, true).then(() => {
+      void forgetEndedSession(context, descriptor).then(() => {
         void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
       }).catch((error) => {
         output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
@@ -477,15 +492,28 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       status.hide();
       if (reason === 'host-unreachable' || reason === 'session-ended') {
         runUiBackground('Close ended Pair Notebook editors', async () => {
-          await closeSessionTabs(descriptor.workingFolder);
+          const tabs = await closeSessionTabs(descriptor.workingFolder);
           if (reason !== 'host-unreachable') return;
-          await rememberProject(context, descriptor);
-          const choice = await vscode.window.showWarningMessage(
-            'Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. Совместные файлы закрыты; сессию можно повторить из Recent Projects.',
-            'Open Recent Projects',
-          );
-          if (choice === 'Open Recent Projects') void vscode.commands.executeCommand('pairNotebook.openRecentProject');
+          let reconnectable = true;
+          try {
+            await rememberProject(context, descriptor, { pinnedHostId: event.hostId, requireReconnectable: true });
+          } catch (error) {
+            reconnectable = false;
+            output.appendLine(`[error] Could not retain reconnectable Recent Session: ${formatError(error)}`);
+          }
+          const tabDetail = tabs.failed
+            ? `Pair tabs: закрыто ${tabs.closed} из ${tabs.matched}; остальные вкладки не затронуты.`
+            : 'Pair tabs закрыты; остальные вкладки VS Code не затронуты.';
+          const message = reconnectable
+            ? `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Сессия сохранена в Recent Sessions и доступна для reconnect к исходному host.`
+            : `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Безопасные reconnect-данные сохранить не удалось; см. Pair Notebook output.`;
+          const choice = reconnectable
+            ? await vscode.window.showWarningMessage(message, 'Open Recent Sessions')
+            : await vscode.window.showWarningMessage(message);
+          if (choice === 'Open Recent Sessions') void vscode.commands.executeCommand('pairNotebook.openRecentProject');
         });
+      } else if (reason === 'local-route-failed') {
+        void showLocalRouteFailedMessage();
       }
     });
     startStatusUpdates();
@@ -498,14 +526,20 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     }
   } catch (error) {
     output.appendLine(`[error] Session startup failed: ${formatError(error)}`);
+    const startupTerminal = runtime?.terminalLifecycle();
     await runtime?.leave().catch(() => undefined);
     if (error instanceof SessionTerminatedError) {
-      await forgetWorkspaceSession(context, descriptor, true).catch((cleanupError) => {
+      await forgetEndedSession(context, descriptor).catch((cleanupError) => {
         output.appendLine(`[error] Could not forget terminated session: ${formatError(cleanupError)}`);
       });
       void vscode.window.showInformationMessage(
         `Pair Notebook: сессия уже завершена (${error.termination.endedByDisplayName}). Рабочая копия сохранена.`,
       );
+      runtime = undefined;
+      return;
+    }
+    if (startupTerminal?.reason === 'local-route-failed') {
+      await showLocalRouteFailedMessage();
       runtime = undefined;
       return;
     }
@@ -523,34 +557,27 @@ async function leaveSession(): Promise<void> {
   );
   if (answer !== 'Leave Session') return;
   await active.leave();
-  await forgetWorkspaceSession(requireActivationContext(), active.descriptor);
+  const context = requireActivationContext();
+  await forgetWorkspaceSession(context, active.descriptor);
+  const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+  await context.globalState.update(
+    'pairNotebook.recent',
+    clearRecentReconnect(recent, active.descriptor.workingFolder),
+  );
 }
 
 /** Closes only editor tabs backed by this session's isolated working copy. */
-async function closeSessionTabs(workingFolder: string): Promise<void> {
+async function closeSessionTabs(workingFolder: string): Promise<PairTabCloseResult> {
   const tabGroups = (vscode.window as unknown as { tabGroups?: vscode.TabGroups }).tabGroups;
-  if (!tabGroups) return;
-  const root = path.resolve(workingFolder);
-  const tabs = tabGroups.all.flatMap((group) => group.tabs).filter((tab) =>
-    tabInputUris(tab.input).some((uri) => isWithinWorkingCopy(root, uri)));
-  if (tabs.length) await tabGroups.close(tabs, true);
+  const result = await closeIsolatedPairTabs(tabGroups, path.resolve(workingFolder));
+  for (const error of result.errors) output.appendLine(`[debug] Pair tab close: ${error}`);
+  return result;
 }
 
-function tabInputUris(input: unknown): vscode.Uri[] {
-  if (!input || typeof input !== 'object') return [];
-  const record = input as Record<string, unknown>;
-  return [record.uri, record.original, record.modified]
-    .filter((value): value is vscode.Uri => Boolean(value)
-      && typeof value === 'object'
-      && typeof (value as vscode.Uri).fsPath === 'string');
-}
-
-function isWithinWorkingCopy(root: string, uri: vscode.Uri): boolean {
-  if (uri.scheme !== 'file') return false;
-  const relative = path.relative(root, uri.fsPath);
-  return relative === '' || (relative !== '..'
-    && !relative.startsWith(`..${path.sep}`)
-    && !path.isAbsolute(relative));
+async function showLocalRouteFailedMessage(): Promise<void> {
+  await vscode.window.showWarningMessage(
+    'Pair Notebook: локальный сетевой маршрут не удалось запустить. Сессия не подключена; проверьте VPN/proxy и повторите reconnect. Это не потеря удалённого host.',
+  );
 }
 
 async function endSession(): Promise<void> {
@@ -566,7 +593,7 @@ async function endSession(): Promise<void> {
   );
   if (answer !== 'Завершить для всех') return;
   await active.endSession();
-  await forgetWorkspaceSession(requireActivationContext(), active.descriptor, true);
+  await forgetEndedSession(requireActivationContext(), active.descriptor);
   void vscode.window.showInformationMessage(waitingForHostFolder
     ? 'Pair Notebook: сессия завершена. Последнее состояние сохранено в локальных рабочих копиях.'
     : 'Pair Notebook: сессия завершена для всех участников.');
@@ -1190,7 +1217,7 @@ async function openRecentProject(context: vscode.ExtensionContext): Promise<void
     description: new Date(item.at).toLocaleString(),
     detail: item.workingFolder,
     item,
-  })), { title: 'Recent Pair Notebook projects' });
+  })), { title: 'Recent Pair Notebook sessions/projects' });
   if (!picked) return;
   const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const selectedPath = path.resolve(picked.item.workingFolder);
@@ -1198,6 +1225,16 @@ async function openRecentProject(context: vscode.ExtensionContext): Promise<void
   const sameFolder = currentPath !== undefined && (process.platform === 'win32'
     ? currentPath.toLowerCase() === selectedPath.toLowerCase()
     : currentPath === selectedPath);
+  if (picked.item.reconnect) {
+    let markerDescriptor: SessionDescriptor;
+    try {
+      const markerBytes = await readBoundedRegularFile(path.join(selectedPath, MARKER), MAX_SESSION_MARKER_BYTES);
+      markerDescriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), selectedPath);
+      assertRecentReconnectMatchesDescriptor(picked.item.reconnect, markerDescriptor);
+    } catch (error) {
+      throw new Error(`Recent Session cannot reconnect safely: ${formatError(error)}`);
+    }
+  }
   if (sameFolder) {
     if (runtime) {
       void vscode.window.showInformationMessage('This Pair Notebook project is already open.');
@@ -1376,14 +1413,37 @@ async function forgetWorkspaceSession(
   if (removeLegacy) await context.secrets.delete(legacySecretKey(descriptor.sessionId));
 }
 
-async function rememberProject(context: vscode.ExtensionContext, descriptor: SessionDescriptor): Promise<void> {
+interface RememberProjectOptions {
+  pinnedHostId?: string | undefined;
+  requireReconnectable?: boolean | undefined;
+}
+
+async function rememberProject(
+  context: vscode.ExtensionContext,
+  descriptor: SessionDescriptor,
+  options: RememberProjectOptions = {},
+): Promise<void> {
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+  const reconnect = reconnectIdentityFromDescriptor(descriptor, options.pinnedHostId ?? descriptor.hostPeerId);
+  if (options.requireReconnectable && !reconnect) {
+    throw new Error('The guest marker does not contain a valid authenticated pinned host identity.');
+  }
   const next = rememberRecentProject(recent, {
     name: descriptor.projectName,
     workingFolder: descriptor.workingFolder,
     at: Date.now(),
+    ...(reconnect ? { reconnect } : {}),
   });
   await context.globalState.update('pairNotebook.recent', next);
+}
+
+async function forgetEndedSession(
+  context: vscode.ExtensionContext,
+  descriptor: SessionDescriptor,
+): Promise<void> {
+  await forgetWorkspaceSession(context, descriptor, true);
+  const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+  await context.globalState.update('pairNotebook.recent', forgetRecentProject(recent, descriptor.workingFolder));
 }
 
 function displayName(): string {

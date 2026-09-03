@@ -91,6 +91,7 @@ import {
   validateIncomingTransfer,
 } from '../core/transfer';
 import {
+  LOGICAL_PEER_RECOVERY_MS,
   MeshMetrics,
   MeshTransport,
   RouteUpgradeState,
@@ -746,6 +747,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     ), 2_000));
   }
 
+  public terminalLifecycle(): SessionTerminalLifecycle | undefined {
+    return this.terminalLifecycleEvent ? { ...this.terminalLifecycleEvent } : undefined;
+  }
+
   public snapshot(): SessionSnapshot {
     const states: PresenceState[] = [];
     for (const value of this.awareness.getStates().values()) {
@@ -889,24 +894,33 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async reconnect(): Promise<SignallingRefreshResult> {
     const selfId = this.descriptor.localPeer.peerId;
-    const candidates = new Map<string, PeerIdentity>();
-    for (const peer of this.descriptor.knownPeers ?? []) {
-      if (peer.peerId !== selfId) candidates.set(peer.peerId, peer);
+    let reconnectHost: PeerIdentity | undefined;
+    if (this.descriptor.role === 'peer') {
+      const hostId = this.coordinator.clock.hostId;
+      if (hostId !== this.descriptor.hostPeerId || hostId === selfId) {
+        throw new Error('Reconnect refused because the pinned original host identity changed locally.');
+      }
+      reconnectHost = resolveHostIdentity(this.descriptor, hostId);
+      if (validateIdentityPublicKey(reconnectHost.identityKey)) {
+        throw new Error('Reconnect requires the authenticated public identity of the pinned original host.');
+      }
+      // A guest reconnect targets only the pinned logical host. Other remembered
+      // participants cannot substitute for it and reconnect itself never elects.
+      this.transport.connect(reconnectHost);
+    } else {
+      for (const peer of this.descriptor.knownPeers ?? []) {
+        if (peer.peerId !== selfId) this.transport.connect(peer);
+      }
     }
-    if (this.coordinator.clock.hostId !== selfId) {
-      const host = resolveHostIdentity(this.descriptor, this.coordinator.clock.hostId);
-      candidates.set(host.peerId, host);
-    }
-    // Reconnect to every remembered participant without changing authority.
-    // Only an authenticated transfer announcement from the current host can
-    // ever replace the session host.
-    for (const peer of candidates.values()) this.transport.connect(peer);
     const refreshed = await this.transport.refreshSignalling();
+    if (reconnectHost) {
+      await this.waitForTransportRoute(reconnectHost.peerId, LOGICAL_PEER_RECOVERY_MS);
+    }
     this.log.appendLine(
-      `[debug] Manual reconnect completed with ${refreshed.status}: `
+      `[debug] Manual reconnect completed for session ${this.descriptor.sessionId} with ${refreshed.status}: `
       + `${refreshed.nostr.verifiedEndpoints}/${refreshed.nostr.requestedSockets} Nostr and `
       + `${refreshed.mqtt.verifiedEndpoints}/${refreshed.mqtt.requestedSockets} MQTT endpoints verified; `
-      + 'authenticated data routes were retained.',
+      + (reconnectHost ? `pinned host ${reconnectHost.peerId} authenticated route is available.` : 'authenticated data routes were retained.'),
     );
     this.emit('connectionUpdated', { kind: 'manual-reconnect', ...refreshed });
     return refreshed;
