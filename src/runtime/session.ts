@@ -99,6 +99,8 @@ import {
   type SignallingRefreshResult,
 } from './mesh';
 
+export type SessionCloseReason = 'host-unreachable' | 'local-route-failed' | 'explicit-leave' | 'session-ended';
+
 export interface PresenceState {
   peer: PeerIdentity;
   activeFile?: string | undefined;
@@ -479,6 +481,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private activeExecutions = 0;
   private computeEpoch = 0;
   private closed = false;
+  private closeReason: SessionCloseReason = 'explicit-leave';
   private endingSession = false;
   private terminationCheckInFlight = false;
   private lastDisplayNameWarning = '';
@@ -1648,7 +1651,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async leave(): Promise<void> {
     if (this.closed) return;
-    await this.disposeAsync();
+    await this.disposeAsync('explicit-leave');
   }
 
   /** Saves the authoritative copy and closes the session for every participant. */
@@ -1679,7 +1682,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       } catch (error) {
         this.log.appendLine(`[debug] Session-end notification drain: ${formatError(error)}`);
       }
-      await this.disposeAsync();
+      await this.disposeAsync('session-ended');
     } catch (error) {
       this.endingSession = false;
       this.transport.broadcast('sessionEndingCancelled', {});
@@ -1716,12 +1719,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public dispose(): void {
-    this.runBackground('Session shutdown', () => this.disposeAsync());
+    this.runBackground('Session shutdown', () => this.disposeAsync('explicit-leave'));
   }
 
-  private async disposeAsync(): Promise<void> {
+  private async disposeAsync(reason: SessionCloseReason = this.closeReason): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.closeReason = reason;
+    this.log.appendLine(`[lifecycle] session closing: ${reason}`);
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
     if (this.workingCopyFallbackTimer) clearTimeout(this.workingCopyFallbackTimer);
@@ -1819,7 +1824,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await step(() => this.awareness.destroy());
     await step(() => this.removeTransferDirectory());
     await step(() => vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', false));
-    this.emit('closed');
+    this.emit('closed', this.closeReason);
     for (const failure of failures) {
       this.log.appendLine(`[error] Session shutdown step failed: ${formatError(failure)}`);
     }
@@ -2285,7 +2290,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             this.log.appendLine(`[debug] Could not persist the local session-end marker: ${formatError(error)}`);
           }
           this.emit('sessionEnded', endedBy, 'explicit-end');
-          await this.disposeAsync();
+          await this.disposeAsync('session-ended');
           break;
         }
         case 'snapshotCheckpointAck':
@@ -3088,13 +3093,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     this.coordinator.evaluate();
     if (this.coordinator.closed && !this.closed) {
-      this.runBackground('Host-loss notification', () => vscode.window.showErrorMessage(
-        'Pair Notebook could not restore the host connection. The active session was closed; reopen it from Recent Projects to try again.',
-      ));
       const host = this.transport.peerRuntime().find((peer) => peer.peerId === this.coordinator.clock.hostId)
         ?? (this.descriptor.knownPeers ?? []).find((peer) => peer.peerId === this.coordinator.clock.hostId);
       if (host) this.emit('sessionEnded', host, 'host-lost');
-      this.runBackground('Host-only session shutdown', () => this.disposeAsync());
+      this.runBackground('Host-only session shutdown', () => this.disposeAsync('host-unreachable'));
     }
   }
 
@@ -3113,7 +3115,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           displayName: termination.endedByDisplayName,
         };
       this.emit('sessionEnded', endedBy, 'explicit-end');
-      await this.disposeAsync();
+      await this.disposeAsync('session-ended');
       return true;
     } catch (error) {
       this.log.appendLine(`[debug] Could not check the shared session-end marker: ${formatError(error)}`);

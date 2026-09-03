@@ -37,7 +37,7 @@ import {
 import { SnapshotBootstrapError, downloadProjectSnapshot } from './runtime/bootstrap';
 import { configureMeshNetwork } from './runtime/mesh';
 import { EXPLICIT_PROXY_PASSWORD_ERROR, inspectExplicitProxyPassword } from './runtime/proxy';
-import { BackingFolderMismatchError, SessionRuntime } from './runtime/session';
+import { BackingFolderMismatchError, SessionCloseReason, SessionRuntime } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
@@ -471,7 +471,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     runtime.on('networkChanged', () => {
       queueAutomaticNetworkRecovery(context, 'Network interface route changed');
     });
-    runtime.on('closed', () => {
+    runtime.on('closed', (reason: SessionCloseReason = 'explicit-leave') => {
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
       synchronizer?.dispose();
@@ -483,6 +483,18 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       runtime = undefined;
       dashboard.setRuntime(undefined);
       status.hide();
+      if (reason === 'host-unreachable' || reason === 'session-ended') {
+        runUiBackground('Close ended Pair Notebook editors', async () => {
+          await closeSessionTabs(descriptor.workingFolder);
+          if (reason !== 'host-unreachable') return;
+          await rememberProject(context, descriptor);
+          const choice = await vscode.window.showWarningMessage(
+            'Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. Совместные файлы закрыты; сессию можно повторить из Recent Projects.',
+            'Open Recent Projects',
+          );
+          if (choice === 'Open Recent Projects') void vscode.commands.executeCommand('pairNotebook.openRecentProject');
+        });
+      }
     });
     startStatusUpdates();
     const restored = runtime.snapshot();
@@ -520,6 +532,33 @@ async function leaveSession(): Promise<void> {
   if (answer !== 'Leave Session') return;
   await active.leave();
   await forgetWorkspaceSession(requireActivationContext(), active.descriptor);
+}
+
+/** Closes only editor tabs backed by this session's isolated working copy. */
+async function closeSessionTabs(workingFolder: string): Promise<void> {
+  const tabGroups = (vscode.window as unknown as { tabGroups?: vscode.TabGroups }).tabGroups;
+  if (!tabGroups) return;
+  const root = path.resolve(workingFolder);
+  const tabs = tabGroups.all.flatMap((group) => group.tabs).filter((tab) =>
+    tabInputUris(tab.input).some((uri) => isWithinWorkingCopy(root, uri)));
+  if (tabs.length) await tabGroups.close(tabs, true);
+}
+
+function tabInputUris(input: unknown): vscode.Uri[] {
+  if (!input || typeof input !== 'object') return [];
+  const record = input as Record<string, unknown>;
+  return [record.uri, record.original, record.modified]
+    .filter((value): value is vscode.Uri => Boolean(value)
+      && typeof value === 'object'
+      && typeof (value as vscode.Uri).fsPath === 'string');
+}
+
+function isWithinWorkingCopy(root: string, uri: vscode.Uri): boolean {
+  if (uri.scheme !== 'file') return false;
+  const relative = path.relative(root, uri.fsPath);
+  return relative === '' || (relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative));
 }
 
 async function endSession(): Promise<void> {

@@ -470,17 +470,20 @@ describe('production SessionRuntime integration', () => {
     }), token, context(extensionRoot), logger());
     let peerB: any;
     let peerC: any;
+    const closeReasons = new Map<string, string>();
     try {
       await host.start();
       peerB = new SessionRuntime(descriptor({
         sessionId, role: 'peer', peerId: 'peer-b', hostPeerId: 'host', workingFolder: folders[1]!,
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
+      peerB.once('closed', (reason: string) => closeReasons.set('peer-b', reason));
       await peerB.start();
       peerC = new SessionRuntime(descriptor({
         sessionId, role: 'peer', peerId: 'peer-c', hostPeerId: 'host', workingFolder: folders[2]!,
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
+      peerC.once('closed', (reason: string) => closeReasons.set('peer-c', reason));
       await peerC.start();
       useFastLogicalRecovery(peerB, peerC);
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
@@ -494,6 +497,8 @@ describe('production SessionRuntime integration', () => {
         assert.equal(peer.snapshot().descriptor.role, 'peer');
         assert.equal(peer.snapshot().waitingForHostFolder, false);
       }
+      assert.equal(closeReasons.get('peer-b'), 'host-unreachable');
+      assert.equal(closeReasons.get('peer-c'), 'host-unreachable');
     } finally {
       for (const runtime of [host, peerB, peerC].filter(Boolean)) runtime.descriptor.mode = 'host-only';
       await Promise.allSettled([host.leave(), peerB?.leave?.(), peerC?.leave?.()]);
