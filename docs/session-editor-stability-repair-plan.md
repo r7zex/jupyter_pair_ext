@@ -17,7 +17,7 @@ Status: in progress. Each completed checkpoint is tested, committed, and pushed 
 - [x] **2. Deterministic guest termination.** Emit one close reason, persist the reconnectable recent session, clear collaboration state, notify the user, and close only tabs under the isolated Pair working copy.
 - [x] **3. Targeted notebook synchronization.** Apply structural, text, metadata, output, and execution changes independently; preserve viewport/selection; coalesce output updates; eliminate background editor saves.
 - [x] **4. Fast host-only execution.** Send a cell request directly to the pinned host without the normal full-project barrier, retain legacy barrier compatibility, and preserve output/event idempotency.
-- [ ] **5. Line presence.** Publish and render the active line rather than offsets, throttle semantic changes, and clear invalid focus/cell state instead of falling back to line one.
+- [x] **5. Line presence.** Publish and render the active line rather than offsets; invalid focus/cell state is omitted instead of falling back to line one.
 - [ ] **6. Evidence and release hygiene.** Add lifecycle diagnostics and regression coverage, run the package-quality checks, and keep the work source-only without a version/tag/release change.
 
 ## Acceptance scenarios

@@ -24,7 +24,6 @@ import {
 import {
   ResolvedCursorPosition,
   SharedCursorPosition,
-  createSharedCursorPosition,
   resolveSharedCursorPosition,
 } from '../core/cursorPosition';
 import {
@@ -106,6 +105,8 @@ export interface PresenceState {
   activeFile?: string | undefined;
   activeNotebookCell?: number | undefined;
   activeNotebookCellId?: string | undefined;
+  /** Line-only presence avoids unstable cursor offsets during notebook edits. */
+  activeLine?: number | undefined;
   cursor?: SharedCursorPosition | undefined;
   shareCursor: boolean;
   cursorColor: string;
@@ -3165,7 +3166,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     let activeFile: string | undefined;
     let activeNotebookCell: number | undefined;
     let activeNotebookCellId: string | undefined;
-    let cursor: PresenceState['cursor'];
+    let activeLine: number | undefined;
     if (activeNotebook) {
       activeFile = this.relativeKey(activeNotebook.notebook.uri);
       const selectedIndex = activeNotebook.selection.start;
@@ -3183,24 +3184,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         activeNotebookCellId = this.notebookCellId(selectedCell);
       }
       if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString() && shareCursor) {
-        const anchor = activeText.document.offsetAt(activeText.selection.anchor);
-        const active = activeText.document.offsetAt(activeText.selection.active);
-        cursor = createSharedCursorPosition(
-          activeFile ? this.presenceText(activeFile, activeNotebookCellId) : undefined,
-          anchor,
-          active,
-        );
+        activeLine = lineFromSelection(activeText.selection.active);
       }
     } else if (activeText) {
       activeFile = this.relativeKey(activeText.document.uri);
       if (shareCursor) {
-        const anchor = activeText.document.offsetAt(activeText.selection.anchor);
-        const active = activeText.document.offsetAt(activeText.selection.active);
-        cursor = createSharedCursorPosition(
-          activeFile ? this.presenceText(activeFile) : undefined,
-          anchor,
-          active,
-        );
+        activeLine = lineFromSelection(activeText.selection.active);
       }
     }
     this.awareness.setLocalState({
@@ -3208,7 +3197,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       activeFile,
       activeNotebookCell,
       activeNotebookCellId,
-      cursor,
+      activeLine,
       shareCursor,
       cursorColor,
       typing: false,
@@ -5429,6 +5418,12 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function lineFromSelection(position: unknown): number | undefined {
+  if (!position || typeof position !== 'object') return undefined;
+  const line = (position as { line?: unknown }).line;
+  return typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : undefined;
 }
 
 function formatError(error: unknown): string {

@@ -120,7 +120,7 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
         displayName: state.peer.displayName,
         activeFile: state.activeFile,
         activeNotebookCellId: state.activeNotebookCellId,
-        cursor: state.cursor,
+        activeLine: state.activeLine,
         cursorColor: this.colorFor(state.peer.peerId, state.cursorColor),
         showName: this.showName(state.peer.peerId),
       }))
@@ -139,22 +139,19 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
       const location = this.editorLocation(editor);
       if (!location) continue;
       for (const state of visibleStates) {
-        if (state.activeFile !== location.key || !state.cursor) continue;
+        if (state.activeFile !== location.key || state.activeLine === undefined) continue;
         if (location.cellId !== undefined && state.activeNotebookCellId !== location.cellId) continue;
         if (location.cellId === undefined && state.activeNotebookCellId !== undefined) continue;
-        const cursor = this.runtime.resolvePresenceCursor(state);
-        if (!cursor) continue;
         const color = this.colorFor(state.peer.peerId, state.cursorColor);
         const decoration = this.decorationFor(state.peer.peerId, color);
-        const maximum = editor.document.getText().length;
-        const anchor = Math.min(cursor.anchor, maximum);
-        const active = Math.min(cursor.active, maximum);
-        const start = editor.document.positionAt(Math.min(anchor, active));
-        const end = editor.document.positionAt(Math.max(anchor, active));
+        const line = Math.min(Math.max(0, state.activeLine), Math.max(0, editor.document.lineCount - 1));
+        const textLine = editor.document.lineAt(line);
+        const start = textLine.range.start;
+        const end = textLine.range.end;
         const showName = this.showName(state.peer.peerId);
         const option: vscode.DecorationOptions = {
           range: new vscode.Range(start, end),
-          hoverMessage: showName ? `${state.peer.displayName} is editing here` : 'A collaborator is editing here',
+          hoverMessage: showName ? `${state.peer.displayName} is editing this line` : 'A collaborator is editing this line',
           ...(showName ? {
             renderOptions: {
               after: {
@@ -207,7 +204,7 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
     return this.runtime.snapshot().awareness.filter((state) =>
       state.peer.peerId !== this.runtime.descriptor.localPeer.peerId
       && state.shareCursor !== false
-      && Boolean(state.cursor)
+      && state.activeLine !== undefined
       && !hidden.has(state.peer.peerId));
   }
 
