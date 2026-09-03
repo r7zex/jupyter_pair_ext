@@ -1126,6 +1126,120 @@ describe('runtime repair invariants', () => {
 });
 
 
+describe('remote NotebookController rendering', () => {
+  it('renders outputs, running state and success without recreating the cell', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('remote-render-success');
+    const cell = fakeCell('remote', notebook);
+    cell.outputs = [];
+    cell.executionSummary = undefined;
+    const sameCell = cell;
+    const output = new fakeVscode.NotebookCellOutput([
+      fakeVscode.NotebookCellOutputItem.text('REMOTE OUTPUT'),
+    ], { outputType: 'display_data' });
+
+    try {
+      await pairController.renderRemoteCellState(cell, {
+        outputs: [output],
+        execution: { executionOrder: 7 },
+        outputsChanged: true,
+        executionChanged: true,
+        executionMode: 'live',
+      });
+      const running = fakeVscode.__executions.at(-1);
+      assert.equal(running.cell, sameCell);
+      assert.equal(running.started, true);
+      assert.equal(running.ended, false);
+      assert.equal(running.executionOrder, 7);
+      assert.equal(cell.outputs.length, 1);
+      assert.equal(cell.executionSummary?.executionOrder, 7);
+      assert.equal(cell.executionSummary?.success, undefined);
+
+      await pairController.renderRemoteCellState(cell, {
+        outputs: [output],
+        execution: { executionOrder: 7, success: true },
+        outputsChanged: false,
+        executionChanged: true,
+        executionMode: 'live',
+      });
+      assert.equal(running.ended, true);
+      assert.equal(running.endSuccess, true);
+      assert.equal(cell.executionSummary?.success, true);
+      assert.equal(cell, sameCell);
+    } finally {
+      pairController.dispose();
+    }
+  });
+
+  it('restores final timing when timestamps are available before start', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('remote-render-timing');
+    const cell = fakeCell('timed', notebook);
+    cell.outputs = [];
+    cell.executionSummary = undefined;
+    try {
+      await pairController.renderRemoteCellState(cell, {
+        outputs: [],
+        execution: {
+          executionOrder: 3,
+          success: true,
+          timing: { startTime: 100, endTime: 250 },
+        },
+        outputsChanged: false,
+        executionChanged: true,
+        executionMode: 'snapshot',
+      });
+      const execution = fakeVscode.__executions.at(-1);
+      assert.equal(execution.startTime, 100);
+      assert.equal(execution.endTime, 250);
+      assert.deepEqual(cell.executionSummary?.timing, { startTime: 100, endTime: 250 });
+    } finally {
+      pairController.dispose();
+    }
+  });
+
+  it('maps remote failure and historical order-only state without leaving an active execution', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('remote-render-failure');
+    const failed = fakeCell('failed', notebook);
+    failed.outputs = [];
+    failed.executionSummary = undefined;
+    const historical = fakeCell('historical', notebook);
+    historical.outputs = [];
+    historical.executionSummary = undefined;
+    try {
+      await pairController.renderRemoteCellState(failed, {
+        outputs: [],
+        execution: { executionOrder: 8, success: false },
+        outputsChanged: false,
+        executionChanged: true,
+        executionMode: 'live',
+      });
+      const failureExecution = fakeVscode.__executions.at(-1);
+      assert.equal(failureExecution.endSuccess, false);
+      assert.equal(failed.executionSummary?.success, false);
+
+      const output = new fakeVscode.NotebookCellOutput([
+        fakeVscode.NotebookCellOutputItem.text('HISTORICAL OUTPUT'),
+      ]);
+      await pairController.renderRemoteCellState(historical, {
+        outputs: [output],
+        execution: { executionOrder: 2 },
+        outputsChanged: true,
+        executionChanged: true,
+        executionMode: 'snapshot',
+      });
+      const historicalExecution = fakeVscode.__executions.at(-1);
+      assert.equal(historical.outputs.length, 1);
+      assert.equal(historicalExecution.ended, true);
+      assert.equal(historicalExecution.endSuccess, undefined);
+      assert.equal(historical.executionSummary?.executionOrder, 2);
+    } finally {
+      pairController.dispose();
+    }
+  });
+});
+
 describe('compute and lifecycle regression coverage', () => {
   it('accepts a host PythonEnvironment by executable and permits a CUDA-ready non-default environment', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-env-selection-'));
@@ -2920,11 +3034,43 @@ function createVscodeBoundary(): any {
           createNotebookCellExecution: (cell: any) => {
             const execution: any = {
               cell, outputs: [],
-              start: () => undefined,
-              end: () => undefined,
-              clearOutput: async () => { execution.outputs = []; },
-              appendOutput: async (output: any) => { execution.outputs.push(...(Array.isArray(output) ? output : [output])); },
-              replaceOutput: async (output: any) => { execution.outputs = Array.isArray(output) ? [...output] : [output]; },
+              started: false,
+              ended: false,
+              startTime: undefined,
+              endTime: undefined,
+              endSuccess: undefined,
+              start: (startTime?: number) => {
+                execution.started = true;
+                execution.startTime = startTime;
+                cell.executionSummary = {
+                  executionOrder: execution.executionOrder,
+                  success: undefined,
+                };
+              },
+              end: (success?: boolean, endTime?: number) => {
+                execution.ended = true;
+                execution.endSuccess = success;
+                execution.endTime = endTime;
+                cell.executionSummary = {
+                  executionOrder: execution.executionOrder,
+                  success,
+                  ...(execution.startTime !== undefined && endTime !== undefined
+                    ? { timing: { startTime: execution.startTime, endTime } } : {}),
+                };
+              },
+              clearOutput: async () => {
+                execution.outputs = [];
+                cell.outputs = [];
+              },
+              appendOutput: async (output: any) => {
+                const values = Array.isArray(output) ? output : [output];
+                execution.outputs.push(...values);
+                cell.outputs = [...(cell.outputs ?? []), ...values];
+              },
+              replaceOutput: async (output: any) => {
+                execution.outputs = Array.isArray(output) ? [...output] : [output];
+                cell.outputs = [...execution.outputs];
+              },
               replaceOutputItems: async (items: any[], output: any) => { output.items = [...items]; },
               executionOrder: undefined,
             };

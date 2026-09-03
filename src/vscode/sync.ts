@@ -25,6 +25,18 @@ import { safeRelativePath } from '../core/persistence';
 import { classifyFile, normalizeNotebookMetadata, shouldTrackProjectPath } from '../core/projectFiles';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
 
+export interface NotebookCellRenderRequest {
+  outputs: readonly vscode.NotebookCellOutput[];
+  execution: CellExecutionSnapshot | undefined;
+  outputsChanged: boolean;
+  executionChanged: boolean;
+  executionMode: 'live' | 'snapshot';
+}
+
+export interface NotebookCellStateRenderer {
+  renderRemoteCellState(cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void>;
+}
+
 export class EditorSynchronizer implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly applyingText = new Set<string>();
@@ -43,6 +55,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly root: string,
     private readonly log: vscode.OutputChannel,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
+    private readonly cellStateRenderer?: NotebookCellStateRenderer,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
@@ -220,33 +233,35 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.notebookCellStateTimers.set(key, timer);
   }
 
-  private async applyNotebookCellState(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
+  private async applyNotebookCellState(
+    notebook: vscode.NotebookDocument,
+    key: string,
+    cellId: string,
+    executionMode: 'live' | 'snapshot' = 'live',
+  ): Promise<void> {
     const target = this.project.notebookCellSnapshot(key, cellId);
     const located = this.findNotebookCellByStableId(notebook, cellId);
     if (!target || !located) return;
-    const { cell: current, index } = located;
+    const current = located.cell;
     const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
     const executionChanged = !sameJson(executionFromCell(current), target.execution);
     if (!outputsChanged && !executionChanged) return;
+    if (!this.cellStateRenderer) {
+      this.log.appendLine(
+        `[error] Cannot render notebook outputs/execution for ${key} cell ${cellId}: NotebookController renderer is unavailable.`,
+      );
+      return;
+    }
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
-      const edit = new vscode.WorkspaceEdit();
-      // VS Code exposes no direct NotebookEdit for outputs/execution. Replacing
-      // this one cell is the narrowest public API. Preserve source, metadata,
-      // kind and language from the current editor so these scopes cannot
-      // incidentally mutate unrelated cell fields.
-      edit.set(notebook.uri, [vscode.NotebookEdit.replaceCells(
-        new vscode.NotebookRange(index, index + 1),
-        [toNotebookCellData({
-          ...target,
-          kind: current.kind,
-          language: current.document.languageId,
-          source: current.document.getText(),
-          metadata: stripCollaborationMetadata(current.metadata),
-        })],
-      )]);
-      if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook cell output update.');
+      await this.cellStateRenderer.renderRemoteCellState(current, {
+        outputs: target.outputs.map(toNotebookOutput),
+        execution: target.execution,
+        outputsChanged,
+        executionChanged,
+        executionMode,
+      });
     } finally {
       this.applyingNotebooks.delete(uri);
     }
@@ -302,6 +317,91 @@ export class EditorSynchronizer implements vscode.Disposable {
     return undefined;
   }
 
+  private remapStableCellIdsAfterStructure(notebook: vscode.NotebookDocument): void {
+    const seen = new Set<string>();
+    for (const cell of notebook.getCells()) {
+      const explicit = metadataCellId(cell.metadata);
+      if (!explicit || seen.has(explicit)) continue;
+      seen.add(explicit);
+      this.cellIds.seed(cell, explicit, explicit);
+    }
+  }
+
+  private captureStructuralEditorState(notebook: vscode.NotebookDocument): StructuralEditorState | undefined {
+    const editor = vscode.window.visibleNotebookEditors.find((candidate) => candidate.notebook === notebook);
+    if (!editor) return undefined;
+    const idAt = (index: number): string | undefined => {
+      if (index < 0 || index >= notebook.cellCount) return undefined;
+      const cell = notebook.cellAt(index);
+      return this.cellIds.knownId(cell, metadataCellId(cell.metadata));
+    };
+    const selectionIds = editor.selections.map((range) =>
+      notebook.getCells(range)
+        .map((cell) => this.cellIds.knownId(cell, metadataCellId(cell.metadata)))
+        .filter((id): id is string => Boolean(id)));
+    const primaryCellId = idAt(editor.selection.start);
+    const firstVisible = editor.visibleRanges[0];
+    const visibleAnchorId = firstVisible ? idAt(firstVisible.start) : undefined;
+
+    const activeTextEditor = vscode.window.activeTextEditor;
+    let textSelection: StructuralEditorState['textSelection'];
+    if (activeTextEditor) {
+      const cell = notebook.getCells().find((candidate) =>
+        candidate.document.uri.toString() === activeTextEditor.document.uri.toString());
+      const cellId = cell ? this.cellIds.knownId(cell, metadataCellId(cell.metadata)) : undefined;
+      if (cellId) textSelection = { cellId, selections: [...activeTextEditor.selections] };
+    }
+    return { editor, primaryCellId, selectionIds, visibleAnchorId, textSelection };
+  }
+
+  private restoreStructuralEditorState(
+    notebook: vscode.NotebookDocument,
+    state: StructuralEditorState | undefined,
+  ): void {
+    if (!state) return;
+    const primary = state.primaryCellId
+      ? this.findNotebookCellByStableId(notebook, state.primaryCellId)
+      : undefined;
+
+    // If the selected stable cell was deleted, do not fabricate a fallback
+    // cell or line 0. Leave VS Code's post-edit selection untouched.
+    if (primary) {
+      const restoredSelections = state.selectionIds
+        .map((ids) => ids
+          .map((id) => this.findNotebookCellByStableId(notebook, id)?.index)
+          .filter((index): index is number => index !== undefined))
+        .filter((indexes) => indexes.length > 0)
+        .map((indexes) => new vscode.NotebookRange(Math.min(...indexes), Math.max(...indexes) + 1));
+      if (restoredSelections.length) state.editor.selections = restoredSelections;
+    }
+
+    if (state.textSelection) {
+      const target = this.findNotebookCellByStableId(notebook, state.textSelection.cellId);
+      if (target) {
+        const textEditor = vscode.window.visibleTextEditors.find((candidate) =>
+          candidate.document.uri.toString() === target.cell.document.uri.toString());
+        if (textEditor) textEditor.selections = state.textSelection.selections;
+      }
+    }
+
+    if (state.visibleAnchorId) {
+      const anchor = this.findNotebookCellByStableId(notebook, state.visibleAnchorId);
+      if (anchor) {
+        const alreadyVisible = state.editor.visibleRanges.some((range) =>
+          anchor.index >= range.start && anchor.index < range.end);
+        if (!alreadyVisible) {
+          // VS Code 1.95 exposes visibleRanges as read-only. Exact pixel scroll
+          // offset cannot be restored through stable API; revealRange is the
+          // supported best-effort restoration primitive.
+          state.editor.revealRange(
+            new vscode.NotebookRange(anchor.index, anchor.index + 1),
+            vscode.NotebookEditorRevealType.AtTop,
+          );
+        }
+      }
+    }
+  }
+
   private async applyStructuralRecoveryIfNeeded(
     notebook: vscode.NotebookDocument,
     key: string,
@@ -330,7 +430,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       if (!located) continue;
       await this.applyText(located.cell.document, target.source);
       await this.applyNotebookCellMetadata(notebook, key, target.id);
-      await this.applyNotebookCellState(notebook, key, target.id);
+      await this.applyNotebookCellState(notebook, key, target.id, 'snapshot');
     }
     await this.applyNotebookMetadata(notebook, key);
   }
@@ -587,16 +687,22 @@ export class EditorSynchronizer implements vscode.Disposable {
       language: cell.document.languageId,
     }));
     const splice = minimalNotebookSplice(currentStructure, snapshot.cells);
+    const structuralEditorState = splice ? this.captureStructuralEditorState(notebook) : undefined;
+    let structureApplied = false;
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
       if (splice) {
         const edit = new vscode.WorkspaceEdit();
+        // The only normal production replaceCells call. The range is the
+        // minimal structural splice computed from stable logical cell IDs.
         edit.set(notebook.uri, [vscode.NotebookEdit.replaceCells(
           new vscode.NotebookRange(splice.start, splice.start + splice.deleteCount),
           splice.cells.map(toNotebookCellData),
         )]);
         if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook structure.');
+        this.remapStableCellIdsAfterStructure(notebook);
+        structureApplied = true;
       }
 
       for (const target of snapshot.cells) {
@@ -604,23 +710,34 @@ export class EditorSynchronizer implements vscode.Disposable {
         if (!located) continue;
         await this.applyText(located.cell.document, target.source);
       }
+
       const notebookEdits: vscode.NotebookEdit[] = [];
+      const stateRenders: Array<{ cell: vscode.NotebookCell; request: NotebookCellRenderRequest }> = [];
       for (const target of snapshot.cells) {
         const located = this.findNotebookCellByStableId(notebook, target.id);
         if (!located) continue;
         const current = located.cell;
         const desiredMetadata = { ...canonicalJsonObject(target.metadata), pairNotebookCellId: target.id };
-        const outputChanged = !sameJson(outputsFromCell(current), target.outputs);
+        const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
         const executionChanged = !sameJson(executionFromCell(current), target.execution);
-        if (outputChanged || executionChanged) {
-          notebookEdits.push(vscode.NotebookEdit.replaceCells(
-            new vscode.NotebookRange(located.index, located.index + 1),
-            [toNotebookCellData(target)],
-          ));
-        } else if (!sameJson(current.metadata, desiredMetadata)) {
+
+        if (!sameJson(current.metadata, desiredMetadata)) {
           notebookEdits.push(vscode.NotebookEdit.updateCellMetadata(located.index, desiredMetadata));
         }
+        if (outputsChanged || executionChanged) {
+          stateRenders.push({
+            cell: current,
+            request: {
+              outputs: target.outputs.map(toNotebookOutput),
+              execution: target.execution,
+              outputsChanged,
+              executionChanged,
+              executionMode: 'snapshot',
+            },
+          });
+        }
       }
+
       const currentMetadata = normalizeNotebookMetadata(notebook.metadata);
       if (!sameJson(currentMetadata, normalizeNotebookMetadata(snapshot.metadata))) {
         notebookEdits.push(vscode.NotebookEdit.updateNotebookMetadata(
@@ -630,10 +747,26 @@ export class EditorSynchronizer implements vscode.Disposable {
       if (notebookEdits.length) {
         const edit = new vscode.WorkspaceEdit();
         edit.set(notebook.uri, notebookEdits);
-        if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook metadata/output update.');
+        if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook metadata update.');
+      }
+
+      if (stateRenders.length) {
+        if (!this.cellStateRenderer) {
+          this.log.appendLine(
+            `[error] Cannot render ${stateRenders.length} notebook output/execution state update(s): NotebookController renderer is unavailable.`,
+          );
+        } else {
+          for (const state of stateRenders) {
+            await this.cellStateRenderer.renderRemoteCellState(state.cell, state.request);
+          }
+        }
       }
     } finally {
-      this.applyingNotebooks.delete(uri);
+      try {
+        if (structureApplied) this.restoreStructuralEditorState(notebook, structuralEditorState);
+      } finally {
+        this.applyingNotebooks.delete(uri);
+      }
     }
   }
 
@@ -738,6 +871,17 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+}
+
+interface StructuralEditorState {
+  editor: vscode.NotebookEditor;
+  primaryCellId: string | undefined;
+  selectionIds: string[][];
+  visibleAnchorId: string | undefined;
+  textSelection: {
+    cellId: string;
+    selections: readonly vscode.Selection[];
+  } | undefined;
 }
 
 function canonicalJsonObject(value: Record<string, unknown>): Record<string, unknown> {

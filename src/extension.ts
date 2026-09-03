@@ -434,6 +434,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       descriptor.workingFolder,
       output,
       runtime.notebookCellIds,
+      notebookController,
     );
     runtime.setWorkingCopyWriter(
       (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),

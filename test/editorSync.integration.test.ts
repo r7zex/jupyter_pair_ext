@@ -57,7 +57,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);
     vscodeBoundary.__reset(notebook);
     const local = new CollaborativeProject();
-    const synchronizer = new EditorSynchronizer(local, root, logger());
+    const synchronizer = new EditorSynchronizer(local, root, logger(), undefined, fakeCellStateRenderer());
     const remote = new CollaborativeProject();
     try {
       await waitFor(() => local.has('work.ipynb'), 1000, 'initial notebook bind');
@@ -104,9 +104,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
         timing: { startTime: 100, endTime: 200 },
       });
       const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
-      assert.equal(replacements.length, 1, 'output and execution updates coalesce into one targeted cell replacement');
-      assert.equal(replacements[0].range.start, 2);
-      assert.equal(replacements[0].range.end, 3);
+      assert.equal(replacements.length, 0, 'output/execution rendering must never replace the cell');
     } finally {
       synchronizer.dispose();
       local.destroy();
@@ -252,6 +250,270 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       assert.equal(fullSnapshotCalls, 0);
       assert.equal(vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length, 0);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('applies an outputs-only remote update through the renderer with zero replaceCells and no neighbor mutation', async () => {
+    const root = path.resolve('/tmp/pair-editor-output-only');
+    const target = fakeCell('TARGET', 'target');
+    target.metadata = { pairNotebookCellId: 'target', owner: 'keep' };
+    const neighbor = fakeCell('NEIGHBOR', 'neighbor');
+    neighbor.outputs = [{ metadata: { keep: true }, items: [] }];
+    const neighborOutputs = neighbor.outputs;
+    const neighborSummary = { executionOrder: 12, success: true };
+    neighbor.executionSummary = neighborSummary;
+    const notebook = fakeNotebook(root, [target, neighbor]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const targetSource = target.document.getText();
+      const targetMetadata = { ...target.metadata };
+      vscodeBoundary.__notebookEdits = [];
+
+      project.setCellOutputs('work.ipynb', 'target', [{
+        metadata: { outputType: 'stream' },
+        items: [{ mime: 'text/plain', dataBase64: Buffer.from('REMOTE OUT').toString('base64') }],
+      }], REMOTE_ORIGIN);
+
+      await waitFor(() => target.outputs.length === 1, 1000, 'outputs-only renderer');
+      assert.equal(
+        vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length,
+        0,
+      );
+      assert.equal(target.document.getText(), targetSource);
+      assert.deepEqual(target.metadata, targetMetadata);
+      assert.equal(
+        Buffer.from(target.outputs[0].items[0].data).toString('utf8'),
+        'REMOTE OUT',
+      );
+      assert.equal(neighbor.outputs, neighborOutputs);
+      assert.equal(neighbor.executionSummary, neighborSummary);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('applies an execution-only remote update through the renderer with zero replaceCells and no neighbor mutation', async () => {
+    const root = path.resolve('/tmp/pair-editor-execution-only');
+    const target = fakeCell('TARGET', 'target');
+    const targetOutputs = [{ metadata: { keep: true }, items: [] }];
+    target.outputs = targetOutputs;
+    const neighbor = fakeCell('NEIGHBOR', 'neighbor');
+    const neighborMetadata = { ...neighbor.metadata };
+    const neighborOutputs = [{ metadata: { neighbor: true }, items: [] }];
+    neighbor.outputs = neighborOutputs;
+    const notebook = fakeNotebook(root, [target, neighbor]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const targetSource = target.document.getText();
+      const targetMetadata = { ...target.metadata };
+      vscodeBoundary.__notebookEdits = [];
+
+      project.setCellExecution('work.ipynb', 'target', {
+        executionOrder: 5,
+        success: true,
+      }, REMOTE_ORIGIN);
+
+      await waitFor(() => target.executionSummary?.success === true, 1000, 'execution-only renderer');
+      assert.equal(
+        vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells').length,
+        0,
+      );
+      assert.equal(target.document.getText(), targetSource);
+      assert.deepEqual(target.metadata, targetMetadata);
+      assert.equal(target.outputs, targetOutputs);
+      assert.deepEqual(target.executionSummary, {
+        executionOrder: 5,
+        success: true,
+        timing: undefined,
+      });
+      assert.deepEqual(neighbor.metadata, neighborMetadata);
+      assert.equal(neighbor.outputs, neighborOutputs);
+      assert.equal(neighbor.executionSummary, undefined);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('uses one minimal structural splice for insert and preserves unaffected cell identities', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-insert');
+    const a = fakeCell('A', 'a');
+    const b = fakeCell('B', 'b');
+    const notebook = fakeNotebook(root, [a, b]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      vscodeBoundary.__notebookEdits = [];
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [{ id: 'new', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] }, ...snapshot.cells],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.length === 3, 1000, 'structure insert');
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1);
+      assert.equal(replacements[0].range.start, 0);
+      assert.equal(replacements[0].range.end, 0);
+      assert.equal(replacements[0].cells.length, 1);
+      assert.equal(notebook.cells[1], a);
+      assert.equal(notebook.cells[2], b);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('uses one minimal structural splice for delete and preserves unaffected cell identities', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-delete');
+    const a = fakeCell('A', 'a');
+    const b = fakeCell('B', 'b');
+    const c = fakeCell('C', 'c');
+    const notebook = fakeNotebook(root, [a, b, c]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      vscodeBoundary.__notebookEdits = [];
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [snapshot.cells[0]!, snapshot.cells[2]!],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.length === 2, 1000, 'structure delete');
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1);
+      assert.equal(replacements[0].range.start, 1);
+      assert.equal(replacements[0].range.end, 2);
+      assert.equal(replacements[0].cells.length, 0);
+      assert.equal(notebook.cells[0], a);
+      assert.equal(notebook.cells[1], c);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('uses a bounded structural splice for reorder and preserves unaffected prefix/suffix identities', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-reorder');
+    const a = fakeCell('A', 'a');
+    const b = fakeCell('B', 'b');
+    const c = fakeCell('C', 'c');
+    const d = fakeCell('D', 'd');
+    const notebook = fakeNotebook(root, [a, b, c, d]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      vscodeBoundary.__notebookEdits = [];
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [snapshot.cells[0]!, snapshot.cells[2]!, snapshot.cells[1]!, snapshot.cells[3]!],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.map((cell: any) => cell.metadata.pairNotebookCellId).join(',') === 'a,c,b,d',
+        1000, 'structure reorder');
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1);
+      assert.equal(replacements[0].range.start, 1);
+      assert.equal(replacements[0].range.end, 3);
+      assert.equal(replacements[0].cells.length, 2);
+      assert.equal(notebook.cells[0], a);
+      assert.equal(notebook.cells[3], d);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('restores notebook/text selection and a stable viewport anchor after structural insert', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-ui');
+    const a = fakeCell('AAAA', 'a');
+    const b = fakeCell('BBBB', 'b');
+    const notebook = fakeNotebook(root, [a, b]);
+    vscodeBoundary.__reset(notebook);
+    const revealCalls: any[] = [];
+    const notebookEditor: any = {
+      notebook,
+      selection: new vscodeBoundary.NotebookRange(1, 2),
+      selections: [new vscodeBoundary.NotebookRange(1, 2)],
+      visibleRanges: [new vscodeBoundary.NotebookRange(1, 2)],
+      revealRange: (range: any, revealType: any) => {
+        revealCalls.push({ range, revealType });
+        notebookEditor.visibleRanges = [range];
+      },
+    };
+    const textSelection = { anchor: 2, active: 3 };
+    const textEditor: any = { document: b.document, selections: [textSelection] };
+    vscodeBoundary.window.activeNotebookEditor = notebookEditor;
+    vscodeBoundary.window.visibleNotebookEditors = [notebookEditor];
+    vscodeBoundary.window.activeTextEditor = textEditor;
+    vscodeBoundary.window.visibleTextEditors = [textEditor];
+
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [{ id: 'new', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] }, ...snapshot.cells],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.length === 3, 1000, 'structure UI restore');
+      assert.equal(notebook.cells[2], b);
+      assert.equal(notebookEditor.selections[0].start, 2);
+      assert.equal(notebookEditor.selections[0].end, 3);
+      assert.deepEqual(textEditor.selections, [textSelection]);
+      assert.equal(revealCalls.length, 1);
+      assert.equal(revealCalls[0].range.start, 2);
+      assert.equal(revealCalls[0].revealType, vscodeBoundary.NotebookEditorRevealType.AtTop);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('does not fabricate cell/line zero when the active stable cell is deleted', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-delete-active');
+    const a = fakeCell('A', 'a');
+    const b = fakeCell('B', 'b');
+    const notebook = fakeNotebook(root, [a, b]);
+    vscodeBoundary.__reset(notebook);
+    const originalSelections = [new vscodeBoundary.NotebookRange(1, 2)];
+    const notebookEditor: any = {
+      notebook,
+      selection: originalSelections[0],
+      selections: originalSelections,
+      visibleRanges: [new vscodeBoundary.NotebookRange(0, 2)],
+      revealRange: () => undefined,
+    };
+    vscodeBoundary.window.activeNotebookEditor = notebookEditor;
+    vscodeBoundary.window.visibleNotebookEditors = [notebookEditor];
+
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [snapshot.cells[0]!],
+      }, REMOTE_ORIGIN);
+      await waitFor(() => notebook.cells.length === 1, 1000, 'delete active cell');
+      assert.equal(notebookEditor.selections, originalSelections);
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -444,7 +706,9 @@ function fakeNotebook(root: string, cells: any[], relativePath = 'work.ipynb'): 
     metadata: { language_info: { name: 'python' } },
     saveCount: 0,
     get cellCount() { return this.cells.length; },
-    getCells() { return this.cells; },
+    getCells(range?: { start: number; end: number }) {
+      return range ? this.cells.slice(range.start, range.end) : this.cells;
+    },
     cellAt(index: number) { return this.cells[index]; },
     async save() { this.saveCount += 1; return true; },
   };
@@ -581,8 +845,13 @@ function createNotebookVscodeBoundary(): any {
       },
     },
     window: {
+      activeNotebookEditor: undefined as any,
+      activeTextEditor: undefined as any,
+      visibleNotebookEditors: [] as any[],
+      visibleTextEditors: [] as any[],
       showWarningMessage: async () => undefined,
     },
+    NotebookEditorRevealType: { Default: 0, InCenter: 1, InCenterIfOutsideViewport: 2, AtTop: 3 },
     __notebookEdits: [] as any[],
     __textEdits: [] as any[],
     __rejectEdits: false,
@@ -594,6 +863,10 @@ function createNotebookVscodeBoundary(): any {
       boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
+      boundary.window.activeNotebookEditor = undefined;
+      boundary.window.activeTextEditor = undefined;
+      boundary.window.visibleNotebookEditors = [];
+      boundary.window.visibleTextEditors = [];
     },
     __resetText: (document: any) => {
       boundary.workspace.notebookDocuments = [];
@@ -602,6 +875,10 @@ function createNotebookVscodeBoundary(): any {
       boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
+      boundary.window.activeNotebookEditor = undefined;
+      boundary.window.activeTextEditor = undefined;
+      boundary.window.visibleNotebookEditors = [];
+      boundary.window.visibleTextEditors = [];
     },
     __fireNotebookChange: (notebook: any, structural: boolean) => {
       for (const callback of handlers.changeNotebook ?? []) callback({
@@ -616,6 +893,23 @@ function createNotebookVscodeBoundary(): any {
     },
   };
   return boundary;
+}
+
+function fakeCellStateRenderer(): any {
+  return {
+    renderRemoteCellState: async (cell: any, request: any) => {
+      if (request.outputsChanged) cell.outputs = [...request.outputs];
+      if (request.executionChanged) {
+        cell.executionSummary = request.execution
+          ? {
+            executionOrder: request.execution.executionOrder,
+            success: request.execution.success,
+            timing: request.execution.timing ? { ...request.execution.timing } : undefined,
+          }
+          : undefined;
+      }
+    },
+  };
 }
 
 function logger(): any {

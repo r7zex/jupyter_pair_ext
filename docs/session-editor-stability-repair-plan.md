@@ -49,7 +49,9 @@ Audited at repository SHA `3165ce0216eac1c1f67c4e400748ab52581b551d`. This secti
 - Background persistence must not force editor saves; `notebook.save()` and `document.save()` are gated by `forceSave`.
 - Required invariant: structural replacement must be narrowly scoped and must never recreate unrelated cells or viewport state.
 - `applyNotebookSnapshot()` uses a minimal structural splice for true structure changes.
-- **Documented VS Code API deviation:** output/execution synchronization also uses a one-cell `NotebookEdit.replaceCells` because the implementation has no direct `NotebookEdit` for those fields. The replacement is restricted to the affected cell and preserves its current source in the targeted cell-state path. This is not equivalent to permitting broad notebook replacement.
+- **VS Code 1.95 Notebook API boundary (prompt 07):** output/execution synchronization no longer uses `NotebookEdit.replaceCells`. Remote output is rendered with a controller-owned `NotebookCellExecution.replaceOutput()`; execution order uses the writable `executionOrder`, running state uses `start()`, and final success/failure uses `end(success, endTime)`. `NotebookCellExecutionSummary` itself is read-only, so arbitrary summary assignment is not a supported public-API path.
+- **Timing limitation:** `startTime` can only be supplied when `NotebookCellExecution.start(startTime)` is called. If a live running update first arrives without a start timestamp, a later final update cannot retroactively rewrite that start timestamp through the public API; the final `endTime` can still be supplied.
+- **Viewport limitation:** `NotebookEditor.visibleRanges` is read-only in the supported VS Code 1.95 API. Structural edits therefore preserve a stable visible-cell anchor and use `revealRange` only if that anchor falls outside the post-edit viewport; exact pixel scroll offset cannot be restored through the stable API.
 
 ### Presence and awareness
 

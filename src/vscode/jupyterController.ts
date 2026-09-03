@@ -1,9 +1,13 @@
 import * as vscode from 'vscode';
-import { OutputSnapshot } from '../core/crdt';
+import { CellExecutionSnapshot, OutputSnapshot } from '../core/crdt';
 import { PerNotebookExecutionQueue } from '../core/executionQueue';
 import { JupyterKernelEvent } from '../core/pythonKernel';
 import { SessionRuntime } from '../runtime/session';
-import { EditorSynchronizer } from './sync';
+import {
+  EditorSynchronizer,
+  type NotebookCellRenderRequest,
+  type NotebookCellStateRenderer,
+} from './sync';
 
 const MAX_RENDERED_CELL_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RENDERED_CELL_OUTPUTS = 1_024;
@@ -11,12 +15,13 @@ const MAX_MIME_ITEMS_PER_OUTPUT = 64;
 const MAX_PENDING_RENDER_EVENTS = 2_048;
 const MAX_PENDING_RENDER_BYTES = 32 * 1024 * 1024;
 
-export class PairNotebookController implements vscode.Disposable {
+export class PairNotebookController implements vscode.Disposable, NotebookCellStateRenderer {
   private readonly controller: vscode.NotebookController;
   private runtime: SessionRuntime | undefined;
   private synchronizer: EditorSynchronizer | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly queues = new PerNotebookExecutionQueue();
+  private readonly mirroredExecutions = new Map<vscode.NotebookCell, MirroredExecutionState>();
 
   public constructor(private readonly log: vscode.OutputChannel) {
     this.controller = vscode.notebooks.createNotebookController(
@@ -45,6 +50,7 @@ export class PairNotebookController implements vscode.Disposable {
   }
 
   public setRuntime(runtime: SessionRuntime | undefined): void {
+    if (!runtime) this.finishMirroredExecutions();
     this.runtime = runtime;
     if (runtime) for (const notebook of vscode.workspace.notebookDocuments) {
       if (runtime.notebookKey(notebook.uri)) {
@@ -67,7 +73,72 @@ export class PairNotebookController implements vscode.Disposable {
   }
 
   public dispose(): void {
+    this.finishMirroredExecutions();
     for (const disposable of this.disposables) disposable.dispose();
+  }
+
+  /**
+   * Render execution started on another Pair compute target via the stable
+   * NotebookController API. In VS Code 1.95 executionSummary is read-only;
+   * createNotebookCellExecution + executionOrder/start/end are the supported
+   * reconstruction path.
+   *
+   * startTime can only be supplied to start(). If a live running update first
+   * arrives without it, a later final event cannot retroactively set startTime;
+   * only endTime can still be supplied exactly.
+   */
+  public async renderRemoteCellState(
+    cell: vscode.NotebookCell,
+    request: NotebookCellRenderRequest,
+  ): Promise<void> {
+    if (!request.outputsChanged && !request.executionChanged) return;
+    const target: CellExecutionSnapshot | undefined = request.execution;
+    let state = this.mirroredExecutions.get(cell);
+    if (!state) {
+      state = {
+        execution: this.controller.createNotebookCellExecution(cell),
+        started: false,
+      };
+      this.mirroredExecutions.set(cell, state);
+    }
+
+    if (request.executionChanged) {
+      state.execution.executionOrder = target?.executionOrder;
+    } else if (target?.executionOrder !== undefined) {
+      state.execution.executionOrder = target.executionOrder;
+    }
+
+    if (target && !state.started) {
+      state.execution.start(target.timing?.startTime);
+      state.started = true;
+    }
+
+    if (request.outputsChanged) {
+      await state.execution.replaceOutput(request.outputs);
+    }
+
+    const liveRunning = request.executionMode === 'live'
+      && target !== undefined
+      && target.success === undefined;
+    if (liveRunning) return;
+
+    if (!state.started) {
+      state.execution.start(target?.timing?.startTime);
+      state.started = true;
+    }
+    state.execution.end(target?.success, target?.timing?.endTime);
+    this.mirroredExecutions.delete(cell);
+  }
+
+  private finishMirroredExecutions(): void {
+    for (const state of this.mirroredExecutions.values()) {
+      try {
+        state.execution.end(undefined);
+      } catch {
+        // Best effort during controller/session disposal.
+      }
+    }
+    this.mirroredExecutions.clear();
   }
 
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
@@ -92,6 +163,11 @@ export class PairNotebookController implements vscode.Disposable {
   }
 
   private async executeCell(runtime: SessionRuntime, notebookKey: string, cell: vscode.NotebookCell): Promise<void> {
+    const mirrored = this.mirroredExecutions.get(cell);
+    if (mirrored) {
+      mirrored.execution.end(undefined);
+      this.mirroredExecutions.delete(cell);
+    }
     const execution = this.controller.createNotebookCellExecution(cell);
     const cellId = runtime.notebookCellId(cell);
     if (!cellId) {
@@ -329,6 +405,11 @@ export class PairNotebookController implements vscode.Disposable {
     if (!this.runtime) throw new Error('No active Pair Notebook session.');
     return this.runtime;
   }
+}
+
+interface MirroredExecutionState {
+  execution: vscode.NotebookCellExecution;
+  started: boolean;
 }
 
 interface RenderState {
