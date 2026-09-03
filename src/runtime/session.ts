@@ -98,7 +98,35 @@ import {
   type SignallingRefreshResult,
 } from './mesh';
 
+/**
+ * Terminal close reasons are deliberately non-overlapping:
+ * - host-unreachable: an established guest lost the pinned host beyond recovery;
+ * - local-route-failed: this runtime could not establish its own transport readiness;
+ * - explicit-leave: local user/extension disposal;
+ * - session-ended: authenticated explicit end by the Session Host.
+ */
 export type SessionCloseReason = 'host-unreachable' | 'local-route-failed' | 'explicit-leave' | 'session-ended';
+
+export interface SessionTerminalLifecycle {
+  reason: SessionCloseReason;
+  sessionId: string;
+  peerId: string;
+  hostId: string;
+  at: number;
+  /** Reserved integration point for the bounded lifecycle diagnostics correlation id. */
+  correlationId?: string;
+}
+
+export class SessionClosedError extends Error {
+  public constructor(public readonly lifecycle: SessionTerminalLifecycle) {
+    super(`Pair Notebook session closed: ${lifecycle.reason}`);
+    this.name = 'SessionClosedError';
+  }
+
+  public get reason(): SessionCloseReason {
+    return this.lifecycle.reason;
+  }
+}
 
 export interface PresenceState {
   peer: PeerIdentity;
@@ -483,6 +511,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private computeEpoch = 0;
   private closed = false;
   private closeReason: SessionCloseReason = 'explicit-leave';
+  private terminalLifecycleEvent: SessionTerminalLifecycle | undefined;
+  private terminalEventEmitted = false;
+  private terminalResolve!: (event: SessionTerminalLifecycle) => void;
+  private readonly terminalSignal = new Promise<SessionTerminalLifecycle>((resolve) => {
+    this.terminalResolve = resolve;
+  });
   private endingSession = false;
   private terminationCheckInFlight = false;
   private lastDisplayNameWarning = '';
@@ -641,7 +675,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.installProjectHandlers();
     this.installTransportHandlers();
     this.installAwarenessHandlers();
-    await this.transport.start();
+    try {
+      await this.transport.start();
+    } catch (error) {
+      // This is the exact local-route-failed boundary: our own MeshTransport
+      // never reached readiness. A later loss of an established pinned host is
+      // a different condition and remains host-unreachable.
+      try {
+        await this.disposeAsync('local-route-failed');
+      } catch (cleanupError) {
+        this.log.appendLine(`[error] Local-route startup cleanup failed: ${formatError(cleanupError)}`);
+      }
+      throw error;
+    }
     this.transition('connected', 'Joined the encrypted Trystero room; discovering peers.');
     this.coordinator.upsertPeer(this.asRuntime(this.descriptor.localPeer, true));
     if (this.recoveringHost) {
@@ -686,6 +732,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await this.refreshAutosaveManager();
     this.updatePresence();
     await vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', true);
+    await vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', true);
     this.emit('ready');
     if (this.waitingForHostFolder) {
       this.transition('waiting-for-host-folder', 'You are the new host. The session is paused until you choose a folder on this computer.');
@@ -1040,7 +1087,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       } catch (error) {
         if (!isRouteUnavailableError(error)) throw error;
       }
-      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+      await this.waitForRetryDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
     }
   }
 
@@ -1118,13 +1165,41 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     pending.resolve(result);
   }
 
+  private terminalCancellation(): Promise<never> {
+    return this.terminalSignal.then((event) => {
+      throw new SessionClosedError(event);
+    });
+  }
+
+  private sessionClosedError(): SessionClosedError {
+    const event = this.terminalLifecycleEvent ?? {
+      reason: this.closeReason,
+      sessionId: this.descriptor.sessionId,
+      peerId: this.descriptor.localPeer.peerId,
+      hostId: this.coordinator.clock.hostId,
+      at: Date.now(),
+    };
+    return new SessionClosedError(event);
+  }
+
+  private async waitForRetryDelay(ms: number): Promise<void> {
+    if (this.closed) throw this.sessionClosedError();
+    await Promise.race([runtimeDelay(ms), this.terminalCancellation()]);
+    if (this.closed) throw this.sessionClosedError();
+  }
+
   private async waitForTransportRoute(peerId: string, timeoutMs: number): Promise<void> {
+    if (this.closed) throw this.sessionClosedError();
     const transport = this.transport as MeshTransport & {
       waitForRoute?: ((targetPeerId: string, waitMs?: number) => Promise<void>) | undefined;
     };
     if (typeof transport.waitForRoute === 'function') {
-      await transport.waitForRoute(peerId, timeoutMs);
+      await Promise.race([
+        transport.waitForRoute(peerId, timeoutMs),
+        this.terminalCancellation(),
+      ]);
     }
+    if (this.closed) throw this.sessionClosedError();
   }
 
   private async sendToWithRouteRecovery(
@@ -1144,7 +1219,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       } catch (error) {
         if (!isRouteUnavailableError(error)) throw error;
         lastError = error;
-        await runtimeDelay(Math.min(100, Math.max(1, deadline - Date.now())));
+        await this.waitForRetryDelay(Math.min(100, Math.max(1, deadline - Date.now())));
       }
     }
     throw new Error(`Could not deliver ${type} to ${peerId} after route recovery: ${formatError(lastError)}`);
@@ -1243,7 +1318,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       } catch (error) {
         if (!isRouteUnavailableError(error)) throw error;
       }
-      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+      await this.waitForRetryDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
     }
   }
 
@@ -1725,7 +1800,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (this.closed) return;
     this.closed = true;
     this.closeReason = reason;
-    this.log.appendLine(`[lifecycle] session closing: ${reason}`);
+    const terminal: SessionTerminalLifecycle = {
+      reason,
+      sessionId: this.descriptor.sessionId,
+      peerId: this.descriptor.localPeer.peerId,
+      hostId: this.coordinator.clock.hostId,
+      at: Date.now(),
+    };
+    this.terminalLifecycleEvent = terminal;
+    this.terminalResolve(terminal);
+    const closedError = () => new SessionClosedError(terminal);
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
     if (this.workingCopyFallbackTimer) clearTimeout(this.workingCopyFallbackTimer);
@@ -1734,12 +1818,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.watcher = undefined;
     for (const pending of this.pendingBinaryAcks.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during file synchronization.'));
+      pending.reject(closedError());
     }
     this.pendingBinaryAcks.clear();
     for (const pending of this.pendingBarrierReplies.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during file synchronization.'));
+      pending.reject(closedError());
     }
     this.pendingBarrierReplies.clear();
     for (const pending of this.pendingBarrierAuthorizations.values()) clearTimeout(pending.timer);
@@ -1748,17 +1832,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.completedExecutionBarriers.clear();
     for (const pending of this.pendingKernelCommands.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during kernel command.'));
+      pending.reject(closedError());
     }
     this.pendingKernelCommands.clear();
     for (const pending of this.pendingInputReplies.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during Jupyter input delivery.'));
+      pending.reject(closedError());
     }
     this.pendingInputReplies.clear();
     for (const pending of this.pendingExecutions.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during remote execution.'));
+      pending.reject(closedError());
     }
     this.pendingExecutions.clear();
     for (const completed of this.completedRemoteExecutions.values()) {
@@ -1771,12 +1855,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.completedExecutionReceipts.clear();
     for (const pending of this.pendingTransfers.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during host transfer.'));
+      pending.reject(closedError());
     }
     this.pendingTransfers.clear();
     for (const pending of this.pendingSnapshotCheckpoints.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Pair Notebook session closed during project snapshot transfer.'));
+      pending.reject(closedError());
     }
     this.pendingSnapshotCheckpoints.clear();
     this.sentSnapshotTransfers.clear();
@@ -1808,6 +1892,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         failures.push(error);
       }
     };
+    await step(() => {
+      if (this.awareness.getLocalState() !== null) this.awareness.setLocalState(null);
+    });
     for (const disposable of this.sessionDisposables.splice(0)) {
       await step(() => disposable.dispose());
     }
@@ -1822,8 +1909,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await step(() => this.project.destroy());
     await step(() => this.awareness.destroy());
     await step(() => this.removeTransferDirectory());
+    await step(() => vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', false));
     await step(() => vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', false));
-    this.emit('closed', this.closeReason);
+    await step(() => {
+      if (this.terminalEventEmitted) return;
+      this.terminalEventEmitted = true;
+      this.log.appendLine(
+        `[lifecycle] terminal reason=${terminal.reason} session=${terminal.sessionId} peer=${terminal.peerId} host=${terminal.hostId} at=${terminal.at}`,
+      );
+      this.emit('terminal', terminal);
+    });
+    // Compatibility event for existing internal/tests; product UI no longer
+    // consumes this unstructured reason-only event.
+    await step(() => this.emit('closed', this.closeReason));
     for (const failure of failures) {
       this.log.appendLine(`[error] Session shutdown step failed: ${formatError(failure)}`);
     }
@@ -2173,6 +2271,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private async onMessage(frame: WireFrame, sourceId: string): Promise<void> {
+    if (this.closed) return;
     try {
       const rawClock = frame.meta.clock;
       const clock = normalizeHostClock(rawClock, this.coordinator.clock.sessionEpoch);
@@ -3116,9 +3215,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     this.coordinator.evaluate();
     if (this.coordinator.closed && !this.closed) {
-      const host = this.transport.peerRuntime().find((peer) => peer.peerId === this.coordinator.clock.hostId)
-        ?? (this.descriptor.knownPeers ?? []).find((peer) => peer.peerId === this.coordinator.clock.hostId);
-      if (host) this.emit('sessionEnded', host, 'host-lost');
+      // Host loss is not an explicit session-end message. The terminal event
+      // below is the single lifecycle source for UI cleanup and notification.
       this.runBackground('Host-only session shutdown', () => this.disposeAsync('host-unreachable'));
     }
   }
@@ -4251,7 +4349,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           return;
         }
       }
-      await runtimeDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
+      await this.waitForRetryDelay(Math.min(EXECUTION_REQUEST_RETRY_MS, Math.max(1, deadline - Date.now())));
     }
   }
 
@@ -5175,9 +5273,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.setKernelStatus(notebookKey, 'Busy');
     this.transition('executing', `Executing ${notebookKey} locally.`);
     try {
-      return await kernel.execute(requestId, code);
+      return await Promise.race([
+        kernel.execute(requestId, code),
+        this.terminalCancellation(),
+      ]);
     } catch (error) {
-      this.transition('kernel-failed', formatError(error));
+      if (!(error instanceof SessionClosedError)) {
+        this.transition('kernel-failed', formatError(error));
+      }
       throw error;
     } finally {
       kernel.off('event', listener);

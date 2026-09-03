@@ -33,7 +33,10 @@ moduleWithLoader._load = function load(request: string, parent: unknown, isMain:
 // and the
 // synchronization protocol remain real.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { SessionRuntime } = require('../src/runtime/session') as { SessionRuntime: new (...args: any[]) => any };
+const { SessionClosedError, SessionRuntime } = require('../src/runtime/session') as {
+  SessionClosedError: new (...args: any[]) => Error & { reason: string };
+  SessionRuntime: new (...args: any[]) => any;
+};
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { PairNotebookController, decodeJupyterBase64 } = require('../src/vscode/jupyterController') as {
   PairNotebookController: new (...args: any[]) => any;
@@ -46,6 +49,7 @@ const runtimeRoomFactory = createInMemoryTrysteroFactory();
 beforeEach(() => {
   resetInMemoryTrystero();
   MeshTransport.setRoomFactoryForTesting(runtimeRoomFactory);
+  fakeVscode.__commands.length = 0;
 });
 
 afterEach(() => {
@@ -471,6 +475,7 @@ describe('production SessionRuntime integration', () => {
     let peerB: any;
     let peerC: any;
     const closeReasons = new Map<string, string>();
+    const terminalReasons = new Map<string, string>();
     try {
       await host.start();
       peerB = new SessionRuntime(descriptor({
@@ -478,12 +483,14 @@ describe('production SessionRuntime integration', () => {
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       peerB.once('closed', (reason: string) => closeReasons.set('peer-b', reason));
+      peerB.once('terminal', (event: any) => terminalReasons.set('peer-b', event.reason));
       await peerB.start();
       peerC = new SessionRuntime(descriptor({
         sessionId, role: 'peer', peerId: 'peer-c', hostPeerId: 'host', workingFolder: folders[2]!,
         pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
       }), token, context(extensionRoot), logger());
       peerC.once('closed', (reason: string) => closeReasons.set('peer-c', reason));
+      peerC.once('terminal', (event: any) => terminalReasons.set('peer-c', event.reason));
       await peerC.start();
       useFastLogicalRecovery(peerB, peerC);
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
@@ -499,6 +506,8 @@ describe('production SessionRuntime integration', () => {
       }
       assert.equal(closeReasons.get('peer-b'), 'host-unreachable');
       assert.equal(closeReasons.get('peer-c'), 'host-unreachable');
+      assert.equal(terminalReasons.get('peer-b'), 'host-unreachable');
+      assert.equal(terminalReasons.get('peer-c'), 'host-unreachable');
     } finally {
       for (const runtime of [host, peerB, peerC].filter(Boolean)) runtime.descriptor.mode = 'host-only';
       await Promise.allSettled([host.leave(), peerB?.leave?.(), peerC?.leave?.()]);
@@ -2486,6 +2495,130 @@ describe('large reconnect metadata', () => {
   });
 });
 
+describe('terminal session lifecycle', () => {
+  const reasons = ['host-unreachable', 'local-route-failed', 'explicit-leave', 'session-ended'] as const;
+
+  it('emits one structured terminal lifecycle payload for every close reason and repeated dispose is idempotent', async () => {
+    for (const reason of reasons) {
+      const root = await mkdtemp(path.join(os.tmpdir(), `pair-terminal-${reason}-`));
+      const runtime = new SessionRuntime(descriptor({
+        sessionId: `terminal-${reason}`, role: 'host', peerId: 'local-peer', hostPeerId: 'local-peer',
+        workingFolder: root, pythonPath: process.execPath,
+      }), 'terminal-lifecycle-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+      const terminalEvents: any[] = [];
+      const closedReasons: string[] = [];
+      runtime.on('terminal', (event: unknown) => terminalEvents.push(event));
+      runtime.on('closed', (value: string) => closedReasons.push(value));
+      try {
+        await (runtime as any).disposeAsync(reason);
+        await (runtime as any).disposeAsync(reason);
+        assert.equal(terminalEvents.length, 1);
+        assert.equal(closedReasons.length, 1);
+        assert.equal(terminalEvents[0].reason, reason);
+        assert.equal(terminalEvents[0].sessionId, `terminal-${reason}`);
+        assert.equal(terminalEvents[0].peerId, 'local-peer');
+        assert.equal(terminalEvents[0].hostId, 'local-peer');
+        assert.equal(Number.isSafeInteger(terminalEvents[0].at), true);
+        assert.equal(terminalEvents[0].correlationId, undefined);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('classifies failure to establish local transport readiness as local-route-failed', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-local-route-failed-'));
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'local-route-failed', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+    }), 'local-route-failed-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    const terminals: any[] = [];
+    runtime.on('terminal', (event: unknown) => terminals.push(event));
+    (runtime as any).transport.start = async () => { throw new Error('synthetic transport readiness failure'); };
+    try {
+      await assert.rejects(runtime.start(), /synthetic transport readiness failure/);
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0].reason, 'local-route-failed');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects pending execution with typed SessionClosedError and stops an active route wait', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-terminal-cancel-'));
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'terminal-cancel', role: 'peer', peerId: 'peer', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath, knownPeers: [
+        { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      ],
+    }), 'terminal-cancel-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    let rejectExecution!: (error: Error) => void;
+    const pendingExecution = new Promise<never>((_resolve, reject) => { rejectExecution = reject; });
+    const pendingTimer = setTimeout(() => undefined, 60_000);
+    (runtime as any).pendingExecutions.set('pending-execution', {
+      resolve: () => undefined,
+      reject: rejectExecution,
+      onEvent: () => undefined,
+      executorId: 'host',
+      notebookKey: 'work.ipynb',
+      timer: pendingTimer,
+      accepted: false,
+      nextEventSequence: 0,
+      bufferedEvents: new Map(),
+      bufferedEventBytes: 0,
+    });
+
+    const never = new Promise<void>(() => undefined);
+    (runtime as any).transport = {
+      waitForRoute: async () => never,
+      stop: async () => undefined,
+    };
+    const routeWait = (runtime as any).waitForTransportRoute('host', 60_000);
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      await (runtime as any).disposeAsync('host-unreachable');
+      await assert.rejects(pendingExecution, (error: any) =>
+        error instanceof SessionClosedError && error.reason === 'host-unreachable');
+      await assert.rejects(routeWait, (error: any) =>
+        error instanceof SessionClosedError && error.reason === 'host-unreachable');
+      assert.equal((runtime as any).pendingExecutions.size, 0);
+    } finally {
+      clearTimeout(pendingTimer);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('clears execution contexts and local awareness before awareness destruction', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-terminal-contexts-'));
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'terminal-contexts', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+    }), 'terminal-contexts-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    runtime.awareness.setLocalState({
+      peer: runtime.descriptor.localPeer,
+      shareCursor: true,
+      cursorColor: '#123456',
+      kernelStatus: 'Offline',
+    });
+    let awarenessStateAtDestroy: unknown = 'not-destroyed';
+    const originalDestroy = runtime.awareness.destroy.bind(runtime.awareness);
+    (runtime.awareness as any).destroy = () => {
+      awarenessStateAtDestroy = runtime.awareness.getLocalState();
+      originalDestroy();
+    };
+    try {
+      await (runtime as any).disposeAsync('explicit-leave');
+      assert.equal(awarenessStateAtDestroy, null);
+      assert.ok(fakeVscode.__commands.some((args: unknown[]) =>
+        args[0] === 'setContext' && args[1] === 'pairNotebook.executionAvailable' && args[2] === false));
+      assert.ok(fakeVscode.__commands.some((args: unknown[]) =>
+        args[0] === 'setContext' && args[1] === 'pairNotebook.inSession' && args[2] === false));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('identity and lifecycle regressions', () => {
   it('propagates a local display-name change into the session descriptor', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-identity-update-'));
@@ -2644,6 +2777,7 @@ function createVscodeBoundary(): any {
   });
   const boundary: any = {
     __controllers: controllers,
+    __commands: [] as unknown[][],
     Uri,
     RelativePattern,
     __config: {} as Record<string, unknown>,
@@ -2670,7 +2804,12 @@ function createVscodeBoundary(): any {
       showErrorMessage: async () => undefined,
       showInputBox: async () => boundary.__inputValue,
     },
-    commands: { executeCommand: async () => undefined },
+    commands: {
+      executeCommand: async (...args: unknown[]) => {
+        boundary.__commands.push(args);
+        return undefined;
+      },
+    },
     NotebookCellKind: { Markup: 1, Code: 2 },
     NotebookControllerAffinity: { Preferred: 2 },
     NotebookCellOutput,

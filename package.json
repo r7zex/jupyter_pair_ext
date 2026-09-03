@@ -130,11 +130,13 @@
       },
       {
         "command": "pairNotebook.runActiveCell",
-        "title": "Pair Notebook: Run Active Cell on Compute"
+        "title": "Pair Notebook: Run Active Cell on Compute",
+        "enablement": "pairNotebook.inSession && pairNotebook.executionAvailable"
       },
       {
         "command": "pairNotebook.restartKernel",
-        "title": "Pair Notebook: Restart Jupyter Kernel"
+        "title": "Pair Notebook: Restart Jupyter Kernel",
+        "enablement": "pairNotebook.inSession && pairNotebook.executionAvailable"
       },
       {
         "command": "pairNotebook.toggleShareMyCursor",
@@ -188,7 +190,7 @@
         {
           "command": "pairNotebook.runActiveCell",
           "group": "navigation@20",
-          "when": "pairNotebook.inSession"
+          "when": "pairNotebook.inSession && pairNotebook.executionAvailable"
         }
       ]
     },

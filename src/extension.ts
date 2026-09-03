@@ -37,7 +37,7 @@ import {
 import { SnapshotBootstrapError, downloadProjectSnapshot } from './runtime/bootstrap';
 import { configureMeshNetwork } from './runtime/mesh';
 import { EXPLICIT_PROXY_PASSWORD_ERROR, inspectExplicitProxyPassword } from './runtime/proxy';
-import { BackingFolderMismatchError, SessionCloseReason, SessionRuntime } from './runtime/session';
+import { BackingFolderMismatchError, SessionRuntime, SessionTerminalLifecycle } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer, pickCursorColor } from './vscode/presence';
@@ -452,23 +452,18 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     runtime.on('hostResumed', () => {
       void vscode.window.showInformationMessage('Pair Notebook: новый хост подготовил папку. Совместная сессия продолжена.');
     });
-    runtime.on('sessionEnded', (peer: PeerIdentity, reason: 'explicit-end' | 'host-lost' = 'explicit-end') => {
-      if (reason === 'explicit-end') {
-        void forgetWorkspaceSession(context, descriptor, true).then(() => {
-          void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
-        }).catch((error) => {
-          output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
-        });
-      } else {
-        void rememberProject(context, descriptor).catch((error) => {
-          output.appendLine(`[error] Could not retain disconnected session in recent projects: ${formatError(error)}`);
-        });
-      }
+    runtime.on('sessionEnded', (peer: PeerIdentity) => {
+      void forgetWorkspaceSession(context, descriptor, true).then(() => {
+        void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
+      }).catch((error) => {
+        output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
+      });
     });
     runtime.on('networkChanged', () => {
       queueAutomaticNetworkRecovery(context, 'Network interface route changed');
     });
-    runtime.on('closed', (reason: SessionCloseReason = 'explicit-leave') => {
+    runtime.on('terminal', (event: SessionTerminalLifecycle) => {
+      const reason = event.reason;
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
       synchronizer?.dispose();
