@@ -6,7 +6,7 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ['out/**', 'node_modules/**'],
+    ignores: ['out/**', 'node_modules/**', '.pytest_cache/**', '**/__pycache__/**'],
   },
   {
     // Packaging helper: plain Node script, not part of the extension bundle.

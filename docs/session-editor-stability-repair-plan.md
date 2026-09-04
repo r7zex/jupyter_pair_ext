@@ -1,6 +1,6 @@
 # Pair Notebook — Session/editor stability repair plan
 
-**Status: in progress — implementation and Prompt 16 quality gate are closed; the 16-prompt series remains administratively incomplete because the mandatory Prompt 15 PDF report was not produced in its prompt.**
+**Status: completed — implementation, regression matrix, static audit, quality gate, and the separately delivered Prompt 15 PDF report are closed.**
 
 This document records the original repair contracts and the evidence used to decide whether they are closed. Requirements are not rewritten after implementation to manufacture `[x]` status: a box is checked only where production code plus regression evidence satisfy the original contract.
 
@@ -269,8 +269,8 @@ Final Prompt 16 quality evidence after that fix:
 
 Implementation acceptance criteria above are fully evidenced. Documentation has been reconciled with the implementation instead of redefining the implementation to match stale documentation.
 
-The following **series-level administrative gap remains open and is intentionally not converted to `[x]`**:
+The previously open series-level administrative gap is now closed by the explicitly authorized follow-up task:
 
-- [ ] Prompt 15 required `pair-notebook-15-report.pdf`, but that artifact was not produced in Prompt 15. Prompt 16 is not allowed to retroactively perform another prompt, so the 16-prompt series verdict remains **PARTIAL / ЧАСТИЧНО** under Prompt 16.66 even though the current code, tests, static audit, quality gate, and Prompt 16 documentation are complete.
+- [x] `pair-notebook-15-report.pdf` was generated as a separate user artifact, visually inspected on every rendered page, and intentionally kept out of git and release packages as required by Prompt 15. SHA-256: `7bf08cf5eecc0e99dc96ac74a4f8c84a91edf3831e7bb5ccab925f35170ee33f`.
 
-Accordingly, this document deliberately keeps `Status: in progress`. The technical repair can be treated as implementation-complete, but the full 16-prompt series cannot be declared completely closed until the historical Prompt 15 artifact gap is resolved in an explicitly authorized task.
+The implementation acceptance criteria and the required reporting artifact are complete. Physical two-computer VPN-switch validation remains a separate environment-dependent release check and is not represented as having run here.

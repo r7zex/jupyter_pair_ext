@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.9 - 2026-09-04 (session and notebook stability)
+
+- Unifies physical-route recovery behind one 30-second logical participant deadline while preserving pinned host authority, semantic awareness, queued work, and one correlated lifecycle trail.
+- Closes terminal sessions only after cleanup, retains reconnect metadata for the original authenticated host, and closes Pair-owned text and notebook tabs without affecting unrelated editors.
+- Applies remote text, metadata, output, and execution updates by stable cell identity; `NotebookEdit.replaceCells` is limited to the smallest real structural splice.
+- Removes editor `save()` and full-notebook replacement from background synchronization and keeps explicit persistence/materialization barriers separate from live collaboration.
+- Sends ordinary guest Run Cell as a revision/digest-bound stable-cell request, waits only for host canonical CRDT text, and preserves exactly-once acceptance, execution, output, and replay behavior through route loss.
+- Publishes semantic file/cell/line presence separately from resource, hardware, and kernel telemetry; legacy exact cursors remain receive-only and invalid locations render no first-line artifact.
+- Adds a bounded sanitized lifecycle diagnostics ring with one opaque correlation ID per recovery cycle.
+- Advances admission to protocol v5 so protocol-v4 clients cannot join sessions that use the new host-canonical lightweight execution framing.
+- Completes the 68-item regression matrix and final static/quality audit. The exact two-physical-computer VPN-switch scenario remains pending physical validation.
+
 ## 0.5.8 - 2026-09-03 (pinned host authority and VPN continuity)
 
 - Pins session authority to the current host. Heartbeat loss, signalling failure, VPN changes, partitions, ordinary Leave, and higher clocks announced by non-hosts cannot promote a participant; only the authenticated explicit host-transfer protocol can advance the host clock.
