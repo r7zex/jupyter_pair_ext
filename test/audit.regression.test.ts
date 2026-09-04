@@ -182,7 +182,7 @@ describe('audit regressions', () => {
       assert.equal(coordinator.clock.hostEpoch, 1);
     });
 
-    it('closes after a sustained heartbeat loss without a connection close', () => {
+    it('keeps the guest connected through delayed host heartbeats while Mesh recovers the route', () => {
       const clock: HostClock = { sessionEpoch: 1, hostEpoch: 1, hostId: 'host' };
       const coordinator = new SessionCoordinator({
         selfId: 'self',
@@ -195,11 +195,9 @@ describe('audit regressions', () => {
       coordinator.upsertPeer(peer('self', 1, start));
       coordinator.evaluate(start);
       coordinator.markHeartbeat('self', start + 800);
-      assert.equal(coordinator.evaluate(start + 1500), undefined);
-      coordinator.markHeartbeat('self', start + 2000);
-      const next = coordinator.evaluate(start + 2600);
+      const next = coordinator.evaluate(start + 60_000);
       assert.equal(next, undefined);
-      assert.equal(coordinator.closed, true);
+      assert.equal(coordinator.closed, false);
       assert.equal(coordinator.clock.hostId, 'host');
     });
   });

@@ -1,16 +1,12 @@
 import { EventEmitter } from 'node:events';
 import { HostClock, PeerRuntime, SessionMode, compareClock, normalizeHostClock } from './types';
 
-/**
- * How many heartbeat lease periods may elapse between two `evaluate` calls
- * before the gap is attributed to a local stall rather than to a lost Host.
- */
-const STALL_FACTOR = 4;
 export interface CoordinatorOptions {
 
   selfId: string;
   mode: SessionMode;
   clock: HostClock;
+  /** Kept for descriptor compatibility; route recovery owns host-loss timing. */
   heartbeatTimeoutMs?: number;
 }
 
@@ -18,18 +14,9 @@ export class SessionCoordinator extends EventEmitter {
   public readonly peers = new Map<string, PeerRuntime>();
   public clock: HostClock;
   public closed = false;
-  private readonly heartbeatTimeoutMs: number;
-  /** Wall-clock time of the previous `evaluate` call, used to detect a stall. */
-  private lastEvaluateAt = 0;
-  /** Guest shutdown is deferred until this instant after a detected local stall. */
-  private graceUntil = 0;
-  /** First instant at which the host lease was observed as expired. */
-  private hostSuspectSince: number | undefined;
-
   public constructor(private readonly options: CoordinatorOptions) {
     super();
     this.clock = { ...options.clock };
-    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 1600;
   }
 
   public upsertPeer(peer: PeerRuntime): void {
@@ -42,7 +29,6 @@ export class SessionCoordinator extends EventEmitter {
     peer.lastHeartbeat = at;
     peer.online = true;
     peer.missedHeartbeats = 0;
-    if (peerId === this.clock.hostId) this.hostSuspectSince = undefined;
   }
 
   public markDisconnected(peerId: string): void {
@@ -50,52 +36,22 @@ export class SessionCoordinator extends EventEmitter {
     if (peer) peer.online = false;
   }
 
-  public evaluate(now = Date.now()): HostClock | undefined {
+  public evaluate(_now = Date.now()): HostClock | undefined {
     if (this.closed || this.clock.hostId === this.options.selfId) {
-      this.lastEvaluateAt = now;
-      this.hostSuspectSince = undefined;
       return undefined;
     }
-    // A blocked event loop (large notebook render, snapshot, GC pause, laptop
-    // sleep) delays both this timer and the inbound heartbeat processing.  In
-    // that case every lease looks expired although the Host is perfectly
-    // alive, so the observed stall grants a fresh grace period instead of
-    // closing the guest session.
-    const sinceLastEvaluation = this.lastEvaluateAt ? now - this.lastEvaluateAt : 0;
-    this.lastEvaluateAt = now;
-    // `evaluate` runs on a sub-second timer, so a gap several times longer than
-    // the heartbeat lease means *we* were frozen, not that the Host vanished.
-    if (sinceLastEvaluation > this.heartbeatTimeoutMs * STALL_FACTOR) {
-
-      this.graceUntil = now + this.heartbeatTimeoutMs;
-      this.hostSuspectSince = undefined;
-      return undefined;
-    }
-    if (now < this.graceUntil) return undefined;
-
     const host = this.peers.get(this.clock.hostId);
-    // The mesh has already retired the physical route and is trying the
-    // authenticated alternatives.  Do not race its bounded recovery window:
-    // a guest can never infer a replacement host from a local partition.
+    // MeshTransport owns logical recovery for both a missing heartbeat and a
+    // physical route loss. Closing here from a short heartbeat lease races its
+    // 30-second recovery window and ejects guests whenever the host is briefly
+    // busy (for example, during snapshot materialization on a laptop).
+    // `markDisconnected` is reached only from MeshTransport's terminal
+    // peerDisconnected event after that bounded recovery is exhausted.
     if (host?.connectionState === 'recovering') {
-      this.hostSuspectSince = undefined;
       return undefined;
     }
-    // A WebRTC disconnect can be transient. Guest shutdown starts only after
-    // the heartbeat lease expires, which gives route recovery a chance.
-    const leaseExpired = !host || now - host.lastHeartbeat > this.heartbeatTimeoutMs;
-    if (!leaseExpired) {
-      this.hostSuspectSince = undefined;
-      return undefined;
-    }
-    // An observed socket close is authoritative; a merely late heartbeat has to
-    // stay expired across a confirmation window before the role is taken away.
     const hardLoss = !host || host.connectionState === 'disconnected' || host.online === false;
-    if (!hardLoss) {
-      this.hostSuspectSince ??= now;
-      if (now - this.hostSuspectSince < this.heartbeatTimeoutMs) return undefined;
-    }
-    this.hostSuspectSince = undefined;
+    if (!hardLoss) return undefined;
 
     // Host authority is never inferred from reachability. A partitioned guest
     // cannot distinguish its own isolation from a failed host, so promoting a

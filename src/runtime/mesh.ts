@@ -1004,8 +1004,9 @@ export class MeshTransport extends EventEmitter {
    * Runs the reachability probe without letting werift's internal socket
    * failures crash the extension host: unreachable TURN endpoints surface
    * TLS/TCP resets as unhandled rejections from library-internal promises
-   * that are not tied to our awaited call. The guard swallows only network
-   * errors during the probe window; anything else is re-thrown unchanged.
+   * that are not tied to our awaited call. This handler is intentionally a
+   * containment boundary: throwing from an `unhandledRejection` listener
+   * terminates the entire VS Code extension host, including unrelated UI.
    */
   private async probeTurnEndpointsSafely(
     endpoints: readonly TurnEndpoint[],
@@ -1016,8 +1017,11 @@ export class MeshTransport extends EventEmitter {
     const guard = (reason: unknown): void => {
       const error = reason as { code?: string; message?: string } | undefined;
       const text = `${error?.code ?? ''} ${error?.message ?? String(reason)}`;
-      if (/econnreset|etimedout|ehostunreach|enetunreach|econnrefused|timeout|tls|ssl|turn/i.test(text)) return;
-      throw reason;
+      if (!/econnreset|etimedout|ehostunreach|enetunreach|econnrefused|timeout|tls|ssl|turn/i.test(text)) {
+        // Do not include the rejection text: it can originate in a third-party
+        // socket and must not put endpoint credentials into the VS Code log.
+        console.error('[pair-notebook] contained an unexpected asynchronous TURN probe rejection.');
+      }
     };
     process.on('unhandledRejection', guard);
     try {

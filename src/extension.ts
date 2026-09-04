@@ -78,6 +78,7 @@ let automaticNetworkRecoveryPending = false;
 let observedSystemProxyFingerprint: string | undefined;
 let systemProxyPollInFlight = false;
 let lastLifecycleDiagnostics: LifecycleDiagnosticEvent[] = [];
+let workspaceSessionRestore: Promise<void> | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -204,7 +205,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.manageParticipantCursors', () => requirePresence().manageParticipant());
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
-  await restoreWorkspaceSession(context);
+  // A restored guest can legitimately wait for the host's first project state
+  // for up to 45 seconds. Do not make VS Code wait for that network operation
+  // before the dashboard and commands become available.
+  startWorkspaceSessionRestore(context);
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -216,6 +220,9 @@ export function deactivate(): Thenable<void> | undefined {
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
+  if (workspaceSessionRestore) {
+    throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
+  }
   if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
   await applyMeshNetworkConfiguration(context);
   const localDisplayName = await promptDisplayName(
@@ -293,6 +300,9 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {
+  if (workspaceSessionRestore) {
+    throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
+  }
   if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
   await applyMeshNetworkConfiguration(context);
   const raw = await vscode.window.showInputBox({
@@ -572,6 +582,18 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     void vscode.window.showErrorMessage(`Pair Notebook could not start: ${formatError(error)}`);
     runtime = undefined;
   }
+}
+
+function startWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
+  if (workspaceSessionRestore) return;
+  workspaceSessionRestore = restoreWorkspaceSession(context)
+    .catch((error) => {
+      output.appendLine(`[error] Background session restore failed: ${formatError(error)}`);
+      void vscode.window.showErrorMessage(`Pair Notebook could not restore the previous session: ${formatError(error)}`);
+    })
+    .finally(() => {
+      workspaceSessionRestore = undefined;
+    });
 }
 
 async function leaveSession(): Promise<void> {
