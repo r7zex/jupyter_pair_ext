@@ -12,7 +12,9 @@ describe('terminal lifecycle product wiring', () => {
 
   it('disables Run Cell and Restart when execution context is not available', () => {
     const manifest = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as any;
-    const commands = new Map(manifest.contributes.commands.map((entry: any) => [entry.command, entry]));
+    const commands = new Map<string, { enablement?: string }>(
+      manifest.contributes.commands.map((entry: { command: string; enablement?: string }) => [entry.command, entry]),
+    );
     assert.equal(
       commands.get('pairNotebook.runActiveCell')?.enablement,
       'pairNotebook.inSession && pairNotebook.executionAvailable',

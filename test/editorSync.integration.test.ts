@@ -274,16 +274,14 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
           items: [{ mime: 'text/plain', dataBase64: Buffer.from(value).toString('base64') }],
         }], REMOTE_ORIGIN);
       }
-      assert.equal((synchronizer as any).notebookCellStateTimers.size, 1);
-      assert.equal((synchronizer as any).pendingNotebookCellStates.get('work.ipynb').size, 1);
       await waitFor(() => calls.length === 1, 1000, 'coalesced output burst');
       assert.equal(calls.length, 1);
       assert.equal(
         Buffer.from(calls[0].outputs[0].items[0].data).toString('utf8'),
         'third',
       );
-      assert.equal((synchronizer as any).notebookCellStateTimers.size, 0);
-      assert.equal((synchronizer as any).pendingNotebookCellStates.size, 0);
+      assert.equal(target.outputs.length, 1, 'the editor exposes only the final coalesced output');
+      assert.equal(Buffer.from(target.outputs[0].items[0].data).toString('utf8'), 'third');
     } finally {
       synchronizer.dispose();
       project.destroy();

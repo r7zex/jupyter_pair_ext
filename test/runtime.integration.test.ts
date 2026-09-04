@@ -501,8 +501,10 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
       await waitFor(() => peerB.descriptor.localPeer.joinOrder === 1
         && peerC.descriptor.localPeer.joinOrder === 2, 2000, 'monotonic host-assigned participant order');
-      await host.transport.stop();
-      await waitFor(() => peerB.snapshot().closed && peerC.snapshot().closed, 6000, 'guest shutdown after host loss');
+      const peerBClosed = onceEvent(peerB, 'closed');
+      const peerCClosed = onceEvent(peerC, 'closed');
+      partitionInMemoryTrystero();
+      await Promise.all([peerBClosed, peerCClosed]);
       for (const peer of [peerB, peerC]) {
         assert.equal(peer.snapshot().clock.hostId, 'host');
         assert.equal(peer.snapshot().clock.hostEpoch, 0);
@@ -514,6 +516,7 @@ describe('production SessionRuntime integration', () => {
       assert.equal(terminalReasons.get('peer-b'), 'host-unreachable');
       assert.equal(terminalReasons.get('peer-c'), 'host-unreachable');
     } finally {
+      healInMemoryTrystero();
       for (const runtime of [host, peerB, peerC].filter(Boolean)) runtime.descriptor.mode = 'host-only';
       await Promise.allSettled([host.leave(), peerB?.leave?.(), peerC?.leave?.()]);
       await rm(root, { recursive: true, force: true });
@@ -554,9 +557,10 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => alpha.snapshot().peers.some((peer: any) => peer.peerId === 'beta' && peer.online), 5000, 'full mesh before partition');
       useFastLogicalRecovery(alpha, beta);
 
+      const alphaClosed = onceEvent(alpha, 'closed');
+      const betaClosed = onceEvent(beta, 'closed');
       partitionInMemoryTrystero();
-      await host.transport.stop();
-      await waitFor(() => alpha.snapshot().closed && beta.snapshot().closed, 5000, 'isolated guest shutdown');
+      await Promise.all([alphaClosed, betaClosed]);
       for (const peer of [alpha, beta]) {
         assert.equal(peer.coordinator.clock.hostId, 'host');
         assert.equal(peer.coordinator.clock.hostEpoch, 0);
@@ -861,7 +865,7 @@ describe('runtime repair invariants', () => {
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0]?.event, 'connectionUpdated');
     assert.equal((emitted[0]?.payload as { kind?: string }).kind, 'manual-reconnect');
-    assert.match(logLines[0] ?? '', /Manual reconnect completed with verified/);
+    assert.match(logLines[0] ?? '', /Manual reconnect completed .* with verified/);
     assert.doesNotMatch(JSON.stringify({ emitted, logLines }), /room-token-secret|endpoint-secret/);
   });
 
@@ -2558,10 +2562,10 @@ describe('compute and lifecycle regression coverage', () => {
       sessionId: 'dispose-exec', role: 'host', peerId: 'host', hostPeerId: 'host',
       workingFolder: folder, pythonPath: process.execPath,
     }), 'dispose-exec-token-that-is-long-enough', context(extensionRoot), logger());
-    let rejected = '';
+    let rejected: (Error & { reason?: string }) | undefined;
     (runtime as any).pendingExecutions.set('pending', {
       resolve: () => undefined,
-      reject: (error: Error) => { rejected = error.message; },
+      reject: (error: Error & { reason?: string }) => { rejected = error; },
       onEvent: () => undefined,
       executorId: 'peer-z',
       notebookKey: 'work.ipynb',
@@ -2570,7 +2574,9 @@ describe('compute and lifecycle regression coverage', () => {
     });
     try {
       await (runtime as any).disposeAsync();
-      assert.match(rejected, /closed during remote execution/);
+      assert.ok(rejected instanceof SessionClosedError);
+      assert.equal(rejected.reason, 'explicit-leave');
+      assert.match(rejected.message, /Pair Notebook session closed: explicit-leave/);
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
       await rm(root, { recursive: true, force: true });

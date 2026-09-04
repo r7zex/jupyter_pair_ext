@@ -41,11 +41,15 @@ describe('isolated Pair tab cleanup', () => {
     } };
     const unrelatedText = { input: { uri: fileUri(path.join(os.tmpdir(), 'workspace', 'a.py')) } };
     const unrelatedNotebook = { input: { uri: fileUri(path.join(os.tmpdir(), 'workspace', 'n.ipynb')) } };
+    const unrelatedDiff = { input: {
+      original: fileUri(path.join(os.tmpdir(), 'workspace', 'old.py')),
+      modified: fileUri(path.join(os.tmpdir(), 'workspace', 'new.py')),
+    } };
     const siblingPrefix = { input: { uri: fileUri(`${root}-other/sibling.py`) } };
     const closed: unknown[] = [];
     let windowCloseCalls = 0;
     const groups = {
-      all: [{ tabs: [pairText, pairNotebook, pairDiff, unrelatedText, unrelatedNotebook, siblingPrefix] }],
+      all: [{ tabs: [pairText, pairNotebook, pairDiff, unrelatedText, unrelatedNotebook, unrelatedDiff, siblingPrefix] }],
       close: async (tab: unknown) => {
         closed.push(tab);
         if (tab === pairNotebook) throw new Error('synthetic one-tab close failure');
@@ -60,6 +64,7 @@ describe('isolated Pair tab cleanup', () => {
     assert.deepEqual(closed, [pairText, pairNotebook, pairDiff]);
     assert.equal(closed.includes(unrelatedText), false);
     assert.equal(closed.includes(unrelatedNotebook), false);
+    assert.equal(closed.includes(unrelatedDiff), false);
     assert.equal(closed.includes(siblingPrefix), false);
     assert.equal(windowCloseCalls, 0, 'tab cleanup must never close the VS Code window');
   });
