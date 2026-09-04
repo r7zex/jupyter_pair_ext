@@ -5,6 +5,7 @@ import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from './core/atomicFile';
 import { buildNetworkDiagnostics, type SignallingFamilyDiagnostic } from './runtime/diagnostics';
+import { formatLifecycleDiagnostics, type LifecycleDiagnosticEvent } from './runtime/lifecycleDiagnostics';
 import {
   generateIdentityCredentials,
   publicKeyFromPrivate,
@@ -76,6 +77,7 @@ let automaticNetworkRecovery: Promise<void> | undefined;
 let automaticNetworkRecoveryPending = false;
 let observedSystemProxyFingerprint: string | undefined;
 let systemProxyPollInFlight = false;
+let lastLifecycleDiagnostics: LifecycleDiagnosticEvent[] = [];
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -479,6 +481,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       queueAutomaticNetworkRecovery(context, 'Network interface route changed');
     });
     runtime.on('terminal', (event: SessionTerminalLifecycle) => {
+      const closedRuntime = runtime;
       const reason = event.reason;
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
@@ -489,15 +492,37 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       notebookController.setSynchronizer(undefined);
       notebookController.setRuntime(undefined);
       runtime = undefined;
+      lastLifecycleDiagnostics = closedRuntime?.lifecycleDiagnostics() ?? lastLifecycleDiagnostics;
       dashboard.setRuntime(undefined);
       status.hide();
       if (reason === 'host-unreachable' || reason === 'session-ended') {
         runUiBackground('Close ended Pair Notebook editors', async () => {
+          const correlationId = event.correlationId ?? closedRuntime?.newLifecycleCorrelationId();
+          if (closedRuntime && correlationId) {
+            closedRuntime.recordLifecycleDiagnostic('pair-tabs-close-started', {
+              correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+              reason: 'tab-cleanup',
+            });
+          }
           const tabs = await closeSessionTabs(descriptor.workingFolder);
+          if (closedRuntime && correlationId) {
+            closedRuntime.recordLifecycleDiagnostic('pair-tabs-close-completed', {
+              correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+              reason: 'tab-cleanup', metadata: { tabMatched: tabs.matched, tabClosed: tabs.closed, tabFailed: tabs.failed },
+            });
+            lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
+          }
           if (reason !== 'host-unreachable') return;
           let reconnectable = true;
           try {
             await rememberProject(context, descriptor, { pinnedHostId: event.hostId, requireReconnectable: true });
+            if (closedRuntime && correlationId) {
+              closedRuntime.recordLifecycleDiagnostic('recent-session-saved', {
+                correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+                reason: 'recent-session-saved',
+              });
+              lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
+            }
           } catch (error) {
             reconnectable = false;
             output.appendLine(`[error] Could not retain reconnectable Recent Session: ${formatError(error)}`);
@@ -1003,10 +1028,22 @@ function systemProxyFingerprint(value: Awaited<ReturnType<typeof readWindowsSyst
 }
 
 async function showDiagnostics(advanced = false): Promise<void> {
-  const snapshot = requireRuntime().snapshot();
+  const activeRuntime = runtime;
+  const lifecycleEvents = activeRuntime?.lifecycleDiagnostics() ?? lastLifecycleDiagnostics;
+  if (!activeRuntime) {
+    if (!lifecycleEvents.length) throw new Error('No active or recently closed Pair Notebook diagnostics are available.');
+    const lifecycleText = formatLifecycleDiagnostics(lifecycleEvents);
+    const diagnostics = ['PAIR NOTEBOOK LIFECYCLE DIAGNOSTICS', '', lifecycleText].join('\n');
+    output.appendLine(diagnostics);
+    output.show(true);
+    const choice = await vscode.window.showInformationMessage('Pair Notebook diagnostics opened. Session tokens are excluded.', 'Copy Diagnostics');
+    if (choice === 'Copy Diagnostics') await vscode.env.clipboard.writeText(diagnostics);
+    return;
+  }
+  const snapshot = activeRuntime.snapshot();
   // networkDiagnostics is sanitized: no tokens, TURN or proxy credentials.
   const network = (() => {
-    try { return runtime?.networkDiagnostics(); } catch { return undefined; }
+    try { return activeRuntime.networkDiagnostics(); } catch { return undefined; }
   })() as {
     relays?: string[];
     turnStatus?: 'not-configured' | 'invalid' | 'configured';
@@ -1097,6 +1134,13 @@ async function showDiagnostics(advanced = false): Promise<void> {
       ...(passive.observations.length === 0 ? ['  No network limitations detected.'] : []),
     );
   }
+  lines.push(
+    '',
+    `Lifecycle evidence ring (${lifecycleEvents.length} events; oldest -> newest):`,
+    ...(lifecycleEvents.length
+      ? formatLifecycleDiagnostics(lifecycleEvents).split('\n').map((line) => `  ${line}`)
+      : ['  no lifecycle events']),
+  );
   const diagnostics = lines.join('\n');
   output.appendLine(diagnostics);
   output.show(true);

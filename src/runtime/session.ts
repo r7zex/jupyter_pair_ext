@@ -105,7 +105,19 @@ import {
   RouteUpgradeState,
   RouteUpgradeStatus,
   type SignallingRefreshResult,
+  type TransportLifecycleDiagnostic,
 } from './mesh';
+import {
+  LifecycleDiagnosticRing,
+  isDiagnosticCorrelationId,
+  type DiagnosticCorrelationId,
+  type DiagnosticReason,
+  type DiagnosticRouteKind,
+  type LifecycleDiagnosticEvent,
+  type LifecycleDiagnosticMetadata,
+  type LifecycleDiagnosticEventType,
+  type RecordLifecycleDiagnosticOptions,
+} from './lifecycleDiagnostics';
 
 /**
  * Terminal close reasons are deliberately non-overlapping:
@@ -122,8 +134,8 @@ export interface SessionTerminalLifecycle {
   peerId: string;
   hostId: string;
   at: number;
-  /** Reserved integration point for the bounded lifecycle diagnostics correlation id. */
-  correlationId?: string;
+  /** Opaque diagnostics correlation; emitted for every terminal lifecycle event. */
+  correlationId?: DiagnosticCorrelationId;
 }
 
 export class SessionClosedError extends Error {
@@ -498,10 +510,46 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public readonly coordinator: SessionCoordinator;
   public readonly startedAt = Date.now();
   private transport: MeshTransport;
+  private lifecycleDiagnosticsRing: LifecycleDiagnosticRing | undefined;
+  private latestLifecycleCorrelationByPeer = new Map<string, DiagnosticCorrelationId>();
+  private executionDiagnosticCorrelations = new Map<string, DiagnosticCorrelationId>();
 
-  /** Sanitized networking diagnostics for the diagnostics command. */
+  private getLifecycleDiagnosticsRing(): LifecycleDiagnosticRing {
+    if (!this.lifecycleDiagnosticsRing) {
+      this.lifecycleDiagnosticsRing = new LifecycleDiagnosticRing(
+        this.descriptor?.sessionId ?? 'uninitialized-session',
+        this.descriptor?.localPeer?.peerId ?? 'unknown-peer',
+      );
+    }
+    return this.lifecycleDiagnosticsRing;
+  }
+
+  private getExecutionDiagnosticCorrelations(): Map<string, DiagnosticCorrelationId> {
+    return this.executionDiagnosticCorrelations ??= new Map<string, DiagnosticCorrelationId>();
+  }
+
+  private getLatestLifecycleCorrelationByPeer(): Map<string, DiagnosticCorrelationId> {
+    return this.latestLifecycleCorrelationByPeer ??= new Map<string, DiagnosticCorrelationId>();
+  }
+
+  /** Sanitized networking + bounded lifecycle diagnostics for the diagnostics command. */
   public networkDiagnostics(): Record<string, unknown> {
-    return this.transport.networkDiagnostics();
+    return { ...this.transport.networkDiagnostics(), lifecycleEvents: this.getLifecycleDiagnosticsRing().snapshot() };
+  }
+
+  public lifecycleDiagnostics(): LifecycleDiagnosticEvent[] {
+    return this.getLifecycleDiagnosticsRing().snapshot();
+  }
+
+  public newLifecycleCorrelationId(): DiagnosticCorrelationId {
+    return this.getLifecycleDiagnosticsRing().newCorrelationId();
+  }
+
+  public recordLifecycleDiagnostic(
+    eventType: LifecycleDiagnosticEventType,
+    options: RecordLifecycleDiagnosticOptions,
+  ): void {
+    this.getLifecycleDiagnosticsRing().record(eventType, options);
   }
 
   private storage: StorageAdapter | undefined;
@@ -620,6 +668,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     identityPrivateKey?: string,
   ) {
     super();
+    this.lifecycleDiagnosticsRing = new LifecycleDiagnosticRing(descriptor.sessionId, descriptor.localPeer.peerId);
     descriptor.knownPeers = normalizeKnownPeers(descriptor.knownPeers, descriptor.localPeer.peerId);
     this.assignedJoinOrders.set(descriptor.localPeer.peerId, descriptor.localPeer.joinOrder);
     for (const peer of descriptor.knownPeers) this.assignedJoinOrders.set(peer.peerId, peer.joinOrder);
@@ -970,37 +1019,55 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public async reconnect(): Promise<SignallingRefreshResult> {
-    const selfId = this.descriptor.localPeer.peerId;
-    let reconnectHost: PeerIdentity | undefined;
-    if (this.descriptor.role === 'peer') {
-      const hostId = this.coordinator.clock.hostId;
-      if (hostId !== this.descriptor.hostPeerId || hostId === selfId) {
-        throw new Error('Reconnect refused because the pinned original host identity changed locally.');
-      }
-      reconnectHost = resolveHostIdentity(this.descriptor, hostId);
-      if (validateIdentityPublicKey(reconnectHost.identityKey)) {
-        throw new Error('Reconnect requires the authenticated public identity of the pinned original host.');
-      }
-      // A guest reconnect targets only the pinned logical host. Other remembered
-      // participants cannot substitute for it and reconnect itself never elects.
-      this.transport.connect(reconnectHost);
-    } else {
-      for (const peer of this.descriptor.knownPeers ?? []) {
-        if (peer.peerId !== selfId) this.transport.connect(peer);
-      }
+    const correlationId = this.getLifecycleDiagnosticsRing().newCorrelationId();
+    const remotePeerId = this.descriptor.role === 'peer' ? this.coordinator.clock.hostId : undefined;
+    this.getLifecycleDiagnosticsRing().record('reconnect-started', {
+      correlationId, ...(remotePeerId ? { remotePeerId } : {}),
+      connectionState: 'reconnecting', routeKind: 'signalling', reason: 'manual-reconnect',
+    });
+    try {
+          const selfId = this.descriptor.localPeer.peerId;
+          let reconnectHost: PeerIdentity | undefined;
+          if (this.descriptor.role === 'peer') {
+            const hostId = this.coordinator.clock.hostId;
+            if (hostId !== this.descriptor.hostPeerId || hostId === selfId) {
+              throw new Error('Reconnect refused because the pinned original host identity changed locally.');
+            }
+            reconnectHost = resolveHostIdentity(this.descriptor, hostId);
+            if (validateIdentityPublicKey(reconnectHost.identityKey)) {
+              throw new Error('Reconnect requires the authenticated public identity of the pinned original host.');
+            }
+            // A guest reconnect targets only the pinned logical host. Other remembered
+            // participants cannot substitute for it and reconnect itself never elects.
+            this.transport.connect(reconnectHost);
+          } else {
+            for (const peer of this.descriptor.knownPeers ?? []) {
+              if (peer.peerId !== selfId) this.transport.connect(peer);
+            }
+          }
+          const refreshed = await this.transport.refreshSignalling();
+          if (reconnectHost) {
+            await this.waitForTransportRoute(reconnectHost.peerId, LOGICAL_PEER_RECOVERY_MS);
+          }
+          this.log.appendLine(
+            `[debug] Manual reconnect completed for ${this.getLifecycleDiagnosticsRing().snapshot().at(-1)?.sessionIdentifier ?? 'session-unknown'} with ${refreshed.status}: `
+            + `${refreshed.nostr.verifiedEndpoints}/${refreshed.nostr.requestedSockets} Nostr and `
+            + `${refreshed.mqtt.verifiedEndpoints}/${refreshed.mqtt.requestedSockets} MQTT endpoints verified; `
+            + (reconnectHost ? `pinned host ${reconnectHost.peerId} authenticated route is available.` : 'authenticated data routes were retained.'),
+          );
+          this.emit('connectionUpdated', { kind: 'manual-reconnect', ...refreshed });
+      this.getLifecycleDiagnosticsRing().record('reconnect-succeeded', {
+        correlationId, ...(remotePeerId ? { remotePeerId } : {}),
+        connectionState: 'connected', routeKind: 'signalling', reason: 'manual-reconnect-succeeded',
+      });
+      return refreshed;
+    } catch (error) {
+      this.getLifecycleDiagnosticsRing().record('reconnect-failed', {
+        correlationId, ...(remotePeerId ? { remotePeerId } : {}),
+        connectionState: 'disconnected', routeKind: 'signalling', reason: 'manual-reconnect-failed',
+      });
+      throw error;
     }
-    const refreshed = await this.transport.refreshSignalling();
-    if (reconnectHost) {
-      await this.waitForTransportRoute(reconnectHost.peerId, LOGICAL_PEER_RECOVERY_MS);
-    }
-    this.log.appendLine(
-      `[debug] Manual reconnect completed for session ${this.descriptor.sessionId} with ${refreshed.status}: `
-      + `${refreshed.nostr.verifiedEndpoints}/${refreshed.nostr.requestedSockets} Nostr and `
-      + `${refreshed.mqtt.verifiedEndpoints}/${refreshed.mqtt.requestedSockets} MQTT endpoints verified; `
-      + (reconnectHost ? `pinned host ${reconnectHost.peerId} authenticated route is available.` : 'authenticated data routes were retained.'),
-    );
-    this.emit('connectionUpdated', { kind: 'manual-reconnect', ...refreshed });
-    return refreshed;
   }
 
   public async transferHost(targetPeerId: string): Promise<void> {
@@ -1087,6 +1154,33 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.persistDescriptorInBackground();
   }
 
+  private diagnosticRouteKind(peerId: string | undefined): DiagnosticRouteKind {
+    if (!peerId) return 'none';
+    const peerRuntime = (this.transport as MeshTransport & { peerRuntime?: () => PeerRuntime[] }).peerRuntime;
+    if (typeof peerRuntime !== 'function') return 'unknown';
+    const peer = peerRuntime.call(this.transport).find((candidate) => candidate.peerId === peerId);
+    return peer?.route === 'Direct' ? 'direct' : peer?.route === 'Relay' ? 'relay' : 'unknown';
+  }
+
+  private recordExecutionDiagnostic(
+    eventType: LifecycleDiagnosticEventType,
+    requestId: string,
+    remotePeerId: string | undefined,
+    reason: DiagnosticReason,
+    metadata?: LifecycleDiagnosticMetadata,
+  ): void {
+    const correlationId = this.getExecutionDiagnosticCorrelations().get(requestId);
+    if (!correlationId) return;
+    this.getLifecycleDiagnosticsRing().record(eventType, {
+      correlationId,
+      ...(remotePeerId ? { remotePeerId } : {}),
+      connectionState: 'executing',
+      routeKind: this.diagnosticRouteKind(remotePeerId),
+      reason,
+      metadata: { requestId, ...metadata },
+    });
+  }
+
   public async executeActiveCell(): Promise<void> {
     if (this.waitingForHostFolder) {
       throw new Error('The session is paused until the new host chooses a folder.');
@@ -1110,8 +1204,24 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onRequestId?.(requestId);
     const target = this.computeForNotebook(notebookKey);
     const executorId = target.executorId;
+    const diagnosticCorrelationId = this.getLifecycleDiagnosticsRing().newCorrelationId();
+    this.getExecutionDiagnosticCorrelations().set(requestId, diagnosticCorrelationId);
     if (executorId === this.descriptor.localPeer.peerId) {
-      return this.executeLocally(notebookKey, target, requestId, code, onEvent);
+      this.recordExecutionDiagnostic('execution-request-created', requestId, undefined, 'execution-request', {
+        cellId, computeEpoch: target.epoch,
+      });
+      this.recordExecutionDiagnostic('execution-started', requestId, undefined, 'execution-started', {
+        cellId, computeEpoch: target.epoch,
+      });
+      try {
+        const result = await this.executeLocally(notebookKey, target, requestId, code, onEvent);
+        this.recordExecutionDiagnostic('execution-completed', requestId, undefined, 'execution-completed', {
+          cellId, computeEpoch: target.epoch, result: result.success ? 'success' : 'failure',
+        });
+        return result;
+      } finally {
+        this.getExecutionDiagnosticCorrelations().delete(requestId);
+      }
     }
     if (executorId !== this.coordinator.clock.hostId) {
       throw new Error('Guest execution is pinned to the current Session Host.');
@@ -1129,6 +1239,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       cellRevision: cellState.revision,
       cellDigest,
     };
+    this.recordExecutionDiagnostic('execution-request-created', requestId, executorId, 'execution-request', {
+      cellId, revision: cellState.revision, digest: cellDigest, computeEpoch: target.epoch,
+    });
     this.transition('executing', `Requesting host execution for ${notebookKey} on ${executorId}.`);
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1156,6 +1269,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           requestId,
           ...request,
           fastPath: true,
+          diagnosticCorrelationId,
         },
         new Uint8Array(),
       ).catch((error) => {
@@ -1166,7 +1280,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
-    return remote.finally(() => this.transition('ready', `Execution finished for ${notebookKey}.`));
+    return remote.finally(() => {
+      this.transition('ready', `Execution finished for ${notebookKey}.`);
+      this.getExecutionDiagnosticCorrelations().delete(requestId);
+    });
   }
 
   private async dispatchRemoteExecutionRequest(
@@ -1176,6 +1293,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   ): Promise<void> {
     const requestId = String(meta.requestId ?? '');
     const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
+    let attempt = 0;
     while (!this.closed && Date.now() < deadline) {
       const pending = this.pendingExecutions.get(requestId);
       if (!pending || pending.accepted) return;
@@ -1185,6 +1303,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         const current = this.pendingExecutions.get(requestId);
         if (!current || current.accepted) return;
         this.transport.sendTo(executorId, 'executeRequest', meta, payload);
+        attempt += 1;
+        this.recordExecutionDiagnostic('execution-request-sent', requestId, executorId, 'execution-send', { attempt });
       } catch (error) {
         if (!isRouteUnavailableError(error)) throw error;
       }
@@ -1197,6 +1317,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!pending || pending.executorId !== executorId || pending.accepted) return;
     clearTimeout(pending.timer);
     pending.accepted = true;
+    this.recordExecutionDiagnostic('execution-accepted', requestId, executorId, 'execution-accepted');
     pending.timer = setTimeout(() => {
       if (this.pendingExecutions.get(requestId) !== pending) return;
       this.pendingExecutions.delete(requestId);
@@ -1263,6 +1384,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.pendingExecutions.delete(requestId);
     this.rememberCompletedExecutionReceipt(requestId, executorId);
     this.acknowledgeExecutionResult(requestId, executorId);
+    this.recordExecutionDiagnostic('execution-completed', requestId, executorId, 'execution-completed', {
+      result: result.success ? 'success' : 'failure',
+    });
     pending.resolve(result);
   }
 
@@ -1899,6 +2023,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private async disposeAsync(reason: SessionCloseReason = this.closeReason): Promise<void> {
     if (this.closed) return;
+    const terminalHostId = this.coordinator.clock.hostId;
+    const correlationId = reason === 'host-unreachable'
+      ? this.getLatestLifecycleCorrelationByPeer().get(terminalHostId) ?? this.getLifecycleDiagnosticsRing().newCorrelationId()
+      : this.getLifecycleDiagnosticsRing().newCorrelationId();
+    const diagnosticReason: DiagnosticReason = reason;
+    this.getLifecycleDiagnosticsRing().record('runtime-close-started', {
+      correlationId,
+      ...(terminalHostId !== this.descriptor.localPeer.peerId ? { remotePeerId: terminalHostId } : {}),
+      connectionState: 'closing', routeKind: 'none', reason: diagnosticReason,
+    });
     this.closed = true;
     this.closeReason = reason;
     const terminal: SessionTerminalLifecycle = {
@@ -2015,8 +2149,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await step(() => {
       if (this.terminalEventEmitted) return;
       this.terminalEventEmitted = true;
+      this.getLifecycleDiagnosticsRing().record('runtime-close-completed', {
+        correlationId,
+        ...(terminalHostId !== this.descriptor.localPeer.peerId ? { remotePeerId: terminalHostId } : {}),
+        connectionState: 'closed', routeKind: 'none', reason: diagnosticReason,
+      });
+      const sanitizedSession = this.getLifecycleDiagnosticsRing().snapshot().at(-1)?.sessionIdentifier ?? 'session-unknown';
       this.log.appendLine(
-        `[lifecycle] terminal reason=${terminal.reason} session=${terminal.sessionId} peer=${terminal.peerId} host=${terminal.hostId} at=${terminal.at}`,
+        `[lifecycle] terminal reason=${terminal.reason} correlation=${correlationId} session=${sanitizedSession} peer=${terminal.peerId} host=${terminal.hostId} at=${terminal.at}`,
       );
       this.emit('terminal', terminal);
     });
@@ -2053,6 +2193,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private installTransportHandlers(): void {
+    this.transport.on('lifecycleDiagnostic', (event: TransportLifecycleDiagnostic) => {
+      this.getLatestLifecycleCorrelationByPeer().set(event.remotePeerId, event.correlationId);
+      this.getLifecycleDiagnosticsRing().record(event.eventType, {
+        correlationId: event.correlationId,
+        remotePeerId: event.remotePeerId,
+        connectionState: event.connectionState,
+        routeKind: event.routeKind,
+        reason: event.reason,
+        ...(event.metadata ? { metadata: event.metadata } : {}),
+      });
+    });
     this.transport.on('peerConnected', (peer: PeerIdentity) => {
       if (this.coordinator.isCurrentHost()) peer = this.assignPeerJoinOrder(peer);
       this.coordinator.upsertPeer(this.asRuntime(peer, true));
@@ -4961,10 +5112,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private replayRemoteExecutionsForPeer(peerId: string): void {
     for (const [requestId, owner] of this.executionOwners) {
       if (owner.peerId !== peerId || !owner.events) continue;
+      this.recordExecutionDiagnostic('execution-replayed', requestId, peerId, 'execution-replay', {
+        ...(owner.cellId ? { cellId: owner.cellId } : {}),
+      });
       this.deliverActiveRemoteExecution(requestId);
     }
     for (const [requestId, completed] of this.completedRemoteExecutions) {
-      if (completed.sourceId === peerId) this.deliverCompletedRemoteExecution(requestId);
+      if (completed.sourceId !== peerId) continue;
+      this.recordExecutionDiagnostic('execution-replayed', requestId, peerId, 'execution-replay');
+      this.deliverCompletedRemoteExecution(requestId);
     }
   }
 
@@ -5046,6 +5202,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     clearTimeout(completed.expiryTimer);
     if (completed.retryTimer) clearTimeout(completed.retryTimer);
     this.completedRemoteExecutions.delete(requestId);
+    this.getExecutionDiagnosticCorrelations().delete(requestId);
     this.completedRemoteExecutionBytes = Math.max(
       0,
       this.completedRemoteExecutionBytes - completed.retainedBytes,
@@ -5101,6 +5258,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private async waitForAuthoritativeCellState(
     request: LightweightExecutionRequest,
+    requestId: string,
+    sourceId: string,
   ): Promise<{ source: string; revision: string; digest: string }> {
     const inspect = (): { source: string; revision: string; digest: string } | undefined => {
       if (this.project.kindOf(request.notebookKey) !== 'notebook'
@@ -5127,13 +5286,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       return 'wait';
     };
 
+    const diagnosticMetadata: LifecycleDiagnosticMetadata = {
+      cellId: request.cellId,
+      revision: request.cellRevision,
+      digest: request.cellDigest,
+      computeEpoch: request.computeEpoch,
+    };
     const initial = inspect();
     const initialClass = classify(initial);
-    if (initialClass === 'match') return initial!;
+    if (initialClass === 'match') {
+      this.recordExecutionDiagnostic('execution-cell-state-ready', requestId, sourceId, 'cell-state-ready', diagnosticMetadata);
+      return initial!;
+    }
     if (initialClass === 'host-ahead') {
       throw new StaleCellRevisionError('The host canonical cell is newer than the requested guest revision.');
     }
 
+    this.recordExecutionDiagnostic('execution-cell-state-wait', requestId, sourceId, 'cell-state-wait', diagnosticMetadata);
     return new Promise((resolve, reject) => {
       let settled = false;
       const cleanup = (): void => {
@@ -5145,6 +5314,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (settled) return;
         settled = true;
         cleanup();
+        this.recordExecutionDiagnostic('execution-cell-state-ready', requestId, sourceId, 'cell-state-ready', diagnosticMetadata);
         resolve(state);
       };
       const finishReject = (error: Error): void => {
@@ -5192,6 +5362,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private async handleExecutionRequest(frame: WireFrame, sourceId: string): Promise<void> {
     const requestId = String(frame.meta.requestId ?? '');
     const notebookKey = normalizedTrackedPath(String(frame.meta.notebookKey ?? ''));
+    let diagnosticCorrelationId: DiagnosticCorrelationId | undefined = undefined;
     const rejectRequest = (ename: string, evalue: string): void => {
       if (!TRANSFER_ID_PATTERN.test(requestId)) return;
       try {
@@ -5206,6 +5377,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }, encodeRemoteExecutionResult(result));
       } catch (error) {
         this.log.appendLine(`[debug] Could not reject execution ${requestId}: ${formatError(error)}`);
+      }
+      if (diagnosticCorrelationId) {
+        this.recordExecutionDiagnostic('execution-completed', requestId, sourceId, 'execution-completed', { result: ename });
+        if (this.getExecutionDiagnosticCorrelations().get(requestId) === diagnosticCorrelationId) {
+          this.getExecutionDiagnosticCorrelations().delete(requestId);
+        }
       }
     };
 
@@ -5242,10 +5419,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const requestDigest = fastPath
       ? lightweightExecutionRequestDigest(lightweight!)
       : legacyRemoteExecutionRequestDigest(notebookKey, legacyTarget!, legacyManifest!, frame.payload);
+    const advertisedCorrelation = frame.meta.diagnosticCorrelationId;
+    diagnosticCorrelationId = this.getExecutionDiagnosticCorrelations().get(requestId)
+      ?? (isDiagnosticCorrelationId(advertisedCorrelation)
+        ? advertisedCorrelation
+        : this.getLifecycleDiagnosticsRing().newCorrelationId());
+    this.getExecutionDiagnosticCorrelations().set(requestId, diagnosticCorrelationId);
 
     const completed = this.completedRemoteExecutions.get(requestId);
     if (completed) {
       if (completed.sourceId === sourceId && completed.requestDigest === requestDigest) {
+        this.recordExecutionDiagnostic('execution-replayed', requestId, sourceId, 'execution-replay');
         this.sendExecutionAccepted(sourceId, requestId);
         this.deliverCompletedRemoteExecution(requestId);
       } else {
@@ -5256,6 +5440,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const activeOwner = this.executionOwners.get(requestId);
     if (activeOwner) {
       if (activeOwner.peerId === sourceId && activeOwner.requestDigest === requestDigest) {
+        this.recordExecutionDiagnostic('execution-replayed', requestId, sourceId, 'execution-replay', {
+          ...(activeOwner.cellId ? { cellId: activeOwner.cellId } : {}),
+        });
         this.deliverActiveRemoteExecution(requestId);
       } else {
         rejectRequest('ExecutionBusy', 'The execution request id is already active with different request identity.');
@@ -5298,7 +5485,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       let canonical: { source: string; revision: string; digest: string };
       try {
-        canonical = await this.waitForAuthoritativeCellState(request);
+        canonical = await this.waitForAuthoritativeCellState(request, requestId, sourceId);
       } catch (error) {
         if (this.executionOwners.get(requestId) === executionOwner) {
           this.executionOwners.delete(requestId);
@@ -5425,10 +5612,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.project.setCellOutputs(notebookKey, executionOwner.cellId, []);
     }
     executionOwner.accepted = true;
+    this.recordExecutionDiagnostic('execution-accepted', requestId, sourceId, 'execution-accepted', {
+      ...(executionOwner.cellId ? { cellId: executionOwner.cellId } : {}),
+    });
     this.sendExecutionAccepted(sourceId, requestId);
     let timeout: NodeJS.Timeout | undefined;
     let result: JupyterExecutionResult;
     try {
+      this.recordExecutionDiagnostic('execution-started', requestId, sourceId, 'execution-started', {
+        ...(executionOwner.cellId ? { cellId: executionOwner.cellId } : {}),
+      });
       const execution = this.executeLocally(
         notebookKey,
         target,
@@ -5537,6 +5730,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         },
       });
     }
+    this.recordExecutionDiagnostic('execution-completed', requestId, sourceId, 'execution-completed', {
+      ...(executionOwner.cellId ? { cellId: executionOwner.cellId } : {}),
+      result: result.success ? 'success' : 'failure',
+    });
     this.rememberCompletedRemoteExecution(
       sourceId,
       requestId,

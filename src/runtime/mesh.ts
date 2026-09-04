@@ -64,6 +64,15 @@ import { assessUdpAvailability, type SignallingFamilyDiagnostic } from './diagno
 import { shouldMigrateRoute } from './routeScoring';
 import { NetworkChangeWatcher } from './netWatch';
 import { signallingEndpointIdentity } from './signallingEndpoint';
+import {
+  newDiagnosticCorrelationId,
+  type DiagnosticConnectionState,
+  type DiagnosticCorrelationId,
+  type DiagnosticReason,
+  type DiagnosticRouteKind,
+  type LifecycleDiagnosticEventType,
+  type LifecycleDiagnosticMetadata,
+} from './lifecycleDiagnostics';
 
 export const TRYSTERO_APP_ID = 'dev.pair-notebook.vscode.v2';
 /**
@@ -325,9 +334,21 @@ interface ConnectedPeer {
   snapshotRequested: boolean;
 }
 
+export interface TransportLifecycleDiagnostic {
+  correlationId: DiagnosticCorrelationId;
+  eventType: LifecycleDiagnosticEventType;
+  remotePeerId: string;
+  connectionState: DiagnosticConnectionState;
+  routeKind: DiagnosticRouteKind;
+  reason: DiagnosticReason;
+  metadata?: LifecycleDiagnosticMetadata | undefined;
+}
+
 interface RecoveringPeer {
   identity: PeerIdentity;
   purpose: PeerConnectionPurpose;
+  correlationId: DiagnosticCorrelationId;
+  lostRouteKind: 'direct' | 'relay';
   /** Start of this logical recovery cycle; never reused as heartbeat freshness. */
   startedAt: number;
   /** Absolute wall-clock deadline for this recovery cycle. */
@@ -1157,6 +1178,10 @@ export class MeshTransport extends EventEmitter {
     const error = validatePeerIdentity(peer);
     if (error) throw new Error(`Cannot remember an invalid peer: ${error}`);
     this.rememberPeer(normalizedPeerIdentity(peer));
+    const recovery = this.recoveringPeers.get(peer.peerId);
+    if (recovery) {
+      this.emitLifecycleDiagnostic(recovery, 'direct-reconnect-started', 'reconnecting', 'signalling', 'direct-reconnect');
+    }
     if (this.identityToTransport.has(peer.peerId)) this.sendHelloAck(peer.peerId);
   }
 
@@ -1918,6 +1943,10 @@ public improvablePeerIds(): string[] {
     const attempts = this.relayAttempts.get(peerId) ?? 0;
     if (attempts >= 6 || this.relayNegotiations.has(peerId)) return;
     this.relayAttempts.set(peerId, attempts + 1);
+    const recovery = this.recoveringPeers.get(peerId);
+    if (recovery) {
+      this.emitLifecycleDiagnostic(recovery, 'relay-negotiation-started', 'recovering', 'relay', 'relay-fallback', { attempt: attempts + 1 });
+    }
     this.sendRelayHandshake(peerId);
   }
 
@@ -2463,6 +2492,26 @@ public improvablePeerIds(): string[] {
     }
   }
 
+  private emitLifecycleDiagnostic(
+    recovery: RecoveringPeer,
+    eventType: LifecycleDiagnosticEventType,
+    connectionState: DiagnosticConnectionState,
+    routeKind: DiagnosticRouteKind,
+    reason: DiagnosticReason,
+    metadata?: LifecycleDiagnosticMetadata,
+  ): void {
+    const event: TransportLifecycleDiagnostic = {
+      correlationId: recovery.correlationId,
+      eventType,
+      remotePeerId: recovery.identity.peerId,
+      connectionState,
+      routeKind,
+      reason,
+      ...(metadata ? { metadata } : {}),
+    };
+    this.emit('lifecycleDiagnostic', event);
+  }
+
   private onPeerJoin(transportPeerId: string): void {
     if (this.stopped) return;
     const handshake = this.pendingHandshakes.get(transportPeerId);
@@ -2495,6 +2544,16 @@ public improvablePeerIds(): string[] {
     };
     this.connections.set(transportPeerId, connection);
     this.identityToTransport.set(handshake.peer.peerId, transportPeerId);
+    const recovery = this.recoveringPeers.get(handshake.peer.peerId);
+    if (recovery) {
+      const routeKind: DiagnosticRouteKind = transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX) ? 'relay' : 'direct';
+      this.emitLifecycleDiagnostic(recovery, 'candidate-authenticated', 'recovering', routeKind, 'candidate-authenticated');
+      this.emitLifecycleDiagnostic(recovery, 'route-replaced', 'connected', routeKind, 'replacement-authenticated', {
+        routeFrom: recovery.lostRouteKind,
+        routeTo: routeKind,
+      });
+      this.emitLifecycleDiagnostic(recovery, 'recovery-succeeded', 'connected', routeKind, 'replacement-authenticated');
+    }
     this.finishLogicalRecovery(handshake.peer.peerId);
     this.rememberPeer(handshake.peer);
     this.routes.set(handshake.peer.peerId, 'Direct');
@@ -2515,7 +2574,10 @@ public improvablePeerIds(): string[] {
     }
   }
 
-  private onPeerLeave(transportPeerId: string): void {
+  private onPeerLeave(
+    transportPeerId: string,
+    trigger: 'route-lost' | 'half-open-detected' = 'route-lost',
+  ): void {
     // Propagate the death to the room level so the REMOTE side also learns
     // its route died (otherwise a half-dead route stays "fresh" there and
     // blocks symmetric recovery through the surviving signalling family).
@@ -2546,7 +2608,8 @@ public improvablePeerIds(): string[] {
       this.identityToTransport.delete(connection.identity.peerId);
     }
     if (!this.stopped && wasActiveIdentityRoute) {
-      this.beginLogicalRecovery(connection.identity, connection.purpose, connection.lastSeen);
+      const lostRouteKind = transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX) ? 'relay' : 'direct';
+      this.beginLogicalRecovery(connection.identity, connection.purpose, connection.lastSeen, trigger, lostRouteKind);
     }
   }
 
@@ -2554,11 +2617,14 @@ public improvablePeerIds(): string[] {
     identity: PeerIdentity,
     purpose: PeerConnectionPurpose,
     lastHeartbeat = 0,
+    trigger: 'route-lost' | 'half-open-detected' = 'route-lost',
+    lostRouteKind: 'direct' | 'relay' = 'direct',
   ): void {
     if (this.stopped || this.hasRoute(identity.peerId) || this.recoveringPeers.has(identity.peerId)) return;
     const startedAt = Date.now();
     const recoveryMs = this.options.logicalPeerRecoveryMs ?? LOGICAL_PEER_RECOVERY_MS;
     const deadlineAt = startedAt + recoveryMs;
+    const correlationId = newDiagnosticCorrelationId();
     const timer = setTimeout(() => {
       const recovery = this.recoveringPeers.get(identity.peerId);
       if (!recovery || recovery.startedAt !== startedAt || recovery.deadlineAt !== deadlineAt) return;
@@ -2566,21 +2632,32 @@ public improvablePeerIds(): string[] {
         this.finishLogicalRecovery(identity.peerId);
         return;
       }
+      this.emitLifecycleDiagnostic(recovery, 'recovery-deadline', 'disconnected', 'none', 'recovery-deadline');
+      this.emitLifecycleDiagnostic(recovery, 'peer-disconnected', 'disconnected', 'none', 'peer-disconnected');
       this.recoveringPeers.delete(identity.peerId);
       this.emit(
         recovery.purpose === 'bootstrap' ? 'bootstrapDisconnected' : 'peerDisconnected',
         recovery.identity,
+        { correlationId: recovery.correlationId },
       );
     }, Math.max(0, deadlineAt - Date.now()));
     timer.unref?.();
-    this.recoveringPeers.set(identity.peerId, {
+    const recovery: RecoveringPeer = {
       identity: { ...identity },
       purpose,
+      correlationId,
+      lostRouteKind,
       startedAt,
       deadlineAt,
       lastHeartbeat,
       timer,
-    });
+    };
+    this.recoveringPeers.set(identity.peerId, recovery);
+    if (trigger === 'half-open-detected') {
+      this.emitLifecycleDiagnostic(recovery, 'half-open-detected', 'recovering', lostRouteKind, 'half-open');
+    }
+    this.emitLifecycleDiagnostic(recovery, 'route-lost', 'recovering', lostRouteKind, 'route-lost');
+    this.emitLifecycleDiagnostic(recovery, 'recovery-started', 'recovering', lostRouteKind, 'recovery-started');
     this.emit('peerRecovering', { ...identity });
 
     // Do not wait for the periodic 20-second sweep. The already-verified full
@@ -3032,7 +3109,7 @@ public improvablePeerIds(): string[] {
             // VPN/TUN changes can leave a DataChannel half-open without a
             // Trystero leave callback. Retire only after repeated failed
             // probes, then preserve the logical peer during the recovery lease.
-            this.onPeerLeave(connection.transportPeerId);
+            this.onPeerLeave(connection.transportPeerId, 'half-open-detected');
           }
         }
       }));
