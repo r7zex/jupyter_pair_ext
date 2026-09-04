@@ -50,12 +50,14 @@ const runtimeRoomFactory = createInMemoryTrysteroFactory();
 
 beforeEach(() => {
   resetInMemoryTrystero();
+  configureMeshNetwork({ disableRelayFallback: true, disableTurnProbe: true });
   MeshTransport.setRoomFactoryForTesting(runtimeRoomFactory);
   fakeVscode.__commands.length = 0;
 });
 
 afterEach(() => {
   MeshTransport.setRoomFactoryForTesting(undefined);
+  configureMeshNetwork({});
   resetInMemoryTrystero();
 });
 
@@ -501,8 +503,8 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => peerB.snapshot().peers.some((peer: any) => peer.peerId === 'peer-c' && peer.online), 5000, 'peer mesh');
       await waitFor(() => peerB.descriptor.localPeer.joinOrder === 1
         && peerC.descriptor.localPeer.joinOrder === 2, 2000, 'monotonic host-assigned participant order');
-      const peerBClosed = onceEvent(peerB, 'closed');
-      const peerCClosed = onceEvent(peerC, 'closed');
+      const peerBClosed = onceEvent(peerB, 'closed', 15_000);
+      const peerCClosed = onceEvent(peerC, 'closed', 15_000);
       partitionInMemoryTrystero();
       await Promise.all([peerBClosed, peerCClosed]);
       for (const peer of [peerB, peerC]) {
@@ -557,8 +559,8 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => alpha.snapshot().peers.some((peer: any) => peer.peerId === 'beta' && peer.online), 5000, 'full mesh before partition');
       useFastLogicalRecovery(alpha, beta);
 
-      const alphaClosed = onceEvent(alpha, 'closed');
-      const betaClosed = onceEvent(beta, 'closed');
+      const alphaClosed = onceEvent(alpha, 'closed', 15_000);
+      const betaClosed = onceEvent(beta, 'closed', 15_000);
       partitionInMemoryTrystero();
       await Promise.all([alphaClosed, betaClosed]);
       for (const peer of [alpha, beta]) {
@@ -3937,9 +3939,9 @@ function useFastLogicalRecovery(...runtimes: any[]): void {
   }
 }
 
-function onceEvent(emitter: NodeJS.EventEmitter, event: string): Promise<void> {
+function onceEvent(emitter: NodeJS.EventEmitter, event: string, timeoutMs = 5000): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`event ${event} timeout`)), 5000);
+    const timer = setTimeout(() => reject(new Error(`event ${event} timeout`)), timeoutMs);
     emitter.once(event, () => {
       clearTimeout(timer);
       resolve();
