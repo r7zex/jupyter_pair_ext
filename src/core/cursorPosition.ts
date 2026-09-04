@@ -44,9 +44,18 @@ export function resolveSharedCursorPosition(
   text: Y.Text | undefined,
   cursor: SharedCursorPosition,
 ): ResolvedCursorPosition | undefined {
-  const anchor = resolveRelativeOffset(text, cursor.relativeAnchor, cursor.anchor);
-  const active = resolveRelativeOffset(text, cursor.relativeActive, cursor.active);
+  const relativeAnchor = resolveRelativeOffset(text, cursor.relativeAnchor, undefined);
+  const relativeActive = resolveRelativeOffset(text, cursor.relativeActive, undefined);
+  const anchor = relativeAnchor ?? strictLegacyOffset(cursor.anchor, text?.length);
+  const active = relativeActive ?? strictLegacyOffset(cursor.active, text?.length);
   return anchor === undefined || active === undefined ? undefined : { anchor, active };
+}
+
+function strictLegacyOffset(value: unknown, maximum: number | undefined): number | undefined {
+  if (maximum === undefined || typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    return undefined;
+  }
+  return value <= maximum ? value : undefined;
 }
 
 export function encodeRelativeOffset(text: Y.Text, offset: number): string | undefined {

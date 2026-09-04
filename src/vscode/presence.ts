@@ -2,7 +2,7 @@ import path from 'node:path';
 import * as vscode from 'vscode';
 import { safeRelativePath } from '../core/persistence';
 import { shouldTrackProjectPath } from '../core/projectFiles';
-import { PresenceState, SessionRuntime } from '../runtime/session';
+import type { PresenceState, SessionRuntime } from '../runtime/session';
 
 const HIDDEN_CURSORS = 'pairNotebook.hiddenCursorPeers';
 const HIDDEN_NAMES = 'pairNotebook.hiddenCursorNames';
@@ -28,9 +28,14 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
   private readonly disposables: vscode.Disposable[];
   private cursorSignature = '';
   private cellStatusSignature = '';
+  private readonly invalidPresenceSignatures = new Map<string, string>();
 
   public constructor(private readonly runtime: SessionRuntime, private readonly context: vscode.ExtensionContext) {
-    const updatePresence = () => this.render(false);
+    const updatePresence = () => {
+      const hadInvalid = this.invalidPresenceSignatures.size > 0;
+      this.invalidPresenceSignatures.clear();
+      this.render(hadInvalid);
+    };
     const forceUpdate = () => this.render(true);
     runtime.on('presence', updatePresence);
     this.disposables = [
@@ -41,6 +46,7 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
         if (vscode.window.visibleTextEditors.some((editor) =>
           editor.document.uri.toString() === event.document.uri.toString())) forceUpdate();
       }),
+      vscode.workspace.onDidChangeNotebookDocument(forceUpdate),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration('pairNotebook.showRemoteCursors')
           || event.affectsConfiguration('pairNotebook.showRemoteCursorNames')) forceUpdate();
@@ -58,6 +64,7 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
     if (!key || !cellId) return [];
     return this.visibleRemoteStates()
       .filter((state) => state.activeFile === key && state.activeNotebookCellId === cellId)
+      .filter((state) => this.renderedLine(state, cell.document) !== undefined)
       .map((state) => {
         const showName = this.showName(state.peer.peerId);
         const item = new vscode.NotebookCellStatusBarItem(
@@ -121,36 +128,42 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
         activeFile: state.activeFile,
         activeNotebookCellId: state.activeNotebookCellId,
         activeLine: state.activeLine,
+        cursor: state.cursor,
         cursorColor: this.colorFor(state.peer.peerId, state.cursorColor),
         showName: this.showName(state.peer.peerId),
       }))
       .sort((left, right) => left.peerId.localeCompare(right.peerId)));
     if (!force && cursorSignature === this.cursorSignature) return;
     this.cursorSignature = cursorSignature;
+
     const currentPeerIds = new Set(visibleStates.map((state) => state.peer.peerId));
     for (const peerId of [...this.decorations.keys()]) {
-      if (!currentPeerIds.has(peerId)) {
-        this.decorations.get(peerId)?.type.dispose();
-        this.decorations.delete(peerId);
-      }
+      if (!currentPeerIds.has(peerId)) this.disposeDecoration(peerId);
     }
+
     for (const editor of vscode.window.visibleTextEditors) {
       for (const decoration of this.decorations.values()) editor.setDecorations(decoration.type, []);
       const location = this.editorLocation(editor);
       if (!location) continue;
       for (const state of visibleStates) {
-        if (state.activeFile !== location.key || state.activeLine === undefined) continue;
-        if (location.cellId !== undefined && state.activeNotebookCellId !== location.cellId) continue;
-        if (location.cellId === undefined && state.activeNotebookCellId !== undefined) continue;
+        if (state.activeFile !== location.key) continue;
+        if (location.cellId !== undefined) {
+          if (state.activeNotebookCellId !== location.cellId) continue;
+          if (!this.findNotebookCell(location.key, location.cellId)) {
+            this.blockInvalidPresence(state);
+            continue;
+          }
+        } else if (state.activeNotebookCellId !== undefined) {
+          continue;
+        }
+        const line = this.renderedLine(state, editor.document);
+        if (line === undefined) continue;
         const color = this.colorFor(state.peer.peerId, state.cursorColor);
         const decoration = this.decorationFor(state.peer.peerId, color);
-        const line = Math.min(Math.max(0, state.activeLine), Math.max(0, editor.document.lineCount - 1));
         const textLine = editor.document.lineAt(line);
-        const start = textLine.range.start;
-        const end = textLine.range.end;
         const showName = this.showName(state.peer.peerId);
         const option: vscode.DecorationOptions = {
-          range: new vscode.Range(start, end),
+          range: new vscode.Range(textLine.range.start, textLine.range.end),
           hoverMessage: showName ? `${state.peer.displayName} is editing this line` : 'A collaborator is editing this line',
           ...(showName ? {
             renderOptions: {
@@ -167,13 +180,26 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
         editor.setDecorations(decoration, [option]);
       }
     }
+
     const cellStatusSignature = JSON.stringify(visibleStates
-      .filter((state) => state.activeNotebookCellId !== undefined)
+      .filter((state) => {
+        if (!state.activeFile || !state.activeNotebookCellId) return false;
+        const notebook = this.notebookForKey(state.activeFile);
+        if (!notebook) return false;
+        const cell = notebook.getCells().find((candidate) =>
+          this.runtime.notebookCellId(candidate) === state.activeNotebookCellId);
+        if (!cell) {
+          this.blockInvalidPresence(state);
+          return false;
+        }
+        return this.renderedLine(state, cell.document) !== undefined;
+      })
       .map((state) => ({
         peerId: state.peer.peerId,
         displayName: state.peer.displayName,
         activeFile: state.activeFile,
         activeNotebookCellId: state.activeNotebookCellId,
+        cursorColor: this.colorFor(state.peer.peerId, state.cursorColor),
         showName: this.showName(state.peer.peerId),
       }))
       .sort((left, right) => left.peerId.localeCompare(right.peerId)));
@@ -181,6 +207,66 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
       this.cellStatusSignature = cellStatusSignature;
       this.changeEmitter.fire();
     }
+  }
+
+  private renderedLine(state: PresenceState, document: vscode.TextDocument): number | undefined {
+    if (state.activeLine !== undefined) {
+      if (!Number.isSafeInteger(state.activeLine)
+        || state.activeLine < 0
+        || state.activeLine >= document.lineCount) {
+        this.blockInvalidPresence(state);
+        return undefined;
+      }
+      return state.activeLine;
+    }
+    if (!state.cursor) return undefined;
+    const resolved = this.runtime.resolvePresenceCursor(state);
+    if (!resolved || !Number.isSafeInteger(resolved.active) || resolved.active < 0) {
+      this.blockInvalidPresence(state);
+      return undefined;
+    }
+    try {
+      const position = document.positionAt(resolved.active);
+      if (!Number.isSafeInteger(position.line) || position.line < 0 || position.line >= document.lineCount) {
+        this.blockInvalidPresence(state);
+        return undefined;
+      }
+      return position.line;
+    } catch {
+      this.blockInvalidPresence(state);
+      return undefined;
+    }
+  }
+
+  private notebookForKey(key: string): vscode.NotebookDocument | undefined {
+    return vscode.workspace.notebookDocuments.find((notebook) => this.relativeKey(notebook.uri) === key);
+  }
+
+  private findNotebookCell(key: string, cellId: string): vscode.NotebookCell | undefined {
+    const notebook = this.notebookForKey(key);
+    return notebook?.getCells().find((cell) => this.runtime.notebookCellId(cell) === cellId);
+  }
+
+  private presenceSignature(state: PresenceState): string {
+    return JSON.stringify({
+      activeFile: state.activeFile,
+      activeNotebookCellId: state.activeNotebookCellId,
+      activeLine: state.activeLine,
+      cursor: state.cursor,
+      shareCursor: state.shareCursor,
+      cursorColor: state.cursorColor,
+      displayName: state.peer.displayName,
+    });
+  }
+
+  private blockInvalidPresence(state: PresenceState): void {
+    this.invalidPresenceSignatures.set(state.peer.peerId, this.presenceSignature(state));
+    this.disposeDecoration(state.peer.peerId);
+  }
+
+  private disposeDecoration(peerId: string): void {
+    this.decorations.get(peerId)?.type.dispose();
+    this.decorations.delete(peerId);
   }
 
   private editorLocation(editor: vscode.TextEditor): { key: string; cellId?: string } | undefined {
@@ -201,11 +287,19 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
 
   private visibleRemoteStates(): PresenceState[] {
     const hidden = this.hiddenCursorPeers();
-    return this.runtime.snapshot().awareness.filter((state) =>
-      state.peer.peerId !== this.runtime.descriptor.localPeer.peerId
-      && state.shareCursor !== false
-      && state.activeLine !== undefined
-      && !hidden.has(state.peer.peerId));
+    return this.runtime.snapshot().awareness
+      .filter((state) => {
+        if (state.peer.peerId === this.runtime.descriptor.localPeer.peerId
+          || state.shareCursor === false
+          || !state.activeFile
+          || (state.activeLine === undefined && state.cursor === undefined)
+          || hidden.has(state.peer.peerId)) return false;
+        return this.invalidPresenceSignatures.get(state.peer.peerId) !== this.presenceSignature(state);
+      })
+      .sort((left, right) => {
+        const joinOrder = left.peer.joinOrder - right.peer.joinOrder;
+        return joinOrder || left.peer.peerId.localeCompare(right.peer.peerId);
+      });
   }
 
   private decorationFor(peerId: string, color: string): vscode.TextEditorDecorationType {
@@ -213,6 +307,7 @@ export class PresenceRenderer implements vscode.Disposable, vscode.NotebookCellS
     if (existing?.color === color) return existing.type;
     existing?.type.dispose();
     const type = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true,
       borderStyle: 'solid',
       borderWidth: '0 0 0 2px',
       borderColor: color,

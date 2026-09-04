@@ -55,6 +55,7 @@ describe('presence decoration lifecycle', () => {
         notebookDocuments: [],
         getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback }),
         onDidChangeTextDocument: () => disposable(),
+        onDidChangeNotebookDocument: () => disposable(),
         onDidChangeConfiguration: () => disposable(),
       },
       notebooks: {
