@@ -2642,9 +2642,12 @@ describe('reconnectable Recent Sessions', () => {
     assert.equal(remembered[0]?.reconnect?.sessionId, 'recent-session');
     assert.equal(remembered[0]?.reconnect?.hostPeerId, 'original-host');
     assert.equal(remembered[0]?.reconnect?.hostEpoch, 7);
+    const rememberedEntry = remembered[0]!;
     const leftProject = clearRecentReconnect(remembered, descriptor.workingFolder);
     assert.equal(leftProject.length, 1, 'explicit Leave keeps the Recent Project entry');
     assert.equal(leftProject[0]?.reconnect, undefined, 'explicit Leave removes reconnect semantics');
+    assert.notEqual(leftProject[0], rememberedEntry, 'reconnect cleanup returns a new immutable Recent Project value');
+    assert.deepEqual(rememberedEntry.reconnect, reconnect, 'reconnect cleanup never mutates the remembered source entry');
     assert.equal(forgetRecentProject(remembered, descriptor.workingFolder).length, 0);
   });
 

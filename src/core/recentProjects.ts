@@ -68,7 +68,8 @@ export function clearRecentReconnect(
   const wanted = canonicalPath(workingFolder);
   return recent.map((item) => {
     if (canonicalPath(item.workingFolder) !== wanted || !item.reconnect) return item;
-    const { reconnect: _reconnect, ...project } = item;
+    const project = { ...item };
+    delete project.reconnect;
     return project;
   });
 }
