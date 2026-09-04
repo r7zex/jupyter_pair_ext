@@ -1,126 +1,276 @@
-# Session, notebook, and presence stability repair
+# Pair Notebook — Session/editor stability repair plan
 
-Status: in progress. Each completed checkpoint is tested, committed, and pushed before the next checkpoint begins.
+**Status: in progress — implementation and Prompt 16 quality gate are closed; the 16-prompt series remains administratively incomplete because the mandatory Prompt 15 PDF report was not produced in its prompt.**
 
-## Incident findings
+This document records the original repair contracts and the evidence used to decide whether they are closed. Requirements are not rewritten after implementation to manufacture `[x]` status: a box is checked only where production code plus regression evidence satisfy the original contract.
 
-- The coordinator could expire the pinned host heartbeat before the mesh classified a VPN-switched WebRTC channel as half-open.
-- Logical route recovery was represented as `online`, leaving a disconnected participant visible in the host panel.
-- Runtime shutdown did not have one UI-visible reason or close the isolated-session tabs.
-- Output and execution updates reapplied a complete notebook, including unrelated cells, which recreated editor state and caused viewport movement.
-- Guest execution performed a complete filesystem barrier before sending the host execution request.
-- Presence updates carried precise offsets and were republished with resource data; deleted or replaced cells could resolve an obsolete offset to the first line.
+## Non-negotiable contracts
 
-## Checkpoints
+- The logical participant is independent from any one physical route.
+- Route loss, VPN/TUN change, half-open detection, signalling refresh, heartbeat delay, or ordinary Leave must not elect a new host.
+- The one logical route-recovery contract is **30 seconds** (`LOGICAL_PEER_RECOVERY_MS = 30_000`).
+- A guest reconnects only to the original pinned authenticated host identity.
+- Terminal close reasons are typed and non-overlapping.
+- Notebook non-structural updates are narrow; `NotebookEdit.replaceCells` is structure-only.
+- Background editor persistence does not force `save()` and does not use full notebook replacement as a hot-path fallback.
+- Ordinary guest Run Cell executes host-canonical CRDT text without project-wide file synchronization/materialization/flush.
+- Remote execution and result delivery are idempotent/exactly-once at the logical operation boundary.
+- New presence is file/cell/**line** semantic state, never an exact cursor offset/selection publisher.
+- Resource/hardware/kernel telemetry is separate from semantic presence.
+- Lifecycle diagnostics are correlated, bounded, sanitized, and passive.
 
-- [x] **1. Route-recovery state contract.** Model `connected`, `recovering`, and `disconnected` separately; use a 30-second bounded recovery lease; do not report recovery as online; coordinator retains the pinned host while recovery is active.
-- [x] **2. Deterministic guest termination.** Emit one close reason, persist the reconnectable recent session, clear collaboration state, notify the user, and close only tabs under the isolated Pair working copy.
-- [x] **3. Targeted notebook synchronization.** Apply structural, text, metadata, output, and execution changes independently; preserve viewport/selection; coalesce output updates; eliminate background editor saves.
-- [x] **4. Fast host-only execution.** Send a cell request directly to the pinned host without the normal full-project barrier, retain legacy barrier compatibility, and preserve output/event idempotency.
-- [x] **5. Line presence.** Publish and render the active line rather than offsets; invalid focus/cell state is omitted instead of falling back to line one.
-- [ ] **6. Evidence and release hygiene.** Add lifecycle diagnostics and regression coverage, run the package-quality checks, and keep the work source-only without a version/tag/release change.
+## 1. Recovery state machine and authority
 
-## Baseline contract snapshot (prompt 01)
+- [x] A physical route failure starts logical recovery, not participant replacement.
+- [x] The shared recovery deadline is 30 seconds; there is no competing 60-second logical participant lease.
+- [x] Authenticated replacement admission ends the current recovery cycle and reconciles state.
+- [x] Missing every route for the full deadline emits one logical disconnect.
+- [x] Route loss itself does not mutate `(sessionEpoch, hostEpoch, hostId)`.
+- [x] Only explicit current-host transfer or an authenticated next-clock announcement from the trusted current host may advance authority.
+- [x] A lost pinned host closes a guest as `host-unreachable`; it never self-promotes.
+- [x] Manual Recent Session reconnect targets the same pinned host key and rejects a substitute identity.
 
-Audited at repository SHA `3165ce0216eac1c1f67c4e400748ab52581b551d`. This section records the required invariants and the observed implementation without converting unresolved implementation or evidence gaps into completed checkpoints.
+Production anchors:
 
-### Session authority and recovery
+- `src/runtime/mesh.ts`: `LOGICAL_PEER_RECOVERY_MS = 30_000`, logical recovery/replacement handling.
+- `src/core/election.ts`: route/heartbeat loss closes without election; authority mutation is confined to `manualTransfer()` and validated `applyAnnouncement()`.
+- `src/runtime/session.ts`: manual reconnect checks `descriptor.hostPeerId`, pinned identity key, and waits with `LOGICAL_PEER_RECOVERY_MS`.
 
-- `PeerRuntime.online` is distinct from `connectionState: connected|recovering|disconnected`.
-- Canonical route-recovery timing is `LOGICAL_PEER_RECOVERY_MS = 30_000`; route probes run every 1000 ms, half-open retirement requires 3 failed probes and 3000 ms of inbound staleness, and the coordinator heartbeat lease defaults to 1600 ms.
-- Required state machine: `connected -> recovering -> connected|disconnected`.
-- `recovering` must never be reported as `online`.
-- Route loss must not change `hostId` or `hostEpoch`. Host authority advances only through `SessionCoordinator.manualTransfer()` or a valid authenticated `applyAnnouncement()` from the currently trusted host; bootstrap only establishes the initial clock.
-- The runtime close-reason contract is exactly `host-unreachable`, `local-route-failed`, `explicit-leave`, and `session-ended`.
-- Host loss closes only editor tabs rooted in the isolated Pair working copy; the reconnectable entry is retained through the existing Recent Projects model (`pairNotebook.recent`, `RecentProject { name, workingFolder, at }`).
-- **Open documentation mismatch:** `docs/protocol.md` still describes a 60-second recovery lease and a recovering participant as logically online. That text is stale relative to the current 30-second/`online=false` runtime contract.
+Evidence:
 
-### Execution protocol
+- `keeps recovery timing separate from heartbeat freshness and reconnects before the deadline`
+- `cancels terminal disconnect when authenticated recovery completes near the deadline`
+- `emits one logical disconnect only after every route misses the recovery lease`
+- `keeps pinned host id and epoch unchanged throughout route recovery`
+- `still allows an explicit current-host transfer after adding the recovery guard`
+- `does not transfer host authority when the host simply leaves`
+- `reconnects a guest only to the original authenticated host without role or epoch mutation`
+- `fails when the original host has no route and never self-assigns authority`
 
-- Ordinary guest Run Cell uses the `executeRequest` fast path and does not invoke a full project manifest/file barrier.
-- `synchronizeExecutionFiles()` and the `executionBarrierCheck/status/commit/ack` frames are retained only as an explicit protocol-compatibility path for peers that still request the legacy barrier.
-- Execution-event compatibility still accepts pre-sequencing peers when `eventSequence` is absent; newer peers use ordered event sequencing and acknowledgements.
-- Required invariant: ordinary guest Run Cell must execute the host-canonical CRDT text for the selected cell.
-- **Open implementation gap:** the current VS Code controller calls `runtime.executeCell(..., cell.document.getText(), ...)`; therefore the canonical-CRDT-text invariant must remain an explicit acceptance requirement until the execution construction path is changed and regression-tested.
+## 2. Terminal lifecycle and Recent Sessions
 
-### Notebook synchronization
+Typed terminal reasons:
 
-- Notebook CRDT scopes are exactly `structure`, `cellText`, `cellMetadata`, `notebookMetadata`, `cellOutputs`, and `cellExecution`.
-- Background persistence must not force editor saves; `notebook.save()` and `document.save()` are gated by `forceSave`.
-- Required invariant: structural replacement must be narrowly scoped and must never recreate unrelated cells or viewport state.
-- `applyNotebookSnapshot()` uses a minimal structural splice for true structure changes.
-- **VS Code 1.95 Notebook API boundary (prompt 07):** output/execution synchronization no longer uses `NotebookEdit.replaceCells`. Remote output is rendered with a controller-owned `NotebookCellExecution.replaceOutput()`; execution order uses the writable `executionOrder`, running state uses `start()`, and final success/failure uses `end(success, endTime)`. `NotebookCellExecutionSummary` itself is read-only, so arbitrary summary assignment is not a supported public-API path.
-- **Timing limitation:** `startTime` can only be supplied when `NotebookCellExecution.start(startTime)` is called. If a live running update first arrives without a start timestamp, a later final update cannot retroactively rewrite that start timestamp through the public API; the final `endTime` can still be supplied.
-- **Viewport limitation:** `NotebookEditor.visibleRanges` is read-only in the supported VS Code 1.95 API. Structural edits therefore preserve a stable visible-cell anchor and use `revealRange` only if that anchor falls outside the post-edit viewport; exact pixel scroll offset cannot be restored through the stable API.
+- `local-route-failed` — local `MeshTransport.start()` failed before the runtime established its own transport readiness.
+- `host-unreachable` — an established guest exhausted recovery to its pinned host.
+- `explicit-leave` — local explicit Leave/dispose.
+- `session-ended` — authenticated Session Host ended the session.
 
-### Presence and awareness
+- [x] Every terminal path emits one structured lifecycle payload.
+- [x] Repeated disposal is idempotent.
+- [x] Pending execution rejects with typed `SessionClosedError`.
+- [x] Execution contexts/awareness are cleared during teardown.
+- [x] Run Cell and Restart become unavailable without an execution context.
+- [x] Pair-owned text/notebook/diff tabs are closed without closing unrelated tabs or the VS Code window.
+- [x] Explicit Leave keeps the Recent Project record but removes reconnect metadata.
+- [x] Host-unreachable preserves reconnectable pinned-host identity.
 
-- New local presence publication contains `activeLine` and does not publish `cursor`, exact offsets, columns, or ranges.
-- `SharedCursorPosition` plus `sanitizeCursor()`/`resolvePresenceCursor()` remain receive-side compatibility support for older peers only.
-- Remote awareness state is removed with `removeAwarenessStates()` when the peer is cleaned up.
-- Required invariant: resource sampling must update resource state without republishing line presence.
-- **Open implementation gap:** `resourceTick()` currently calls `updatePresence()`, so a resource sample republishes the whole local awareness payload, including line presence. This remains unresolved and must not be marked complete until changed and regression-tested.
+Evidence:
 
-### Diagnostics and evidence
+- `emits one structured terminal lifecycle payload for every close reason and repeated dispose is idempotent`
+- `classifies failure to establish local transport readiness as local-route-failed`
+- `rejects pending execution with typed SessionClosedError and stops an active route wait`
+- `clears execution contexts and local awareness before awareness destruction`
+- `disables Run Cell and Restart when execution context is not available`
+- `closes only Pair text/notebook/diff tabs, leaves unrelated tabs/window alone and continues after one close failure`
+- `persists session and original host identity without storing reconnect secrets`
 
-- Required invariant: lifecycle diagnostics use a bounded in-memory ring and every lifecycle record carries a correlation ID that lets route-loss, recovery, terminal close, and UI-visible outcome be associated without unbounded logging.
-- **Open implementation gap:** no correlation-ID lifecycle ring is present in the audited source.
-- Checkpoint 6 stays unchecked until lifecycle diagnostics/regression coverage exists and the package-quality commands have actually passed.
-- Required verification evidence before claiming the remaining work complete: `npm run lint`, full `npm test` with exact counts, Python bridge tests when separate from npm test, and the repository compile/build script.
-- Version, tag, release, and release-VSIX must remain unchanged for this repair series.
+## 3. Notebook update scopes and structure-only replacement
 
-## Acceptance scenarios
+Semantic scopes are `cellText`, `cellMetadata`, `cellOutputs`, `cellExecution`, `notebookMetadata`, plus structural/unscoped reconciliation.
 
-1. Switching a VPN/TUN route starts recovery immediately and the same authenticated host resumes within 30 seconds; no participant becomes host.
-2. If the host remains unreachable after 30 seconds, only the guest runtime terminates, its Pair tabs close, the host is retained in Recent Sessions, and the existing host has no ghost online participant.
-3. A notebook execution update touches only the executed cell and does not replace unrelated cells or move the active viewport.
-4. A guest cell run reaches the host without a full manifest/file barrier, executes exactly once, and publishes one authoritative result for every participant.
-5. Presence shows an active line/cell only, never a fabricated first-line cursor after a cell disappears.
+- [x] `cellText` uses a narrow text edit by stable cell ID.
+- [x] `cellMetadata` changes metadata only.
+- [x] `cellOutputs` renders outputs only.
+- [x] `cellExecution` renders execution state only.
+- [x] `notebookMetadata` does not replace cells.
+- [x] `NotebookEdit.replaceCells` has one production call and is guarded by `minimalNotebookSplice()`.
+- [x] Full `applyNotebookSnapshot()` is reachable only after proven structural mismatch/recovery.
+- [x] Unscoped historical/state-vector reconciliation applies fields narrowly if structure already matches.
+- [x] Structural insert/delete/reorder preserves unaffected stable IDs and restores best-effort editor selection/viewport state.
+- [x] Public VS Code API limitation is explicit: exact pixel scroll offset cannot be restored; `NotebookEditor.revealRange(...AtTop)` is the supported stable best-effort primitive.
 
+Static-audit classification:
 
-## Notebook persistence hot-path contract (prompt 08)
+- `src/vscode/sync.ts` contains the sole production `NotebookEdit.replaceCells` call inside `applyNotebookSnapshot()`, and only when `minimalNotebookSplice()` returns a structural splice.
+- The sole production caller of `applyNotebookSnapshot()` is `applyStructuralRecoveryIfNeeded()`, after it proves a structural difference.
 
-- Output/execution coalescing uses one named `NOTEBOOK_CELL_STATE_COALESCE_MS = 75` window per notebook. Pending work is a `Set` of stable cell IDs, so duplicate events for one cell collapse to one render.
-- The coalescing timer never stores output/execution payload snapshots. On expiry (or explicit persistence drain), it reads the latest canonical CRDT cell state, so obsolete intermediate iopub states are not replayed and a terminal execution update supersedes an earlier running state.
-- `dispose()` clears every notebook coalescing timer and pending stable-cell set.
-- Production editor `.save()` calls are intentionally limited to exactly two guarded calls in `EditorSynchronizer.persistOpenWorkingCopy()`: `notebook.save()` and `document.save()`, both only when `forceSave === true`.
-- Ordinary CRDT text, notebook output/execution, metadata, presence, and debounced persistence never call editor `save()`. `prepareWorkingCopy()` is the explicit filesystem barrier used by local execution, final host save/session end, and host transfer.
-- Physical persistence is independently debounced by `StorageAdapter.schedule()` using the configured `persistenceDebounceMs` (default 750 ms). It serializes CRDT state and writes the durable backing copy before requesting a non-saving open-editor reconciliation; the editor hot path does not await this timer.
-- `applyNotebookSnapshot()` is no longer an initial-bind or routine-persistence operation. Initial bind and persistence use narrow unscoped reconciliation. The only production caller is `applyStructuralRecoveryIfNeeded()`, after `minimalNotebookSplice()` proves a real structural inconsistency; that path emits a `[structural-recovery]` diagnostic.
-- Text, metadata, output, and execution failures remain scope-specific. Output/execution renderer failures are logged separately and do not escalate into a generic full-notebook fallback.
+Evidence:
 
+- `applies cellText by stable ID with one minimal text edit, zero replaceCells and no full snapshot`
+- `applies cellMetadata by stable ID with updateCellMetadata only and preserves source/output/execution`
+- `applies notebookMetadata without replacing cells and preserves every cell object`
+- `does not escalate a cell metadata apply failure to a full notebook snapshot`
+- `allows full snapshot only after a proven structural inconsistency`
+- `uses one minimal structural splice for insert and preserves unaffected cell identities`
+- `uses one minimal structural splice for delete and preserves unaffected cell identities`
+- `uses a bounded structural splice for reorder and preserves unaffected prefix/suffix identities`
+- `restores notebook/text selection and a stable viewport anchor after structural insert`
 
-## Lightweight execution request contract (prompt 09)
+## 4. Persistence boundaries
 
-- Ordinary guest Run Cell uses `executeRequest` with no code payload and no project manifest. The request identity is `requestId + notebookKey + stable cellId + pinned host executorId + computeEpoch + cellRevision + cellDigest`.
-- `cellRevision` is a CRDT marker stored with the logical cell and changed only in the same transaction as canonical cell-text mutations. Output, execution and metadata transactions never change it. A new stable cell gets a new revision lineage.
-- `cellDigest` is SHA-256 over the canonical UTF-8 CRDT cell text. Filesystem mtime, editor save state, outputs, execution and metadata are excluded.
-- Guests compute revision/digest from their canonical CRDT state. The host recomputes both from its own canonical CRDT state and executes only that host-side source after an exact match.
-- Request retries reuse the same request ID and request identity. Active/completed dedupe stores a digest over the lightweight identity, so reusing one request ID with another revision/digest is rejected and cannot launch a second kernel execution.
-- Ordinary guest Run Cell does not call `synchronizeExecutionFiles()`, `executionManifest()`, `prepareWorkingCopy()` or full `flush()`. The legacy non-fast-path execution barrier is retained only for explicitly barrier-framed requests.
-- The lightweight framing intentionally omits the old `target` and manifest fields. A pre-prompt-09 fast-path peer is rejected as malformed rather than accidentally executing an empty payload; legacy barrier framing remains separately parseable.
-- Raw cell source is never included in request metadata or diagnostics.
+- [x] Background open-notebook persistence reconciles through VS Code and does not call `notebook.save()`.
+- [x] Background open-text persistence does not call `document.save()`.
+- [x] `NotebookDocument.save()` and `TextDocument.save()` are guarded by `forceSave` inside `prepareWorkingCopy()` materialization.
+- [x] Full storage `flush()` is an explicit persistence/barrier operation, not an ordinary guest Run Cell operation.
 
+Explicit materialization/barrier contexts found by static audit:
 
-## Host-authoritative target-cell convergence contract (prompt 10)
+- current-host `saveAsHost()`;
+- host-transfer preparation before authority is committed;
+- session-end fencing/final persistence;
+- peer acknowledgement of explicit session ending;
+- local execution when a physical workspace snapshot is required;
+- explicit legacy execution-barrier commit.
 
-- A lightweight execution request is accepted only after the private runtime handler receives a valid authenticated MeshTransport source identity, validates request ID/notebook/stable cell/executor/host/compute epoch, and proves an exact host-side canonical CRDT revision+digest match.
-- Cell text revisions are now ordered markers of the form `r<sequence>_<id>`. A new stable cell starts at revision 1; a canonical cell-text mutation advances the sequence. Metadata, outputs, execution state, filesystem mtime and editor save state never advance it.
-- If host revision+digest already match, execution proceeds immediately. If the host sequence is behind the request, the host waits up to `TARGET_CELL_CONVERGENCE_TIMEOUT_MS` for only that notebook's target-cell text update. Unrelated documents, metadata/output/execution updates, binaries and directories do not satisfy the wait.
-- The target-cell wait subscribes only to scoped `cellText` updates for the requested stable cell (plus unscoped bootstrap/state-vector updates that may contain it). It recalculates host canonical revision+digest after each relevant update.
-- If host sequence is already ahead of the request, the request is rejected as `StaleCellRevision`; host CRDT state is never rolled back. If convergence does not arrive before the bounded timeout, the request is rejected as `CellStateUnavailable`. Neither case executes stale host text or falls back to guest payload.
-- `executeAccepted` is emitted only after authority and canonical-state validation has completed. The kernel receives only host canonical CRDT text.
-- Ordinary guest Run Cell never invokes project-wide `synchronizeExecutionFiles()`, `executionManifest()`, `prepareWorkingCopy()` or full `flush()`. Full materialization remains explicit for host save, host transfer, final session save and the retained legacy/manual project barrier.
-- Project-import semantics are therefore deliberate: the target cell itself is exact host-canonical CRDT text, while Python imports read the host physical working copy maintained asynchronously by normal persistence. A caller that requires an exact project-wide filesystem barrier must use an explicit save/transfer/manual synchronization path; ordinary guest Run Cell does not silently reintroduce that global barrier.
+Evidence:
 
+- `keeps background persistence out of the open notebook save hot path`
+- `keeps background text persistence unsaved and saves only at an explicit filesystem barrier`
+- `keeps participant mirrors unsaved while allowing an explicit execution snapshot`
+- `does not externally replace an open working file while still updating the backing copy`
 
-## Exactly-once execution and authoritative output contract (prompt 11)
+## 5. Host-authoritative execution contract
 
-- A lightweight request ID is reserved on the Session Host before any asynchronous target-cell convergence wait. The reservation stores the authenticated peer, notebook, request-identity digest and stable cell ID. An identical duplicate observes the same reservation; it never creates a second waiter or kernel execution.
-- A pre-start reservation is not considered accepted. `deliverActiveRemoteExecution()` sends no `executeAccepted` until host authority and canonical target-cell validation complete. After acceptance, losing the acknowledgement is harmless because an identical retry resends the same acceptance and replays retained events from the same owner.
-- Active execution ownership is independent of the current transport route. Route replacement/reconnect reuses the same owner, event sequence and request ID. Completed requests retain bounded event/result replay state until `executeResultAck` or expiry; an identical duplicate replays the cached result, while a changed digest/cell/compute epoch is rejected.
-- Execution events remain zero-based and ordered. The initiator buffers gaps, drops sequences below `nextEventSequence`, deduplicates buffered sequence numbers, and defers the terminal result until `eventCount` proves every preceding event was delivered.
-- The Session Host is now the sole CRDT publisher for a guest-triggered execution. Real kernel events are accumulated with the same notebook-output normalization used by the VS Code controller, and the host publishes target-cell `cellOutputs` and `cellExecution` scopes directly to the collaborative CRDT. Replay delivery never re-applies those events to CRDT, so reconnect cannot multiply authoritative outputs.
-- The initiating participant still renders live execution events immediately through its local NotebookCellExecution, but when compute is remote it does not call `project.setCellOutputs()` or `project.setCellExecution()`. Host `cellExecution` state carries the bounded `requestId`; the initiator retains the latest remote request identity for the lifetime of the NotebookCell and suppresses matching CRDT output/execution echo even when that authoritative final echo arrives after the terminal result. The host CRDT copy remains authoritative without a second NotebookCellExecution/output application.
-- Local host execution continues to publish through the local controller. Guest-triggered host execution publishes through SessionRuntime. In both cases one physical kernel execution yields one authoritative final CRDT output/execution state visible to every participant.
-- `synchronizeExecutionFiles()` remains a legacy/explicit project-barrier mechanism. Ordinary Run Cell never enters it. Full project materialization remains available for final durable host save, host transfer and explicit/manual working-folder synchronization.
+Ordinary guest Run Cell is not a project barrier.
+
+- [x] Request identity includes random request ID, notebook/stable cell identity, compute target/epoch, canonical cell revision and digest.
+- [x] The host waits only for the target cell CRDT revision required by the request.
+- [x] The host resolves code from its canonical CRDT state; guest payload text is not execution authority.
+- [x] Revision/digest mutation or stale/mismatched authority is rejected.
+- [x] Ordinary guest Run Cell does not call `synchronizeExecutionFiles()`.
+- [x] Ordinary guest Run Cell does not call `prepareWorkingCopy()`.
+- [x] Ordinary guest Run Cell does not perform full storage `flush()`.
+- [x] `synchronizeExecutionFiles()` remains only an explicit legacy/protocol-compatible full-project barrier.
+- [x] Local execution may materialize the workspace because imports must observe the physical host working copy.
+
+Evidence:
+
+- `executes lightweight requests from host canonical CRDT text and rejects request-id digest mutation`
+- `deduplicates a duplicate lightweight request before acceptance and starts one kernel execution`
+- `waits only for lagging target-cell CRDT convergence and executes without a project barrier`
+- `times out a lagging target cell without execution or guest-payload fallback`
+- `rejects stale guest revision without rolling back host-ahead canonical state`
+- `rejects lightweight compute-epoch mismatch, wrong executor and invalid source before acceptance`
+
+## 6. Exactly-once execution/output semantics
+
+- [x] Duplicate identical execution requests do not launch a second kernel execution.
+- [x] Request-ID reuse with changed identity/content is rejected.
+- [x] Accepted execution ownership survives route loss.
+- [x] Sequenced Jupyter events are deduplicated/reordered before requester completion.
+- [x] Terminal result repeats until acknowledged and is resolved once.
+- [x] Host canonical CRDT output/execution state is published once and reaches other participants.
+- [x] VS Code renderer coalesces output bursts while retaining the last canonical output.
+
+Evidence:
+
+- `executes a repeated remote request exactly once and replays the terminal result until acknowledged`
+- `keeps lightweight execution ownership across route loss after acceptance and replays without re-execution`
+- `orders and deduplicates replayed execution events before resolving the result`
+- `publishes one authoritative host CRDT output/execution state that reaches a third participant`
+- `coalesces a remote output burst into one render and the last canonical output wins`
+- `does not lose a terminal execution update that arrives inside the coalescing window`
+
+## 7. Line-only semantic presence
+
+- [x] New local presence publishes `activeFile`, stable `activeNotebookCellId`, `activeLine`, `shareCursor`, participant/name/color renderer metadata.
+- [x] New local presence does not publish exact offset, anchor, active column, or selection range.
+- [x] Legacy exact cursor is receive-only compatibility.
+- [x] Same-line column/range movement is deduplicated and publishes no new semantic packet.
+- [x] Real line/cell/file changes publish one semantic update.
+- [x] Blur/leave clears stale semantic location without fabricating line zero.
+
+Evidence:
+
+- `publishes line semantics only and suppresses same-line column/range noise plus duplicate blur`
+- `publishes a stable notebook cell id and one packet for a real cell change`
+- `preserves incoming line-only presence while legacy cursor remains receive-only compatibility`
+- `highlights the entire active line and never decorates an exact column or selection range`
+- `deleted or invalid stable cells never render a fabricated first line and stay cleared until new presence`
+- `peer blur and disconnect clear decorations/status immediately without a throttle`
+
+## 8. Resources/hardware/kernel separation
+
+- [x] `resourceTick()` samples resources and calls `publishResourcePresence()`, not `updatePresence()`.
+- [x] Resource publication has an independent rate limit.
+- [x] Hardware and kernel status have separate transport frames.
+- [x] Resource/hardware/kernel updates do not mutate `activeLine` and do not cause semantic cursor redraw.
+- [x] Dashboard compute/resource data continues to update from merged runtime metadata.
+
+Evidence:
+
+- `resource ticks are rate-limited and do not republish semantic awareness`
+- `merges remote resource frames into snapshots so the dashboard still updates without a presence event`
+- `advertises compute hardware only from the current host`
+- `tracks kernel status independently for each notebook and publishes the per-notebook map`
+
+## 9. Lifecycle diagnostic ring and correlation
+
+- [x] Each recovery cycle gets one opaque random correlation ID.
+- [x] Route-loss → recovery → replacement/deadline → runtime close → Pair-tab close can be correlated without raw secrets.
+- [x] The next independent recovery cycle gets a new correlation ID.
+- [x] The ring is fixed at 256 events and evicts oldest-first.
+- [x] Session identifier is hashed/sanitized.
+- [x] Metadata is allow-listed and bounded; token, proxy credentials, SDP, and notebook code are not retained.
+- [x] Runtime disposal leaves the bounded ring available for final extension-level cleanup evidence.
+
+Evidence:
+
+- `keeps one opaque correlation id per recovery cycle and rotates it for the next cycle`
+- `is fixed-size, evicts oldest first, and snapshot reads do not mutate the ring`
+- `drops secret-shaped arbitrary fields and never exposes token, proxy credentials, SDP, or notebook code`
+- `preserves route-loss -> recovery -> replacement order under one correlation id`
+- `preserves route-loss -> deadline -> runtime close -> tabs close order with the same correlation id`
+- `emits half-open, route loss, deadline and terminal peer disconnect under one id`
+
+## 10. Prompt 16 static audit and quality gate
+
+Static searches performed across the working tree:
+
+- [x] all `NotebookEdit.replaceCells` / `replaceCells(`;
+- [x] all `applyNotebookSnapshot`;
+- [x] all `notebook.save()`;
+- [x] all `document.save()`;
+- [x] all `synchronizeExecutionFiles`;
+- [x] all `prepareWorkingCopy`;
+- [x] all full `.flush(` paths;
+- [x] local legacy cursor publication;
+- [x] `resourceTick` / `updatePresence()` coupling;
+- [x] `local-route-failed`;
+- [x] recovery constants;
+- [x] host authority mutations;
+- [x] lifecycle diagnostic correlation implementation.
+
+Findings:
+
+- no non-structural production `replaceCells`;
+- no forbidden hot-path `applyNotebookSnapshot`;
+- no background editor `save()` outside explicit `forceSave` materialization;
+- no ordinary guest Run Cell project barrier/materialize/full flush;
+- no new-peer exact cursor publisher;
+- no resource sampling → semantic presence coupling;
+- one pre-existing lint-only defect in `clearRecentReconnect()` was found and fixed without changing behavior; the regression test now also proves immutable cleanup.
+
+Final Prompt 16 quality evidence after that fix:
+
+- `npm run lint` — PASS, 0 errors/warnings;
+- `npm test` — **392 passing, 1 pending, 0 failing**;
+- pending test is the explicitly environment-dependent real-Jupyter capability test; CI Python lacks `jupyter_client`/`ipykernel`;
+- `python3 test/jupyter_bridge_unit.py -v` — **7/7 OK**;
+- `npm run compile` — PASS;
+- `node scripts/make-artifacts.mjs --preflight-only` — PASS;
+- `npx vsce ls --no-yarn --no-dependencies` — PASS without creating a VSIX;
+- `git diff --check` — PASS;
+- package version remained `0.5.8`;
+- no Prompt-series tag, release, tracked VSIX, or release asset was created.
+
+## 11. Completion gate
+
+Implementation acceptance criteria above are fully evidenced. Documentation has been reconciled with the implementation instead of redefining the implementation to match stale documentation.
+
+The following **series-level administrative gap remains open and is intentionally not converted to `[x]`**:
+
+- [ ] Prompt 15 required `pair-notebook-15-report.pdf`, but that artifact was not produced in Prompt 15. Prompt 16 is not allowed to retroactively perform another prompt, so the 16-prompt series verdict remains **PARTIAL / ЧАСТИЧНО** under Prompt 16.66 even though the current code, tests, static audit, quality gate, and Prompt 16 documentation are complete.
+
+Accordingly, this document deliberately keeps `Status: in progress`. The technical repair can be treated as implementation-complete, but the full 16-prompt series cannot be declared completely closed until the historical Prompt 15 artifact gap is resolved in an explicitly authorized task.
