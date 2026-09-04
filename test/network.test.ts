@@ -1508,7 +1508,7 @@ describe('mesh relay fallback integration', function () {
       const failedNonce = localInternals.relayNegotiations.get('z-guest')?.localHs.nonce;
       assert.ok(failedNonce);
       localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
-        k: 'pr', pr: { version: 4, signature: Buffer.alloc(64).toString('base64') },
+        k: 'pr', pr: { version: 5, signature: Buffer.alloc(64).toString('base64') },
       }));
       await new Promise<void>((resolve) => queueMicrotask(resolve));
 
@@ -1568,7 +1568,7 @@ describe('mesh relay fallback integration', function () {
       localInternals.handleRelayData('z-guest', remoteInternals.createSignedRelayEnvelope('a-host', {
         k: 'pr',
         pr: {
-          version: 4,
+          version: 5,
           signature: Buffer.alloc(64).toString('base64'),
           transcriptId: '0'.repeat(64),
         },

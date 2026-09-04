@@ -4,7 +4,7 @@
 
 The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port.
 
-Before Trystero admits a peer, Pair Notebook 0.5.6 exchanges a protocol-v4 handshake containing:
+Before Trystero admits a peer, Pair Notebook 0.5.9 exchanges a protocol-v5 handshake containing:
 
 - session ID;
 - connection purpose (`runtime` or `bootstrap`);
@@ -16,7 +16,7 @@ Before Trystero admits a peer, Pair Notebook 0.5.6 exchanges a protocol-v4 hands
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v4 is first released in Pair Notebook 0.5.6. It authenticates every emergency-relay envelope with the sender's Ed25519 identity, its intended recipient, a freshness timestamp, and a replay-resistant message id. It is intentionally incompatible with protocol-v3 and older clients. Incompatible peers are rejected during admission; every participant must run 0.5.6 or another explicitly protocol-v4-compatible release.
+Protocol v5 is first released in Pair Notebook 0.5.9. It retains v4's authenticated emergency-relay envelope and adds the host-canonical lightweight execution request as an admission boundary. It is intentionally incompatible with protocol-v4 and older clients so a mixed-version session cannot interpret execution frames under different contracts. Incompatible peers are rejected during admission; every participant must run a protocol-v5-compatible release.
 
 ## Frames and delivery
 

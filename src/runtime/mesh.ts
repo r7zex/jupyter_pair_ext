@@ -237,7 +237,7 @@ export function configureMeshNetwork(config: MeshNetworkConfig): void {
 }
 
 const RELAY_REDUNDANCY = 8;
-const HANDSHAKE_VERSION = 4;
+const HANDSHAKE_VERSION = 5;
 const RELAY_ENVELOPE_VERSION = 2;
 const RELAY_ENVELOPE_MAX_AGE_MS = 10 * 60_000;
 const RELAY_ENVELOPE_MAX_FUTURE_SKEW_MS = 2 * 60_000;
