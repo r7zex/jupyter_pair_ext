@@ -40,9 +40,11 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 
 - CB-010: A gated inbound snapshot regression verified Interrupt and Restart complete before the snapshot is released, with queue counters fully reclaimed. Existing per-peer rate and global admission limits remain enforced. TypeScript and targeted ESLint passed.
 
-## Release gates
-
 - CB-011: The production controller regression verified that Stop cancels the remaining Run All cell and an already queued batch, while a fresh Run succeeds afterward. Restart and runtime replacement also invalidate old batches. TypeScript and targeted ESLint passed.
+
+- Host-loss release gate: Terminal disconnect now clears the coordinator's stale `recovering` state. The coordinator regression and previously failing three-runtime host-loss test both passed; guests close without changing authority. TypeScript and targeted ESLint passed.
+
+## Release gates
 
 - [ ] Every fix validated and pushed; previously reported review findings resolved.
 - [ ] Full tests, lint, Python bridge tests, production dependency audit.

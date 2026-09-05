@@ -33,7 +33,10 @@ export class SessionCoordinator extends EventEmitter {
 
   public markDisconnected(peerId: string): void {
     const peer = this.peers.get(peerId);
-    if (peer) peer.online = false;
+    if (peer) {
+      peer.online = false;
+      peer.connectionState = 'disconnected';
+    }
   }
 
   public evaluate(now = Date.now()): HostClock | undefined {
