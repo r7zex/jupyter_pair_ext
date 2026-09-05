@@ -8,6 +8,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
 import { CollaborativeProject } from '../src/core/crdt';
+import { formatInvite, parseInvite } from '../src/core/types';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
@@ -2639,7 +2640,7 @@ describe('compute and lifecycle regression coverage', () => {
   });
 
   it('completes host transfer across two Trystero runtimes without dual-role divergence', async function () {
-    this.timeout(30_000);
+    this.timeout(50_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-transfer-real-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
@@ -2656,16 +2657,20 @@ describe('compute and lifecycle regression coverage', () => {
       pythonPath: process.execPath,
     }), token, context(extensionRoot), logger());
     let peer: any;
+    let third: any;
     try {
       await host.start();
       host.project.ensureText('handoff.txt', 'saved before handoff');
       await host.flush();
       const oldHostBacking = host.descriptor.backingFolder;
-      peer = new SessionRuntime(descriptor({
+      const peerIdentity = generateIdentityCredentials();
+      const peerDescriptor = descriptor({
         sessionId, role: 'peer', peerId: 'peer-z', hostPeerId: 'host', workingFolder: peerFolder,
         pythonPath: process.execPath,
         knownPeers: [{ ...host.descriptor.localPeer }],
-      }), token, context(extensionRoot), logger());
+      });
+      peerDescriptor.localPeer.identityKey = peerIdentity.publicKey;
+      peer = new SessionRuntime(peerDescriptor, token, context(extensionRoot), logger(), peerIdentity.privateKey);
       await peer.start();
       await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'transfer peer online');
       await host.transferHost('peer-z');
@@ -2686,10 +2691,30 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(peer.descriptor.backingFolder, oldHostBacking);
       assert.equal((host as any).pendingTransfers.size, 0);
       assert.equal((peer as any).preparedHostTransfers.size, 0);
+      const invite = parseInvite(formatInvite({
+        sessionId, projectId: peer.descriptor.projectId, projectName: peer.descriptor.projectName,
+        mode: 'resilient', token, sessionEpoch: peer.coordinator.clock.sessionEpoch,
+        hostEpoch: peer.coordinator.clock.hostEpoch, hostPeerId: peer.descriptor.localPeer.peerId,
+        hostDisplayName: peer.descriptor.localPeer.displayName, hostIdentityKey: peer.descriptor.localPeer.identityKey,
+      }));
+      const thirdDescriptor = descriptor({ sessionId, role: 'peer', peerId: 'third', hostPeerId: invite.hostPeerId,
+        workingFolder: path.join(root, 'third'), pythonPath: process.execPath, knownPeers: [{ ...peer.descriptor.localPeer }] });
+      thirdDescriptor.hostEpoch = invite.hostEpoch ?? 0;
+      await mkdir(thirdDescriptor.workingFolder, { recursive: true });
+      third = new SessionRuntime(thirdDescriptor, token, context(extensionRoot), logger());
+      await third.start();
+      assert.deepEqual(third.coordinator.clock, peer.coordinator.clock);
+      await peer.transferHost('third');
+      await waitFor(() => [host, peer, third].every((item) => item.coordinator.clock.hostEpoch === 2
+        && item.coordinator.clock.hostId === 'third' && item.snapshot().waitingForHostFolder), 5000, 'second transfer and pause');
+      await third.setBackingFolder(oldHostBacking, 'reuse-existing');
+      await waitFor(() => [host, peer, third].every((item) => !item.snapshot().waitingForHostFolder), 3000, 'second transfer resume');
+      assert.equal(third.descriptor.hostEpoch, 2);
     } finally {
       host.descriptor.mode = 'host-only';
       if (peer) peer.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), peer?.leave()]);
+      if (third) third.descriptor.mode = 'host-only';
+      await Promise.allSettled([host.leave(), peer?.leave(), third?.leave()]);
       await rm(root, { recursive: true, force: true });
     }
   });

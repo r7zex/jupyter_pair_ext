@@ -161,6 +161,7 @@ export interface InviteData {
   mode: SessionMode;
   token: string;
   sessionEpoch: number;
+  hostEpoch?: number;
   hostPeerId: string;
   hostDisplayName: string;
   hostIdentityKey?: string | undefined;
@@ -182,12 +183,14 @@ export function formatInvite(invite: InviteData): string {
   if (validateIdentityPublicKey(invite.hostIdentityKey)) {
     throw new Error('Cannot create an invite without a valid host identity key.');
   }
+  if (!Number.isSafeInteger(invite.hostEpoch ?? 0) || (invite.hostEpoch ?? 0) < 0) throw new Error('Invalid invite host epoch.');
   const query = new URLSearchParams({
     token: invite.token,
     project: invite.projectId,
     projectName: invite.projectName,
     mode: invite.mode,
     epoch: String(invite.sessionEpoch),
+    hostEpoch: String(invite.hostEpoch ?? 0),
     hostPeer: invite.hostPeerId,
     hostName: invite.hostDisplayName,
     hostKey: invite.hostIdentityKey!,
@@ -218,6 +221,8 @@ export function parseInvite(raw: string): InviteData {
   const token = parsed.searchParams.get('token') ?? '';
   const mode = parsed.searchParams.get('mode');
   const sessionEpoch = Number(parsed.searchParams.get('epoch') ?? '0');
+  const hostEpochValue = parsed.searchParams.get('hostEpoch') ?? '0';
+  const hostEpoch = Number(hostEpochValue);
   const hostPeerId = parsed.searchParams.get('hostPeer') ?? '';
   const hostDisplayName = parsed.searchParams.get('hostName') ?? '';
   const hostIdentityKey = parsed.searchParams.get('hostKey') ?? '';
@@ -228,6 +233,8 @@ export function parseInvite(raw: string): InviteData {
     || !/^[A-Za-z0-9_-]{32,128}$/.test(token)
     || !Number.isSafeInteger(sessionEpoch)
     || sessionEpoch <= 0
+    || !/^(0|[1-9]\d*)$/.test(hostEpochValue)
+    || !Number.isSafeInteger(hostEpoch)
     || validateProjectName(projectName)
     || validateDisplayName(hostDisplayName)
     || validateIdentityPublicKey(hostIdentityKey)
@@ -241,6 +248,7 @@ export function parseInvite(raw: string): InviteData {
     token,
     mode,
     sessionEpoch,
+    hostEpoch,
     hostPeerId,
     hostDisplayName: cleanDisplayName(hostDisplayName),
     hostIdentityKey,

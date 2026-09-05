@@ -10,7 +10,7 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 | CB-002 | Fixed in `e6730f6`; performance correction `48167ea` validated | Further review canceled by user |
 | CB-003 | Structural deltas preserve canonical fields and unseen remote cells; 36 editor tests and lint passed | Not requested |
 | CB-004 | Native summaries preserve protocol request ownership; active native output echoes are ignored | Not requested |
-| CB-005 | Pending | Pending |
+| CB-005 | Invitations pin the current host epoch; bootstrap and join preserve it | Not requested |
 | CB-006 | Pending | Pending |
 | CB-007 | Pending | Pending |
 | CB-008 | Pending | Pending |
@@ -27,6 +27,8 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 - CB-002 review correction: Luna identified full-notebook decoding once per cell. A single incremental source-only template now supplies shared displayed versions. A 100-cell notebook with a 1 MiB output is encoded from canonical state once; the shared displayed update remains below 50 KiB. Concurrent local edits retain neighboring cells and the original rich output. Targeted replica regression passed; editor integration file passed (36 tests including the pending CB-003 scenarios).
 
 - CB-004: The native-summary/output regression and production controller rendering test passed; TypeScript and targeted ESLint passed. Completed outputs can still be explicitly cleared. Installed two-window native-event timing remains a separate acceptance check.
+
+- CB-005: Invite round-trip, legacy default and malformed-epoch checks passed. The production transport test transferred host A to B, joined C using B's new invite, transferred B to C, and verified epoch 2 plus pause/resume on all three runtimes. TypeScript and targeted lint passed.
 
 ## Release gates
 

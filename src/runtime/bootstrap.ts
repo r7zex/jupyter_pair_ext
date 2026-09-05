@@ -115,7 +115,7 @@ export async function downloadProjectSnapshot(
   let messageQueue: Promise<void> = Promise.resolve();
   const clock = (): HostClock => ({
     sessionEpoch: invite.sessionEpoch,
-    hostEpoch: 0,
+    hostEpoch: invite.hostEpoch ?? 0,
     hostId: hostPeerId,
   });
   const transport = new MeshTransport({
