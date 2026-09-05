@@ -30,6 +30,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly disposables: vscode.Disposable[] = [];
   private readonly queues = new PerNotebookExecutionQueue();
   private readonly queueKeys = new WeakMap<vscode.NotebookDocument, string>();
+  private readonly cancellationGenerations = new WeakMap<vscode.NotebookDocument, number>();
+  private runtimeGeneration = 0;
   private readonly mirroredExecutions = new Map<vscode.NotebookCell, MirroredExecutionState>();
   private remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
   private readonly activeExecutions = new WeakSet<vscode.NotebookCell>();
@@ -45,6 +47,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.controller.supportsExecutionOrder = true;
     this.controller.description = 'Real Jupyter kernel on the selected Pair Notebook compute target';
     this.controller.interruptHandler = async (notebook) => {
+      this.cancelQueuedExecution(notebook);
       const runtime = this.requireRuntime();
       const key = runtime.notebookKey(notebook.uri);
       if (key) await runtime.interruptNotebook(key);
@@ -64,6 +67,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   public setRuntime(runtime: SessionRuntime | undefined): void {
+    if (this.runtime !== runtime) this.runtimeGeneration += 1;
     if (!runtime) {
       this.finishMirroredExecutions();
       this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
@@ -90,6 +94,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     const runtime = this.requireRuntime();
     const key = runtime.notebookKey(editor.notebook.uri);
     if (!key) throw new Error('The active notebook is outside the Pair Notebook working copy.');
+    this.cancelQueuedExecution(editor.notebook);
     await runtime.restartNotebook(key);
   }
 
@@ -108,6 +113,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   public dispose(): void {
+    this.runtimeGeneration += 1;
     this.finishMirroredExecutions();
     this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
     for (const disposable of this.disposables) disposable.dispose();
@@ -184,8 +190,14 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.mirroredExecutions.clear();
   }
 
+  private cancelQueuedExecution(notebook: vscode.NotebookDocument): void {
+    this.cancellationGenerations.set(notebook, (this.cancellationGenerations.get(notebook) ?? 0) + 1);
+  }
+
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
     const runtime = this.requireRuntime();
+    const runtimeGeneration = this.runtimeGeneration;
+    const cancellationGeneration = this.cancellationGenerations.get(notebook) ?? 0;
     let notebookKey = runtime.notebookKey(notebook.uri);
     if (!notebookKey) throw new Error('This notebook is outside the Pair Notebook working copy.');
     const queueKey = this.queueKeys.get(notebook) ?? notebookKey;
@@ -197,6 +209,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     const requested = cells.map((cell) => ({ cell, id: runtime.notebookCellId(cell) }));
     await this.queues.enqueue(queueKey, async () => {
       for (const item of requested) {
+        if (this.runtimeGeneration !== runtimeGeneration
+          || (this.cancellationGenerations.get(notebook) ?? 0) !== cancellationGeneration) break;
         // Initial identity repair can replace ambiguous cells. Resolve the live
         // object by stable ID after the queue barrier. A numerical index can
         // point at a different cell after a concurrent move or deletion.

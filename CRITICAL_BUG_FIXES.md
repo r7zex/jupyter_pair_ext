@@ -16,7 +16,7 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 | CB-008 | Pair Run explicitly selects its own controller and invokes its execution path | Not requested |
 | CB-009 | File type transitions remove obsolete collaborative documents and binary versions before materialization | Not requested |
 | CB-010 | Kernel commands use a separate bounded control queue, independent of bulk snapshot/file work | Not requested |
-| CB-011 | Pending | Pending |
+| CB-011 | Stop cancels remaining and queued notebook batches; fresh runs retain a new cancellation generation | Not requested |
 
 ## Validation evidence
 
@@ -41,6 +41,8 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 - CB-010: A gated inbound snapshot regression verified Interrupt and Restart complete before the snapshot is released, with queue counters fully reclaimed. Existing per-peer rate and global admission limits remain enforced. TypeScript and targeted ESLint passed.
 
 ## Release gates
+
+- CB-011: The production controller regression verified that Stop cancels the remaining Run All cell and an already queued batch, while a fresh Run succeeds afterward. Restart and runtime replacement also invalidate old batches. TypeScript and targeted ESLint passed.
 
 - [ ] Every fix validated and pushed; previously reported review findings resolved.
 - [ ] Full tests, lint, Python bridge tests, production dependency audit.

@@ -3220,6 +3220,28 @@ describe('standard VS Code NotebookController production path', () => {
     await productionController.interruptHandler(notebookA);
     assert.equal(calls.at(-1), 'A:interrupt');
 
+    // Stop cancels both the remainder of Run All and batches queued before it.
+    let releaseInterrupted!: () => void;
+    const interruptedGate = new Promise<void>((resolve) => { releaseInterrupted = resolve; });
+    const executedAfterStop: string[] = [];
+    runtime.executeCell = async (_key: string, id: string) => {
+      executedAfterStop.push(id);
+      if (id === 'stop-first') await interruptedGate;
+      return { requestId: id, success: id !== 'stop-first', content: { status: 'ok' } };
+    };
+    const first = fakeCell('stop-first', notebookA);
+    const remaining = fakeCell('stop-remaining', notebookA);
+    const queued = fakeCell('stop-queued', notebookA);
+    const runAll = productionController.executeHandler([first, remaining], notebookA);
+    const queuedRun = productionController.executeHandler([queued], notebookA);
+    await waitFor(() => executedAfterStop.includes('stop-first'), 2000, 'Run All starts');
+    await productionController.interruptHandler(notebookA);
+    releaseInterrupted();
+    await Promise.all([runAll, queuedRun]);
+    assert.deepEqual(executedAfterStop, ['stop-first']);
+    await productionController.executeHandler([queued], notebookA);
+    assert.deepEqual(executedAfterStop, ['stop-first', 'stop-queued'], 'a fresh Run still works after Stop');
+
     runtime.executeCell = async (_key: string, id: string, _code: string, onEvent: (event: any) => void) => {
       onEvent({ type: 'inputRequest', requestId: id, content: { prompt: 'Name:' } });
       return { requestId: id, success: true, content: { status: 'ok' } };
