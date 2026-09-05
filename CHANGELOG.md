@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.10 - 2026-09-05 (laptop recovery and startup stability)
+
+- Prevents a guest from closing on a short delayed-heartbeat window while MeshTransport is still performing its bounded 30-second authenticated route recovery.
+- Keeps VS Code activation responsive while a restored guest session waits for initial host state; the dashboard and commands register before background restoration completes.
+- Contains unexpected asynchronous TURN-probe rejections instead of throwing from a process-wide handler and terminating the VS Code extension host.
+
 ## 0.5.9 - 2026-09-04 (session and notebook stability)
 
 - Unifies physical-route recovery behind one 30-second logical participant deadline while preserving pinned host authority, semantic awareness, queued work, and one correlated lifecycle trail.

@@ -36,7 +36,10 @@ export class SessionCoordinator extends EventEmitter {
     if (peer) peer.online = false;
   }
 
-  public evaluate(_now = Date.now()): HostClock | undefined {
+  public evaluate(now = Date.now()): HostClock | undefined {
+    // Keep the clock argument for deterministic callers; host-loss timing is
+    // intentionally owned by MeshTransport rather than this coordinator.
+    void now;
     if (this.closed || this.clock.hostId === this.options.selfId) {
       return undefined;
     }
