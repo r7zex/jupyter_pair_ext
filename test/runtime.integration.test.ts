@@ -2719,6 +2719,39 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('preserves a live Jupyter kernel and its variables across a notebook rename', async function () {
+    this.timeout(35_000);
+    const folder = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-rename-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: `rename-${Date.now()}`, role: 'host',
+      peerId: 'host', hostPeerId: 'host', workingFolder: folder, pythonPath: 'python' }),
+    'rename-kernel-token-that-is-long-enough', context(path.resolve(__dirname, '../..')), logger());
+    try {
+      await writeFile(path.join(folder, 'work.ipynb'), JSON.stringify({ cells: [
+        { cell_type: 'code', id: 'a', source: ['x = 42'], metadata: {}, outputs: [], execution_count: null },
+      ], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
+      await runtime.start();
+      await runtime.executeCell('work.ipynb', 'a', 'x = 42', () => undefined);
+      const kernel = runtime.kernels.get('work.ipynb');
+      const events: any[] = [];
+      const active = runtime.executeCell('work.ipynb', 'a', 'import time; time.sleep(0.5); x += 1; print(x)', (event: any) => events.push(event));
+      await waitFor(() => runtime.kernelStatuses.get('work.ipynb') === 'Busy', 1000, 'active execution');
+      await rename(path.join(folder, 'work.ipynb'), path.join(folder, 'renamed.ipynb'));
+      await runtime.onLocalRename(fakeVscode.Uri.file(path.join(folder, 'work.ipynb')), fakeVscode.Uri.file(path.join(folder, 'renamed.ipynb')));
+      assert.equal((await active).success, true);
+      assert.equal(runtime.kernels.get('renamed.ipynb'), kernel);
+      assert.equal(runtime.kernelStatuses.has('work.ipynb'), false);
+      const result = await runtime.executeCell('renamed.ipynb', 'a', 'print(x)', (event: any) => events.push(event));
+      assert.equal(result.success, true);
+      assert.ok(events.some((event) => event.messageType === 'stream' && String(event.content?.text).includes('43')));
+      assert.equal(runtime.kernels.size, 1);
+      assert.equal(runtime.project.has('work.ipynb'), false);
+    } finally {
+      await runtime.leave();
+      await rm(folder, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+      await rm(`${folder}-backing`, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    }
+  });
+
   it('lets a paused host transfer again and end without choosing a backing folder', async function () {
     this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-paused-host-actions-'));

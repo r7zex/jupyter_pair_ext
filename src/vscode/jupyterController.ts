@@ -29,6 +29,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private synchronizer: EditorSynchronizer | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly queues = new PerNotebookExecutionQueue();
+  private readonly queueKeys = new WeakMap<vscode.NotebookDocument, string>();
   private readonly mirroredExecutions = new Map<vscode.NotebookCell, MirroredExecutionState>();
   private remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
   private readonly activeExecutions = new WeakSet<vscode.NotebookCell>();
@@ -171,11 +172,16 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
     const runtime = this.requireRuntime();
-    const notebookKey = runtime.notebookKey(notebook.uri);
+    let notebookKey = runtime.notebookKey(notebook.uri);
     if (!notebookKey) throw new Error('This notebook is outside the Pair Notebook working copy.');
+    const queueKey = this.queueKeys.get(notebook) ?? notebookKey;
+    this.queueKeys.set(notebook, queueKey);
+    const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
+    runtime.project.on('documentRenamed', onRename);
+    try {
     await this.synchronizer?.whenNotebookReady(notebook);
     const requested = cells.map((cell) => ({ cell, id: runtime.notebookCellId(cell) }));
-    await this.queues.enqueue(notebookKey, async () => {
+    await this.queues.enqueue(queueKey, async () => {
       for (const item of requested) {
         // Initial identity repair can replace ambiguous cells. Resolve the live
         // object by stable ID after the queue barrier. A numerical index can
@@ -186,13 +192,17 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         if (!cell) continue;
         if (cell.kind !== vscode.NotebookCellKind.Code) continue;
         this.activeExecutions.add(cell);
-        try { await this.executeCell(runtime, notebookKey, cell); }
+        try { await this.executeCell(runtime, notebookKey!, cell); }
         finally { this.activeExecutions.delete(cell); }
       }
     });
+    } finally { runtime.project.off('documentRenamed', onRename); }
   }
 
   private async executeCell(runtime: SessionRuntime, notebookKey: string, cell: vscode.NotebookCell): Promise<void> {
+    const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
+    runtime.project.on('documentRenamed', onRename);
+    try {
     const mirrored = this.mirroredExecutions.get(cell);
     if (mirrored) {
       mirrored.execution.end(undefined);
@@ -308,6 +318,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       // WeakMap keeps this bounded by the lifetime of the NotebookCell; the
       // next remote execution simply replaces the stored request ID.
     }
+    } finally { runtime.project.off('documentRenamed', onRename); }
   }
 
   private async applyEvent(

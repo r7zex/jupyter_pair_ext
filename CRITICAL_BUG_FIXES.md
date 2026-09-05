@@ -12,7 +12,7 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 | CB-004 | Native summaries preserve protocol request ownership; active native output echoes are ignored | Not requested |
 | CB-005 | Invitations pin the current host epoch; bootstrap and join preserve it | Not requested |
 | CB-006 | Incremental source/output/metadata mutations enforce the aggregate notebook budget, including retained cells | Not requested |
-| CB-007 | Pending | Pending |
+| CB-007 | Rename migrates live kernels, execution ownership, status and notebook settings; controller queues retain identity | Not requested |
 | CB-008 | Pending | Pending |
 | CB-009 | Pending | Pending |
 | CB-010 | Pending | Pending |
@@ -31,6 +31,8 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 - CB-005: Invite round-trip, legacy default and malformed-epoch checks passed. The production transport test transferred host A to B, joined C using B's new invite, transferred B to C, and verified epoch 2 plus pause/resume on all three runtimes. TypeScript and targeted lint passed.
 
 - CB-006: Three budget/replica tests and 17 focused CRDT tests passed, plus TypeScript and lint. Three 10 MiB rich outputs remain transferable; the next over-budget output is rejected before mutation. A fresh peer applies the accepted state document, clearing outputs restores capacity, and retained deleted cells remain accounted for. Incremental source growth uses the same budget.
+
+- CB-007: A real Jupyter process retained `x = 42`, completed an active execution across rename, and returned `43` from the renamed notebook using the same kernel. Old CRDT/status paths were absent. Three relevant runtime/controller tests, TypeScript and lint passed. Host output callbacks and local controller execution track document rename events.
 
 ## Release gates
 

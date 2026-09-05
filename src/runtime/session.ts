@@ -2871,6 +2871,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               await this.acceptFileState(conflict.losingPath, conflict.tombstone, sourceId, false, true);
             }
             this.renameFileStates(effectiveFrom, to, fromState, toState);
+            this.renameNotebookRuntimeState(effectiveFrom, to);
             this.project.renameDocument(effectiveFrom, to);
             this.renameBinaryVersions(effectiveFrom, to);
             this.renameDirectories(effectiveFrom, to);
@@ -3806,6 +3807,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private renameNotebookRuntimeState(from: string, to: string): void {
+    const moved = (key: string) => key === from ? to : key.startsWith(`${from}/`) ? `${to}${key.slice(from.length)}` : key;
+    const move = <T>(map: Map<string, T>, replace?: (value: T) => void) => {
+      for (const [key, value] of [...map]) {
+        const next = moved(key);
+        if (next === key) continue;
+        const previous = map.get(next);
+        if (previous !== undefined && previous !== value) replace?.(previous);
+        map.delete(key);
+        map.set(next, value);
+      }
+    };
+    move(this.kernels, (kernel) => kernel.stop());
+    move(this.kernelStatuses);
+    move(this.kernelLastUsed);
+    move(this.notebookActiveExecutions);
+    for (const owner of this.executionOwners.values()) owner.notebookKey = moved(owner.notebookKey);
+    for (const pending of this.pendingExecutions.values()) pending.notebookKey = moved(pending.notebookKey);
+    for (const settings of [this.descriptor.notebookCompute, this.descriptor.notebookPythonPaths]) {
+      if (!settings) continue;
+      for (const key of Object.keys(settings)) {
+        const next = moved(key);
+        if (next === key) continue;
+        Object.assign(settings, { [next]: settings[key] });
+        delete settings[key];
+      }
+    }
+  }
+
   private async onLocalRename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
     const rawFrom = this.relativeKey(oldUri, true);
     const rawTo = this.relativeKey(newUri, true);
@@ -3833,6 +3863,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const toState = this.nextFileState(kind, false);
 
     this.renameFileStates(rawFrom, rawTo, fromState, toState);
+    this.renameNotebookRuntimeState(rawFrom, rawTo);
     this.project.renameDocument(rawFrom, rawTo);
     this.renameBinaryVersions(rawFrom, rawTo);
     this.renameDirectories(rawFrom, rawTo);
@@ -5720,7 +5751,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             payload = encodeRemoteExecutionEvent(event);
           } catch (error) {
             executionOwner.eventOverflow = error instanceof Error ? error : new Error(String(error));
-            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const events = executionOwner.events ?? [];
@@ -5730,7 +5761,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             executionOwner.eventOverflow = new Error(
               'Remote Jupyter output exceeded the bounded reconnect replay queue.',
             );
-            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const record = { sequence: events.length, payload } satisfies RemoteExecutionEventRecord;
@@ -5742,14 +5773,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           if (executionOwner.outputState && executionOwner.cellId) {
             const authoritative = applyJupyterEventToState(executionOwner.outputState, event);
             if (authoritative.executionOrder !== undefined) {
-              this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+              this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
                 requestId,
                 executionOrder: authoritative.executionOrder,
               });
             }
             if (authoritative.outputsChanged) {
               this.project.setCellOutputs(
-                notebookKey,
+                executionOwner.notebookKey,
                 executionOwner.cellId,
                 snapshotJupyterOutputs(executionOwner.outputState),
               );
@@ -5769,7 +5800,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       );
       const timedOut = new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
-          void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+          void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
           reject(new Error('Remote execution timed out after four hours.'));
         }, REMOTE_EXECUTION_TIMEOUT_MS);
       });
@@ -5799,14 +5830,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (executionOwner.outputState && executionOwner.cellId) {
       appendJupyterFailureToState(executionOwner.outputState, result);
       this.project.setCellOutputs(
-        notebookKey,
+        executionOwner.notebookKey,
         executionOwner.cellId,
         snapshotJupyterOutputs(executionOwner.outputState),
       );
       const resultCount = Number(result.content.execution_count);
       const executionOrder = executionOwner.outputState.executionOrder
         ?? (Number.isFinite(resultCount) ? resultCount : undefined);
-      this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+      this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
         requestId,
         ...(executionOrder !== undefined ? { executionOrder } : {}),
         success: result.success,
@@ -5950,6 +5981,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
+    const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
+    this.project.on('documentRenamed', onRename);
+    try {
     // Python reads the physical working copy, including files whose current
     // canonical content is still owned by an unsaved VS Code editor.
     if (materializeWorkspace) {
@@ -5983,9 +6017,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       kernel.on('stderr', (message) => this.log.appendLine(`[jupyter] ${String(message).trimEnd()}`));
       kernel.on('protocolError', (error) => this.log.appendLine(`[error] Jupyter protocol: ${formatError(error)}`));
       kernel.on('exit', () => {
-        if (this.kernels.get(notebookKey) === kernel) this.kernels.delete(notebookKey);
-        this.kernelLastUsed.delete(notebookKey);
-        this.setKernelStatus(notebookKey, 'Offline');
+        const currentKey = [...this.kernels].find(([, candidate]) => candidate === kernel)?.[0];
+        if (!currentKey) return;
+        this.kernels.delete(currentKey);
+        this.kernelLastUsed.delete(currentKey);
+        this.setKernelStatus(currentKey, 'Offline');
       });
       this.kernels.set(notebookKey, kernel);
     }
@@ -6036,6 +6072,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           : `Execution finished for ${notebookKey}.`);
       }
     }
+    } finally { this.project.off('documentRenamed', onRename); }
   }
 
   private setKernelStatus(notebookKey: string, status: 'Idle' | 'Busy' | 'Offline'): void {
