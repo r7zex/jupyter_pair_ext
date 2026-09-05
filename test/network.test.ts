@@ -1173,6 +1173,96 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
+  it('retires every authenticated route on an explicit peer departure', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const { encodeFrame } = await import('../src/core/wire.js');
+    const identity = { peerId: 'departing-peer', displayName: 'Departing Peer', joinOrder: 1 };
+    const transport = new MeshTransport({
+      sessionId: 'explicit-peer-departure', token: 'explicit-peer-departure-token-is-long-enough',
+      localPeer: { peerId: 'remaining-peer', displayName: 'Remaining Peer', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'remaining-peer' }),
+      isHost: () => true,
+    });
+    type Internals = {
+      connections: Map<string, {
+        transportPeerId: string;
+        identity: typeof identity;
+        purpose: 'runtime';
+        connectedAt: number;
+        lastSeen: number;
+        pingFailures: number;
+        snapshotRequested: boolean;
+      }>;
+      identityToTransport: Map<string, string>;
+      handleAction: (data: ArrayBuffer, transportPeerId: string) => void;
+    };
+    const internals = transport as unknown as Internals;
+    const now = Date.now();
+    transport.connect(identity);
+    for (const transportPeerId of ['relay:departing-peer', 'direct-departing-peer']) {
+      internals.connections.set(transportPeerId, {
+        transportPeerId,
+        identity,
+        purpose: 'runtime',
+        connectedAt: now,
+        lastSeen: now,
+        pingFailures: 0,
+        snapshotRequested: false,
+      });
+    }
+    internals.identityToTransport.set(identity.peerId, 'relay:departing-peer');
+    let disconnects = 0;
+    transport.on('peerDisconnected', () => { disconnects += 1; });
+
+    try {
+      const frame = encodeFrame('peerLeaving', {
+        sourceId: identity.peerId,
+        messageId: 'departure-frame',
+        sentAt: now,
+        clock: { sessionEpoch: 1, hostEpoch: 0, hostId: 'remaining-peer' },
+      });
+      internals.handleAction(
+        frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) as ArrayBuffer,
+        'relay:departing-peer',
+      );
+      assert.equal(disconnects, 1);
+      assert.equal(transport.peerRuntime().some((peer) => peer.peerId === identity.peerId), false);
+      assert.equal(internals.connections.size, 0);
+      assert.equal(internals.identityToTransport.has(identity.peerId), false);
+    } finally {
+      await transport.stop();
+    }
+  });
+
+  it('publishes departure before clearing local transport routes', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const identity = { peerId: 'stopping-peer', displayName: 'Stopping Peer', joinOrder: 1 };
+    const transport = new MeshTransport({
+      sessionId: 'departure-order', token: 'departure-order-token-is-long-enough',
+      localPeer: { peerId: 'local-peer', displayName: 'Local Peer', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'local-peer' }),
+      isHost: () => true,
+    });
+    type Internals = {
+      broadcast: (type: string) => string;
+      awaitDrainAll: () => Promise<void>;
+      connections: Map<string, unknown>;
+    };
+    const internals = transport as unknown as Internals;
+    const observed: string[] = [];
+    internals.connections.set('relay:stopping-peer', identity);
+    internals.broadcast = (type) => {
+      observed.push(`${type}:${internals.connections.size}`);
+      return 'departure-order-frame';
+    };
+    internals.awaitDrainAll = async () => undefined;
+
+    await transport.stop();
+
+    assert.deepEqual(observed, ['peerLeaving:1']);
+    assert.equal(internals.connections.size, 0);
+  });
+
   it('leases bootstrap route recovery without exposing the joiner as a runtime participant', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const identity = { peerId: 'joining-peer', displayName: 'Joining Peer', joinOrder: 1 };

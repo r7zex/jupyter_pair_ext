@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.15 - 2026-09-06 (departure cleanup and connection progress)
+
+- Sends an authenticated departure notice before transport shutdown, so relay-only participants disappear immediately from other session views while unexpected route loss keeps its bounded recovery lease. Fixes #13.
+- Shows a non-cancellable VS Code connection notification during runtime startup and keeps the status bar spinner visible for the initial `connecting` state. Fixes #14.
+- Adds regression coverage for multi-route departure cleanup, shutdown ordering, and connection-progress status text.
+
+Installed VS Code UI and physical two-computer acceptance remain separate checks.
+
 ## 0.5.14 - 2026-09-06 (editor echo and kernel selection fixes)
 
 - Prevents duplicated characters and newlines when VS Code splits or reshapes a remote text edit. Echo recognition uses the applied document version and resulting text, while preserving concurrent user typing. Fixes #12.

@@ -2308,6 +2308,15 @@ public improvablePeerIds(): string[] {
 
   public async stop(): Promise<void> {
     if (this.stopped) return;
+    // Relay routes have no Trystero onPeerLeave callback. Publish an explicit
+    // authenticated departure before clearing the local route maps so remote
+    // participants can retire relay-only peers immediately.
+    try {
+      this.broadcast('peerLeaving');
+      await this.awaitDrainAll(0, 1_000, 0);
+    } catch {
+      // Route teardown below remains authoritative when a peer is already gone.
+    }
     this.stopped = true;
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
@@ -2580,7 +2589,7 @@ public improvablePeerIds(): string[] {
 
   private onPeerLeave(
     transportPeerId: string,
-    trigger: 'route-lost' | 'half-open-detected' = 'route-lost',
+    trigger: 'route-lost' | 'half-open-detected' | 'peer-departed' = 'route-lost',
   ): void {
     // Propagate the death to the room level so the REMOTE side also learns
     // its route died (otherwise a half-dead route stays "fresh" there and
@@ -2612,6 +2621,10 @@ public improvablePeerIds(): string[] {
       this.identityToTransport.delete(connection.identity.peerId);
     }
     if (!this.stopped && wasActiveIdentityRoute) {
+      if (trigger === 'peer-departed') {
+        this.emit('peerDisconnected', connection.identity);
+        return;
+      }
       const lostRouteKind = transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX) ? 'relay' : 'direct';
       this.beginLogicalRecovery(connection.identity, connection.purpose, connection.lastSeen, trigger, lostRouteKind);
     }
@@ -2931,6 +2944,14 @@ public improvablePeerIds(): string[] {
         this.acceptPeerAdmission(frame, sourceId);
       } else if (frame.type === 'peerIdentity') {
         this.acceptIdentityUpdate(frame, connection);
+      } else if (frame.type === 'peerLeaving') {
+        // One broadcast frame can arrive over several authenticated routes
+        // with the same message id. Retire every route for this identity from
+        // the first departure notice instead of waiting for duplicate frames.
+        for (const route of [...this.connections.values()]) {
+          if (route.identity.peerId === sourceId) this.onPeerLeave(route.transportPeerId, 'peer-departed');
+        }
+        return;
       } else if (frame.type === 'appPing') {
         this.sendTo(sourceId, 'appPong', { pingAt: frame.meta.pingAt });
       } else if (frame.type === 'appPong') {

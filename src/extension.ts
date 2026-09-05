@@ -47,6 +47,7 @@ import { BackingFolderMismatchError, SessionRuntime, SessionTerminalLifecycle } 
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer } from './vscode/presence';
+import { statusBarTextForRuntimeState } from './vscode/connectionProgress';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
 import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
@@ -435,7 +436,11 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     const identityPrivateKey = await ensureDescriptorIdentity(context, descriptor, storedSecret);
     output.appendLine(`[info] Starting session ${descriptor.sessionId} in ${descriptor.mode} mode.`);
     runtime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
-    await runtime.start();
+    await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: 'Pair Notebook: connecting to session',
+      cancellable: false,
+    }, async () => runtime!.start());
     synchronizer = new EditorSynchronizer(
       runtime.project,
       descriptor.workingFolder,
@@ -1308,17 +1313,18 @@ function startStatusUpdates(): void {
     const host = snapshot.awareness.find((state) => state.peer.peerId === snapshot.clock.hostId)?.peer.displayName ?? '—';
     const compute = snapshot.awareness.find((state) => state.peer.peerId === snapshot.computeExecutorId)?.peer.displayName ?? '—';
     const onlineParticipants = snapshot.peers.filter((peer) => peer.online).length;
+    const progressText = statusBarTextForRuntimeState(snapshot.runtimeState);
     status.text = snapshot.runtimeState === 'waiting-for-host-folder'
       ? '$(debug-pause) Pair: waiting for host folder'
-      : snapshot.runtimeState === 'reconnecting' || snapshot.runtimeState === 'syncing'
-      ? `$(sync~spin) Pair: ${snapshot.runtimeState}`
-      : snapshot.runtimeState === 'host-unavailable' || snapshot.runtimeState === 'executor-unavailable'
-        ? `$(warning) Pair: ${snapshot.runtimeState}`
-        : snapshot.kernelStatus === 'Busy'
-      ? `$(sync~spin) Pair: ${compute} • Running`
-      : snapshot.clock.hostId === snapshot.descriptor.localPeer.peerId
-        ? `$(radio-tower) Pair: Host • ${onlineParticipants}`
-        : `$(broadcast) Pair: ${onlineParticipants} • H:${host} • C:${compute}`;
+      : progressText ?? (
+        snapshot.runtimeState === 'host-unavailable' || snapshot.runtimeState === 'executor-unavailable'
+          ? `$(warning) Pair: ${snapshot.runtimeState}`
+          : snapshot.kernelStatus === 'Busy'
+            ? `$(sync~spin) Pair: ${compute} • Running`
+            : snapshot.clock.hostId === snapshot.descriptor.localPeer.peerId
+              ? `$(radio-tower) Pair: Host • ${onlineParticipants}`
+              : `$(broadcast) Pair: ${onlineParticipants} • H:${host} • C:${compute}`
+      );
     status.tooltip = `${snapshot.runtimeState}: ${snapshot.runtimeDetail}`;
     status.show();
   };
