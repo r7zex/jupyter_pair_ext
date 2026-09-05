@@ -96,6 +96,55 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
+  for (const action of ['insert', 'delete', 'move']) {
+    it(`preserves pending remote fields during a local structural ${action}`, async () => {
+      const root = path.resolve('/tmp/pair-editor-structural-fields');
+      const notebook = fakeNotebook(root, [fakeCell('OLD', 'a'), fakeCell('B', 'b'), fakeCell('C', 'c')]);
+      vscodeBoundary.__reset(notebook);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+      try {
+        await synchronizer.whenNotebookReady(notebook);
+        project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 0, deleteCount: 3, insertText: 'REMOTE' }], REMOTE_ORIGIN);
+        project.setCellMetadata('work.ipynb', 'a', { owner: 'remote' }, REMOTE_ORIGIN);
+        project.setCellOutputs('work.ipynb', 'a', [{ metadata: {}, items: [
+          { mime: 'text/plain', dataBase64: Buffer.from('fresh').toString('base64') },
+        ] }], REMOTE_ORIGIN);
+        project.setCellExecution('work.ipynb', 'a', { requestId: 'request-a', executionOrder: 3 }, REMOTE_ORIGIN);
+        project.setNotebookMetadata('work.ipynb', { owner: 'remote' }, REMOTE_ORIGIN);
+        const expected = project.notebookSnapshot('work.ipynb');
+        if (action === 'insert') notebook.cells.splice(1, 0, fakeCell('NEW', 'new'));
+        if (action === 'delete') notebook.cells.splice(1, 1);
+        if (action === 'move') notebook.cells.splice(1, 2, notebook.cells[2], notebook.cells[1]);
+        reindex(notebook);
+        vscodeBoundary.__fireNotebookChange(notebook, true);
+        const actual = project.notebookSnapshot('work.ipynb');
+        assert.deepEqual(actual.cells.find((cell) => cell.id === 'a'), expected.cells[0]);
+        assert.deepEqual(actual.metadata, expected.metadata);
+        await waitFor(() => notebook.cells[0].document.getText() === 'REMOTE', 1000, 'preserved remote source rendered');
+      } finally { synchronizer.dispose(); project.destroy(); }
+    });
+  }
+
+  it('retains an unseen remote insertion when a local cell is inserted', async () => {
+    const root = path.resolve('/tmp/pair-editor-concurrent-structure');
+    const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const initial = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', { ...initial, cells: [initial.cells[0]!,
+        { id: 'remote', kind: 2, language: 'python', source: 'REMOTE', metadata: {}, outputs: [] }, initial.cells[1]!] }, REMOTE_ORIGIN);
+      notebook.cells.splice(1, 0, fakeCell('LOCAL', 'local'));
+      reindex(notebook);
+      vscodeBoundary.__fireNotebookChange(notebook, true);
+      assert.deepEqual(new Set(project.notebookSnapshot('work.ipynb').cells.map((cell) => cell.id)), new Set(['a', 'b', 'remote', 'local']));
+      await waitFor(() => notebook.cells.length === 4, 1000, 'both inserted cells rendered');
+    } finally { synchronizer.dispose(); project.destroy(); }
+  });
+
   it('applies remote Yjs structure/text/metadata/output updates to the correct stable cell with a minimal splice', async () => {
     const root = path.resolve('/tmp/pair-editor-remote');
     const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);

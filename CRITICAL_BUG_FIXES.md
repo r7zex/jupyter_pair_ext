@@ -2,13 +2,13 @@
 
 Source audit: [CRITICAL_BUG_AUDIT.md](CRITICAL_BUG_AUDIT.md), commit `1afa67c`.
 
-Workflow: fix one finding, validate it, push its commit, obtain a read-only review from GPT-5.6 Luna, resolve blocking findings, then proceed. Publish the GitHub release after every checkpoint and the final artifact gates pass. The original audit remains a historical reproduction record.
+Workflow: fix one finding, validate it, and push its commit. The user subsequently canceled further agent reviews to conserve usage. Publish the GitHub release after all checkpoints and final artifact gates pass. The original audit remains a historical reproduction record.
 
 | Finding | Implementation | Post-push review |
 | --- | --- | --- |
 | CB-001 | Fixed in `42c7594`, review correction `d812f93` | Luna re-reviewed `d812f93`: no P1/P2 blockers |
-| CB-002 | Versioned remote edits and displayed-text Yjs replicas; validation passed | Pending |
-| CB-003 | Pending | Pending |
+| CB-002 | Fixed in `e6730f6`; performance correction `48167ea` validated | Further review canceled by user |
+| CB-003 | Structural deltas preserve canonical fields and unseen remote cells; 36 editor tests and lint passed | Not requested |
 | CB-004 | Pending | Pending |
 | CB-005 | Pending | Pending |
 | CB-006 | Pending | Pending |
@@ -28,7 +28,7 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 
 ## Release gates
 
-- [ ] Every fix pushed and reviewed; blocking review findings resolved.
+- [ ] Every fix validated and pushed; previously reported review findings resolved.
 - [ ] Full tests, lint, Python bridge tests, production dependency audit.
 - [ ] Version, changelog, and current architecture/protocol documentation updated.
 - [ ] VSIX and source archive built and inspected.

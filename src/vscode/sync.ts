@@ -60,6 +60,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly notebookCellStateTimers = new Map<string, NodeJS.Timeout>();
   private readonly notebookBindings = new WeakMap<vscode.NotebookDocument, Promise<void>>();
   private readonly boundNotebooks = new WeakSet<vscode.NotebookDocument>();
+  private readonly displayedStructures = new WeakMap<vscode.NotebookDocument, Array<Pick<CellSnapshot, 'id' | 'kind' | 'language'>>>();
   private lastRejectedEditorWarningAt = 0;
 
   public constructor(
@@ -389,6 +390,48 @@ export class EditorSynchronizer implements vscode.Disposable {
       seen.add(explicit);
       this.cellIds.seed(cell, explicit, explicit);
     }
+    this.rememberStructure(notebook);
+  }
+
+  private rememberStructure(notebook: vscode.NotebookDocument): void {
+    this.displayedStructures.set(notebook, notebook.getCells().map((cell) => ({
+      id: this.cellIds.idFor(cell, metadataCellId(cell.metadata)), kind: cell.kind, language: cell.document.languageId,
+    })));
+  }
+
+  private reconcileEditorStructure(notebook: vscode.NotebookDocument, key: string): void {
+    const canonical = this.project.notebookSnapshot(key);
+    const editor = this.snapshotFromNotebook(notebook);
+    const before = this.displayedStructures.get(notebook) ?? canonical.cells;
+    const splice = minimalNotebookSplice(before, editor.cells);
+    if (!splice) return;
+    const previous = new Map(before.map((cell) => [cell.id, cell]));
+    const canonicalCells = new Map(canonical.cells.map((cell) => [cell.id, cell]));
+    const removed = new Set(before.slice(splice.start, splice.start + splice.deleteCount).map((cell) => cell.id));
+    const inserted = splice.cells.flatMap((cell) => {
+      const existing = canonicalCells.get(cell.id);
+      const old = previous.get(cell.id);
+      // A remote deletion wins over moving a stale editor cell. New cells are
+      // initialized from the editor; existing cells retain canonical fields.
+      if (!existing) return old ? [] : [cell];
+      return [{ ...existing,
+        kind: old && old.kind !== cell.kind ? cell.kind : existing.kind,
+        language: old && old.language !== cell.language ? cell.language : existing.language,
+      }];
+    });
+    const insertedIds = new Set(inserted.map((cell) => cell.id));
+    const cells = canonical.cells.filter((cell) => !removed.has(cell.id) && !insertedIds.has(cell.id));
+    const right = editor.cells.slice(splice.start + splice.cells.length).find((cell) => cells.some((current) => current.id === cell.id));
+    const left = editor.cells.slice(0, splice.start).reverse().find((cell) => cells.some((current) => current.id === cell.id));
+    const index = right ? cells.findIndex((cell) => cell.id === right.id)
+      : left ? cells.findIndex((cell) => cell.id === left.id) + 1 : cells.length;
+    cells.splice(index, 0, ...inserted);
+    this.project.reconcileNotebook(key, { metadata: canonical.metadata, cells }, LOCAL_EDITOR_ORIGIN);
+    this.rememberStructure(notebook);
+    for (const cell of notebook.getCells()) {
+      const id = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
+      if (this.project.hasNotebookCell(key, id)) this.rememberText(cell.document, key, id);
+    }
   }
 
   private captureStructuralEditorState(notebook: vscode.NotebookDocument): StructuralEditorState | undefined {
@@ -707,6 +750,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (!this.project.has(key)) {
       await this.ensureStableCellIds(notebook);
       this.project.ensureNotebook(key, this.snapshotFromNotebook(notebook));
+      this.rememberStructure(notebook);
     } else {
       const snapshot = this.project.notebookSnapshot(key);
       const matches = matchInitialCellIds(
@@ -725,6 +769,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       await this.applyUnscopedNotebookReconciliation(notebook, key);
     }
     await this.ensureStableCellIds(notebook);
+    this.rememberStructure(notebook);
     for (const cell of notebook.getCells()) {
       const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
       if (this.project.hasNotebookCell(key, cellId)) this.rememberText(cell.document, key, cellId);
@@ -737,7 +782,7 @@ export class EditorSynchronizer implements vscode.Disposable {
 
     if (event.contentChanges.length) {
       try {
-        this.project.reconcileNotebook(key, this.snapshotFromNotebook(event.notebook), LOCAL_EDITOR_ORIGIN);
+        this.reconcileEditorStructure(event.notebook, key);
         void this.ensureStableCellIds(event.notebook).catch((error) => {
           this.log.appendLine(`[error] Failed to persist notebook cell identities: ${formatError(error)}`);
         });
@@ -811,7 +856,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
         if (!key || !cellId) return;
         if (!this.project.hasNotebookCell(key, cellId)) {
-          this.project.reconcileNotebook(key, this.snapshotFromNotebook(notebook), LOCAL_EDITOR_ORIGIN);
+          this.reconcileEditorStructure(notebook, key);
           return;
         }
         canonicalSource = this.project.cellSource(key, cellId).toString();
