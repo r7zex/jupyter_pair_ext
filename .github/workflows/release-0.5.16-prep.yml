@@ -1,0 +1,118 @@
+name: One-time 0.5.16 release preparation
+
+on:
+  push:
+    branches:
+      - release/v0.5.16
+    paths:
+      - .github/workflows/release-0.5.16-prep.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: release/v0.5.16
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          python -m pip install jupyter_client==8.6.3 ipykernel==6.29.5
+
+      - name: Prepare 0.5.16 metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          old_version = '0.5.15'
+          new_version = '0.5.16'
+
+          package = Path('package.json')
+          text = package.read_text()
+          old = f'"version": "{old_version}"'
+          new = f'"version": "{new_version}"'
+          if text.count(old) != 1:
+              raise SystemExit(f'package.json: expected exactly one {old!r}, found {text.count(old)}')
+          package.write_text(text.replace(old, new, 1))
+
+          lock = Path('package-lock.json')
+          text = lock.read_text()
+          if text.count(old) < 2:
+              raise SystemExit(f'package-lock.json: expected at least two root version markers, found {text.count(old)}')
+          text = text.replace(old, new, 2)
+          lock.write_text(text)
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text()
+          if '## 0.5.16' in text:
+              raise SystemExit('CHANGELOG.md already contains 0.5.16')
+          anchor = '# Changelog\n\n'
+          if not text.startswith(anchor):
+              raise SystemExit('CHANGELOG.md heading anchor not found')
+          section = '''## 0.5.16 - 2026-09-06 (multi-event editor echo race repair)
+
+- Reworks editor echo recognition around the exact displayed baseline and immutable text deltas, so one remote VS Code edit split across multiple change events is consumed exactly once instead of being republished as fresh local text. Fixes #12.
+- Preserves genuine local typing before, between, or after split remote events; rejected workspace edits replay against the correct displayed baseline, and interleavings with no intermediate remote-target state are reconciled from the actual editor text instead of stale offsets.
+- Adds file and notebook-cell regressions for characters, newlines, line joins, version jumps, hidden intermediate targets, rejected edits, second-peer convergence, idempotent wire replay, and repeated split-echo interleavings.
+
+Installed VS Code UI and physical two-computer acceptance remain separate checks.
+
+'''
+          changelog.write_text(anchor + section + text[len(anchor):])
+          PY
+
+          node - <<'NODE'
+          const pkg = require('./package.json');
+          const lock = require('./package-lock.json');
+          if (pkg.version !== '0.5.16') throw new Error(`package.json version is ${pkg.version}`);
+          if (lock.version !== '0.5.16') throw new Error(`package-lock.json version is ${lock.version}`);
+          if (lock.packages?.['']?.version !== '0.5.16') throw new Error(`package-lock root version is ${lock.packages?.['']?.version}`);
+          NODE
+          git diff --check
+
+      - name: Lint full repository
+        run: npm run lint
+
+      - name: Run full Node test suite
+        run: npm test
+
+      - name: Run Python bridge tests
+        run: python -m unittest discover -s test -p jupyter_bridge_unit.py -v
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+
+      - name: Package release candidate
+        run: npm run package
+
+      - name: Commit only release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json CHANGELOG.md
+          git rm .github/workflows/release-0.5.16-prep.yml
+          git diff --cached --check
+          git commit -m "chore(release): prepare 0.5.16"
+          git push origin HEAD:release/v0.5.16
