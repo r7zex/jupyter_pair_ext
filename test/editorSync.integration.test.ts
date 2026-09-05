@@ -18,6 +18,30 @@ const { EditorSynchronizer } = require('../src/vscode/sync') as { EditorSynchron
 moduleWithLoader._load = originalLoad;
 
 describe('EditorSynchronizer VS Code-compatible production path', () => {
+  it('preserves execution ownership through native summaries and allows an explicit completed-output clear', async () => {
+    const root = path.resolve('/tmp/pair-native-execution-ownership');
+    const notebook = fakeNotebook(root, [fakeCell('pass', 'a')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    let managing = true;
+    const renderer = { ...fakeCellStateRenderer(), isManagingCellState: () => managing };
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, renderer);
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      project.setCellExecution('work.ipynb', 'a', { requestId: 'host-request', executionOrder: 1, success: true });
+      project.setCellOutputs('work.ipynb', 'a', [{ metadata: {}, items: [{ mime: 'text/plain', dataBase64: 'T0s=' }] }]);
+      const expected = project.notebookCellSnapshot('work.ipynb', 'a');
+      const cell = notebook.cells[0];
+      cell.executionSummary = { executionOrder: 1 };
+      cell.outputs = [];
+      vscodeBoundary.__fireCellChange(notebook, { cell, outputs: [], executionSummary: cell.executionSummary });
+      assert.deepEqual(project.notebookCellSnapshot('work.ipynb', 'a'), expected, 'native clear/start events must not overwrite host state');
+      managing = false;
+      vscodeBoundary.__fireCellChange(notebook, { cell, outputs: [] });
+      assert.equal(project.notebookCellSnapshot('work.ipynb', 'a')!.outputs.length, 0);
+      assert.equal(project.notebookCellSnapshot('work.ipynb', 'a')!.execution?.requestId, 'host-request');
+    } finally { synchronizer.dispose(); project.destroy(); }
+  });
   for (const notebookCell of [false, true]) for (const local of [
     { name: 'append', text: 'abcL', offset: 3, length: 0, insert: 'L', expected: 'RabcL' },
     { name: 'identical insertion', text: 'Rabc', offset: 0, length: 0, insert: 'R', expected: 'RRabc' },
@@ -1149,6 +1173,9 @@ function createNotebookVscodeBoundary(): any {
         cellChanges: [],
         metadata: undefined,
       });
+    },
+    __fireCellChange: (notebook: any, change: any) => {
+      for (const callback of handlers.changeNotebook ?? []) callback({ notebook, contentChanges: [], cellChanges: [change] });
     },
     __fireTextChange: (document: any, contentChanges: any[]) => {
       document.version = (document.version ?? 0) + 1;

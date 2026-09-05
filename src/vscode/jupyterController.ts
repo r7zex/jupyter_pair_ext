@@ -31,6 +31,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly queues = new PerNotebookExecutionQueue();
   private readonly mirroredExecutions = new Map<vscode.NotebookCell, MirroredExecutionState>();
   private remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
+  private readonly activeExecutions = new WeakSet<vscode.NotebookCell>();
 
   public constructor(private readonly log: vscode.OutputChannel) {
     this.controller = vscode.notebooks.createNotebookController(
@@ -76,6 +77,10 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   public setSynchronizer(synchronizer: EditorSynchronizer | undefined): void {
     this.synchronizer = synchronizer;
+  }
+
+  public isManagingCellState(cell: vscode.NotebookCell): boolean {
+    return this.activeExecutions.has(cell) || this.mirroredExecutions.has(cell);
   }
 
   public async restartActive(): Promise<void> {
@@ -180,7 +185,9 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
           : notebook.getCells().includes(item.cell) ? item.cell : undefined;
         if (!cell) continue;
         if (cell.kind !== vscode.NotebookCellKind.Code) continue;
-        await this.executeCell(runtime, notebookKey, cell);
+        this.activeExecutions.add(cell);
+        try { await this.executeCell(runtime, notebookKey, cell); }
+        finally { this.activeExecutions.delete(cell); }
       }
     });
   }

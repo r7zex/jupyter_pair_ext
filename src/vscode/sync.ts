@@ -38,6 +38,7 @@ export interface NotebookCellRenderRequest {
 
 export interface NotebookCellStateRenderer {
   renderRemoteCellState(cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void>;
+  isManagingCellState?(cell: vscode.NotebookCell): boolean;
 }
 
 export type LineLockGuard = (
@@ -812,6 +813,10 @@ export class EditorSynchronizer implements vscode.Disposable {
 
     for (const change of event.cellChanges) {
       const cellId = this.cellIds.idFor(change.cell, metadataCellId(change.cell.metadata));
+      const sharedExecution = this.project.notebookCellSnapshot(key, cellId)?.execution;
+      const protocolOwnsState = !!this.cellStateRenderer || !!sharedExecution?.requestId;
+      const manualOutputClear = change.outputs && change.cell.outputs.length === 0
+        && sharedExecution?.success !== undefined && !this.cellStateRenderer?.isManagingCellState?.(change.cell);
       if (change.metadata) {
         try {
           this.project.setCellMetadata(key, cellId, stripCollaborationMetadata(change.metadata), LOCAL_EDITOR_ORIGIN);
@@ -822,7 +827,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           this.warnRejectedEditorUpdate(detail);
         }
       }
-      if (change.outputs) {
+      if (change.outputs && (!protocolOwnsState || manualOutputClear)) {
         try {
           this.project.setCellOutputs(key, cellId, outputsFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
         } catch (error) {
@@ -832,7 +837,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           this.warnRejectedEditorUpdate(detail);
         }
       }
-      if (change.executionSummary) {
+      if (change.executionSummary && !protocolOwnsState) {
         try {
           this.project.setCellExecution(key, cellId, executionFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
         } catch (error) {
