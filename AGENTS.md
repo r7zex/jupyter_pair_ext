@@ -1,41 +1,105 @@
 ## Octocode GitHub research policy
 
-When researching remote GitHub repositories, large codebases, external dependencies, or upstream implementations, use Octocode CLI as the primary research/navigation layer.
+When researching remote GitHub repositories, large codebases, external dependencies, or upstream implementations, use the repository wrapper `scripts/octocode-query.mjs` as the primary research/navigation layer.
 
-Octocode MCP may not be exposed to the current Codex Desktop session. If MCP tools are unavailable, invoke Octocode through the shell.
+Octocode MCP may not be exposed to the current Codex Desktop session. Direct `npx octocode ... --queries <json>` calls are also fragile on Windows because PowerShell/cmd can alter JSON quoting. The wrapper avoids both problems: it constructs JSON inside Node and launches the globally installed Octocode entrypoint with an argument array and `shell:false`.
 
-### Available Octocode tools
+### One-time prerequisite
 
-Use primarily:
+Octocode must be installed globally on the Windows host:
 
-- `ghSearch`
-  - `operation:"tree"` — browse a known repository structure.
-  - `operation:"code"` — search code or paths.
-  - `operation:"repositories"` — discover repositories.
-- `ghGetFileContent` — read a known path after discovery.
+```powershell
+npm install -g octocode@latest
+```
 
-Do not assume deprecated Octocode CLI tool names such as `ghViewRepoStructure`, `ghSearchCode`, or `ghSearchRepos` exist.
+Do not reinstall it on every task.
+
+### Canonical commands
+
+Use these commands from the repository root. Do not use `npx --% octocode ...` unless the wrapper itself is unavailable.
+
+Shallow repository tree:
+
+```powershell
+node scripts/octocode-query.mjs tree --owner OWNER --repo REPO --depth 1
+```
+
+Targeted code search:
+
+```powershell
+node scripts/octocode-query.mjs code --owner OWNER --repo REPO --keyword SYMBOL_OR_TERM --page-size 10
+```
+
+Multiple ANDed search terms:
+
+```powershell
+node scripts/octocode-query.mjs code --owner OWNER --repo REPO --keyword TERM1 --keyword TERM2 --page-size 10
+```
+
+Repository discovery:
+
+```powershell
+node scripts/octocode-query.mjs repos --keyword TERM --page-size 10
+```
+
+Symbol outline for a known large file:
+
+```powershell
+node scripts/octocode-query.mjs symbols --owner OWNER --repo REPO --path PATH
+```
+
+Matched slice around a known symbol/text:
+
+```powershell
+node scripts/octocode-query.mjs match --owner OWNER --repo REPO --path PATH --text SYMBOL_OR_TEXT --context 8
+```
+
+Narrow line range:
+
+```powershell
+node scripts/octocode-query.mjs range --owner OWNER --repo REPO --path PATH --start START --end END
+```
+
+Small/targeted file read:
+
+```powershell
+node scripts/octocode-query.mjs file --owner OWNER --repo REPO --path PATH --minify standard
+```
+
+The wrapper always requests Octocode `--compact` output internally.
 
 ### Required research workflow
 
-1. Orient first. For a known repository, start with `ghSearch` using `operation:"tree"` and `maxDepth:1`.
-2. Keep tree exploration shallow. Increase depth only for a relevant subtree instead of requesting a deep tree for the whole repository.
-3. Search before reading. Use `ghSearch` with `operation:"code"` to locate relevant symbols, filenames, strings, interfaces, functions, or implementations.
-4. Read only known relevant files. After obtaining an exact path, use `ghGetFileContent`.
-5. For an unknown or large file, read a symbol outline first with `minify:"symbols"`.
-6. After identifying the relevant symbol, prefer `matchString` with a small `contextLines` value or a narrow `startLine` + `endLine` range.
-7. For ordinary targeted reads where exact formatting is unnecessary, prefer `minify:"standard"`.
-8. Use `minify:"none"` or `fullContent:true` only for small files where exact complete contents are genuinely required, such as short config files.
-9. If Octocode returns partial content with a continuation offset, continue using the returned `charOffset`; partial content cannot prove absence.
-10. A complete code-search snippet does not need to be fetched again unless additional surrounding source is required.
-11. Do not clone a remote repository merely to investigate it when `ghSearch` and `ghGetFileContent` provide sufficient evidence.
+1. Orient first with a shallow `tree` query (`--depth 1`).
+2. Increase tree depth only for a relevant subtree; never request a deep whole-repository tree without need.
+3. Search before reading. Use `code` to locate relevant symbols, filenames, strings, interfaces, functions, or implementations.
+4. Read only known relevant files.
+5. For an unknown or large file, use `symbols` first.
+6. After identifying the relevant symbol, prefer `match` with small context or `range` with narrow line bounds.
+7. Use `file --minify standard` for an ordinary targeted read where exact formatting is unnecessary.
+8. Read complete exact content only for a genuinely small file when needed.
+9. If Octocode returns partial content with a continuation offset, follow the continuation; partial content cannot prove absence.
+10. A complete code-search snippet does not need to be fetched again unless more surrounding source is required.
+11. Do not clone a remote repository merely to investigate it when Octocode provides sufficient evidence.
 12. Do not dump entire repositories, deep directory trees, generated files, lockfiles, vendored code, or large source files into model context without a concrete need.
-13. Use Octocode CLI `--compact` output for research calls.
-14. Batch related queries when the tool schema supports batching instead of performing redundant calls.
-15. If the exact Octocode input schema is uncertain, inspect it first with `npx octocode tools <tool> --scheme`.
-16. On Windows PowerShell, JSON passed through `npx.cmd` may lose quoting. If direct JSON parsing fails, use PowerShell stop-parsing syntax: `npx --% octocode tools ...` and escape JSON quotes as `\"`.
-17. Octocode is the research/navigation layer. Normal local editing, compilation, tests, linting, Git operations, and targeted local inspection may still use the usual Codex tools.
-18. Fall back to ordinary GitHub/web/shell inspection only when Octocode cannot retrieve the required evidence.
+13. Avoid repeating evidence already obtained in the current task.
+14. Octocode is the remote research/navigation layer. Normal local editing, compilation, tests, linting, Git operations, and targeted local inspection may still use the normal Codex tools.
+15. Fall back to ordinary GitHub/web/shell inspection only when Octocode cannot retrieve the required evidence.
+
+### Failure handling
+
+If a wrapper call fails or hangs:
+
+1. Stop it rather than waiting indefinitely.
+2. Run:
+   ```powershell
+   node scripts/octocode-query.mjs --help
+   ```
+3. Verify the global package exists:
+   ```powershell
+   npm root -g
+   ```
+4. Do not silently switch to recursively reading the whole project. Report the concrete wrapper/Octocode error first.
 
 ### Token-efficiency priority
 
@@ -44,41 +108,7 @@ Prefer, in order:
 1. shallow repository tree;
 2. targeted code search;
 3. symbol outline;
-4. exact function/match with limited context;
+4. exact match with limited context;
 5. narrow line range;
 6. standard-minified file;
 7. complete file only as a last resort.
-
-Avoid repeating evidence already obtained in the current task.
-
-### Windows PowerShell command patterns
-
-Shallow tree:
-
-```powershell
-npx --% octocode tools ghSearch --queries "{\"operation\":\"tree\",\"owner\":\"OWNER\",\"repo\":\"REPO\",\"maxDepth\":1}" --compact
-```
-
-Targeted code search:
-
-```powershell
-npx --% octocode tools ghSearch --queries "{\"operation\":\"code\",\"keywords\":[\"SYMBOL_OR_TERM\"],\"owner\":\"OWNER\",\"repo\":\"REPO\",\"pageSize\":10}" --compact
-```
-
-Symbol outline for a known large file:
-
-```powershell
-npx --% octocode tools ghGetFileContent --queries "{\"owner\":\"OWNER\",\"repo\":\"REPO\",\"path\":\"PATH\",\"minify\":\"symbols\"}" --compact
-```
-
-Matched slice:
-
-```powershell
-npx --% octocode tools ghGetFileContent --queries "{\"owner\":\"OWNER\",\"repo\":\"REPO\",\"path\":\"PATH\",\"matchString\":\"SYMBOL_OR_TEXT\",\"contextLines\":8}" --compact
-```
-
-Narrow line range:
-
-```powershell
-npx --% octocode tools ghGetFileContent --queries "{\"owner\":\"OWNER\",\"repo\":\"REPO\",\"path\":\"PATH\",\"startLine\":START,\"endLine\":END}" --compact
-```
