@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -9,48 +9,105 @@ function fail(message, code = 2) {
   process.exit(code);
 }
 
-function findOctocodeEntrypoint() {
-  const candidates = [];
+function resolveOctocodeFromGlobalRoot(globalRoot) {
+  if (!globalRoot) return undefined;
+
+  const packageDir = path.join(globalRoot.trim(), 'octocode');
+  const packageJsonPath = path.join(packageDir, 'package.json');
+  if (!existsSync(packageJsonPath)) return undefined;
+
+  try {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+    const bin =
+      typeof packageJson.bin === 'string'
+        ? packageJson.bin
+        : packageJson.bin?.octocode ?? Object.values(packageJson.bin ?? {})[0];
+
+    if (typeof bin === 'string') {
+      const entrypoint = path.resolve(packageDir, bin);
+      if (existsSync(entrypoint)) return entrypoint;
+    }
+  } catch {
+    // Fall through to the published default path below.
+  }
+
+  const fallback = path.join(packageDir, 'out', 'octocode.js');
+  return existsSync(fallback) ? fallback : undefined;
+}
+
+function getGlobalNpmRoots() {
+  const roots = new Set();
 
   if (process.env.APPDATA) {
-    candidates.push(
-      path.join(
-        process.env.APPDATA,
-        'npm',
-        'node_modules',
-        'octocode',
-        'out',
-        'octocode.js'
-      )
-    );
+    roots.add(path.join(process.env.APPDATA, 'npm', 'node_modules'));
   }
 
   if (process.env.NPM_CONFIG_PREFIX) {
-    candidates.push(
-      path.join(
-        process.env.NPM_CONFIG_PREFIX,
-        'node_modules',
-        'octocode',
-        'out',
-        'octocode.js'
-      )
-    );
+    roots.add(path.join(process.env.NPM_CONFIG_PREFIX, 'node_modules'));
   }
 
-  const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const npmRoot = spawnSync(npmCommand, ['root', '-g'], {
-    encoding: 'utf8',
-    windowsHide: true,
-    shell: false,
-  });
+  // Prefer running npm's JS entrypoint directly through the current node.exe.
+  // This avoids the Windows npm.cmd shell wrapper entirely.
+  const npmCliCandidates = [
+    path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
 
-  if (npmRoot.status === 0 && npmRoot.stdout?.trim()) {
-    candidates.push(
-      path.join(npmRoot.stdout.trim(), 'octocode', 'out', 'octocode.js')
-    );
+  for (const npmCli of npmCliCandidates) {
+    if (!existsSync(npmCli)) continue;
+    const result = spawnSync(process.execPath, [npmCli, 'root', '-g'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      shell: false,
+    });
+    if (result.status === 0 && result.stdout?.trim()) {
+      roots.add(result.stdout.trim());
+    }
   }
 
-  return candidates.find(candidate => existsSync(candidate));
+  // Fallback for Windows installations where npm is exposed only through npm.cmd.
+  // No user JSON is passed through cmd.exe here, so quoting is not a concern.
+  if (process.platform === 'win32' && process.env.ComSpec) {
+    const result = spawnSync(
+      process.env.ComSpec,
+      ['/d', '/s', '/c', 'npm root -g'],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: false,
+      }
+    );
+    if (result.status === 0 && result.stdout?.trim()) {
+      roots.add(result.stdout.trim());
+    }
+
+    // npm's global command shim normally lives next to the global node_modules.
+    const where = spawnSync('where.exe', ['octocode.cmd'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      shell: false,
+    });
+    if (where.status === 0 && where.stdout?.trim()) {
+      for (const shim of where.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean)) {
+        roots.add(path.join(path.dirname(shim), 'node_modules'));
+      }
+    }
+  }
+
+  return [...roots];
+}
+
+function findOctocodeEntrypoint() {
+  if (process.env.OCTOCODE_CLI_PATH && existsSync(process.env.OCTOCODE_CLI_PATH)) {
+    return process.env.OCTOCODE_CLI_PATH;
+  }
+
+  for (const root of getGlobalNpmRoots()) {
+    const entrypoint = resolveOctocodeFromGlobalRoot(root);
+    if (entrypoint) return entrypoint;
+  }
+
+  return undefined;
 }
 
 function parseOptions(argv) {
@@ -113,8 +170,11 @@ function omitUndefined(object) {
 function runOctocode(tool, payload) {
   const entrypoint = findOctocodeEntrypoint();
   if (!entrypoint) {
+    const searchedRoots = getGlobalNpmRoots();
     fail(
-      'Global Octocode package not found. Install it once with: npm install -g octocode@latest'
+      `Global Octocode package not found. npm roots checked: ${
+        searchedRoots.length ? searchedRoots.join(', ') : '(none resolved)'
+      }. Install once with: npm install -g octocode@latest`
     );
   }
 
@@ -126,10 +186,14 @@ function runOctocode(tool, payload) {
       windowsHide: true,
       shell: false,
       env: process.env,
+      timeout: 45000,
     }
   );
 
   if (child.error) {
+    if (child.error.code === 'ETIMEDOUT') {
+      fail('Octocode timed out after 45 seconds.', 1);
+    }
     fail(`Failed to launch Octocode: ${child.error.message}`, 1);
   }
 
