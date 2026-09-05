@@ -196,7 +196,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   register(context, 'pairNotebook.showComputeResources', () => showComputeResources());
   register(context, 'pairNotebook.selectPythonEnvironment', () => selectPythonEnvironment());
-  register(context, 'pairNotebook.runActiveCell', async () => requireRuntime().executeActiveCell());
+  register(context, 'pairNotebook.runActiveCell', async () => notebookController.executeActive());
   register(context, 'pairNotebook.restartKernel', async () => notebookController.restartActive());
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 

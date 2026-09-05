@@ -3053,6 +3053,43 @@ describe('compute and lifecycle regression coverage', () => {
 });
 
 describe('standard VS Code NotebookController production path', () => {
+  it('selects the Pair controller before Pair Run and refuses a failed kernel selection', async () => {
+    const controller = new PairNotebookController(logger());
+    const notebook = notebookForController('A');
+    fakeCell('a', notebook);
+    const project = new CollaborativeProject();
+    let pairRuns = 0;
+    let nativeRuns = 0;
+    let selected = 'native-python';
+    let allowSelection = true;
+    const originalCommand = fakeVscode.commands.executeCommand;
+    controller.setRuntime({ project, descriptor: { localPeer: { peerId: 'guest' } },
+      notebookKey: () => 'A', notebookCellId: () => 'a', computeForNotebook: () => ({ executorId: 'host' }),
+      executeCell: async () => { pairRuns += 1; assert.equal(selected, 'pair-notebook-jupyter'); return { success: true, content: {} }; },
+    });
+    fakeVscode.window.activeNotebookEditor = { notebook, selection: { start: 0, end: 1 } };
+    fakeVscode.commands.executeCommand = async (command: string, options: any) => {
+      if (command === 'notebook.cell.execute') nativeRuns += 1;
+      if (command !== 'notebook.selectKernel') return undefined;
+      assert.equal(options.extension, 'pair-notebook.pair-notebook');
+      assert.equal(options.notebookEditor.notebook, notebook);
+      if (allowSelection) selected = options.id;
+      return allowSelection;
+    };
+    try {
+      await controller.executeActive();
+      assert.equal(pairRuns, 1);
+      assert.equal(nativeRuns, 0);
+      allowSelection = false;
+      await assert.rejects(controller.executeActive(), /could not select/);
+      assert.equal(pairRuns, 1);
+    } finally {
+      fakeVscode.commands.executeCommand = originalCommand;
+      fakeVscode.window.activeNotebookEditor = undefined;
+      controller.dispose(); project.destroy();
+    }
+  });
+
   it('routes Run Cell through per-notebook queues and routes Interrupt to the runtime', async () => {
     const controller = new PairNotebookController(logger());
     const calls: string[] = [];
@@ -3078,10 +3115,10 @@ describe('standard VS Code NotebookController production path', () => {
       reportInputResolved: (key: string) => { calls.push(`${key}:input-resolved`); },
       replyToInput: (requestId: string, value: string) => { calls.push(`${requestId}:reply:${value}`); },
       cancelInput: async (requestId: string) => { calls.push(`${requestId}:cancel`); },
-      project: {
+      project: Object.assign(new CollaborativeProject(), {
         setCellOutputs: () => { outputPublishCount += 1; },
         setCellExecution: () => { executionPublishCount += 1; },
-      },
+      }),
     };
     controller.setRuntime(runtime);
     const productionController = fakeVscode.__controllers.at(-1);

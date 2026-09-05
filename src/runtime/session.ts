@@ -1189,15 +1189,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
   }
 
-  public async executeActiveCell(): Promise<void> {
-    if (this.waitingForHostFolder) {
-      throw new Error('The session is paused until the new host chooses a folder.');
-    }
-    const editor = vscode.window.activeNotebookEditor;
-    if (!editor) throw new Error('Open a notebook and select a code cell first.');
-    await vscode.commands.executeCommand('notebook.cell.execute');
-  }
-
   public async executeCell(
     notebookKey: string,
     cellId: string,

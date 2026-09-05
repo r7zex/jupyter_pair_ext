@@ -93,6 +93,20 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     await runtime.restartNotebook(key);
   }
 
+  public async executeActive(): Promise<void> {
+    const editor = vscode.window.activeNotebookEditor;
+    if (!editor) throw new Error('Open a notebook and select a code cell first.');
+    const runtime = this.requireRuntime();
+    if (!runtime.notebookKey(editor.notebook.uri)) throw new Error('The active notebook is outside the Pair Notebook working copy.');
+    const cells = editor.notebook.getCells(editor.selection).filter((cell) => cell.kind === vscode.NotebookCellKind.Code);
+    if (!cells.length) throw new Error('Select a Python code cell first.');
+    const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
+      id: 'pair-notebook-jupyter', extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
+    });
+    if (selected !== true) throw new Error('VS Code could not select the Pair Notebook kernel.');
+    await this.execute(cells, editor.notebook);
+  }
+
   public dispose(): void {
     this.finishMirroredExecutions();
     this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
