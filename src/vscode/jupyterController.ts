@@ -47,14 +47,17 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       const key = runtime.notebookKey(notebook.uri);
       if (key) await runtime.interruptNotebook(key);
     };
-    const prefer = (notebook: vscode.NotebookDocument) => {
+    const claim = (notebook: vscode.NotebookDocument) => {
       if (this.runtime?.notebookKey(notebook.uri)) {
+        // VS Code exposes Preferred as its strongest NotebookController
+        // affinity. All Pair commands route through this controller; native
+        // kernels are never used by Pair's execution/output protocol.
         this.controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
       }
     };
     this.disposables.push(
       this.controller,
-      vscode.workspace.onDidOpenNotebookDocument(prefer),
+      vscode.workspace.onDidOpenNotebookDocument(claim),
     );
   }
 

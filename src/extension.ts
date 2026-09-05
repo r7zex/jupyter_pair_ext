@@ -46,7 +46,7 @@ import { EXPLICIT_PROXY_PASSWORD_ERROR, inspectExplicitProxyPassword } from './r
 import { BackingFolderMismatchError, SessionRuntime, SessionTerminalLifecycle } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
 import { DashboardProvider } from './vscode/dashboard';
-import { PresenceRenderer, pickCursorColor } from './vscode/presence';
+import { PresenceRenderer } from './vscode/presence';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
 import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
@@ -198,11 +198,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.selectPythonEnvironment', () => selectPythonEnvironment());
   register(context, 'pairNotebook.runActiveCell', async () => requireRuntime().executeActiveCell());
   register(context, 'pairNotebook.restartKernel', async () => notebookController.restartActive());
-  register(context, 'pairNotebook.toggleShareMyCursor', () => toggleBooleanSetting('shareMyCursor', 'Мой курсор'));
-  register(context, 'pairNotebook.toggleRemoteCursors', () => toggleBooleanSetting('showRemoteCursors', 'Чужие курсоры'));
-  register(context, 'pairNotebook.toggleRemoteCursorNames', () => toggleBooleanSetting('showRemoteCursorNames', 'Имена участников'));
-  register(context, 'pairNotebook.changeMyCursorColor', () => changeMyCursorColor());
-  register(context, 'pairNotebook.manageParticipantCursors', () => requirePresence().manageParticipant());
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
   // A restored guest can legitimately wait for the host's first project state
@@ -447,12 +442,18 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       output,
       runtime.notebookCellIds,
       notebookController,
+      (key, cellId, changes, canonicalSource) => runtime?.lineLockMessage(
+        key,
+        cellId,
+        changes,
+        canonicalSource,
+      ),
     );
     runtime.setWorkingCopyWriter(
       (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),
       () => synchronizer?.prepareWorkingCopy() ?? Promise.resolve(),
     );
-    presence = new PresenceRenderer(runtime, context);
+    presence = new PresenceRenderer(runtime);
     notebookController.setSynchronizer(synchronizer);
     notebookController.setRuntime(runtime);
     dashboard.setRuntime(runtime);
@@ -1255,22 +1256,6 @@ async function selectPythonEnvironment(): Promise<void> {
   }
 }
 
-async function toggleBooleanSetting(key: string, label: string): Promise<void> {
-  const configuration = vscode.workspace.getConfiguration('pairNotebook');
-  const current = configuration.get<boolean>(key, true);
-  await configuration.update(key, !current, vscode.ConfigurationTarget.Global);
-  presence?.refresh();
-  void vscode.window.showInformationMessage(`${label}: ${!current ? 'включено' : 'выключено'}.`);
-}
-
-async function changeMyCursorColor(): Promise<void> {
-  const configuration = vscode.workspace.getConfiguration('pairNotebook');
-  const current = configuration.get<string>('myCursorColor', '#4FC3F7');
-  const selected = await pickCursorColor('Цвет моего общего курсора', current);
-  if (!selected) return;
-  await configuration.update('myCursorColor', selected, vscode.ConfigurationTarget.Global);
-}
-
 async function openRecentProject(context: vscode.ExtensionContext): Promise<void> {
   const stored = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
   const recent = await accessibleRecentProjects(stored);
@@ -1657,11 +1642,6 @@ function requireRuntime(): SessionRuntime {
 function requireActivationContext(): vscode.ExtensionContext {
   if (!activationContext) throw new Error('Pair Notebook extension context is unavailable.');
   return activationContext;
-}
-
-function requirePresence(): PresenceRenderer {
-  if (!presence) throw new Error('No active Pair Notebook session.');
-  return presence;
 }
 
 function formatError(error: unknown): string {

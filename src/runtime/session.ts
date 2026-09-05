@@ -22,8 +22,10 @@ import {
   defaultAutosaveRoot,
 } from '../core/autosave';
 import {
+  encodeRelativeOffset,
   ResolvedCursorPosition,
   SharedCursorPosition,
+  resolveRelativeOffset,
   resolveSharedCursorPosition,
 } from '../core/cursorPosition';
 import {
@@ -157,6 +159,8 @@ export interface PresenceState {
   activeNotebookCellId?: string | undefined;
   /** Line-only presence avoids unstable cursor offsets during notebook edits. */
   activeLine?: number | undefined;
+  /** CRDT-relative start of the active line, so it follows inserted lines. */
+  activeLineAnchor?: string | undefined;
   /** Legacy receive-only compatibility. New local packets never publish exact offsets. */
   cursor?: SharedCursorPosition | undefined;
   shareCursor: boolean;
@@ -229,7 +233,10 @@ const MAX_REMOTE_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
 const MAX_REMOTE_INPUT_CHARACTERS = 64 * 1024;
 const MAX_REMOTE_EXECUTIONS = 4;
 const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
-const REMOTE_EXECUTION_TIMEOUT_MS = 4 * 60 * 60_000;
+/** A stuck kernel must end visibly instead of leaving a notebook cell Busy indefinitely. */
+const KERNEL_EXECUTION_TIMEOUT_MS = 10 * 60_000;
+/** Leave one extra minute for the terminal output/result to cross the route. */
+const REMOTE_EXECUTION_TIMEOUT_MS = KERNEL_EXECUTION_TIMEOUT_MS + 60_000;
 /** A routed request must be acknowledged before VS Code leaves the cell in a running state. */
 const EXECUTION_ACCEPT_TIMEOUT_MS = 45_000;
 /** Host waits only this long for the requested target-cell CRDT state to arrive. */
@@ -599,6 +606,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private lastPublishedActiveFile: string | undefined;
   private lastPublishedActiveNotebookCellId: string | undefined;
   private lastPublishedActiveLine: number | undefined;
+  private lastPublishedActiveLineAnchor: string | undefined;
   private lastPublishedShareCursor = true;
   private lastPublishedCursorColor = '#4FC3F7';
   private lastPublishedDisplayName = '';
@@ -1595,6 +1603,49 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       ? this.presenceText(state.activeFile, state.activeNotebookCellId)
       : undefined;
     return resolveSharedCursorPosition(text, state.cursor);
+  }
+
+  /** Resolves a line anchor without exposing a character cursor to the UI. */
+  public resolvePresenceLineOffset(state: PresenceState): number | undefined {
+    if (!state.activeLineAnchor || !state.activeFile) return undefined;
+    return resolveRelativeOffset(
+      this.presenceText(state.activeFile, state.activeNotebookCellId),
+      state.activeLineAnchor,
+      undefined,
+    );
+  }
+
+  /**
+   * Rejects local edits that touch another participant's selected line. The
+   * CRDT-relative anchor keeps that lock on the same logical line when a peer
+   * inserts new lines above it. If two peers select the same line concurrently,
+   * the stable join order breaks the tie instead of blocking both editors.
+   */
+  public lineLockMessage(
+    key: string,
+    cellId: string | undefined,
+    changes: readonly { rangeOffset: number; rangeLength: number }[],
+    canonicalSource: string,
+  ): string | undefined {
+    if (!changes.length) return undefined;
+    const states = this.snapshot().awareness;
+    const own = states.find((state) => state.peer.peerId === this.descriptor.localPeer.peerId);
+    const ownStart = own ? this.presenceLineStart(own, canonicalSource) : undefined;
+    for (const state of states) {
+      if (state.peer.peerId === this.descriptor.localPeer.peerId
+        || state.shareCursor === false
+        || state.activeFile !== key
+        || state.activeNotebookCellId !== cellId) continue;
+      const lockedStart = this.presenceLineStart(state, canonicalSource);
+      if (lockedStart === undefined) continue;
+      // A simultaneous selection is resolved consistently on every peer.
+      if (ownStart === lockedStart && comparePeerPriority(this.descriptor.localPeer, state.peer) < 0) continue;
+      const lockedEnd = lineEndOffset(canonicalSource, lockedStart);
+      if (changes.some((change) => changeTouchesLine(change, lockedStart, lockedEnd))) {
+        return `Line is currently selected by ${state.peer.displayName}.`;
+      }
+    }
+    return undefined;
   }
 
   public async refreshHardware(): Promise<void> {
@@ -3555,14 +3606,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.lastDisplayNameWarning = warning;
       }
     }
-    const shareCursor = configuration.get<boolean>('shareMyCursor', true);
-    const configuredColor = configuration.get<string>('myCursorColor', '#4FC3F7');
-    const cursorColor = /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor.toUpperCase() : '#4FC3F7';
+    // Presence is now line-only. Keep the legacy wire fields fixed so older
+    // participants can still see activity, but no local setting can turn a
+    // line lock into an unannounced editable cursor.
+    const shareCursor = true;
+    const cursorColor = '#4FC3F7';
     const activeText = vscode.window.activeTextEditor;
     const activeNotebook = vscode.window.activeNotebookEditor;
     let activeFile: string | undefined;
     let activeNotebookCellId: string | undefined;
     let activeLine: number | undefined;
+    let activeLineAnchor: string | undefined;
     const notebookKey = activeNotebook ? this.relativeKey(activeNotebook.notebook.uri) : undefined;
     if (activeNotebook && notebookKey) {
       activeFile = notebookKey;
@@ -3577,14 +3631,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const selectedCell = focusedCell
         ?? (selectedIndexIsValid ? activeNotebook.notebook.cellAt(selectedIndex) : undefined);
       if (selectedCell) activeNotebookCellId = this.notebookCellId(selectedCell);
-      if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString() && shareCursor) {
+      if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString()) {
         activeLine = lineFromSelection(activeText.selection.active);
+        activeLineAnchor = this.lineAnchorForEditor(activeText.document, activeLine, notebookKey, activeNotebookCellId);
       }
     } else if (activeText) {
       const textKey = this.relativeKey(activeText.document.uri);
       if (textKey) {
         activeFile = textKey;
-        if (shareCursor) activeLine = lineFromSelection(activeText.selection.active);
+        activeLine = lineFromSelection(activeText.selection.active);
+        activeLineAnchor = this.lineAnchorForEditor(activeText.document, activeLine, textKey, undefined);
       }
     }
     const displayName = this.descriptor.localPeer.displayName;
@@ -3592,6 +3648,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       && this.lastPublishedActiveFile === activeFile
       && this.lastPublishedActiveNotebookCellId === activeNotebookCellId
       && this.lastPublishedActiveLine === activeLine
+      && this.lastPublishedActiveLineAnchor === activeLineAnchor
       && this.lastPublishedShareCursor === shareCursor
       && this.lastPublishedCursorColor === cursorColor
       && this.lastPublishedDisplayName === displayName) return;
@@ -3599,6 +3656,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.lastPublishedActiveFile = activeFile;
     this.lastPublishedActiveNotebookCellId = activeNotebookCellId;
     this.lastPublishedActiveLine = activeLine;
+    this.lastPublishedActiveLineAnchor = activeLineAnchor;
     this.lastPublishedShareCursor = shareCursor;
     this.lastPublishedCursorColor = cursorColor;
     this.lastPublishedDisplayName = displayName;
@@ -3608,10 +3666,25 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       activeFile,
       activeNotebookCellId,
       activeLine,
+      activeLineAnchor,
       shareCursor,
       cursorColor,
       typing: false,
     });
+  }
+
+  private lineAnchorForEditor(
+    document: vscode.TextDocument,
+    line: number | undefined,
+    key: string,
+    cellId: string | undefined,
+  ): string | undefined {
+    if (line === undefined || typeof document.offsetAt !== 'function') return undefined;
+    try {
+      return encodeRelativeOffset(this.presenceText(key, cellId) ?? new Y.Text(), document.offsetAt(new vscode.Position(line, 0)));
+    } catch {
+      return undefined;
+    }
   }
 
   private publishResourcePresence(peerId?: string): void {
@@ -3692,6 +3765,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     } catch {
       return undefined;
     }
+  }
+
+  private presenceLineStart(state: PresenceState, source: string): number | undefined {
+    const offset = this.resolvePresenceLineOffset(state)
+      ?? offsetForLine(source, state.activeLine);
+    return offset === undefined ? undefined : lineStartOffset(source, offset);
   }
 
   private async onCreatedFromExplorer(uri: vscode.Uri): Promise<void> {
@@ -5921,9 +6000,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.notebookActiveExecutions.set(notebookKey, (this.notebookActiveExecutions.get(notebookKey) ?? 0) + 1);
     this.setKernelStatus(notebookKey, 'Busy');
     this.transition('executing', `Executing ${notebookKey} locally.`);
+    let executionTimeout: NodeJS.Timeout | undefined;
     try {
+      const timedOut = new Promise<never>((_resolve, reject) => {
+        executionTimeout = setTimeout(() => {
+          void kernel.interrupt().catch(() => undefined);
+          reject(new Error('Pair kernel execution timed out after ten minutes and was interrupted.'));
+        }, KERNEL_EXECUTION_TIMEOUT_MS);
+      });
       return await Promise.race([
         kernel.execute(requestId, code),
+        timedOut,
         this.terminalCancellation(),
       ]);
     } catch (error) {
@@ -5932,6 +6019,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       throw error;
     } finally {
+      if (executionTimeout) clearTimeout(executionTimeout);
       kernel.off('event', listener);
       if (this.executionOwners.get(requestId)?.peerId === this.descriptor.localPeer.peerId) this.executionOwners.delete(requestId);
       this.activeExecutions = Math.max(0, this.activeExecutions - 1);
@@ -6204,6 +6292,44 @@ function lineFromSelection(position: unknown): number | undefined {
   return typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : undefined;
 }
 
+function offsetForLine(source: string, line: number | undefined): number | undefined {
+  if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 0) return undefined;
+  let offset = 0;
+  for (let index = 0; index < line; index += 1) {
+    const newline = source.indexOf('\n', offset);
+    if (newline < 0) return undefined;
+    offset = newline + 1;
+  }
+  return offset;
+}
+
+function lineStartOffset(source: string, offset: number): number {
+  const bounded = Math.max(0, Math.min(source.length, offset));
+  const newline = source.lastIndexOf('\n', Math.max(0, bounded - 1));
+  return newline + 1;
+}
+
+function lineEndOffset(source: string, start: number): number {
+  const newline = source.indexOf('\n', start);
+  return newline < 0 ? source.length : newline + 1;
+}
+
+function changeTouchesLine(
+  change: { rangeOffset: number; rangeLength: number },
+  lineStart: number,
+  lineEnd: number,
+): boolean {
+  const start = Math.max(0, change.rangeOffset);
+  const end = Math.max(start, start + change.rangeLength);
+  return change.rangeLength === 0
+    ? start >= lineStart && start <= lineEnd
+    : start < lineEnd && end > lineStart;
+}
+
+function comparePeerPriority(left: PeerIdentity, right: PeerIdentity): number {
+  return left.joinOrder - right.joinOrder || left.peerId.localeCompare(right.peerId);
+}
+
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -6326,6 +6452,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     ? raw.activeNotebookCellId
     : undefined;
   const activeLine = boundedNumber(raw.activeLine, 0, 1_000_000, true);
+  const activeLineAnchor = encodedCursorPosition(raw.activeLineAnchor);
   const cursor = sanitizeCursor(raw.cursor);
   const hardware = sanitizeHardware(raw.hardware);
   const environments = sanitizeEnvironments(raw.environments);
@@ -6338,6 +6465,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     activeNotebookCell,
     activeNotebookCellId,
     activeLine,
+    activeLineAnchor,
     cursor,
     shareCursor: raw.shareCursor === true,
     cursorColor: typeof raw.cursorColor === 'string' && /^#[0-9a-f]{6}$/i.test(raw.cursorColor)

@@ -39,6 +39,13 @@ export interface NotebookCellStateRenderer {
   renderRemoteCellState(cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void>;
 }
 
+export type LineLockGuard = (
+  key: string,
+  cellId: string | undefined,
+  changes: readonly vscode.TextDocumentContentChangeEvent[],
+  canonicalSource: string,
+) => string | undefined;
+
 export class EditorSynchronizer implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly applyingText = new Set<string>();
@@ -58,6 +65,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly log: vscode.OutputChannel,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
+    private readonly lineLockGuard?: LineLockGuard,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
@@ -547,6 +555,12 @@ export class EditorSynchronizer implements vscode.Disposable {
     const key = this.keyForUri(document.uri);
     if (!key || this.applyingText.has(document.uri.toString()) || !event.contentChanges.length) return;
     if (this.project.kindOf(key) !== 'text') return;
+    const canonicalSource = this.project.text(key).toString();
+    const lineLock = this.lineLockGuard?.(key, undefined, event.contentChanges, canonicalSource);
+    if (lineLock) {
+      this.restoreRejectedText(document, canonicalSource, lineLock);
+      return;
+    }
     const changes: TextChange[] = event.contentChanges.map((change) => ({
       offset: change.rangeOffset,
       deleteCount: change.rangeLength,
@@ -690,6 +704,11 @@ export class EditorSynchronizer implements vscode.Disposable {
           return;
         }
         canonicalSource = this.project.cellSource(key, cellId).toString();
+        const lineLock = this.lineLockGuard?.(key, cellId, event.contentChanges, canonicalSource);
+        if (lineLock) {
+          this.restoreRejectedText(event.document, canonicalSource, lineLock);
+          return;
+        }
         const changes = event.contentChanges.map((change) => ({
           offset: change.rangeOffset,
           deleteCount: change.rangeLength,

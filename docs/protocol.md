@@ -60,9 +60,9 @@ The authoritative host CRDT receives the final output/execution state once, and 
 
 ## Presence and resources
 
-New peers publish semantic presence only: participant identity/renderer metadata, active file, stable notebook cell ID, active **line**, `shareCursor`, and cursor color. Exact offsets, columns, selections, and anchors are not published by the new local packet. Legacy exact cursor data is receive-only compatibility and is rendered line-only after validation.
+New peers publish semantic presence only: participant identity, active file, stable notebook cell ID, active **line**, and a CRDT-relative line-start anchor. The anchor follows the same logical line when text is inserted above it. Exact cursors, columns, selections, names, and colors are not rendered; a selected line is highlighted and edits to it are rejected for other participants. Legacy exact cursor data remains receive-only compatibility and is not rendered.
 
-Resource/hardware/kernel telemetry is separate from semantic awareness. Resource sampling emits dedicated resource frames with its own rate limit; hardware and kernel status use their dedicated frames. Those updates can refresh the dashboard but do not change `activeLine`, do not republish semantic awareness, and do not cause cursor redraws.
+Resource/hardware/kernel telemetry is separate from semantic awareness. Resource sampling emits dedicated resource frames with its own rate limit; hardware and kernel status use their dedicated frames. Those updates can refresh the dashboard but do not change `activeLine`, do not republish semantic awareness, and do not move a selected-line highlight.
 
 ## Host clock and recovery
 

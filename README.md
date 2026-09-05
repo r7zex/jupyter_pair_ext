@@ -8,7 +8,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 
 ## What it provides
 
-- Live text, notebook structure, outputs, files, directories, renames, deletions, and participant cursors.
+- Live text, notebook structure, outputs, files, directories, renames, deletions, and selected-line collaboration locks.
 - Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
 - Direct WebRTC for the normal low-latency path, optional user-configured TURN, and two independent encrypted emergency relay families.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.

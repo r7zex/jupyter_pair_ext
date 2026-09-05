@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.11 - 2026-09-05 (execution and selected-line collaboration)
+
+- Routes Pair Notebook execution through the preferred Pair Jupyter controller and adds a ten-minute kernel timeout with an automatic interrupt, so a lost completion cannot leave a cell running indefinitely.
+- Synchronizes selected lines through CRDT-relative anchors, blocks edits to another participant's selected line, and keeps the lock on that logical line when new lines are inserted above it.
+- Removes cursor labels, cursor configuration, and cursor-management UI; collaborators now see only selected-line highlighting.
+
 ## 0.5.10 - 2026-09-05 (laptop recovery and startup stability)
 
 - Prevents a guest from closing on a short delayed-heartbeat window while MeshTransport is still performing its bounded 30-second authenticated route recovery.

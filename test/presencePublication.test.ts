@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import * as Y from 'yjs';
+import { encodeRelativeOffset } from '../src/core/cursorPosition';
 
 function disposable() { return { dispose: () => undefined }; }
 
@@ -187,14 +188,6 @@ describe('semantic presence publication', () => {
       assert.equal(semanticState(runtime).activeFile, 'b.py');
 
       updates.reset();
-      fakeVscode.__config.shareMyCursor = false;
-      (runtime as any).updatePresence();
-      state = semanticState(runtime);
-      assert.equal(updates.count(), 1, 'disabling cursor sharing publishes exactly one clear');
-      assert.equal(state.activeLine, undefined);
-      assert.equal(state.activeFile, 'b.py');
-
-      updates.reset();
       fakeVscode.window.activeTextEditor = undefined;
       (runtime as any).updatePresence();
       state = semanticState(runtime);
@@ -206,10 +199,6 @@ describe('semantic presence publication', () => {
       (runtime as any).updatePresence();
       assert.equal(updates.count(), 0, 'repeated blur does not resend the same clear state');
 
-      fakeVscode.__config.myCursorColor = '#F44336';
-      (runtime as any).updatePresence();
-      assert.equal(updates.count(), 1, 'color change publishes renderer metadata once');
-      assert.equal(semanticState(runtime).cursorColor, '#F44336');
     } finally { destroy(runtime); }
   });
 
@@ -289,6 +278,37 @@ describe('semantic presence publication', () => {
         'legacy exact cursor is accepted only on incoming compatibility');
       source.destroy();
     } finally { destroy(runtime); }
+  });
+
+  it('keeps a remote line lock on the same logical line after inserted lines', () => {
+    const root = path.join(os.tmpdir(), 'pair-line-lock-anchor');
+    const runtime = new SessionRuntime(descriptor({ role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: root }),
+      'line-lock-token-that-is-long-enough', context(root), logger());
+    const source = new Awareness(new Y.Doc());
+    try {
+      runtime.project.ensureText('work.py', 'one\ntarget\nlast');
+      const anchor = encodeRelativeOffset(runtime.project.text('work.py'), 4);
+      assert.ok(anchor);
+      const guest = { peerId: 'guest', displayName: 'Guest', joinOrder: 1 };
+      (runtime as any).transport.peerRuntime = () => [guest];
+      source.setLocalState({
+        peer: guest,
+        activeFile: 'work.py',
+        activeLine: 1,
+        activeLineAnchor: anchor,
+        shareCursor: true,
+      });
+      (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(source, [source.clientID]), 'guest');
+      assert.match(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 4, rangeLength: 0 }], 'one\ntarget\nlast') ?? '', /Guest/);
+
+      runtime.project.applyTextChanges('work.py', [{ offset: 0, deleteCount: 0, insertText: 'new\n' }]);
+      const shifted = runtime.project.text('work.py').toString();
+      assert.equal(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 8, rangeLength: 0 }], shifted), 'Line is currently selected by Guest.');
+      assert.equal(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 0, rangeLength: 0 }], shifted), undefined);
+    } finally {
+      source.destroy();
+      destroy(runtime);
+    }
   });
 });
 

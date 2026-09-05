@@ -823,6 +823,33 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       project.destroy();
     }
   });
+
+  it('restores a notebook cell before publishing a change to another participant-selected line', async () => {
+    const root = path.resolve('/tmp/pair-editor-line-lock');
+    const notebook = fakeNotebook(root, [fakeCell('locked', 'stable')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(
+      project,
+      root,
+      logger(),
+      undefined,
+      undefined,
+      () => 'Line is currently selected by Guest.',
+    );
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      notebook.cells[0].document.text = 'attempted overwrite';
+      vscodeBoundary.__fireTextChange(notebook.cells[0].document, [{
+        rangeOffset: 0, rangeLength: 6, text: 'attempted overwrite',
+      }]);
+      await waitFor(() => notebook.cells[0].document.text === 'locked', 1000, 'line-lock restoration');
+      assert.equal(project.notebookSnapshot('work.ipynb').cells[0]!.source, 'locked');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
 });
 
 function applyUpdates(project: CollaborativeProject, updates: ProjectUpdate[]): void {
