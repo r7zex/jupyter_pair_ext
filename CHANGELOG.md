@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.12 - 2026-09-05 (critical collaboration and execution repairs)
+## 0.5.13 - 2026-09-05 (critical collaboration and execution repairs)
 
 - Synchronizes guest-edited dependencies before execution and materializes the host workspace before running canonical cell text. Acceptance timeouts start after the dependency barrier.
 - Preserves concurrent typing, canonical cell metadata/outputs, and unseen remote cells during VS Code text and structural updates. Shared source-only replicas avoid copying notebook outputs into every cell editor.
@@ -11,6 +11,7 @@
 - Removes stale CRDT or binary representations when a file changes type, keeping snapshots and host-folder verification consistent.
 - Dispatches Interrupt and Restart independently of bulk snapshot transfers; Stop cancels remaining Run All cells and previously queued batches.
 - Clears terminal recovery state so guests close after host recovery expires while keeping the same pinned host authority.
+- Installs the tested Jupyter dependencies in release CI so real-kernel regressions run on the clean Linux runner. The unpublished v0.5.12 tag is retained unchanged after its missing-dependency gate failure.
 
 Automated validation is recorded in `CRITICAL_BUG_FIXES.md`. Installed VS Code UI and physical two-computer VPN acceptance remain separate checks.
 

@@ -48,7 +48,8 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 
 - [x] Every fix validated and pushed; previously reported review findings resolved.
 - [x] Full tests, lint, Python bridge tests, production dependency audit: 407 TypeScript tests and 7 Python bridge tests passed; zero production dependency vulnerabilities.
-- [x] Version 0.5.12, changelog, and current architecture/protocol documentation updated.
+- [x] Version 0.5.13, changelog, and current architecture/protocol documentation updated.
 - [x] VSIX and source archive built and inspected: required runtime assets present, no unsafe or sensitive archive paths.
 - [ ] Version tag and GitHub Release published; remote commit and assets verified.
+- The v0.5.12 CI run had 405 passing, one skipped and one failed real-kernel test because the clean runner lacked Jupyter dependencies. The tag remains unchanged and unpublished. Release 0.5.13 installs the locally validated `jupyter_client==8.6.3` and `ipykernel==6.29.5` before running the full gate; no application-code change was needed after the 407-test local pass.
 - Physical two-computer and installed VS Code UI acceptance must be reported separately; automated tests do not imply either was performed.

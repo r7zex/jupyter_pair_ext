@@ -2,7 +2,7 @@
 
 ## Responsibilities
 
-Version 0.5.12 adds shared source-only editor replicas with version-aware merges, stable-ID structural deltas, and native execution ownership guards. Incremental notebook mutations account for the aggregate source/output budget, including retained cells. File lifecycle transitions remove obsolete CRDT/binary representations before materialization.
+Version 0.5.13 adds shared source-only editor replicas with version-aware merges, stable-ID structural deltas, and native execution ownership guards. Incremental notebook mutations account for the aggregate source/output budget, including retained cells. File lifecycle transitions remove obsolete CRDT/binary representations before materialization.
 
 Guest execution synchronizes project dependencies before request retries, then materializes the host working copy. Kernel controls have a separate inbound queue from bulk transfers. Controller cancellation generations stop remaining and queued batches, while stable notebook queue identities and migrated kernel maps preserve execution through rename. Invitations carry the current host epoch. Terminal transport disconnect explicitly clears coordinator recovery state.
 
