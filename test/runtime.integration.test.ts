@@ -439,6 +439,8 @@ describe('production SessionRuntime integration', () => {
       assert.equal(host.completedExecutionBarriers.size, 0, 'accepted lightweight requests consume barrier authorization');
       assert.ok(events.some((event) => event.messageType === 'execute_result'
         && event.content?.data?.['text/plain'] === 'NEW_MODEL'));
+      assert.ok(events.some((event) => event.content?.data?.['application/x-pair-test-dependency'] === 'guest dependency'),
+        'the kernel subprocess reads the synchronized dependency before reporting its result');
 
       // The standard controller publishes streaming/final outputs into the
       // notebook CRDT. A third participant therefore renders the result without
@@ -1501,6 +1503,8 @@ describe('compute and lifecycle regression coverage', () => {
       let manifestCalls = 0;
       (runtime as any).synchronizeExecutionFiles = async () => {
         syncCalls += 1;
+        assert.equal([...runtime.pendingExecutions.values()][0]?.timer, undefined,
+          'the acceptance budget starts only after dependency transfer finishes');
         return { documents: {}, binaries: {}, directories: [] };
       };
       (runtime as any).prepareWorkingCopy = async () => { prepareCalls += 1; };
@@ -3935,7 +3939,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (command.command === 'execute') {
     const value = fs.readFileSync(path.join(process.env.PAIR_NOTEBOOK_CWD, 'model.bin'), 'utf8');
     emit({ type: 'accepted', requestId });
-    emit({ type: 'iopub', requestId, messageType: 'execute_result', content: { data: { 'text/plain': value }, execution_count: 1 } });
+    const dependency = path.join(process.env.PAIR_NOTEBOOK_CWD, 'notes.txt');
+    const data = { 'text/plain': value };
+    if (fs.existsSync(dependency)) data['application/x-pair-test-dependency'] = fs.readFileSync(dependency, 'utf8');
+    emit({ type: 'iopub', requestId, messageType: 'execute_result', content: { data, execution_count: 1 } });
     emit({ type: 'complete', requestId, success: true, executionCount: 1, content: { status: 'ok', execution_count: 1 } });
   } else if (command.command === 'interrupt' || command.command === 'restart') {
     emit({ type: 'commandResult', requestId, command: command.command });

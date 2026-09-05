@@ -293,7 +293,7 @@ interface PendingExecution {
   onEvent: (event: JupyterKernelEvent) => void;
   executorId: string;
   notebookKey: string;
-  timer: NodeJS.Timeout;
+  timer: NodeJS.Timeout | undefined;
   accepted: boolean;
   nextEventSequence: number;
   bufferedEvents: Map<number, { event: JupyterKernelEvent; byteLength: number }>;
@@ -1252,20 +1252,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
     this.transition('executing', `Requesting host execution for ${notebookKey} on ${executorId}.`);
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingExecutions.delete(requestId);
-        reject(new Error(
-          `Compute executor ${executorId} did not acknowledge the request after route recovery. `
-          + 'The cell was not left running remotely; retry it after the connection is stable.',
-        ));
-      }, EXECUTION_ACCEPT_TIMEOUT_MS);
       this.pendingExecutions.set(requestId, {
         resolve,
         reject,
         onEvent,
         executorId,
         notebookKey,
-        timer,
+        timer: undefined,
         accepted: false,
         nextEventSequence: 0,
         bufferedEvents: new Map(),
@@ -1302,6 +1295,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const requestId = String(meta.requestId ?? '');
     const notebookKey = String(meta.notebookKey ?? '');
     await this.synchronizeExecutionFiles(executorId, requestId, notebookKey, this.computeForNotebook(notebookKey));
+    const awaitingAcceptance = this.pendingExecutions.get(requestId);
+    if (!awaitingAcceptance || this.closed) return;
+    awaitingAcceptance.timer = setTimeout(() => {
+      if (this.pendingExecutions.get(requestId) !== awaitingAcceptance) return;
+      this.pendingExecutions.delete(requestId);
+      awaitingAcceptance.reject(new Error(
+        `Compute executor ${executorId} did not acknowledge the request after route recovery. `
+        + 'Retry it after the connection is stable.',
+      ));
+    }, EXECUTION_ACCEPT_TIMEOUT_MS);
     const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
     let attempt = 0;
     while (!this.closed && Date.now() < deadline) {

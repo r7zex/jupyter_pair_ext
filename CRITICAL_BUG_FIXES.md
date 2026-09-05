@@ -20,7 +20,7 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 
 ## Validation evidence
 
-- CB-001: TypeScript compilation passed. The two-runtime regression now checks a guest-edited dependency whose host working file remains unsaved until execution. Route retries retain one request identity and perform one dependency barrier. Accepted lightweight requests release completed barrier authorization. Targeted runtime tests: 2 passing; targeted ESLint and TypeScript passed. Full runtime file: 63 passing, one host-loss closure timeout; isolated rerun reproduced that timeout. This remains an open release gate.
+- CB-001: TypeScript compilation passed. The two-runtime regression now checks a guest-edited dependency whose host working file remains unsaved until execution. Route retries retain one request identity and perform one dependency barrier. Accepted lightweight requests release completed barrier authorization. Luna found that acceptance timeout included the file barrier; moved the acceptance timer after synchronization and verified no timer exists during transfer. The subprocess now reads the updated dependency before returning its result. Targeted runtime tests: 2 passing; targeted ESLint and TypeScript passed. Full runtime file: 63 passing, one host-loss closure timeout; isolated rerun reproduced that timeout. This remains an open release gate.
 
 ## Release gates
 
@@ -30,4 +30,3 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 - [ ] VSIX and source archive built and inspected.
 - [ ] Version tag and GitHub Release published; remote commit and assets verified.
 - Physical two-computer and installed VS Code UI acceptance must be reported separately; automated tests do not imply either was performed.
-
