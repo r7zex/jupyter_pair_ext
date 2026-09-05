@@ -112,6 +112,8 @@ Editing state remains in the CRDT during the short folder-selection pause, so an
 
 ## Saving behavior
 
+Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. Pair Run selects the Pair Jupyter controller explicitly. Stop cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
+
 Live text and notebook updates are sent immediately; disk persistence is separate and debounced. The canonical host copy and join snapshots are serialized directly from current CRDT state, so an unsaved open editor cannot make a new participant receive stale disk contents.
 
 Pair Notebook does not call VS Code's document or notebook `save()` method after every keystroke. That avoids repeatedly triggering format-on-save, save hooks, notebook serialization, and other extensions. Open editors are explicitly saved only for operations that require a physical filesystem barrier, such as execution, final host save, and host transfer. Closed files are written atomically.

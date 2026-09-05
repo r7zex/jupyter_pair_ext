@@ -2,7 +2,7 @@
 
 ## Room and admission
 
-The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port.
+The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port. New invites include the current pinned host epoch, which bootstrap and runtime admission preserve after voluntary transfers; legacy invites without it default to epoch zero.
 
 Before Trystero admits a peer, Pair Notebook 0.5.9 exchanges a protocol-v5 handshake containing:
 
@@ -48,15 +48,17 @@ Open VS Code documents are persisted through the editor API. Background persiste
 
 The current host is the only compute executor. Every authenticated session participant may submit notebook execution and kernel-control requests to it without a separate consent or CPU/GPU sharing flag. Only the host advertises compute hardware and Python environments, and only the host may select its local CPU/GPU device or interpreter. Restored and received compute targets naming a participant are rejected or normalized back to the current host.
 
-Ordinary guest **Run Cell** is a lightweight, host-authoritative protocol. The request identifies the notebook, stable cell ID, host compute epoch/target, canonical cell revision and digest, and a random request ID; it does not send guest code as an execution authority. The host waits only for the target cell's CRDT state to reach the requested revision, resolves the canonical cell text locally, verifies the digest and execution authority, and then executes that host-canonical text. Ordinary guest Run Cell does **not** call `synchronizeExecutionFiles()`, `prepareWorkingCopy()`, or a full storage `flush()`.
+Ordinary guest **Run Cell** uses a host-authoritative cell request after a project dependency barrier. The request identifies the notebook, stable cell ID, host compute epoch/target, canonical cell revision and digest, and a random request ID; it does not send guest code as an execution authority. The host waits for the requested canonical revision, verifies its digest and execution authority, materializes the workspace, and executes the host-canonical text.
 
-The project-wide document/binary/directory execution barrier remains only as an explicit legacy/protocol-compatible barrier. Its check/commit frames are idempotent and may retry across route replacement, but it is not on the ordinary guest Run Cell path.
+The project-wide document/binary/directory execution barrier runs once before dispatch retries, including ordinary guest Run Cell. Its check/commit frames are idempotent across route replacement. The request acceptance timer starts only after synchronization completes; host execution saves open working-copy editors and flushes storage before launching code.
 
 Execution requests are keyed by random request ID and immutable identity fields. A duplicate request with the same identity is acknowledged/replayed rather than launched twice; reuse with different content/revision/digest is rejected. After acceptance, execution ownership survives route replacement.
 
 Jupyter events carry a zero-based sequence in the frame metadata and the JSON event in the binary payload. The executor retains a bounded 2,048-event/32 MiB replay window, replays it after route restoration and before every terminal result, and retains completed delivery state within a 64 MiB aggregate cap. The requester buffers gaps, renders each sequence once, and does not resolve the cell until `eventCount` proves that every preceding event arrived. Terminal results also use the payload and repeat until `executeResultAck`.
 
 The authoritative host CRDT receives the final output/execution state once, and that state is then replicated to every participant. Output bursts are coalesced at the VS Code renderer boundary without dropping the last canonical state. The Python bridge, Mesh payload filter, and execution replay queue accept a bounded 32 MiB message; VS Code rendering remains capped at 16 MiB and emits a truncation notice beyond that limit. Stdin replies identify the input event sequence and are digest-bound, retried, and acknowledged. Duplicate replies receive another acknowledgement without writing a second line into the kernel. Interrupt and Restart wait for an authenticated route before dispatch.
+
+Kernel control frames enter a separate serialized runtime queue, so an unfinished inbound project snapshot cannot block Interrupt or Restart. Per-peer command rates and global inbound admission budgets still apply. Native Stop invalidates remaining and already queued batches for that notebook; fresh runs use a new cancellation generation. Notebook rename preserves the kernel, execution owners, and controller queue identity.
 
 ## Presence and resources
 

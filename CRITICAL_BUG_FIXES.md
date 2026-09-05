@@ -46,9 +46,9 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 
 ## Release gates
 
-- [ ] Every fix validated and pushed; previously reported review findings resolved.
-- [ ] Full tests, lint, Python bridge tests, production dependency audit.
-- [ ] Version, changelog, and current architecture/protocol documentation updated.
-- [ ] VSIX and source archive built and inspected.
+- [x] Every fix validated and pushed; previously reported review findings resolved.
+- [x] Full tests, lint, Python bridge tests, production dependency audit: 407 TypeScript tests and 7 Python bridge tests passed; zero production dependency vulnerabilities.
+- [x] Version 0.5.12, changelog, and current architecture/protocol documentation updated.
+- [x] VSIX and source archive built and inspected: required runtime assets present, no unsafe or sensitive archive paths.
 - [ ] Version tag and GitHub Release published; remote commit and assets verified.
 - Physical two-computer and installed VS Code UI acceptance must be reported separately; automated tests do not imply either was performed.
