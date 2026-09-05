@@ -41,17 +41,27 @@ export interface NotebookCellStateRenderer {
   isManagingCellState?(cell: vscode.NotebookCell): boolean;
 }
 
+interface LineTouchChange {
+  readonly rangeOffset: number;
+  readonly rangeLength: number;
+}
+
 export type LineLockGuard = (
   key: string,
   cellId: string | undefined,
-  changes: readonly vscode.TextDocumentContentChangeEvent[],
+  changes: readonly LineTouchChange[],
   canonicalSource: string,
 ) => string | undefined;
 
+interface BufferedTextEvent {
+  readonly changes: TextChange[];
+  readonly after: string;
+}
+
 interface PendingTextEdit {
-  version: number;
-  target: string;
-  events: Array<{ event: vscode.TextDocumentChangeEvent; matchesTarget: boolean }>;
+  readonly baseline: string;
+  readonly target: string;
+  readonly events: BufferedTextEvent[];
 }
 
 export class EditorSynchronizer implements vscode.Disposable {
@@ -622,7 +632,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       return;
     }
     const key = this.keyForUri(document.uri);
-    if (!key || !event.contentChanges.length || this.consumeTextEcho(event)) return;
+    if (!key || !event.contentChanges.length || this.capturePendingTextEvent(event)) return;
     if (this.project.kindOf(key) !== 'text') return;
     const canonicalSource = this.project.text(key).toString();
     const lineLock = this.lineLockGuard?.(key, undefined, event.contentChanges, canonicalSource);
@@ -679,23 +689,24 @@ export class EditorSynchronizer implements vscode.Disposable {
         edit.insertText,
       );
       const version = document.version;
-      const pending: PendingTextEdit = { version, target, events: [] };
+      const pending: PendingTextEdit = { baseline: current, target, events: [] };
       this.pendingTextEdits.set(uri, pending);
       let applied = false;
       try {
         applied = await vscode.workspace.applyEdit(workspaceEdit);
       } finally {
         this.pendingTextEdits.delete(uri);
-        let echoed = false;
-        for (const { event, matchesTarget } of pending.events) {
-          if (applied && !echoed && matchesTarget) {
-            echoed = true;
-            if (replica) this.replaceTextReplica(uri, replica);
-          } else {
-            this.onTextChanged(event);
+        if (applied) {
+          if (replica) this.replaceTextReplica(uri, replica);
+          const echoEnd = findRemoteEchoEnd(pending);
+          if (replica && echoEnd >= 0) {
+            this.publishBufferedTextEvents(document, replica, target, pending.events.slice(echoEnd + 1));
+          } else if (replica && document.getText() !== target) {
+            this.publishPostApplyText(document, replica, document.getText());
           }
+        } else if (displayed) {
+          this.publishBufferedTextEvents(document, displayed, pending.baseline, pending.events);
         }
-        if (applied && !echoed && replica) this.replaceTextReplica(uri, replica);
         if (replica && this.textReplicas.get(uri) !== replica) replica.dispose();
       }
       if (!applied) {
@@ -719,16 +730,103 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (!this.textReplicas.has(uri)) this.replaceTextReplica(uri, new EditorTextReplica(this.project, key, cellId));
   }
 
-  private consumeTextEcho(event: vscode.TextDocumentChangeEvent): boolean {
+  private publishBufferedTextEvents(
+    document: vscode.TextDocument,
+    replica: EditorTextReplica,
+    baseline: string,
+    events: readonly BufferedTextEvent[],
+  ): void {
+    let state = baseline;
+    for (const buffered of events) {
+      const next = applyBufferedTextChanges(state, buffered.changes);
+      if (next === undefined || next !== buffered.after || replica.source() !== state) {
+        this.publishPostApplyText(document, replica, document.getText());
+        return;
+      }
+      const canonicalSource = this.canonicalSourceForReplica(replica);
+      const lineLock = this.lineLockGuard?.(
+        replica.key,
+        replica.cellId,
+        buffered.changes.map((change) => ({
+          rangeOffset: change.offset,
+          rangeLength: change.deleteCount,
+        })),
+        canonicalSource,
+      );
+      if (lineLock) {
+        this.restoreRejectedText(document, canonicalSource, lineLock);
+        return;
+      }
+      try {
+        this.publishTextChanges(document, replica.key, replica.cellId, buffered.changes);
+      } catch (error) {
+        this.restoreRejectedText(
+          document,
+          this.canonicalSourceForReplica(replica),
+          `Rejected unsafe buffered editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`,
+        );
+        return;
+      }
+      state = next;
+    }
+    if (replica.source() !== document.getText()) {
+      this.publishPostApplyText(document, replica, document.getText());
+    }
+  }
+
+  private publishPostApplyText(
+    document: vscode.TextDocument,
+    replica: EditorTextReplica,
+    value: string,
+  ): void {
+    const current = replica.source();
+    if (current === value) return;
+    const change = minimalEdit(current, value);
+    if (!change.deleteCount && !change.insertText) return;
+    const canonicalSource = this.canonicalSourceForReplica(replica);
+    const lineLock = this.lineLockGuard?.(
+      replica.key,
+      replica.cellId,
+      [{ rangeOffset: change.offset, rangeLength: change.deleteCount }],
+      canonicalSource,
+    );
+    if (lineLock) {
+      this.restoreRejectedText(document, canonicalSource, lineLock);
+      return;
+    }
+    try {
+      this.publishTextChanges(document, replica.key, replica.cellId, [change]);
+    } catch (error) {
+      this.restoreRejectedText(
+        document,
+        this.canonicalSourceForReplica(replica),
+        `Rejected unsafe post-apply editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`,
+      );
+    }
+  }
+
+  private canonicalSourceForReplica(replica: EditorTextReplica): string {
+    try {
+      return (replica.cellId
+        ? this.project.cellSource(replica.key, replica.cellId)
+        : this.project.text(replica.key)).toString();
+    } catch {
+      return replica.source();
+    }
+  }
+
+  private capturePendingTextEvent(event: vscode.TextDocumentChangeEvent): boolean {
     const pending = this.pendingTextEdits.get(event.document.uri.toString());
     if (!pending) return false;
-    // VS Code can split or reshape the requested replacement. Capture its
-    // resulting state now: event.document is live and may change before replay.
-    // A rejected WorkspaceEdit never consumes even an identical user edit.
+    // Capture immutable offsets plus the exact resulting text while this
+    // editor version is current. Never replay a live event object later.
     pending.events.push({
-      event,
-      matchesTarget: event.document.version === pending.version + 1
-        && event.document.getText() === pending.target,
+      changes: event.contentChanges.map((change) => ({
+        offset: change.rangeOffset,
+        deleteCount: change.rangeLength,
+        insertText: change.text,
+      })),
+      after: event.document.getText(),
     });
     return true;
   }
@@ -862,7 +960,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private onNotebookCellTextChanged(event: vscode.TextDocumentChangeEvent): void {
     let canonicalSource: string | undefined;
     try {
-      if (!event.contentChanges.length || this.consumeTextEcho(event)) return;
+      if (!event.contentChanges.length || this.capturePendingTextEvent(event)) return;
       for (const notebook of vscode.workspace.notebookDocuments) {
         const cell = notebook.getCells().find((candidate) => candidate.document.uri.toString() === event.document.uri.toString());
         if (!cell) continue;
@@ -1143,6 +1241,37 @@ function sameJson(left: unknown, right: unknown): boolean {
 
 function assertNeverNotebookScope(scope: never): never {
   throw new Error(`Unhandled notebook update scope: ${JSON.stringify(scope)}`);
+}
+
+function findRemoteEchoEnd(pending: PendingTextEdit): number {
+  let state = pending.baseline;
+  let lastTarget = -1;
+  for (let index = 0; index < pending.events.length; index += 1) {
+    const buffered = pending.events[index]!;
+    const next = applyBufferedTextChanges(state, buffered.changes);
+    if (next === undefined || next !== buffered.after) return lastTarget;
+    state = next;
+    if (state === pending.target) lastTarget = index;
+  }
+  return lastTarget;
+}
+
+function applyBufferedTextChanges(value: string, changes: readonly TextChange[]): string | undefined {
+  const ascending = [...changes].sort((left, right) =>
+    left.offset - right.offset || left.deleteCount - right.deleteCount);
+  let previousEnd = 0;
+  for (const change of ascending) {
+    if (!Number.isSafeInteger(change.offset) || !Number.isSafeInteger(change.deleteCount)
+      || change.offset < 0 || change.deleteCount < 0
+      || change.offset + change.deleteCount > value.length
+      || change.offset < previousEnd || typeof change.insertText !== 'string') return undefined;
+    previousEnd = change.offset + change.deleteCount;
+  }
+  let next = value;
+  for (const change of ascending.reverse()) {
+    next = `${next.slice(0, change.offset)}${change.insertText}${next.slice(change.offset + change.deleteCount)}`;
+  }
+  return next;
 }
 
 function minimalEdit(current: string, target: string): TextChange {
