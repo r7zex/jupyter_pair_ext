@@ -24,6 +24,8 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 
 - CB-002: TypeScript and targeted ESLint passed; all 32 editor integration tests passed. Six gated regressions cover concurrent append, identical insertion and deletion in both a file and a notebook cell. The test boundary now emits native text-change events and rejects edits after a document version change. Displayed source replicas preserve Yjs identities, strip unrelated cell/output payloads, and merge only newly authored transactions; received editor echoes never republish remote updates. VS Code's [bulk-edit version provider](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostBulkEdits.ts) supplies text-document versions at submission.
 
+- CB-002 review correction: Luna identified full-notebook decoding once per cell. A single incremental source-only template now supplies shared displayed versions. A 100-cell notebook with a 1 MiB output is encoded from canonical state once; the shared displayed update remains below 50 KiB. Concurrent local edits retain neighboring cells and the original rich output. Targeted replica regression passed; editor integration file passed (36 tests including the pending CB-003 scenarios).
+
 ## Release gates
 
 - [ ] Every fix pushed and reviewed; blocking review findings resolved.
