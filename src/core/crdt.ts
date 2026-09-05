@@ -622,6 +622,23 @@ export class CollaborativeProject extends EventEmitter {
     return Y.encodeStateAsUpdate(this.requireDocument(key).doc, remoteStateVector);
   }
 
+  /** Merge edits authored against the editor's displayed Yjs version. */
+  public mergeEditorText(key: string, cellId: string | undefined, update: Uint8Array): void {
+    const entry = this.requireDocument(key);
+    const candidate = new CollaborativeProject();
+    try {
+      candidate.applyRemoteUpdate(key, entry.kind, this.encodeUpdate(key));
+      candidate.applyRemoteUpdate(key, entry.kind, update);
+      const source = cellId ? candidate.cellSource(key, cellId) : candidate.text(key);
+      const limit = cellId ? MAX_CELL_SOURCE_BYTES : MAX_TEXT_DOCUMENT_BYTES;
+      if (Buffer.byteLength(source.toString(), 'utf8') > limit) throw new Error('Merged editor text exceeds the source-size limit.');
+      Y.applyUpdate(entry.doc, update, withScope(LOCAL_EDITOR_ORIGIN,
+        cellId ? { type: 'cellText', cellId } : { type: 'structure' }));
+    } finally {
+      candidate.destroy();
+    }
+  }
+
   public applyRemoteUpdate(key: string, kind: DocumentKind, update: Uint8Array, scope?: ProjectUpdate['scope']): void {
     const entry = this.documents.get(key) ?? this.createDocument(key, kind);
     if (entry.kind !== kind) throw new Error(`Document kind mismatch for ${key}`);

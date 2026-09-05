@@ -18,6 +18,50 @@ const { EditorSynchronizer } = require('../src/vscode/sync') as { EditorSynchron
 moduleWithLoader._load = originalLoad;
 
 describe('EditorSynchronizer VS Code-compatible production path', () => {
+  for (const notebookCell of [false, true]) for (const local of [
+    { name: 'append', text: 'abcL', offset: 3, length: 0, insert: 'L', expected: 'RabcL' },
+    { name: 'identical insertion', text: 'Rabc', offset: 0, length: 0, insert: 'R', expected: 'RRabc' },
+    { name: 'delete', text: 'ac', offset: 1, length: 1, insert: '', expected: 'Rac' },
+  ]) {
+    it(`preserves local ${local.name} during a pending remote ${notebookCell ? 'cell' : 'file'} edit`, async () => {
+      const root = path.resolve('/tmp/pair-editor-concurrent-text');
+      const notebook = fakeNotebook(root, [fakeCell('abc', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'abc');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      let release!: () => void;
+      let entered = false;
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        vscodeBoundary.__beforeApplyEdit = async (edit: any) => {
+          if (!edit.operations.some((operation: any) => operation.type === 'text')) return;
+          vscodeBoundary.__beforeApplyEdit = undefined;
+          entered = true;
+          await new Promise<void>((resolve) => { release = resolve; });
+        };
+        const change = [{ offset: 0, deleteCount: 0, insertText: 'R' }];
+        if (notebookCell) project.applyCellTextChanges('work.ipynb', 'a', change, REMOTE_ORIGIN);
+        else project.applyTextChanges('notes.txt', change, REMOTE_ORIGIN);
+        await waitFor(() => entered, 1000, 'remote edit queued');
+        document.text = local.text;
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: local.offset, rangeLength: local.length, text: local.insert }]);
+        release();
+        const source = () => (notebookCell ? project.cellSource('work.ipynb', 'a') : project.text('notes.txt')).toString();
+        await waitFor(() => document.getText() === local.expected, 1000, 'rebased editor text');
+        assert.equal(source(), local.expected);
+        document.text = `${local.expected}!`;
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: local.expected.length, rangeLength: 0, text: '!' }]);
+        assert.equal(source(), `${local.expected}!`);
+      } finally {
+        release?.();
+        synchronizer.dispose();
+        project.destroy();
+      }
+    });
+  }
+
   it('keeps IDs through middle insertion, first deletion, and movement', async () => {
     const root = path.resolve('/tmp/pair-editor-stable');
     const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);
@@ -963,11 +1007,18 @@ function createNotebookVscodeBoundary(): any {
       textDocuments: [] as any[],
       onDidOpenTextDocument: on('openText'),
       onDidChangeTextDocument: on('changeText'),
+      onDidCloseTextDocument: on('closeText'),
       onDidOpenNotebookDocument: on('openNotebook'),
       onDidChangeNotebookDocument: on('changeNotebook'),
       applyEdit: async (edit: WorkspaceEdit) => {
         if (boundary.__rejectEdits) return false;
+        const documents = [...boundary.workspace.textDocuments,
+          ...boundary.workspace.notebookDocuments.flatMap((item: any) => item.cells.map((cell: any) => cell.document))];
+        const versions = new Map(documents.map((document: any) => [document, document.version]));
         await boundary.__beforeApplyEdit?.(edit);
+        if (edit.operations.some((operation: any) => operation.type === 'text'
+          && documents.some((document: any) => document.uri.toString() === operation.uri.toString()
+            && document.version !== versions.get(document)))) return false;
         for (const operation of edit.operations) {
           if (operation.type === 'text') {
             boundary.__textEdits.push(operation);
@@ -975,7 +1026,11 @@ function createNotebookVscodeBoundary(): any {
               .find((item: any) => item.document.uri.toString() === operation.uri.toString());
             const document = cell?.document ?? boundary.workspace.textDocuments
               .find((item: any) => item.uri.toString() === operation.uri.toString());
-            if (document) document.text = `${document.text.slice(0, operation.range.start)}${operation.text}${document.text.slice(operation.range.end)}`;
+            if (document) {
+              document.text = `${document.text.slice(0, operation.range.start)}${operation.text}${document.text.slice(operation.range.end)}`;
+              boundary.__fireTextChange(document, [{ rangeOffset: operation.range.start,
+                rangeLength: operation.range.end - operation.range.start, text: operation.text }]);
+            }
             continue;
           }
           const notebook = boundary.workspace.notebookDocuments.find((item: any) => item.uri.toString() === operation.uri.toString());
@@ -1047,6 +1102,7 @@ function createNotebookVscodeBoundary(): any {
       });
     },
     __fireTextChange: (document: any, contentChanges: any[]) => {
+      document.version = (document.version ?? 0) + 1;
       for (const callback of handlers.changeText ?? []) callback({ document, contentChanges });
     },
   };

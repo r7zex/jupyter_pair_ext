@@ -6,8 +6,8 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 
 | Finding | Implementation | Post-push review |
 | --- | --- | --- |
-| CB-001 | Guest dependency barrier and host working-copy materialization implemented; targeted tests passed | Pending |
-| CB-002 | Pending | Pending |
+| CB-001 | Fixed in `42c7594`, review correction `d812f93` | Luna re-reviewed `d812f93`: no P1/P2 blockers |
+| CB-002 | Versioned remote edits and displayed-text Yjs replicas; validation passed | Pending |
 | CB-003 | Pending | Pending |
 | CB-004 | Pending | Pending |
 | CB-005 | Pending | Pending |
@@ -21,6 +21,8 @@ Workflow: fix one finding, validate it, push its commit, obtain a read-only revi
 ## Validation evidence
 
 - CB-001: TypeScript compilation passed. The two-runtime regression now checks a guest-edited dependency whose host working file remains unsaved until execution. Route retries retain one request identity and perform one dependency barrier. Accepted lightweight requests release completed barrier authorization. Luna found that acceptance timeout included the file barrier; moved the acceptance timer after synchronization and verified no timer exists during transfer. The subprocess now reads the updated dependency before returning its result. Targeted runtime tests: 2 passing; targeted ESLint and TypeScript passed. Full runtime file: 63 passing, one host-loss closure timeout; isolated rerun reproduced that timeout. This remains an open release gate.
+
+- CB-002: TypeScript and targeted ESLint passed; all 32 editor integration tests passed. Six gated regressions cover concurrent append, identical insertion and deletion in both a file and a notebook cell. The test boundary now emits native text-change events and rejects edits after a document version change. Displayed source replicas preserve Yjs identities, strip unrelated cell/output payloads, and merge only newly authored transactions; received editor echoes never republish remote updates. VS Code's [bulk-edit version provider](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostBulkEdits.ts) supplies text-document versions at submission.
 
 ## Release gates
 
