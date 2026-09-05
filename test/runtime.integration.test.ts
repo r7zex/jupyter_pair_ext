@@ -780,6 +780,35 @@ describe('runtime repair invariants', () => {
     assert.equal(runtime.pendingSnapshotRequests, 0);
   });
 
+  it('handles kernel controls while a project snapshot is blocked', async () => {
+    const runtime: any = Object.create(SessionRuntime.prototype);
+    Object.assign(runtime, {
+      messageQueue: Promise.resolve(), backgroundMessageQueue: Promise.resolve(),
+      kernelCommandQueue: Promise.resolve(), kernelCommandWindows: new Map(),
+      pendingIncomingMessages: 0, pendingIncomingBytes: 0, pendingSnapshotRequests: 0,
+      log: logger(),
+    });
+    let releaseBulk!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseBulk = resolve; });
+    const handled: string[] = [];
+    runtime.onMessage = async (frame: { type: string; meta: { command?: string } }) => {
+      if (frame.type === 'snapshotRequest') await blocked;
+      handled.push(frame.meta.command ?? frame.type);
+    };
+    runtime.enqueueIncomingMessage({ type: 'snapshotRequest', meta: {}, payload: new Uint8Array() }, 'joining');
+    for (const command of ['interrupt', 'restart']) {
+      runtime.enqueueIncomingMessage({ type: 'kernelCommand', meta: { command }, payload: new Uint8Array() }, 'peer');
+    }
+    await runtime.kernelCommandQueue;
+    assert.deepEqual(handled, ['interrupt', 'restart']);
+    assert.equal(runtime.pendingIncomingMessages, 1);
+    releaseBulk();
+    await runtime.backgroundMessageQueue;
+    assert.deepEqual(handled, ['interrupt', 'restart', 'snapshotRequest']);
+    assert.equal(runtime.pendingIncomingMessages, 0);
+    assert.equal(runtime.pendingIncomingBytes, 0);
+  });
+
   it('advertises compute hardware only from the current host', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-private-hardware-'));
     const extensionRoot = path.join(root, 'extension');

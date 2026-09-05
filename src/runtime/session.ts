@@ -283,7 +283,6 @@ const BACKGROUND_MESSAGE_TYPES = new Set([
   'binaryChunk',
   'binaryEnd',
   'executionBarrierCheck',
-  'kernelCommand',
 ]);
 
 
@@ -644,6 +643,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private waitingForHostFolder = false;
   private messageQueue: Promise<void> = Promise.resolve();
   private backgroundMessageQueue: Promise<void> = Promise.resolve();
+  private kernelCommandQueue: Promise<void> = Promise.resolve();
   private pendingIncomingMessages = 0;
   private pendingIncomingBytes = 0;
   private pendingSnapshotRequests = 0;
@@ -2011,6 +2011,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       await this.awaitSessionEndFence();
       await this.messageQueue;
       await this.backgroundMessageQueue;
+      await this.kernelCommandQueue;
       if (this.waitingForHostFolder) {
         // No canonical backing root exists during host-folder selection. Keep
         // the authoritative final state and signed termination marker in the
@@ -2440,6 +2441,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.pendingIncomingBytes -= retainedBytes;
       if (isSnapshotRequest) this.pendingSnapshotRequests -= 1;
     };
+    if (frame.type === 'kernelCommand') {
+      this.kernelCommandQueue = this.kernelCommandQueue
+        .then(() => this.onMessage(frame, sourceId))
+        .catch((error) => this.log.appendLine(`[error] Kernel command queue: ${formatError(error)}`))
+        .finally(release);
+      return;
+    }
     if (isBackgroundMessage(frame.type)) {
       this.backgroundMessageQueue = this.backgroundMessageQueue
         .then(() => this.onMessage(frame, sourceId))

@@ -15,7 +15,7 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 | CB-007 | Rename migrates live kernels, execution ownership, status and notebook settings; controller queues retain identity | Not requested |
 | CB-008 | Pair Run explicitly selects its own controller and invokes its execution path | Not requested |
 | CB-009 | File type transitions remove obsolete collaborative documents and binary versions before materialization | Not requested |
-| CB-010 | Pending | Pending |
+| CB-010 | Kernel commands use a separate bounded control queue, independent of bulk snapshot/file work | Not requested |
 | CB-011 | Pending | Pending |
 
 ## Validation evidence
@@ -36,9 +36,11 @@ Workflow: fix one finding, validate it, and push its commit. The user subsequent
 
 - CB-008: Both production controller tests passed, including a preselected native kernel and a rejected Pair selection. Pair Run never invoked the generic native execute command. TypeScript and targeted lint passed.
 
-## Release gates
-
 - CB-009: The two-runtime regression passed for text/notebook to binary and back, followed by host transfer and backing-folder reuse. Each path retained exactly one materialized representation. TypeScript and targeted ESLint passed.
+
+- CB-010: A gated inbound snapshot regression verified Interrupt and Restart complete before the snapshot is released, with queue counters fully reclaimed. Existing per-peer rate and global admission limits remain enforced. TypeScript and targeted ESLint passed.
+
+## Release gates
 
 - [ ] Every fix validated and pushed; previously reported review findings resolved.
 - [ ] Full tests, lint, Python bridge tests, production dependency audit.
