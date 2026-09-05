@@ -8,7 +8,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 
 ## What it provides
 
-- Live text, notebook structure, outputs, files, directories, renames, deletions, and participant cursors.
+- Live text, notebook structure, outputs, files, directories, renames, deletions, and selected-line collaboration locks.
 - Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
 - Direct WebRTC for the normal low-latency path, optional user-configured TURN, and two independent encrypted emergency relay families.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
@@ -111,6 +111,8 @@ The original host remains the host across heartbeat delays, signalling failures,
 Editing state remains in the CRDT during the short folder-selection pause, so an accidental keystroke is not discarded. The new host materializes the current merged state before the session resumes.
 
 ## Saving behavior
+
+Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. Pair Run selects the Pair Jupyter controller explicitly. Stop cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
 
 Live text and notebook updates are sent immediately; disk persistence is separate and debounced. The canonical host copy and join snapshots are serialized directly from current CRDT state, so an unsaved open editor cannot make a new participant receive stale disk contents.
 

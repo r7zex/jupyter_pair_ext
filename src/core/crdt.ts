@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import * as Y from 'yjs';
 import { relativePathsNested } from './projectPath';
+import { assertNotebookGrowth, storedCellBytes, storedValueBytes } from './notebookBudget';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN, newId } from './types';
 
 export type DocumentKind = 'text' | 'notebook';
@@ -288,6 +289,13 @@ export class CollaborativeProject extends EventEmitter {
     const order = doc.getArray<string>('cells');
     const data = doc.getMap<Y.Map<unknown>>('cellData');
     const notebook = doc.getMap<string>('notebook');
+    let growth = storedValueBytes(JSON.stringify(normalizedSnapshot.metadata)) - storedValueBytes(notebook.get('metadata'));
+    for (const cell of normalizedSnapshot.cells) {
+      const existing = data.get(cell.id);
+      growth += storedCellBytes({ ...cell, metadata: JSON.stringify(cell.metadata), outputs: JSON.stringify(cell.outputs),
+        execution: JSON.stringify(cell.execution ?? null), textRevision: '0'.repeat(64) }) - (existing ? storedCellBytes(existing) : 0);
+    }
+    assertNotebookGrowth(doc, growth, MAX_NOTEBOOK_STATE_BYTES);
     doc.transact(() => {
       notebook.set('metadata', JSON.stringify(normalizedSnapshot.metadata));
       const desiredIds: string[] = [];
@@ -343,6 +351,9 @@ export class CollaborativeProject extends EventEmitter {
     const source = map?.get('source');
     if (!map || !(source instanceof Y.Text)) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const ordered = validatedTextChanges(changes, source.toString(), MAX_CELL_SOURCE_BYTES, `${key} cell ${cellId}`);
+    const original = source.toString();
+    assertNotebookGrowth(doc, ordered.reduce((growth, change) => growth + Buffer.byteLength(change.insertText, 'utf8')
+      - Buffer.byteLength(original.slice(change.offset, change.offset + change.deleteCount), 'utf8'), 0), MAX_NOTEBOOK_STATE_BYTES);
     const changesText = ordered.some((change) => change.deleteCount > 0 || change.insertText.length > 0);
     if (!changesText) return;
     doc.transact(() => {
@@ -387,6 +398,7 @@ export class CollaborativeProject extends EventEmitter {
     const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
     if (!map) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const normalized = normalizeOutputSnapshots(outputs);
+    assertNotebookGrowth(doc, storedValueBytes(JSON.stringify(normalized)) - storedValueBytes(map.get('outputs')), MAX_NOTEBOOK_STATE_BYTES);
     doc.transact(() => map.set('outputs', JSON.stringify(normalized)), withScope(origin, { type: 'cellOutputs', cellId }));
   }
 
@@ -402,6 +414,7 @@ export class CollaborativeProject extends EventEmitter {
     const normalized = normalizeMetadata(metadata, 'Cell metadata');
     const serialized = JSON.stringify(normalized);
     if (map.get('metadata') === serialized) return;
+    assertNotebookGrowth(doc, storedValueBytes(serialized) - storedValueBytes(map.get('metadata')), MAX_NOTEBOOK_STATE_BYTES);
     doc.transact(() => map.set('metadata', serialized), withScope(origin, { type: 'cellMetadata', cellId }));
   }
 
@@ -415,6 +428,7 @@ export class CollaborativeProject extends EventEmitter {
     const map = doc.getMap<Y.Map<unknown>>('cellData').get(cellId);
     if (!map) throw new Error(`Unknown notebook cell ${cellId} in ${key}`);
     const normalized = normalizeExecutionSnapshot(execution);
+    assertNotebookGrowth(doc, storedValueBytes(JSON.stringify(normalized ?? null)) - storedValueBytes(map.get('execution')), MAX_NOTEBOOK_STATE_BYTES);
     doc.transact(
       () => map.set('execution', JSON.stringify(normalized ?? null)),
       withScope(origin, { type: 'cellExecution', cellId }),
@@ -431,6 +445,7 @@ export class CollaborativeProject extends EventEmitter {
     const serialized = JSON.stringify(normalized);
     const notebook = doc.getMap<string>('notebook');
     if (notebook.get('metadata') === serialized) return;
+    assertNotebookGrowth(doc, storedValueBytes(serialized) - storedValueBytes(notebook.get('metadata')), MAX_NOTEBOOK_STATE_BYTES);
     doc.transact(() => notebook.set('metadata', serialized), withScope(origin, { type: 'notebookMetadata' }));
   }
 
@@ -620,6 +635,24 @@ export class CollaborativeProject extends EventEmitter {
 
   public encodeUpdate(key: string, remoteStateVector?: Uint8Array): Uint8Array {
     return Y.encodeStateAsUpdate(this.requireDocument(key).doc, remoteStateVector);
+  }
+
+  /** Merge edits authored against the editor's displayed Yjs version. */
+  public mergeEditorText(key: string, cellId: string | undefined, update: Uint8Array): void {
+    const entry = this.requireDocument(key);
+    const candidate = new CollaborativeProject();
+    try {
+      candidate.applyRemoteUpdate(key, entry.kind, this.encodeUpdate(key));
+      candidate.applyRemoteUpdate(key, entry.kind, update);
+      if (cellId) assertNotebookGrowth(candidate.ensureNotebook(key), 0, MAX_NOTEBOOK_STATE_BYTES);
+      const source = cellId ? candidate.cellSource(key, cellId) : candidate.text(key);
+      const limit = cellId ? MAX_CELL_SOURCE_BYTES : MAX_TEXT_DOCUMENT_BYTES;
+      if (Buffer.byteLength(source.toString(), 'utf8') > limit) throw new Error('Merged editor text exceeds the source-size limit.');
+      Y.applyUpdate(entry.doc, update, withScope(LOCAL_EDITOR_ORIGIN,
+        cellId ? { type: 'cellText', cellId } : { type: 'structure' }));
+    } finally {
+      candidate.destroy();
+    }
   }
 
   public applyRemoteUpdate(key: string, kind: DocumentKind, update: Uint8Array, scope?: ProjectUpdate['scope']): void {

@@ -24,6 +24,7 @@ import {
 import { safeRelativePath } from '../core/persistence';
 import { classifyFile, normalizeNotebookMetadata, shouldTrackProjectPath } from '../core/projectFiles';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
+import { EditorTextReplica } from './editorTextReplica';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = 75;
 
@@ -37,11 +38,21 @@ export interface NotebookCellRenderRequest {
 
 export interface NotebookCellStateRenderer {
   renderRemoteCellState(cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void>;
+  isManagingCellState?(cell: vscode.NotebookCell): boolean;
 }
+
+export type LineLockGuard = (
+  key: string,
+  cellId: string | undefined,
+  changes: readonly vscode.TextDocumentContentChangeEvent[],
+  canonicalSource: string,
+) => string | undefined;
 
 export class EditorSynchronizer implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
-  private readonly applyingText = new Set<string>();
+  private readonly textReplicas = new Map<string, EditorTextReplica>();
+  private readonly pendingTextEdits = new Map<string, vscode.TextDocumentChangeEvent[]>();
+  private readonly textRenders = new Map<string, Promise<void>>();
   private readonly applyingNotebooks = new Set<string>();
   private readonly textObservers = new Map<string, (event: Y.YTextEvent) => void>();
   private readonly textApplyQueues = new Map<string, Promise<void>>();
@@ -50,6 +61,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly notebookCellStateTimers = new Map<string, NodeJS.Timeout>();
   private readonly notebookBindings = new WeakMap<vscode.NotebookDocument, Promise<void>>();
   private readonly boundNotebooks = new WeakSet<vscode.NotebookDocument>();
+  private readonly displayedStructures = new WeakMap<vscode.NotebookDocument, Array<Pick<CellSnapshot, 'id' | 'kind' | 'language'>>>();
   private lastRejectedEditorWarningAt = 0;
 
   public constructor(
@@ -58,10 +70,16 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly log: vscode.OutputChannel,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
+    private readonly lineLockGuard?: LineLockGuard,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
       vscode.workspace.onDidChangeTextDocument((event) => this.onTextChanged(event)),
+      vscode.workspace.onDidCloseTextDocument((document) => {
+        const uri = document.uri.toString();
+        this.textReplicas.get(uri)?.dispose();
+        this.textReplicas.delete(uri);
+      }),
       vscode.workspace.onDidOpenNotebookDocument((notebook) => {
         void this.whenNotebookReady(notebook).catch((error) => {
           this.log.appendLine(`[error] Failed to bind notebook ${notebook.uri.fsPath}: ${formatError(error)}`);
@@ -81,6 +99,8 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   public dispose(): void {
+    for (const replica of this.textReplicas.values()) replica.dispose();
+    this.textReplicas.clear();
     this.project.off('update', this.onProjectUpdate);
     this.project.off('documentRenamed', this.onDocumentRenamed);
     this.project.off('documentDeleted', this.onDocumentDeleted);
@@ -371,6 +391,48 @@ export class EditorSynchronizer implements vscode.Disposable {
       seen.add(explicit);
       this.cellIds.seed(cell, explicit, explicit);
     }
+    this.rememberStructure(notebook);
+  }
+
+  private rememberStructure(notebook: vscode.NotebookDocument): void {
+    this.displayedStructures.set(notebook, notebook.getCells().map((cell) => ({
+      id: this.cellIds.idFor(cell, metadataCellId(cell.metadata)), kind: cell.kind, language: cell.document.languageId,
+    })));
+  }
+
+  private reconcileEditorStructure(notebook: vscode.NotebookDocument, key: string): void {
+    const canonical = this.project.notebookSnapshot(key);
+    const editor = this.snapshotFromNotebook(notebook);
+    const before = this.displayedStructures.get(notebook) ?? canonical.cells;
+    const splice = minimalNotebookSplice(before, editor.cells);
+    if (!splice) return;
+    const previous = new Map(before.map((cell) => [cell.id, cell]));
+    const canonicalCells = new Map(canonical.cells.map((cell) => [cell.id, cell]));
+    const removed = new Set(before.slice(splice.start, splice.start + splice.deleteCount).map((cell) => cell.id));
+    const inserted = splice.cells.flatMap((cell) => {
+      const existing = canonicalCells.get(cell.id);
+      const old = previous.get(cell.id);
+      // A remote deletion wins over moving a stale editor cell. New cells are
+      // initialized from the editor; existing cells retain canonical fields.
+      if (!existing) return old ? [] : [cell];
+      return [{ ...existing,
+        kind: old && old.kind !== cell.kind ? cell.kind : existing.kind,
+        language: old && old.language !== cell.language ? cell.language : existing.language,
+      }];
+    });
+    const insertedIds = new Set(inserted.map((cell) => cell.id));
+    const cells = canonical.cells.filter((cell) => !removed.has(cell.id) && !insertedIds.has(cell.id));
+    const right = editor.cells.slice(splice.start + splice.cells.length).find((cell) => cells.some((current) => current.id === cell.id));
+    const left = editor.cells.slice(0, splice.start).reverse().find((cell) => cells.some((current) => current.id === cell.id));
+    const index = right ? cells.findIndex((cell) => cell.id === right.id)
+      : left ? cells.findIndex((cell) => cell.id === left.id) + 1 : cells.length;
+    cells.splice(index, 0, ...inserted);
+    this.project.reconcileNotebook(key, { metadata: canonical.metadata, cells }, LOCAL_EDITOR_ORIGIN);
+    this.rememberStructure(notebook);
+    for (const cell of notebook.getCells()) {
+      const id = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
+      if (this.project.hasNotebookCell(key, id)) this.rememberText(cell.document, key, id);
+    }
   }
 
   private captureStructuralEditorState(notebook: vscode.NotebookDocument): StructuralEditorState | undefined {
@@ -493,6 +555,9 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private readonly onDocumentRenamed = (from: string, to: string, kind: string): void => {
+    for (const replica of this.textReplicas.values()) {
+      if (replica.key === from) replica.rename(to);
+    }
     if (kind !== 'text') return;
     // A rename is allowed to replace an existing destination. Its observer was
     // attached to the destroyed destination document and must not block a fresh
@@ -508,6 +573,11 @@ export class EditorSynchronizer implements vscode.Disposable {
   };
 
   private readonly onDocumentDeleted = (key: string, kind: string, doc?: Y.Doc): void => {
+    for (const [uri, replica] of this.textReplicas) {
+      if (replica.key !== key) continue;
+      replica.dispose();
+      this.textReplicas.delete(uri);
+    }
     if (kind !== 'text') return;
     const observer = this.textObservers.get(key);
     if (observer) {
@@ -526,6 +596,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const text = this.project.has(key)
       ? this.project.text(key)
       : this.project.ensureText(key, document.getText(), LOCAL_EDITOR_ORIGIN);
+    this.rememberText(document, key);
     if (this.textObservers.has(key)) return;
     const observer = (event: Y.YTextEvent) => {
       if (event.transaction.origin !== REMOTE_ORIGIN) return;
@@ -545,15 +616,21 @@ export class EditorSynchronizer implements vscode.Disposable {
       return;
     }
     const key = this.keyForUri(document.uri);
-    if (!key || this.applyingText.has(document.uri.toString()) || !event.contentChanges.length) return;
+    if (!key || !event.contentChanges.length || this.consumeTextEcho(event)) return;
     if (this.project.kindOf(key) !== 'text') return;
+    const canonicalSource = this.project.text(key).toString();
+    const lineLock = this.lineLockGuard?.(key, undefined, event.contentChanges, canonicalSource);
+    if (lineLock) {
+      this.restoreRejectedText(document, canonicalSource, lineLock);
+      return;
+    }
     const changes: TextChange[] = event.contentChanges.map((change) => ({
       offset: change.rangeOffset,
       deleteCount: change.rangeLength,
       insertText: change.text,
     }));
     try {
-      this.project.applyTextChanges(key, changes, LOCAL_EDITOR_ORIGIN);
+      this.publishTextChanges(document, key, undefined, changes);
     } catch (error) {
       this.restoreRejectedText(
         document,
@@ -564,21 +641,107 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyText(document: vscode.TextDocument, target: string): Promise<void> {
-    const current = document.getText();
-    if (current === target) return;
-    const edit = minimalEdit(current, target);
-    const workspaceEdit = new vscode.WorkspaceEdit();
-    workspaceEdit.replace(
-      document.uri,
-      new vscode.Range(document.positionAt(edit.offset), document.positionAt(edit.offset + edit.deleteCount)),
-      edit.insertText,
-    );
     const uri = document.uri.toString();
-    this.applyingText.add(uri);
-    try {
-      if (!await vscode.workspace.applyEdit(workspaceEdit)) throw new Error(`VS Code rejected remote edit for ${document.uri.fsPath}`);
-    } finally {
-      this.applyingText.delete(uri);
+    const previous = this.textRenders.get(uri) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.renderText(document, target));
+    this.textRenders.set(uri, next);
+    try { await next; } finally {
+      if (this.textRenders.get(uri) === next) this.textRenders.delete(uri);
+    }
+  }
+
+  private async renderText(document: vscode.TextDocument, fallback: string): Promise<void> {
+    const uri = document.uri.toString();
+    for (;;) {
+      const displayed = this.textReplicas.get(uri);
+      if (displayed) {
+        const canonical = displayed.cellId ? this.project.cellSource(displayed.key, displayed.cellId) : this.project.text(displayed.key);
+        if (document.getText() === canonical.toString() && displayed.source() === canonical.toString()) return;
+      }
+      const replica = displayed ? new EditorTextReplica(this.project, displayed.key, displayed.cellId) : undefined;
+      const target = replica?.source() ?? fallback;
+      const current = document.getText();
+      if (current === target) {
+        if (replica) this.replaceTextReplica(uri, replica);
+        return;
+      }
+      const edit = minimalEdit(current, target);
+      const workspaceEdit = new vscode.WorkspaceEdit();
+      workspaceEdit.replace(
+        document.uri,
+        new vscode.Range(document.positionAt(edit.offset), document.positionAt(edit.offset + edit.deleteCount)),
+        edit.insertText,
+      );
+      const version = document.version;
+      const events: vscode.TextDocumentChangeEvent[] = [];
+      this.pendingTextEdits.set(uri, events);
+      let applied = false;
+      try {
+        applied = await vscode.workspace.applyEdit(workspaceEdit);
+      } finally {
+        this.pendingTextEdits.delete(uri);
+        let echoed = false;
+        for (const event of events) {
+          const change = event.contentChanges[0];
+          if (applied && !echoed && event.contentChanges.length === 1 && change
+            && change.rangeOffset === edit.offset && change.rangeLength === edit.deleteCount && change.text === edit.insertText) {
+            echoed = true;
+            if (replica) this.replaceTextReplica(uri, replica);
+          } else {
+            this.onTextChanged(event);
+          }
+        }
+        if (applied && !echoed && replica) this.replaceTextReplica(uri, replica);
+        if (replica && this.textReplicas.get(uri) !== replica) replica.dispose();
+      }
+      if (!applied) {
+        if (document.version !== version) continue;
+        throw new Error(`VS Code rejected remote edit for ${document.uri.fsPath}`);
+      }
+      // A later canonical transaction or local keystroke may have arrived while
+      // VS Code applied this version. Reconcile again before releasing the queue.
+      if (!displayed) return;
+    }
+  }
+
+  private replaceTextReplica(uri: string, replica: EditorTextReplica): void {
+    const previous = this.textReplicas.get(uri);
+    if (previous !== replica) previous?.dispose();
+    this.textReplicas.set(uri, replica);
+  }
+
+  private rememberText(document: vscode.TextDocument, key: string, cellId?: string): void {
+    const uri = document.uri.toString();
+    if (!this.textReplicas.has(uri)) this.replaceTextReplica(uri, new EditorTextReplica(this.project, key, cellId));
+  }
+
+  private consumeTextEcho(event: vscode.TextDocumentChangeEvent): boolean {
+    const pending = this.pendingTextEdits.get(event.document.uri.toString());
+    if (!pending) return false;
+    // Only a successful version-checked WorkspaceEdit proves which event is
+    // its echo. Identical user typing before a rejected edit is still local.
+    pending.push(event);
+    return true;
+  }
+
+  private publishTextChanges(document: vscode.TextDocument, key: string, cellId: string | undefined, changes: TextChange[]): void {
+    const uri = document.uri.toString();
+    const replica = this.textReplicas.get(uri);
+    const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
+    if (replica && replica.source() !== canonical.toString()) {
+      replica.edit(changes);
+    } else {
+      const capture = (event: ProjectUpdate) => {
+        if (event.key === key && event.origin === LOCAL_EDITOR_ORIGIN) replica?.accept(event.update);
+      };
+      this.project.on('update', capture);
+      try {
+        if (cellId) this.project.applyCellTextChanges(key, cellId, changes, LOCAL_EDITOR_ORIGIN);
+        else this.project.applyTextChanges(key, changes, LOCAL_EDITOR_ORIGIN);
+      } finally {
+        this.project.off('update', capture);
+      }
+      if (!replica) this.rememberText(document, key, cellId);
     }
   }
 
@@ -588,6 +751,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (!this.project.has(key)) {
       await this.ensureStableCellIds(notebook);
       this.project.ensureNotebook(key, this.snapshotFromNotebook(notebook));
+      this.rememberStructure(notebook);
     } else {
       const snapshot = this.project.notebookSnapshot(key);
       const matches = matchInitialCellIds(
@@ -600,10 +764,17 @@ export class EditorSynchronizer implements vscode.Disposable {
       for (let index = 0; index < notebook.cellCount; index += 1) {
         const cell = notebook.cellAt(index);
         this.cellIds.seed(cell, metadataCellId(cell.metadata), matches[index]);
+        const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
+        if (this.project.hasNotebookCell(key, cellId)) this.rememberText(cell.document, key, cellId);
       }
       await this.applyUnscopedNotebookReconciliation(notebook, key);
     }
     await this.ensureStableCellIds(notebook);
+    this.rememberStructure(notebook);
+    for (const cell of notebook.getCells()) {
+      const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
+      if (this.project.hasNotebookCell(key, cellId)) this.rememberText(cell.document, key, cellId);
+    }
   }
 
   private onNotebookChanged(event: vscode.NotebookDocumentChangeEvent): void {
@@ -612,7 +783,7 @@ export class EditorSynchronizer implements vscode.Disposable {
 
     if (event.contentChanges.length) {
       try {
-        this.project.reconcileNotebook(key, this.snapshotFromNotebook(event.notebook), LOCAL_EDITOR_ORIGIN);
+        this.reconcileEditorStructure(event.notebook, key);
         void this.ensureStableCellIds(event.notebook).catch((error) => {
           this.log.appendLine(`[error] Failed to persist notebook cell identities: ${formatError(error)}`);
         });
@@ -642,6 +813,10 @@ export class EditorSynchronizer implements vscode.Disposable {
 
     for (const change of event.cellChanges) {
       const cellId = this.cellIds.idFor(change.cell, metadataCellId(change.cell.metadata));
+      const sharedExecution = this.project.notebookCellSnapshot(key, cellId)?.execution;
+      const protocolOwnsState = !!this.cellStateRenderer || !!sharedExecution?.requestId;
+      const manualOutputClear = change.outputs && change.cell.outputs.length === 0
+        && sharedExecution?.success !== undefined && !this.cellStateRenderer?.isManagingCellState?.(change.cell);
       if (change.metadata) {
         try {
           this.project.setCellMetadata(key, cellId, stripCollaborationMetadata(change.metadata), LOCAL_EDITOR_ORIGIN);
@@ -652,7 +827,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           this.warnRejectedEditorUpdate(detail);
         }
       }
-      if (change.outputs) {
+      if (change.outputs && (!protocolOwnsState || manualOutputClear)) {
         try {
           this.project.setCellOutputs(key, cellId, outputsFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
         } catch (error) {
@@ -662,7 +837,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           this.warnRejectedEditorUpdate(detail);
         }
       }
-      if (change.executionSummary) {
+      if (change.executionSummary && !protocolOwnsState) {
         try {
           this.project.setCellExecution(key, cellId, executionFromCell(change.cell), LOCAL_EDITOR_ORIGIN);
         } catch (error) {
@@ -678,7 +853,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private onNotebookCellTextChanged(event: vscode.TextDocumentChangeEvent): void {
     let canonicalSource: string | undefined;
     try {
-      if (this.applyingText.has(event.document.uri.toString()) || !event.contentChanges.length) return;
+      if (!event.contentChanges.length || this.consumeTextEcho(event)) return;
       for (const notebook of vscode.workspace.notebookDocuments) {
         const cell = notebook.getCells().find((candidate) => candidate.document.uri.toString() === event.document.uri.toString());
         if (!cell) continue;
@@ -686,16 +861,21 @@ export class EditorSynchronizer implements vscode.Disposable {
         const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
         if (!key || !cellId) return;
         if (!this.project.hasNotebookCell(key, cellId)) {
-          this.project.reconcileNotebook(key, this.snapshotFromNotebook(notebook), LOCAL_EDITOR_ORIGIN);
+          this.reconcileEditorStructure(notebook, key);
           return;
         }
         canonicalSource = this.project.cellSource(key, cellId).toString();
+        const lineLock = this.lineLockGuard?.(key, cellId, event.contentChanges, canonicalSource);
+        if (lineLock) {
+          this.restoreRejectedText(event.document, canonicalSource, lineLock);
+          return;
+        }
         const changes = event.contentChanges.map((change) => ({
           offset: change.rangeOffset,
           deleteCount: change.rangeLength,
           insertText: change.text,
         }));
-        this.project.applyCellTextChanges(key, cellId, changes, LOCAL_EDITOR_ORIGIN);
+        this.publishTextChanges(event.document, key, cellId, changes);
         return;
       }
     } catch (error) {

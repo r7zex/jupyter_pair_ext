@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, direct WebRTC, and redundant Nostr/MQTT relay fallback.",
-  "version": "0.5.9",
+  "version": "0.5.13",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -139,26 +139,6 @@
         "enablement": "pairNotebook.inSession && pairNotebook.executionAvailable"
       },
       {
-        "command": "pairNotebook.toggleShareMyCursor",
-        "title": "Pair Notebook: Toggle Sharing My Cursor"
-      },
-      {
-        "command": "pairNotebook.toggleRemoteCursors",
-        "title": "Pair Notebook: Toggle Remote Cursors"
-      },
-      {
-        "command": "pairNotebook.toggleRemoteCursorNames",
-        "title": "Pair Notebook: Toggle Remote Cursor Names"
-      },
-      {
-        "command": "pairNotebook.changeMyCursorColor",
-        "title": "Pair Notebook: Change My Cursor Color"
-      },
-      {
-        "command": "pairNotebook.manageParticipantCursors",
-        "title": "Pair Notebook: Manage Participant Cursors"
-      },
-      {
         "command": "pairNotebook.openRecentProject",
         "title": "Pair Notebook: Open Recent Project"
       },
@@ -215,31 +195,6 @@
           "minimum": 0,
           "scope": "machine",
           "description": "CUDA device index exposed to the Pair Notebook Python kernel."
-        },
-        "pairNotebook.shareMyCursor": {
-          "type": "boolean",
-          "default": true,
-          "scope": "application",
-          "description": "Share the current text/notebook-cell cursor with session participants."
-        },
-        "pairNotebook.showRemoteCursors": {
-          "type": "boolean",
-          "default": true,
-          "scope": "application",
-          "description": "Show cursors shared by other participants."
-        },
-        "pairNotebook.showRemoteCursorNames": {
-          "type": "boolean",
-          "default": true,
-          "scope": "application",
-          "description": "Show participant names next to their shared cursors."
-        },
-        "pairNotebook.myCursorColor": {
-          "type": "string",
-          "default": "#4FC3F7",
-          "pattern": "^#[0-9A-Fa-f]{6}$",
-          "scope": "application",
-          "description": "Six-digit color advertised with your shared cursor."
         },
         "pairNotebook.persistenceDebounceMs": {
           "type": "number",

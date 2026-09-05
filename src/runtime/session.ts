@@ -22,8 +22,10 @@ import {
   defaultAutosaveRoot,
 } from '../core/autosave';
 import {
+  encodeRelativeOffset,
   ResolvedCursorPosition,
   SharedCursorPosition,
+  resolveRelativeOffset,
   resolveSharedCursorPosition,
 } from '../core/cursorPosition';
 import {
@@ -157,6 +159,8 @@ export interface PresenceState {
   activeNotebookCellId?: string | undefined;
   /** Line-only presence avoids unstable cursor offsets during notebook edits. */
   activeLine?: number | undefined;
+  /** CRDT-relative start of the active line, so it follows inserted lines. */
+  activeLineAnchor?: string | undefined;
   /** Legacy receive-only compatibility. New local packets never publish exact offsets. */
   cursor?: SharedCursorPosition | undefined;
   shareCursor: boolean;
@@ -229,7 +233,10 @@ const MAX_REMOTE_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
 const MAX_REMOTE_INPUT_CHARACTERS = 64 * 1024;
 const MAX_REMOTE_EXECUTIONS = 4;
 const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
-const REMOTE_EXECUTION_TIMEOUT_MS = 4 * 60 * 60_000;
+/** A stuck kernel must end visibly instead of leaving a notebook cell Busy indefinitely. */
+const KERNEL_EXECUTION_TIMEOUT_MS = 10 * 60_000;
+/** Leave one extra minute for the terminal output/result to cross the route. */
+const REMOTE_EXECUTION_TIMEOUT_MS = KERNEL_EXECUTION_TIMEOUT_MS + 60_000;
 /** A routed request must be acknowledged before VS Code leaves the cell in a running state. */
 const EXECUTION_ACCEPT_TIMEOUT_MS = 45_000;
 /** Host waits only this long for the requested target-cell CRDT state to arrive. */
@@ -276,7 +283,6 @@ const BACKGROUND_MESSAGE_TYPES = new Set([
   'binaryChunk',
   'binaryEnd',
   'executionBarrierCheck',
-  'kernelCommand',
 ]);
 
 
@@ -286,7 +292,7 @@ interface PendingExecution {
   onEvent: (event: JupyterKernelEvent) => void;
   executorId: string;
   notebookKey: string;
-  timer: NodeJS.Timeout;
+  timer: NodeJS.Timeout | undefined;
   accepted: boolean;
   nextEventSequence: number;
   bufferedEvents: Map<number, { event: JupyterKernelEvent; byteLength: number }>;
@@ -599,6 +605,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private lastPublishedActiveFile: string | undefined;
   private lastPublishedActiveNotebookCellId: string | undefined;
   private lastPublishedActiveLine: number | undefined;
+  private lastPublishedActiveLineAnchor: string | undefined;
   private lastPublishedShareCursor = true;
   private lastPublishedCursorColor = '#4FC3F7';
   private lastPublishedDisplayName = '';
@@ -636,6 +643,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private waitingForHostFolder = false;
   private messageQueue: Promise<void> = Promise.resolve();
   private backgroundMessageQueue: Promise<void> = Promise.resolve();
+  private kernelCommandQueue: Promise<void> = Promise.resolve();
   private pendingIncomingMessages = 0;
   private pendingIncomingBytes = 0;
   private pendingSnapshotRequests = 0;
@@ -1181,15 +1189,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
   }
 
-  public async executeActiveCell(): Promise<void> {
-    if (this.waitingForHostFolder) {
-      throw new Error('The session is paused until the new host chooses a folder.');
-    }
-    const editor = vscode.window.activeNotebookEditor;
-    if (!editor) throw new Error('Open a notebook and select a code cell first.');
-    await vscode.commands.executeCommand('notebook.cell.execute');
-  }
-
   public async executeCell(
     notebookKey: string,
     cellId: string,
@@ -1244,20 +1243,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
     this.transition('executing', `Requesting host execution for ${notebookKey} on ${executorId}.`);
     const remote = new Promise<JupyterExecutionResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingExecutions.delete(requestId);
-        reject(new Error(
-          `Compute executor ${executorId} did not acknowledge the request after route recovery. `
-          + 'The cell was not left running remotely; retry it after the connection is stable.',
-        ));
-      }, EXECUTION_ACCEPT_TIMEOUT_MS);
       this.pendingExecutions.set(requestId, {
         resolve,
         reject,
         onEvent,
         executorId,
         notebookKey,
-        timer,
+        timer: undefined,
         accepted: false,
         nextEventSequence: 0,
         bufferedEvents: new Map(),
@@ -1292,6 +1284,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     payload: Uint8Array<ArrayBufferLike>,
   ): Promise<void> {
     const requestId = String(meta.requestId ?? '');
+    const notebookKey = String(meta.notebookKey ?? '');
+    await this.synchronizeExecutionFiles(executorId, requestId, notebookKey, this.computeForNotebook(notebookKey));
+    const awaitingAcceptance = this.pendingExecutions.get(requestId);
+    if (!awaitingAcceptance || this.closed) return;
+    awaitingAcceptance.timer = setTimeout(() => {
+      if (this.pendingExecutions.get(requestId) !== awaitingAcceptance) return;
+      this.pendingExecutions.delete(requestId);
+      awaitingAcceptance.reject(new Error(
+        `Compute executor ${executorId} did not acknowledge the request after route recovery. `
+        + 'Retry it after the connection is stable.',
+      ));
+    }, EXECUTION_ACCEPT_TIMEOUT_MS);
     const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
     let attempt = 0;
     while (!this.closed && Date.now() < deadline) {
@@ -1595,6 +1599,49 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       ? this.presenceText(state.activeFile, state.activeNotebookCellId)
       : undefined;
     return resolveSharedCursorPosition(text, state.cursor);
+  }
+
+  /** Resolves a line anchor without exposing a character cursor to the UI. */
+  public resolvePresenceLineOffset(state: PresenceState): number | undefined {
+    if (!state.activeLineAnchor || !state.activeFile) return undefined;
+    return resolveRelativeOffset(
+      this.presenceText(state.activeFile, state.activeNotebookCellId),
+      state.activeLineAnchor,
+      undefined,
+    );
+  }
+
+  /**
+   * Rejects local edits that touch another participant's selected line. The
+   * CRDT-relative anchor keeps that lock on the same logical line when a peer
+   * inserts new lines above it. If two peers select the same line concurrently,
+   * the stable join order breaks the tie instead of blocking both editors.
+   */
+  public lineLockMessage(
+    key: string,
+    cellId: string | undefined,
+    changes: readonly { rangeOffset: number; rangeLength: number }[],
+    canonicalSource: string,
+  ): string | undefined {
+    if (!changes.length) return undefined;
+    const states = this.snapshot().awareness;
+    const own = states.find((state) => state.peer.peerId === this.descriptor.localPeer.peerId);
+    const ownStart = own ? this.presenceLineStart(own, canonicalSource) : undefined;
+    for (const state of states) {
+      if (state.peer.peerId === this.descriptor.localPeer.peerId
+        || state.shareCursor === false
+        || state.activeFile !== key
+        || state.activeNotebookCellId !== cellId) continue;
+      const lockedStart = this.presenceLineStart(state, canonicalSource);
+      if (lockedStart === undefined) continue;
+      // A simultaneous selection is resolved consistently on every peer.
+      if (ownStart === lockedStart && comparePeerPriority(this.descriptor.localPeer, state.peer) < 0) continue;
+      const lockedEnd = lineEndOffset(canonicalSource, lockedStart);
+      if (changes.some((change) => changeTouchesLine(change, lockedStart, lockedEnd))) {
+        return `Line is currently selected by ${state.peer.displayName}.`;
+      }
+    }
+    return undefined;
   }
 
   public async refreshHardware(): Promise<void> {
@@ -1964,6 +2011,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       await this.awaitSessionEndFence();
       await this.messageQueue;
       await this.backgroundMessageQueue;
+      await this.kernelCommandQueue;
       if (this.waitingForHostFolder) {
         // No canonical backing root exists during host-folder selection. Keep
         // the authoritative final state and signed termination marker in the
@@ -2393,6 +2441,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.pendingIncomingBytes -= retainedBytes;
       if (isSnapshotRequest) this.pendingSnapshotRequests -= 1;
     };
+    if (frame.type === 'kernelCommand') {
+      this.kernelCommandQueue = this.kernelCommandQueue
+        .then(() => this.onMessage(frame, sourceId))
+        .catch((error) => this.log.appendLine(`[error] Kernel command queue: ${formatError(error)}`))
+        .finally(release);
+      return;
+    }
     if (isBackgroundMessage(frame.type)) {
       this.backgroundMessageQueue = this.backgroundMessageQueue
         .then(() => this.onMessage(frame, sourceId))
@@ -2815,6 +2870,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               await this.acceptFileState(conflict.losingPath, conflict.tombstone, sourceId, false, true);
             }
             this.renameFileStates(effectiveFrom, to, fromState, toState);
+            this.renameNotebookRuntimeState(effectiveFrom, to);
             this.project.renameDocument(effectiveFrom, to);
             this.renameBinaryVersions(effectiveFrom, to);
             this.renameDirectories(effectiveFrom, to);
@@ -3368,8 +3424,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     };
     for (const key of this.project.keys()) {
-      if (this.effectiveFileState(key)?.deleted) continue;
       const kind = this.project.kindOf(key);
+      const state = this.effectiveFileState(key);
+      if (state?.deleted || (state && state.kind !== kind)) continue;
       if (kind === 'text') {
         const bytes = Buffer.from(this.project.text(key).toString(), 'utf8');
         if (bytes.byteLength > MAX_TEXT_DOCUMENT_BYTES) {
@@ -3382,7 +3439,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     const binaries: Array<{ relativePath: string; sourcePath: string; hash: string; size: number }> = [];
     for (const [relativePath, version] of this.binaryVersions) {
-      if (this.effectiveFileState(relativePath)?.deleted) continue;
+      const state = this.effectiveFileState(relativePath);
+      if (state?.deleted || (state && state.kind !== 'binary')) continue;
       const sourcePath = await safeProjectTarget(this.descriptor.workingFolder, relativePath, true);
       const info = await lstat(sourcePath);
       if (info.isSymbolicLink() || !info.isFile()) {
@@ -3555,14 +3613,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.lastDisplayNameWarning = warning;
       }
     }
-    const shareCursor = configuration.get<boolean>('shareMyCursor', true);
-    const configuredColor = configuration.get<string>('myCursorColor', '#4FC3F7');
-    const cursorColor = /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor.toUpperCase() : '#4FC3F7';
+    // Presence is now line-only. Keep the legacy wire fields fixed so older
+    // participants can still see activity, but no local setting can turn a
+    // line lock into an unannounced editable cursor.
+    const shareCursor = true;
+    const cursorColor = '#4FC3F7';
     const activeText = vscode.window.activeTextEditor;
     const activeNotebook = vscode.window.activeNotebookEditor;
     let activeFile: string | undefined;
     let activeNotebookCellId: string | undefined;
     let activeLine: number | undefined;
+    let activeLineAnchor: string | undefined;
     const notebookKey = activeNotebook ? this.relativeKey(activeNotebook.notebook.uri) : undefined;
     if (activeNotebook && notebookKey) {
       activeFile = notebookKey;
@@ -3577,14 +3638,16 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const selectedCell = focusedCell
         ?? (selectedIndexIsValid ? activeNotebook.notebook.cellAt(selectedIndex) : undefined);
       if (selectedCell) activeNotebookCellId = this.notebookCellId(selectedCell);
-      if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString() && shareCursor) {
+      if (selectedCell && activeText?.document.uri.toString() === selectedCell.document.uri.toString()) {
         activeLine = lineFromSelection(activeText.selection.active);
+        activeLineAnchor = this.lineAnchorForEditor(activeText.document, activeLine, notebookKey, activeNotebookCellId);
       }
     } else if (activeText) {
       const textKey = this.relativeKey(activeText.document.uri);
       if (textKey) {
         activeFile = textKey;
-        if (shareCursor) activeLine = lineFromSelection(activeText.selection.active);
+        activeLine = lineFromSelection(activeText.selection.active);
+        activeLineAnchor = this.lineAnchorForEditor(activeText.document, activeLine, textKey, undefined);
       }
     }
     const displayName = this.descriptor.localPeer.displayName;
@@ -3592,6 +3655,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       && this.lastPublishedActiveFile === activeFile
       && this.lastPublishedActiveNotebookCellId === activeNotebookCellId
       && this.lastPublishedActiveLine === activeLine
+      && this.lastPublishedActiveLineAnchor === activeLineAnchor
       && this.lastPublishedShareCursor === shareCursor
       && this.lastPublishedCursorColor === cursorColor
       && this.lastPublishedDisplayName === displayName) return;
@@ -3599,6 +3663,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.lastPublishedActiveFile = activeFile;
     this.lastPublishedActiveNotebookCellId = activeNotebookCellId;
     this.lastPublishedActiveLine = activeLine;
+    this.lastPublishedActiveLineAnchor = activeLineAnchor;
     this.lastPublishedShareCursor = shareCursor;
     this.lastPublishedCursorColor = cursorColor;
     this.lastPublishedDisplayName = displayName;
@@ -3608,10 +3673,25 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       activeFile,
       activeNotebookCellId,
       activeLine,
+      activeLineAnchor,
       shareCursor,
       cursorColor,
       typing: false,
     });
+  }
+
+  private lineAnchorForEditor(
+    document: vscode.TextDocument,
+    line: number | undefined,
+    key: string,
+    cellId: string | undefined,
+  ): string | undefined {
+    if (line === undefined || typeof document.offsetAt !== 'function') return undefined;
+    try {
+      return encodeRelativeOffset(this.presenceText(key, cellId) ?? new Y.Text(), document.offsetAt(new vscode.Position(line, 0)));
+    } catch {
+      return undefined;
+    }
   }
 
   private publishResourcePresence(peerId?: string): void {
@@ -3694,6 +3774,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private presenceLineStart(state: PresenceState, source: string): number | undefined {
+    const offset = this.resolvePresenceLineOffset(state)
+      ?? offsetForLine(source, state.activeLine);
+    return offset === undefined ? undefined : lineStartOffset(source, offset);
+  }
+
   private async onCreatedFromExplorer(uri: vscode.Uri): Promise<void> {
     try {
       if ((await stat(uri.fsPath)).isDirectory()) await this.onLocalDirectory(uri);
@@ -3719,6 +3805,35 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.transport.broadcast('directoryCreate', { relativePath, state });
       if (this.coordinator.isCurrentHost()) await this.storage?.createDirectory(relativePath);
       await this.persistDescriptor();
+    }
+  }
+
+  private renameNotebookRuntimeState(from: string, to: string): void {
+    const moved = (key: string) => key === from ? to : key.startsWith(`${from}/`) ? `${to}${key.slice(from.length)}` : key;
+    const move = <T>(map: Map<string, T>, replace?: (value: T) => void) => {
+      for (const [key, value] of [...map]) {
+        const next = moved(key);
+        if (next === key) continue;
+        const previous = map.get(next);
+        if (previous !== undefined && previous !== value) replace?.(previous);
+        map.delete(key);
+        map.set(next, value);
+      }
+    };
+    move(this.kernels, (kernel) => kernel.stop());
+    move(this.kernelStatuses);
+    move(this.kernelLastUsed);
+    move(this.notebookActiveExecutions);
+    for (const owner of this.executionOwners.values()) owner.notebookKey = moved(owner.notebookKey);
+    for (const pending of this.pendingExecutions.values()) pending.notebookKey = moved(pending.notebookKey);
+    for (const settings of [this.descriptor.notebookCompute, this.descriptor.notebookPythonPaths]) {
+      if (!settings) continue;
+      for (const key of Object.keys(settings)) {
+        const next = moved(key);
+        if (next === key) continue;
+        Object.assign(settings, { [next]: settings[key] });
+        delete settings[key];
+      }
     }
   }
 
@@ -3749,6 +3864,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const toState = this.nextFileState(kind, false);
 
     this.renameFileStates(rawFrom, rawTo, fromState, toState);
+    this.renameNotebookRuntimeState(rawFrom, rawTo);
     this.project.renameDocument(rawFrom, rawTo);
     this.renameBinaryVersions(rawFrom, rawTo);
     this.renameDirectories(rawFrom, rawTo);
@@ -4104,6 +4220,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private async ensureLivePathMaterialized(relativePath: string, state: FileLifecycleState): Promise<void> {
+    const previousKind = this.project.kindOf(relativePath);
+    if (previousKind && previousKind !== state.kind) this.project.deleteDocument(relativePath);
+    if (state.kind !== 'binary') this.deleteBinaryVersions(relativePath);
+    if (state.kind !== 'directory') this.directories.delete(relativePath);
     if (state.kind === 'directory') {
       this.directories.add(relativePath);
       await this.storage?.createDirectory(relativePath);
@@ -4493,10 +4613,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private dropBarrierAuthorization(key: string): void {
-    const pending = this.pendingBarrierAuthorizations.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingBarrierAuthorizations.delete(key);
+    for (const authorizations of [this.pendingBarrierAuthorizations, this.completedExecutionBarriers]) {
+      const authorization = authorizations.get(key);
+      if (authorization) clearTimeout(authorization.timer);
+      authorizations.delete(key);
+    }
   }
 
   private remoteComputeTargetError(notebookKey: string, target: NotebookComputeTarget): string | undefined {
@@ -5517,7 +5638,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       // The host executes only its own canonical CRDT cell text after exact
       // revision+digest convergence. Guest payload is never a code source.
       code = canonical.source;
-      materializeWorkspace = false;
+      this.dropBarrierAuthorization(barrierAuthorizationKey(sourceId, requestId));
+      materializeWorkspace = true;
     } else {
       target = legacyTarget!;
       const manifest = legacyManifest!;
@@ -5634,7 +5756,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             payload = encodeRemoteExecutionEvent(event);
           } catch (error) {
             executionOwner.eventOverflow = error instanceof Error ? error : new Error(String(error));
-            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const events = executionOwner.events ?? [];
@@ -5644,7 +5766,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             executionOwner.eventOverflow = new Error(
               'Remote Jupyter output exceeded the bounded reconnect replay queue.',
             );
-            void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const record = { sequence: events.length, payload } satisfies RemoteExecutionEventRecord;
@@ -5656,14 +5778,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           if (executionOwner.outputState && executionOwner.cellId) {
             const authoritative = applyJupyterEventToState(executionOwner.outputState, event);
             if (authoritative.executionOrder !== undefined) {
-              this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+              this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
                 requestId,
                 executionOrder: authoritative.executionOrder,
               });
             }
             if (authoritative.outputsChanged) {
               this.project.setCellOutputs(
-                notebookKey,
+                executionOwner.notebookKey,
                 executionOwner.cellId,
                 snapshotJupyterOutputs(executionOwner.outputState),
               );
@@ -5683,7 +5805,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       );
       const timedOut = new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
-          void this.kernels.get(notebookKey)?.interrupt().catch(() => undefined);
+          void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
           reject(new Error('Remote execution timed out after four hours.'));
         }, REMOTE_EXECUTION_TIMEOUT_MS);
       });
@@ -5713,14 +5835,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (executionOwner.outputState && executionOwner.cellId) {
       appendJupyterFailureToState(executionOwner.outputState, result);
       this.project.setCellOutputs(
-        notebookKey,
+        executionOwner.notebookKey,
         executionOwner.cellId,
         snapshotJupyterOutputs(executionOwner.outputState),
       );
       const resultCount = Number(result.content.execution_count);
       const executionOrder = executionOwner.outputState.executionOrder
         ?? (Number.isFinite(resultCount) ? resultCount : undefined);
-      this.project.setCellExecution(notebookKey, executionOwner.cellId, {
+      this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
         requestId,
         ...(executionOrder !== undefined ? { executionOrder } : {}),
         success: result.success,
@@ -5864,12 +5986,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
-    // Local execution and the explicit legacy barrier materialize the whole
-    // working copy before Python imports. Ordinary guest Run Cell passes
-    // materializeWorkspace=false: the target cell executes directly from
-    // host-canonical CRDT text, while imports observe the host physical working
-    // copy maintained by normal persistence. Exact project-wide filesystem
-    // convergence remains an explicit save/transfer/manual-barrier operation.
+    const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
+    this.project.on('documentRenamed', onRename);
+    try {
+    // Python reads the physical working copy, including files whose current
+    // canonical content is still owned by an unsaved VS Code editor.
     if (materializeWorkspace) {
       await this.prepareWorkingCopy?.();
       await this.flush();
@@ -5901,9 +6022,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       kernel.on('stderr', (message) => this.log.appendLine(`[jupyter] ${String(message).trimEnd()}`));
       kernel.on('protocolError', (error) => this.log.appendLine(`[error] Jupyter protocol: ${formatError(error)}`));
       kernel.on('exit', () => {
-        if (this.kernels.get(notebookKey) === kernel) this.kernels.delete(notebookKey);
-        this.kernelLastUsed.delete(notebookKey);
-        this.setKernelStatus(notebookKey, 'Offline');
+        const currentKey = [...this.kernels].find(([, candidate]) => candidate === kernel)?.[0];
+        if (!currentKey) return;
+        this.kernels.delete(currentKey);
+        this.kernelLastUsed.delete(currentKey);
+        this.setKernelStatus(currentKey, 'Offline');
       });
       this.kernels.set(notebookKey, kernel);
     }
@@ -5921,9 +6044,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.notebookActiveExecutions.set(notebookKey, (this.notebookActiveExecutions.get(notebookKey) ?? 0) + 1);
     this.setKernelStatus(notebookKey, 'Busy');
     this.transition('executing', `Executing ${notebookKey} locally.`);
+    let executionTimeout: NodeJS.Timeout | undefined;
     try {
+      const timedOut = new Promise<never>((_resolve, reject) => {
+        executionTimeout = setTimeout(() => {
+          void kernel.interrupt().catch(() => undefined);
+          reject(new Error('Pair kernel execution timed out after ten minutes and was interrupted.'));
+        }, KERNEL_EXECUTION_TIMEOUT_MS);
+      });
       return await Promise.race([
         kernel.execute(requestId, code),
+        timedOut,
         this.terminalCancellation(),
       ]);
     } catch (error) {
@@ -5932,6 +6063,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       throw error;
     } finally {
+      if (executionTimeout) clearTimeout(executionTimeout);
       kernel.off('event', listener);
       if (this.executionOwners.get(requestId)?.peerId === this.descriptor.localPeer.peerId) this.executionOwners.delete(requestId);
       this.activeExecutions = Math.max(0, this.activeExecutions - 1);
@@ -5945,6 +6077,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           : `Execution finished for ${notebookKey}.`);
       }
     }
+    } finally { this.project.off('documentRenamed', onRename); }
   }
 
   private setKernelStatus(notebookKey: string, status: 'Idle' | 'Busy' | 'Offline'): void {
@@ -6204,6 +6337,44 @@ function lineFromSelection(position: unknown): number | undefined {
   return typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : undefined;
 }
 
+function offsetForLine(source: string, line: number | undefined): number | undefined {
+  if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 0) return undefined;
+  let offset = 0;
+  for (let index = 0; index < line; index += 1) {
+    const newline = source.indexOf('\n', offset);
+    if (newline < 0) return undefined;
+    offset = newline + 1;
+  }
+  return offset;
+}
+
+function lineStartOffset(source: string, offset: number): number {
+  const bounded = Math.max(0, Math.min(source.length, offset));
+  const newline = source.lastIndexOf('\n', Math.max(0, bounded - 1));
+  return newline + 1;
+}
+
+function lineEndOffset(source: string, start: number): number {
+  const newline = source.indexOf('\n', start);
+  return newline < 0 ? source.length : newline + 1;
+}
+
+function changeTouchesLine(
+  change: { rangeOffset: number; rangeLength: number },
+  lineStart: number,
+  lineEnd: number,
+): boolean {
+  const start = Math.max(0, change.rangeOffset);
+  const end = Math.max(start, start + change.rangeLength);
+  return change.rangeLength === 0
+    ? start >= lineStart && start <= lineEnd
+    : start < lineEnd && end > lineStart;
+}
+
+function comparePeerPriority(left: PeerIdentity, right: PeerIdentity): number {
+  return left.joinOrder - right.joinOrder || left.peerId.localeCompare(right.peerId);
+}
+
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -6326,6 +6497,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     ? raw.activeNotebookCellId
     : undefined;
   const activeLine = boundedNumber(raw.activeLine, 0, 1_000_000, true);
+  const activeLineAnchor = encodedCursorPosition(raw.activeLineAnchor);
   const cursor = sanitizeCursor(raw.cursor);
   const hardware = sanitizeHardware(raw.hardware);
   const environments = sanitizeEnvironments(raw.environments);
@@ -6338,6 +6510,7 @@ function sanitizePresenceState(value: unknown, identity: PeerIdentity): Presence
     activeNotebookCell,
     activeNotebookCellId,
     activeLine,
+    activeLineAnchor,
     cursor,
     shareCursor: raw.shareCursor === true,
     cursorColor: typeof raw.cursorColor === 'string' && /^#[0-9a-f]{6}$/i.test(raw.cursorColor)

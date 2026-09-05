@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.13 - 2026-09-05 (critical collaboration and execution repairs)
+
+- Synchronizes guest-edited dependencies before execution and materializes the host workspace before running canonical cell text. Acceptance timeouts start after the dependency barrier.
+- Preserves concurrent typing, canonical cell metadata/outputs, and unseen remote cells during VS Code text and structural updates. Shared source-only replicas avoid copying notebook outputs into every cell editor.
+- Preserves protocol execution ownership through native notebook events and explicitly selects the Pair controller for Pair Run.
+- Includes the current host epoch in invitations so participants can join after voluntary host transfers.
+- Enforces the aggregate notebook source/output budget before incremental mutations, including retained deleted-cell state.
+- Retains live kernels, variables, queued execution identity, and output routing when a notebook is renamed.
+- Removes stale CRDT or binary representations when a file changes type, keeping snapshots and host-folder verification consistent.
+- Dispatches Interrupt and Restart independently of bulk snapshot transfers; Stop cancels remaining Run All cells and previously queued batches.
+- Clears terminal recovery state so guests close after host recovery expires while keeping the same pinned host authority.
+- Installs the tested Jupyter dependencies in release CI so real-kernel regressions run on the clean Linux runner. The unpublished v0.5.12 tag is retained unchanged after its missing-dependency gate failure.
+
+Automated validation is recorded in `CRITICAL_BUG_FIXES.md`. Installed VS Code UI and physical two-computer VPN acceptance remain separate checks.
+
+## 0.5.11 - 2026-09-05 (execution and selected-line collaboration)
+
+- Routes Pair Notebook execution through the preferred Pair Jupyter controller and adds a ten-minute kernel timeout with an automatic interrupt, so a lost completion cannot leave a cell running indefinitely.
+- Synchronizes selected lines through CRDT-relative anchors, blocks edits to another participant's selected line, and keeps the lock on that logical line when new lines are inserted above it.
+- Removes cursor labels, cursor configuration, and cursor-management UI; collaborators now see only selected-line highlighting.
+
+## 0.5.10 - 2026-09-05 (laptop recovery and startup stability)
+
+- Prevents a guest from closing on a short delayed-heartbeat window while MeshTransport is still performing its bounded 30-second authenticated route recovery.
+- Keeps VS Code activation responsive while a restored guest session waits for initial host state; the dashboard and commands register before background restoration completes.
+- Contains unexpected asynchronous TURN-probe rejections instead of throwing from a process-wide handler and terminating the VS Code extension host.
+
 ## 0.5.9 - 2026-09-04 (session and notebook stability)
 
 - Unifies physical-route recovery behind one 30-second logical participant deadline while preserving pinned host authority, semantic awareness, queued work, and one correlated lifecycle trail.

@@ -1714,6 +1714,9 @@ describe('host coordination', () => {
 
   it('closes a resilient guest without electing a replacement after hard loss', () => {
     const coordinator = coordinatorFor('resilient');
+    coordinator.peers.get('host-a')!.connectionState = 'recovering';
+    coordinator.evaluate();
+    assert.equal(coordinator.closed, false);
     coordinator.markDisconnected('host-a');
     const next = coordinator.evaluate(Date.now() + 2000);
     assert.equal(next, undefined);
@@ -2178,7 +2181,7 @@ describe('protocol and notebook compatibility', () => {
     const encoded = formatInvite({
       sessionId: 'session', projectId: 'project', projectName: 'Demo project', mode: 'resilient',
       token: 'abcdefghijklmnopqrstuvwxyz1234567890', sessionEpoch: 123, hostPeerId: 'host-id', hostDisplayName: 'Alice',
-      hostIdentityKey: TEST_IDENTITY_PUBLIC_KEY,
+      hostIdentityKey: TEST_IDENTITY_PUBLIC_KEY, hostEpoch: 7,
     });
     const decoded = parseInvite(encoded);
     assert.equal(decoded.hostPeerId, 'host-id');
@@ -2186,6 +2189,11 @@ describe('protocol and notebook compatibility', () => {
     assert.equal(decoded.hostIdentityKey, TEST_IDENTITY_PUBLIC_KEY);
     assert.equal(decoded.projectName, 'Demo project');
     assert.equal(decoded.mode, 'resilient');
+    assert.equal(decoded.hostEpoch, 7);
+    assert.equal(parseInvite(encoded.replace('&hostEpoch=7', '')).hostEpoch, 0);
+    for (const value of ['-1', '1.5', 'NaN', '9007199254740992']) {
+      assert.throws(() => parseInvite(encoded.replace('hostEpoch=7', `hostEpoch=${value}`)), /malformed/);
+    }
   });
 
   it('rejects invite userinfo and fragments outside the signed room parameters', () => {

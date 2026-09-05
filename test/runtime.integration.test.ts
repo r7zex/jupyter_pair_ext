@@ -8,6 +8,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
 import { CollaborativeProject } from '../src/core/crdt';
+import { formatInvite, parseInvite } from '../src/core/types';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
@@ -423,11 +424,24 @@ describe('production SessionRuntime integration', () => {
       const hostCompute = host.computeForNotebook('work.ipynb');
       await waitFor(() => peer.computeForNotebook('work.ipynb').epoch === hostCompute.epoch, 3000, 'host compute selection propagation');
 
+      // A guest changes a dependency while the host editor owns its unsaved
+      // working copy. Background persistence must not save it; execution must.
+      peer.project.replaceText('notes.txt', 'guest dependency');
+      await waitFor(() => host.project.text('notes.txt').toString() === 'guest dependency', 3000, 'dependency convergence');
+      host.setWorkingCopyWriter(async (key: string) => key === 'notes.txt', async () => {
+        await writeFile(path.join(hostFolder, 'notes.txt'), host.project.text('notes.txt').toString());
+      });
+      await host.flush();
+      assert.equal(await readFile(path.join(hostFolder, 'notes.txt'), 'utf8'), 'host text');
       const events: any[] = [];
       const first = await peer.executeCell('work.ipynb', 'a', 'read model', (event: any) => events.push(event));
       assert.equal(first.success, true);
+      assert.equal(await readFile(path.join(hostFolder, 'notes.txt'), 'utf8'), 'guest dependency');
+      assert.equal(host.completedExecutionBarriers.size, 0, 'accepted lightweight requests consume barrier authorization');
       assert.ok(events.some((event) => event.messageType === 'execute_result'
         && event.content?.data?.['text/plain'] === 'NEW_MODEL'));
+      assert.ok(events.some((event) => event.content?.data?.['application/x-pair-test-dependency'] === 'guest dependency'),
+        'the kernel subprocess reads the synchronized dependency before reporting its result');
 
       // The standard controller publishes streaming/final outputs into the
       // notebook CRDT. A third participant therefore renders the result without
@@ -764,6 +778,35 @@ describe('runtime repair invariants', () => {
     await runtime.backgroundMessageQueue;
     assert.equal(handled, 4);
     assert.equal(runtime.pendingSnapshotRequests, 0);
+  });
+
+  it('handles kernel controls while a project snapshot is blocked', async () => {
+    const runtime: any = Object.create(SessionRuntime.prototype);
+    Object.assign(runtime, {
+      messageQueue: Promise.resolve(), backgroundMessageQueue: Promise.resolve(),
+      kernelCommandQueue: Promise.resolve(), kernelCommandWindows: new Map(),
+      pendingIncomingMessages: 0, pendingIncomingBytes: 0, pendingSnapshotRequests: 0,
+      log: logger(),
+    });
+    let releaseBulk!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseBulk = resolve; });
+    const handled: string[] = [];
+    runtime.onMessage = async (frame: { type: string; meta: { command?: string } }) => {
+      if (frame.type === 'snapshotRequest') await blocked;
+      handled.push(frame.meta.command ?? frame.type);
+    };
+    runtime.enqueueIncomingMessage({ type: 'snapshotRequest', meta: {}, payload: new Uint8Array() }, 'joining');
+    for (const command of ['interrupt', 'restart']) {
+      runtime.enqueueIncomingMessage({ type: 'kernelCommand', meta: { command }, payload: new Uint8Array() }, 'peer');
+    }
+    await runtime.kernelCommandQueue;
+    assert.deepEqual(handled, ['interrupt', 'restart']);
+    assert.equal(runtime.pendingIncomingMessages, 1);
+    releaseBulk();
+    await runtime.backgroundMessageQueue;
+    assert.deepEqual(handled, ['interrupt', 'restart', 'snapshotRequest']);
+    assert.equal(runtime.pendingIncomingMessages, 0);
+    assert.equal(runtime.pendingIncomingBytes, 0);
   });
 
   it('advertises compute hardware only from the current host', async () => {
@@ -1490,6 +1533,8 @@ describe('compute and lifecycle regression coverage', () => {
       let manifestCalls = 0;
       (runtime as any).synchronizeExecutionFiles = async () => {
         syncCalls += 1;
+        assert.equal([...runtime.pendingExecutions.values()][0]?.timer, undefined,
+          'the acceptance budget starts only after dependency transfer finishes');
         return { documents: {}, binaries: {}, directories: [] };
       };
       (runtime as any).prepareWorkingCopy = async () => { prepareCalls += 1; };
@@ -1538,12 +1583,12 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal('binaryManifest' in request, false);
       assert.equal('directoryManifest' in request, false);
       assert.equal('target' in request, false);
-      assert.equal(syncCalls, 0, 'ordinary guest execution does not call synchronizeExecutionFiles');
+      assert.equal(syncCalls, 1, 'guest execution synchronizes dependencies once before route retries');
       assert.equal(prepareCalls, 0, 'ordinary guest execution does not call prepareWorkingCopy');
       assert.equal(flushCalls, 0, 'ordinary guest execution does not call full flush');
       assert.equal(manifestCalls, 0, 'ordinary guest execution does not build a project manifest');
-      assert.equal(syncCalls + prepareCalls + flushCalls + manifestCalls, 0,
-        'ordinary Run Cell never invokes any explicit full-sync function');
+      assert.equal(prepareCalls + flushCalls + manifestCalls, 0,
+        'the host owns physical materialization; the requester uses the barrier');
       assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
@@ -2624,7 +2669,7 @@ describe('compute and lifecycle regression coverage', () => {
   });
 
   it('completes host transfer across two Trystero runtimes without dual-role divergence', async function () {
-    this.timeout(30_000);
+    this.timeout(50_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-transfer-real-'));
     const extensionRoot = path.join(root, 'extension');
     const hostFolder = path.join(root, 'host');
@@ -2641,16 +2686,20 @@ describe('compute and lifecycle regression coverage', () => {
       pythonPath: process.execPath,
     }), token, context(extensionRoot), logger());
     let peer: any;
+    let third: any;
     try {
       await host.start();
       host.project.ensureText('handoff.txt', 'saved before handoff');
       await host.flush();
       const oldHostBacking = host.descriptor.backingFolder;
-      peer = new SessionRuntime(descriptor({
+      const peerIdentity = generateIdentityCredentials();
+      const peerDescriptor = descriptor({
         sessionId, role: 'peer', peerId: 'peer-z', hostPeerId: 'host', workingFolder: peerFolder,
         pythonPath: process.execPath,
         knownPeers: [{ ...host.descriptor.localPeer }],
-      }), token, context(extensionRoot), logger());
+      });
+      peerDescriptor.localPeer.identityKey = peerIdentity.publicKey;
+      peer = new SessionRuntime(peerDescriptor, token, context(extensionRoot), logger(), peerIdentity.privateKey);
       await peer.start();
       await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'transfer peer online');
       await host.transferHost('peer-z');
@@ -2671,11 +2720,106 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(peer.descriptor.backingFolder, oldHostBacking);
       assert.equal((host as any).pendingTransfers.size, 0);
       assert.equal((peer as any).preparedHostTransfers.size, 0);
+      const invite = parseInvite(formatInvite({
+        sessionId, projectId: peer.descriptor.projectId, projectName: peer.descriptor.projectName,
+        mode: 'resilient', token, sessionEpoch: peer.coordinator.clock.sessionEpoch,
+        hostEpoch: peer.coordinator.clock.hostEpoch, hostPeerId: peer.descriptor.localPeer.peerId,
+        hostDisplayName: peer.descriptor.localPeer.displayName, hostIdentityKey: peer.descriptor.localPeer.identityKey,
+      }));
+      const thirdDescriptor = descriptor({ sessionId, role: 'peer', peerId: 'third', hostPeerId: invite.hostPeerId,
+        workingFolder: path.join(root, 'third'), pythonPath: process.execPath, knownPeers: [{ ...peer.descriptor.localPeer }] });
+      thirdDescriptor.hostEpoch = invite.hostEpoch ?? 0;
+      await mkdir(thirdDescriptor.workingFolder, { recursive: true });
+      third = new SessionRuntime(thirdDescriptor, token, context(extensionRoot), logger());
+      await third.start();
+      assert.deepEqual(third.coordinator.clock, peer.coordinator.clock);
+      await peer.transferHost('third');
+      await waitFor(() => [host, peer, third].every((item) => item.coordinator.clock.hostEpoch === 2
+        && item.coordinator.clock.hostId === 'third' && item.snapshot().waitingForHostFolder), 5000, 'second transfer and pause');
+      await third.setBackingFolder(oldHostBacking, 'reuse-existing');
+      await waitFor(() => [host, peer, third].every((item) => !item.snapshot().waitingForHostFolder), 3000, 'second transfer resume');
+      assert.equal(third.descriptor.hostEpoch, 2);
     } finally {
       host.descriptor.mode = 'host-only';
       if (peer) peer.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), peer?.leave()]);
+      if (third) third.descriptor.mode = 'host-only';
+      await Promise.allSettled([host.leave(), peer?.leave(), third?.leave()]);
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps one materialized representation through binary and collaborative file transitions', async function () {
+    this.timeout(35_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kind-transitions-'));
+    const hostFolder = path.join(root, 'host');
+    const peerFolder = path.join(root, 'peer');
+    await Promise.all([mkdir(hostFolder), mkdir(peerFolder)]);
+    const notebook = JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', source: ['x = 1'], metadata: {}, outputs: [], execution_count: null }],
+      metadata: {}, nbformat: 4, nbformat_minor: 5 });
+    await writeFile(path.join(hostFolder, 'switch.py'), 'x = 1');
+    await writeFile(path.join(hostFolder, 'work.ipynb'), notebook);
+    const sessionId = `kind-${Date.now()}`;
+    const token = 'kind-transition-token-that-is-long-enough';
+    const host = new SessionRuntime(descriptor({ sessionId, role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: hostFolder, pythonPath: process.execPath }), token, context(root), logger());
+    let peer: any;
+    try {
+      await host.start();
+      peer = new SessionRuntime(descriptor({ sessionId, role: 'peer', peerId: 'peer', hostPeerId: 'host',
+        workingFolder: peerFolder, pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(root), logger());
+      await peer.start();
+      for (const [key, original, kind] of [['switch.py', 'x = 1', 'text'], ['work.ipynb', notebook, 'notebook']]) {
+        await writeFile(path.join(hostFolder, key!), Buffer.from([255, 0, 1]));
+        await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, key!)), 'change');
+        await waitFor(() => peer.binaryVersions.has(key) && !peer.project.has(key), 4000, 'binary representation');
+        const materialization = await peer.collectMaterialization();
+        assert.equal([...materialization.documents, ...materialization.binaries].filter((file: any) => file.relativePath === key).length, 1);
+        await writeFile(path.join(hostFolder, key!), original!);
+        await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, key!)), 'change');
+        await waitFor(() => peer.project.kindOf(key) === kind && !peer.binaryVersions.has(key), 4000, 'collaborative representation');
+      }
+      await host.flush();
+      const backing = host.descriptor.backingFolder;
+      await host.transferHost('peer');
+      await waitFor(() => peer.descriptor.role === 'host', 3000, 'transferred host');
+      await peer.setBackingFolder(backing, 'reuse-existing');
+      assert.equal((await peer.collectMaterialization()).documents.length, 2);
+    } finally {
+      await Promise.allSettled([host.leave(), peer?.leave()]);
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  it('preserves a live Jupyter kernel and its variables across a notebook rename', async function () {
+    this.timeout(35_000);
+    const folder = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-rename-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: `rename-${Date.now()}`, role: 'host',
+      peerId: 'host', hostPeerId: 'host', workingFolder: folder, pythonPath: 'python' }),
+    'rename-kernel-token-that-is-long-enough', context(path.resolve(__dirname, '../..')), logger());
+    try {
+      await writeFile(path.join(folder, 'work.ipynb'), JSON.stringify({ cells: [
+        { cell_type: 'code', id: 'a', source: ['x = 42'], metadata: {}, outputs: [], execution_count: null },
+      ], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
+      await runtime.start();
+      await runtime.executeCell('work.ipynb', 'a', 'x = 42', () => undefined);
+      const kernel = runtime.kernels.get('work.ipynb');
+      const events: any[] = [];
+      const active = runtime.executeCell('work.ipynb', 'a', 'import time; time.sleep(0.5); x += 1; print(x)', (event: any) => events.push(event));
+      await waitFor(() => runtime.kernelStatuses.get('work.ipynb') === 'Busy', 1000, 'active execution');
+      await rename(path.join(folder, 'work.ipynb'), path.join(folder, 'renamed.ipynb'));
+      await runtime.onLocalRename(fakeVscode.Uri.file(path.join(folder, 'work.ipynb')), fakeVscode.Uri.file(path.join(folder, 'renamed.ipynb')));
+      assert.equal((await active).success, true);
+      assert.equal(runtime.kernels.get('renamed.ipynb'), kernel);
+      assert.equal(runtime.kernelStatuses.has('work.ipynb'), false);
+      const result = await runtime.executeCell('renamed.ipynb', 'a', 'print(x)', (event: any) => events.push(event));
+      assert.equal(result.success, true);
+      assert.ok(events.some((event) => event.messageType === 'stream' && String(event.content?.text).includes('43')));
+      assert.equal(runtime.kernels.size, 1);
+      assert.equal(runtime.project.has('work.ipynb'), false);
+    } finally {
+      await runtime.leave();
+      await rm(folder, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+      await rm(`${folder}-backing`, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     }
   });
 
@@ -2980,6 +3124,43 @@ describe('compute and lifecycle regression coverage', () => {
 });
 
 describe('standard VS Code NotebookController production path', () => {
+  it('selects the Pair controller before Pair Run and refuses a failed kernel selection', async () => {
+    const controller = new PairNotebookController(logger());
+    const notebook = notebookForController('A');
+    fakeCell('a', notebook);
+    const project = new CollaborativeProject();
+    let pairRuns = 0;
+    let nativeRuns = 0;
+    let selected = 'native-python';
+    let allowSelection = true;
+    const originalCommand = fakeVscode.commands.executeCommand;
+    controller.setRuntime({ project, descriptor: { localPeer: { peerId: 'guest' } },
+      notebookKey: () => 'A', notebookCellId: () => 'a', computeForNotebook: () => ({ executorId: 'host' }),
+      executeCell: async () => { pairRuns += 1; assert.equal(selected, 'pair-notebook-jupyter'); return { success: true, content: {} }; },
+    });
+    fakeVscode.window.activeNotebookEditor = { notebook, selection: { start: 0, end: 1 } };
+    fakeVscode.commands.executeCommand = async (command: string, options: any) => {
+      if (command === 'notebook.cell.execute') nativeRuns += 1;
+      if (command !== 'notebook.selectKernel') return undefined;
+      assert.equal(options.extension, 'pair-notebook.pair-notebook');
+      assert.equal(options.notebookEditor.notebook, notebook);
+      if (allowSelection) selected = options.id;
+      return allowSelection;
+    };
+    try {
+      await controller.executeActive();
+      assert.equal(pairRuns, 1);
+      assert.equal(nativeRuns, 0);
+      allowSelection = false;
+      await assert.rejects(controller.executeActive(), /could not select/);
+      assert.equal(pairRuns, 1);
+    } finally {
+      fakeVscode.commands.executeCommand = originalCommand;
+      fakeVscode.window.activeNotebookEditor = undefined;
+      controller.dispose(); project.destroy();
+    }
+  });
+
   it('routes Run Cell through per-notebook queues and routes Interrupt to the runtime', async () => {
     const controller = new PairNotebookController(logger());
     const calls: string[] = [];
@@ -3005,10 +3186,10 @@ describe('standard VS Code NotebookController production path', () => {
       reportInputResolved: (key: string) => { calls.push(`${key}:input-resolved`); },
       replyToInput: (requestId: string, value: string) => { calls.push(`${requestId}:reply:${value}`); },
       cancelInput: async (requestId: string) => { calls.push(`${requestId}:cancel`); },
-      project: {
+      project: Object.assign(new CollaborativeProject(), {
         setCellOutputs: () => { outputPublishCount += 1; },
         setCellExecution: () => { executionPublishCount += 1; },
-      },
+      }),
     };
     controller.setRuntime(runtime);
     const productionController = fakeVscode.__controllers.at(-1);
@@ -3038,6 +3219,28 @@ describe('standard VS Code NotebookController production path', () => {
 
     await productionController.interruptHandler(notebookA);
     assert.equal(calls.at(-1), 'A:interrupt');
+
+    // Stop cancels both the remainder of Run All and batches queued before it.
+    let releaseInterrupted!: () => void;
+    const interruptedGate = new Promise<void>((resolve) => { releaseInterrupted = resolve; });
+    const executedAfterStop: string[] = [];
+    runtime.executeCell = async (_key: string, id: string) => {
+      executedAfterStop.push(id);
+      if (id === 'stop-first') await interruptedGate;
+      return { requestId: id, success: id !== 'stop-first', content: { status: 'ok' } };
+    };
+    const first = fakeCell('stop-first', notebookA);
+    const remaining = fakeCell('stop-remaining', notebookA);
+    const queued = fakeCell('stop-queued', notebookA);
+    const runAll = productionController.executeHandler([first, remaining], notebookA);
+    const queuedRun = productionController.executeHandler([queued], notebookA);
+    await waitFor(() => executedAfterStop.includes('stop-first'), 2000, 'Run All starts');
+    await productionController.interruptHandler(notebookA);
+    releaseInterrupted();
+    await Promise.all([runAll, queuedRun]);
+    assert.deepEqual(executedAfterStop, ['stop-first']);
+    await productionController.executeHandler([queued], notebookA);
+    assert.deepEqual(executedAfterStop, ['stop-first', 'stop-queued'], 'a fresh Run still works after Stop');
 
     runtime.executeCell = async (_key: string, id: string, _code: string, onEvent: (event: any) => void) => {
       onEvent({ type: 'inputRequest', requestId: id, content: { prompt: 'Name:' } });
@@ -3924,7 +4127,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (command.command === 'execute') {
     const value = fs.readFileSync(path.join(process.env.PAIR_NOTEBOOK_CWD, 'model.bin'), 'utf8');
     emit({ type: 'accepted', requestId });
-    emit({ type: 'iopub', requestId, messageType: 'execute_result', content: { data: { 'text/plain': value }, execution_count: 1 } });
+    const dependency = path.join(process.env.PAIR_NOTEBOOK_CWD, 'notes.txt');
+    const data = { 'text/plain': value };
+    if (fs.existsSync(dependency)) data['application/x-pair-test-dependency'] = fs.readFileSync(dependency, 'utf8');
+    emit({ type: 'iopub', requestId, messageType: 'execute_result', content: { data, execution_count: 1 } });
     emit({ type: 'complete', requestId, success: true, executionCount: 1, content: { status: 'ok', execution_count: 1 } });
   } else if (command.command === 'interrupt' || command.command === 'restart') {
     emit({ type: 'commandResult', requestId, command: command.command });

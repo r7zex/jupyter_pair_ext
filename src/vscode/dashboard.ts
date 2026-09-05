@@ -28,7 +28,6 @@ interface DashboardState {
   };
   network?: { direct: number; down: number; up: number; address: string };
   compute?: { name: string; cpu: string; execution: string; python: string; kernel: string; device: string };
-  cursors?: { share: boolean; remote: boolean; names: boolean; color: string };
   closed?: boolean;
   runtimeState?: string;
   runtimeDetail?: string;
@@ -162,11 +161,6 @@ const commandMap: Record<string, string> = {
   compute: 'pairNotebook.changeCompute',
   hardware: 'pairNotebook.refreshHardware',
   recent: 'pairNotebook.openRecentProject',
-  cursorShare: 'pairNotebook.toggleShareMyCursor',
-  cursors: 'pairNotebook.toggleRemoteCursors',
-  cursorNames: 'pairNotebook.toggleRemoteCursorNames',
-  cursorPeople: 'pairNotebook.manageParticipantCursors',
-  cursorColor: 'pairNotebook.changeMyCursorColor',
 };
 
 function formatError(error: unknown): string {
@@ -188,7 +182,6 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
   const selectedGpu = gpuIndex !== undefined
     ? compute?.hardware?.gpus.find((gpu) => gpu.index === gpuIndex)
     : undefined;
-  const configuredColor = vscode.workspace.getConfiguration('pairNotebook').get<string>('myCursorColor', '#4FC3F7');
   const connection = buildConnectionView(snapshot);
   return {
     live: true,
@@ -241,12 +234,6 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
       python: compute?.hardware?.python.version ?? 'неизвестно',
       kernel: snapshot.kernelStatus,
       device: snapshot.computeDevice === 'cpu' ? 'CPU' : `GPU ${gpuIndex ?? ''}`.trim(),
-    },
-    cursors: {
-      share: vscode.workspace.getConfiguration('pairNotebook').get<boolean>('shareMyCursor', true),
-      remote: vscode.workspace.getConfiguration('pairNotebook').get<boolean>('showRemoteCursors', true),
-      names: vscode.workspace.getConfiguration('pairNotebook').get<boolean>('showRemoteCursorNames', true),
-      color: /^#[0-9a-f]{6}$/i.test(configuredColor) ? configuredColor : '#4FC3F7',
     },
     closed: snapshot.closed,
     runtimeState: snapshot.runtimeState,
@@ -487,7 +474,6 @@ function html(): string {
       const hostCard = '<div class="card"><strong>👑 '+esc(state.hostName)+'</strong></div>';
       const computeCard = '<div class="card"><div class="row"><strong>🖥 '+esc(state.compute?.name)+'</strong><span class="badge">'+esc(state.compute?.device)+'</span></div><div class="tiny">'+esc(state.compute?.cpu)+'</div><div class="tiny">'+esc(state.compute?.execution)+'</div><div class="tiny">Python '+esc(state.compute?.python)+' • '+esc(kernelNames[state.compute?.kernel]||state.compute?.kernel)+'</div></div>';
       const networkCard = '<div class="card"><div class="row"><span>Прямые P2P-подключения</span><span>'+esc(state.network?.direct)+'</span></div><div class="row"><span>↓ '+bytes(state.network?.down||0)+'</span><span>↑ '+bytes(state.network?.up||0)+'</span></div><div class="tiny">'+esc(state.network?.address)+'</div></div>';
-      const cursorActions = '<div class="actions">'+toggle('cursorShare',state.cursors?.share,'Мой курсор')+toggle('cursors',state.cursors?.remote,'Чужие курсоры')+toggle('cursorNames',state.cursors?.names,'Имена')+action('cursorColor','Цвет',colorName(state.cursors?.color),{title:'Текущий цвет: '+colorName(state.cursors?.color)+' ('+state.cursors?.color+')'})+action('cursorPeople','Участники','НАСТРОИТЬ')+'</div>';
       const autosaveFolder = state.autosave?.folder || 'Папка не выбрана';
       const paused = Boolean(state.waitingForHostFolder);
       const quickActions = '<div class="actions">'+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.isHost?state.compute?.device:'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
@@ -502,10 +488,9 @@ function html(): string {
         section('participants','УЧАСТНИКИ В СЕТИ: '+onlineParticipants.length,people,'section-participants')+
         section('compute','ВЫЧИСЛЕНИЯ',computeCard,'section-compute')+
         section('network','СЕТЬ',networkCard)+
-        section('cursorsSection','КУРСОРЫ',cursorActions)+
         section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
         '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+transferAction+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
-      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag','cursorShare','cursors','cursorNames','cursorPeople','cursorColor']) {
+      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
       }
