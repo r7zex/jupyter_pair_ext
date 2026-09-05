@@ -1300,6 +1300,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     payload: Uint8Array<ArrayBufferLike>,
   ): Promise<void> {
     const requestId = String(meta.requestId ?? '');
+    const notebookKey = String(meta.notebookKey ?? '');
+    await this.synchronizeExecutionFiles(executorId, requestId, notebookKey, this.computeForNotebook(notebookKey));
     const deadline = Date.now() + EXECUTION_ACCEPT_TIMEOUT_MS;
     let attempt = 0;
     while (!this.closed && Date.now() < deadline) {
@@ -4572,10 +4574,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private dropBarrierAuthorization(key: string): void {
-    const pending = this.pendingBarrierAuthorizations.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingBarrierAuthorizations.delete(key);
+    for (const authorizations of [this.pendingBarrierAuthorizations, this.completedExecutionBarriers]) {
+      const authorization = authorizations.get(key);
+      if (authorization) clearTimeout(authorization.timer);
+      authorizations.delete(key);
+    }
   }
 
   private remoteComputeTargetError(notebookKey: string, target: NotebookComputeTarget): string | undefined {
@@ -5596,7 +5599,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       // The host executes only its own canonical CRDT cell text after exact
       // revision+digest convergence. Guest payload is never a code source.
       code = canonical.source;
-      materializeWorkspace = false;
+      this.dropBarrierAuthorization(barrierAuthorizationKey(sourceId, requestId));
+      materializeWorkspace = true;
     } else {
       target = legacyTarget!;
       const manifest = legacyManifest!;
@@ -5943,12 +5947,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
-    // Local execution and the explicit legacy barrier materialize the whole
-    // working copy before Python imports. Ordinary guest Run Cell passes
-    // materializeWorkspace=false: the target cell executes directly from
-    // host-canonical CRDT text, while imports observe the host physical working
-    // copy maintained by normal persistence. Exact project-wide filesystem
-    // convergence remains an explicit save/transfer/manual-barrier operation.
+    // Python reads the physical working copy, including files whose current
+    // canonical content is still owned by an unsaved VS Code editor.
     if (materializeWorkspace) {
       await this.prepareWorkingCopy?.();
       await this.flush();

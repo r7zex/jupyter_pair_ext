@@ -423,9 +423,20 @@ describe('production SessionRuntime integration', () => {
       const hostCompute = host.computeForNotebook('work.ipynb');
       await waitFor(() => peer.computeForNotebook('work.ipynb').epoch === hostCompute.epoch, 3000, 'host compute selection propagation');
 
+      // A guest changes a dependency while the host editor owns its unsaved
+      // working copy. Background persistence must not save it; execution must.
+      peer.project.replaceText('notes.txt', 'guest dependency');
+      await waitFor(() => host.project.text('notes.txt').toString() === 'guest dependency', 3000, 'dependency convergence');
+      host.setWorkingCopyWriter(async (key: string) => key === 'notes.txt', async () => {
+        await writeFile(path.join(hostFolder, 'notes.txt'), host.project.text('notes.txt').toString());
+      });
+      await host.flush();
+      assert.equal(await readFile(path.join(hostFolder, 'notes.txt'), 'utf8'), 'host text');
       const events: any[] = [];
       const first = await peer.executeCell('work.ipynb', 'a', 'read model', (event: any) => events.push(event));
       assert.equal(first.success, true);
+      assert.equal(await readFile(path.join(hostFolder, 'notes.txt'), 'utf8'), 'guest dependency');
+      assert.equal(host.completedExecutionBarriers.size, 0, 'accepted lightweight requests consume barrier authorization');
       assert.ok(events.some((event) => event.messageType === 'execute_result'
         && event.content?.data?.['text/plain'] === 'NEW_MODEL'));
 
@@ -1538,12 +1549,12 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal('binaryManifest' in request, false);
       assert.equal('directoryManifest' in request, false);
       assert.equal('target' in request, false);
-      assert.equal(syncCalls, 0, 'ordinary guest execution does not call synchronizeExecutionFiles');
+      assert.equal(syncCalls, 1, 'guest execution synchronizes dependencies once before route retries');
       assert.equal(prepareCalls, 0, 'ordinary guest execution does not call prepareWorkingCopy');
       assert.equal(flushCalls, 0, 'ordinary guest execution does not call full flush');
       assert.equal(manifestCalls, 0, 'ordinary guest execution does not build a project manifest');
-      assert.equal(syncCalls + prepareCalls + flushCalls + manifestCalls, 0,
-        'ordinary Run Cell never invokes any explicit full-sync function');
+      assert.equal(prepareCalls + flushCalls + manifestCalls, 0,
+        'the host owns physical materialization; the requester uses the barrier');
       assert.ok(sentTypes.includes('executeResultAck'), 'the terminal result is acknowledged');
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
