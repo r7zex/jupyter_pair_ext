@@ -3416,8 +3416,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     };
     for (const key of this.project.keys()) {
-      if (this.effectiveFileState(key)?.deleted) continue;
       const kind = this.project.kindOf(key);
+      const state = this.effectiveFileState(key);
+      if (state?.deleted || (state && state.kind !== kind)) continue;
       if (kind === 'text') {
         const bytes = Buffer.from(this.project.text(key).toString(), 'utf8');
         if (bytes.byteLength > MAX_TEXT_DOCUMENT_BYTES) {
@@ -3430,7 +3431,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     const binaries: Array<{ relativePath: string; sourcePath: string; hash: string; size: number }> = [];
     for (const [relativePath, version] of this.binaryVersions) {
-      if (this.effectiveFileState(relativePath)?.deleted) continue;
+      const state = this.effectiveFileState(relativePath);
+      if (state?.deleted || (state && state.kind !== 'binary')) continue;
       const sourcePath = await safeProjectTarget(this.descriptor.workingFolder, relativePath, true);
       const info = await lstat(sourcePath);
       if (info.isSymbolicLink() || !info.isFile()) {
@@ -4210,6 +4212,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private async ensureLivePathMaterialized(relativePath: string, state: FileLifecycleState): Promise<void> {
+    const previousKind = this.project.kindOf(relativePath);
+    if (previousKind && previousKind !== state.kind) this.project.deleteDocument(relativePath);
+    if (state.kind !== 'binary') this.deleteBinaryVersions(relativePath);
+    if (state.kind !== 'directory') this.directories.delete(relativePath);
     if (state.kind === 'directory') {
       this.directories.add(relativePath);
       await this.storage?.createDirectory(relativePath);

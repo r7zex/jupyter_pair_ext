@@ -2719,6 +2719,48 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('keeps one materialized representation through binary and collaborative file transitions', async function () {
+    this.timeout(35_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kind-transitions-'));
+    const hostFolder = path.join(root, 'host');
+    const peerFolder = path.join(root, 'peer');
+    await Promise.all([mkdir(hostFolder), mkdir(peerFolder)]);
+    const notebook = JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', source: ['x = 1'], metadata: {}, outputs: [], execution_count: null }],
+      metadata: {}, nbformat: 4, nbformat_minor: 5 });
+    await writeFile(path.join(hostFolder, 'switch.py'), 'x = 1');
+    await writeFile(path.join(hostFolder, 'work.ipynb'), notebook);
+    const sessionId = `kind-${Date.now()}`;
+    const token = 'kind-transition-token-that-is-long-enough';
+    const host = new SessionRuntime(descriptor({ sessionId, role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: hostFolder, pythonPath: process.execPath }), token, context(root), logger());
+    let peer: any;
+    try {
+      await host.start();
+      peer = new SessionRuntime(descriptor({ sessionId, role: 'peer', peerId: 'peer', hostPeerId: 'host',
+        workingFolder: peerFolder, pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(root), logger());
+      await peer.start();
+      for (const [key, original, kind] of [['switch.py', 'x = 1', 'text'], ['work.ipynb', notebook, 'notebook']]) {
+        await writeFile(path.join(hostFolder, key!), Buffer.from([255, 0, 1]));
+        await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, key!)), 'change');
+        await waitFor(() => peer.binaryVersions.has(key) && !peer.project.has(key), 4000, 'binary representation');
+        const materialization = await peer.collectMaterialization();
+        assert.equal([...materialization.documents, ...materialization.binaries].filter((file: any) => file.relativePath === key).length, 1);
+        await writeFile(path.join(hostFolder, key!), original!);
+        await host.onLocalFile(fakeVscode.Uri.file(path.join(hostFolder, key!)), 'change');
+        await waitFor(() => peer.project.kindOf(key) === kind && !peer.binaryVersions.has(key), 4000, 'collaborative representation');
+      }
+      await host.flush();
+      const backing = host.descriptor.backingFolder;
+      await host.transferHost('peer');
+      await waitFor(() => peer.descriptor.role === 'host', 3000, 'transferred host');
+      await peer.setBackingFolder(backing, 'reuse-existing');
+      assert.equal((await peer.collectMaterialization()).documents.length, 2);
+    } finally {
+      await Promise.allSettled([host.leave(), peer?.leave()]);
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
   it('preserves a live Jupyter kernel and its variables across a notebook rename', async function () {
     this.timeout(35_000);
     const folder = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-rename-'));
