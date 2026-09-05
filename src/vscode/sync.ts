@@ -48,10 +48,16 @@ export type LineLockGuard = (
   canonicalSource: string,
 ) => string | undefined;
 
+interface PendingTextEdit {
+  version: number;
+  target: string;
+  events: Array<{ event: vscode.TextDocumentChangeEvent; matchesTarget: boolean }>;
+}
+
 export class EditorSynchronizer implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly textReplicas = new Map<string, EditorTextReplica>();
-  private readonly pendingTextEdits = new Map<string, vscode.TextDocumentChangeEvent[]>();
+  private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
   private readonly textRenders = new Map<string, Promise<void>>();
   private readonly applyingNotebooks = new Set<string>();
   private readonly textObservers = new Map<string, (event: Y.YTextEvent) => void>();
@@ -673,18 +679,16 @@ export class EditorSynchronizer implements vscode.Disposable {
         edit.insertText,
       );
       const version = document.version;
-      const events: vscode.TextDocumentChangeEvent[] = [];
-      this.pendingTextEdits.set(uri, events);
+      const pending: PendingTextEdit = { version, target, events: [] };
+      this.pendingTextEdits.set(uri, pending);
       let applied = false;
       try {
         applied = await vscode.workspace.applyEdit(workspaceEdit);
       } finally {
         this.pendingTextEdits.delete(uri);
         let echoed = false;
-        for (const event of events) {
-          const change = event.contentChanges[0];
-          if (applied && !echoed && event.contentChanges.length === 1 && change
-            && change.rangeOffset === edit.offset && change.rangeLength === edit.deleteCount && change.text === edit.insertText) {
+        for (const { event, matchesTarget } of pending.events) {
+          if (applied && !echoed && matchesTarget) {
             echoed = true;
             if (replica) this.replaceTextReplica(uri, replica);
           } else {
@@ -718,9 +722,14 @@ export class EditorSynchronizer implements vscode.Disposable {
   private consumeTextEcho(event: vscode.TextDocumentChangeEvent): boolean {
     const pending = this.pendingTextEdits.get(event.document.uri.toString());
     if (!pending) return false;
-    // Only a successful version-checked WorkspaceEdit proves which event is
-    // its echo. Identical user typing before a rejected edit is still local.
-    pending.push(event);
+    // VS Code can split or reshape the requested replacement. Capture its
+    // resulting state now: event.document is live and may change before replay.
+    // A rejected WorkspaceEdit never consumes even an identical user edit.
+    pending.events.push({
+      event,
+      matchesTarget: event.document.version === pending.version + 1
+        && event.document.getText() === pending.target,
+    });
     return true;
   }
 

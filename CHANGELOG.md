@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.14 - 2026-09-06 (editor echo and kernel selection fixes)
+
+- Prevents duplicated characters and newlines when VS Code splits or reshapes a remote text edit. Echo recognition uses the applied document version and resulting text, while preserving concurrent user typing. Fixes #12.
+- Selects the Pair Notebook controller when a shared notebook becomes active or a session attaches, keeping the kernel selector populated across file switches without restarting the running Python kernels.
+- Clears obsolete internal-write echo history after an external file change, so restoring previous content is synchronized and binary-to-text/notebook transitions complete correctly.
+- Adds regression coverage for split and reshaped editor echoes, concurrent typing, kernel selection across notebook switches, and restored file content.
+
+Installed VS Code UI and physical two-computer acceptance remain separate checks.
+
 ## 0.5.13 - 2026-09-05 (critical collaboration and execution repairs)
 
 - Synchronizes guest-edited dependencies before execution and materializes the host workspace before running canonical cell text. Acceptance timeouts start after the dependency barrier.

@@ -2748,6 +2748,21 @@ describe('compute and lifecycle regression coverage', () => {
     }
   });
 
+  it('expires internal write echoes after observing different external content', () => {
+    const runtime = Object.create(SessionRuntime.prototype) as any;
+    runtime.internalWorkingWrites = new Map();
+    const original = Buffer.from('x = 1');
+    const internal = Buffer.from('x = 2');
+    runtime.rememberInternalWorkingWrite('switch.py', original);
+    runtime.rememberInternalWorkingWrite('switch.py', internal);
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', original), true);
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', internal), true);
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', internal), true, 'duplicate watcher echoes stay suppressed');
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', Buffer.from([255, 0, 1])), false);
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', original), false, 'restoring previous bytes is a new user edit');
+    assert.equal(runtime.matchesInternalWorkingWrite('switch.py', internal), false);
+  });
+
   it('keeps one materialized representation through binary and collaborative file transitions', async function () {
     this.timeout(35_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kind-transitions-'));
@@ -3124,6 +3139,54 @@ describe('compute and lifecycle regression coverage', () => {
 });
 
 describe('standard VS Code NotebookController production path', () => {
+  it('restores the Pair kernel on notebook switches without restarting or executing', async () => {
+    const notebookA = notebookForController('A');
+    const notebookB = notebookForController('B');
+    const outside = notebookForController('outside');
+    const originalCommand = fakeVscode.commands.executeCommand;
+    const originalSubscribe = fakeVscode.window.onDidChangeActiveNotebookEditor;
+    let activate: ((editor: any) => void) | undefined;
+    const selections: any[] = [];
+    fakeVscode.window.onDidChangeActiveNotebookEditor = (callback: (editor: any) => void) => {
+      activate = callback;
+      return { dispose: () => { activate = undefined; } };
+    };
+    fakeVscode.commands.executeCommand = async (command: string, options: any) => {
+      assert.equal(command, 'notebook.selectKernel');
+      assert.equal(options.id, 'pair-notebook-jupyter');
+      selections.push(options.notebookEditor.notebook);
+      return true;
+    };
+    fakeVscode.window.activeNotebookEditor = { notebook: notebookA };
+    const controller = new PairNotebookController(logger());
+    const runtime = {
+      notebookKey: (uri: any) => uri === outside.uri ? undefined : uri.fsPath,
+      restartNotebook: () => assert.fail('switching files must not restart a kernel'),
+      executeCell: () => assert.fail('switching files must not execute a cell'),
+    };
+    try {
+      controller.setRuntime(runtime);
+      await waitFor(() => selections.length === 1, 1000, 'initial kernel selection');
+      for (const notebook of [notebookB, notebookA]) {
+        fakeVscode.window.activeNotebookEditor = { notebook };
+        activate?.(fakeVscode.window.activeNotebookEditor);
+      }
+      await waitFor(() => selections.length === 3, 1000, 'kernel selection after tab switches');
+      assert.deepEqual(selections, [notebookA, notebookB, notebookA]);
+      activate?.(undefined);
+      activate?.({ notebook: outside });
+      controller.setRuntime(undefined);
+      activate?.({ notebook: notebookB });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(selections.length, 3, 'unshared files and ended sessions must not claim a kernel');
+    } finally {
+      controller.dispose();
+      fakeVscode.commands.executeCommand = originalCommand;
+      fakeVscode.window.onDidChangeActiveNotebookEditor = originalSubscribe;
+      fakeVscode.window.activeNotebookEditor = undefined;
+    }
+  });
+
   it('selects the Pair controller before Pair Run and refuses a failed kernel selection', async () => {
     const controller = new PairNotebookController(logger());
     const notebook = notebookForController('A');

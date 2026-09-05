@@ -86,6 +86,108 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     });
   }
 
+  for (const notebookCell of [false, true]) for (const inserted of [')', '\n', 'r']) {
+    for (const typeAfterEcho of [false, true]) {
+      it(`consumes a split remote ${JSON.stringify(inserted)} echo in a ${notebookCell ? 'cell' : 'file'} with subsequent typing=${typeAfterEcho}`, async () => {
+        const root = path.resolve('/tmp/pair-editor-split-echo');
+        const initial = 'print(a';
+        const notebook = fakeNotebook(root, [fakeCell(initial, 'a')]);
+        const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), initial);
+        if (notebookCell) vscodeBoundary.__reset(notebook);
+        else vscodeBoundary.__resetText(document);
+        const project = new CollaborativeProject();
+        const peer = new CollaborativeProject();
+        const synchronizer = new EditorSynchronizer(project, root, logger());
+        const fireTextChange = vscodeBoundary.__fireTextChange;
+        const localUpdates: ProjectUpdate[] = [];
+        try {
+          if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+          const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+          const kind = notebookCell ? 'notebook' : 'text';
+          peer.applyRemoteUpdate(key, kind, project.encodeUpdate(key));
+          const changes = [
+            { offset: initial.length, deleteCount: 0, insertText: inserted },
+            { offset: 0, deleteCount: 0, insertText: '#' },
+          ];
+          if (notebookCell) peer.applyCellTextChanges(key, 'a', changes);
+          else peer.applyTextChanges(key, changes);
+          const remoteUpdate = peer.encodeUpdate(key);
+          const target = `#${initial}${inserted}`;
+          const expected = `${target}${typeAfterEcho ? '!' : ''}`;
+          let split = false;
+          vscodeBoundary.__fireTextChange = (changed: any, contentChanges: any[]) => {
+            if (changed !== document || split) return fireTextChange(changed, contentChanges);
+            split = true;
+            assert.equal(changed.getText(), target);
+            // Native VS Code may minimize one replacement into disjoint edits.
+            fireTextChange(changed, changes.map((change) => ({
+              rangeOffset: change.offset, rangeLength: change.deleteCount, text: change.insertText,
+            })));
+            if (typeAfterEcho) {
+              changed.text += '!';
+              fireTextChange(changed, [{ rangeOffset: target.length, rangeLength: 0, text: '!' }]);
+            }
+          };
+          project.on('update', (event: ProjectUpdate) => {
+            if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+          });
+          project.applyRemoteUpdate(key, kind, remoteUpdate, notebookCell ? { type: 'cellText', cellId: 'a' } : undefined);
+          await synchronizer.prepareWorkingCopy();
+          assert.equal(document.getText(), expected);
+          assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), expected);
+          assert.equal(localUpdates.length, typeAfterEcho ? 1 : 0, 'only actual typing may publish a new update');
+          applyUpdates(peer, localUpdates);
+          assert.equal((notebookCell ? peer.cellSource(key, 'a') : peer.text(key)).toString(), expected);
+          project.applyRemoteUpdate(key, kind, remoteUpdate);
+          await synchronizer.prepareWorkingCopy();
+          assert.equal(document.getText(), expected, 'wire replay must remain idempotent');
+          assert.equal(localUpdates.length, typeAfterEcho ? 1 : 0);
+        } finally {
+          vscodeBoundary.__fireTextChange = fireTextChange;
+          synchronizer.dispose(); project.destroy(); peer.destroy();
+        }
+      });
+    }
+  }
+
+  for (const notebookCell of [false, true]) {
+    it(`consumes an equivalent reshaped single remote echo in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+      const root = path.resolve('/tmp/pair-editor-reshaped-echo');
+      const notebook = fakeNotebook(root, [fakeCell('aa', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'aa');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      const fireTextChange = vscodeBoundary.__fireTextChange;
+      const localUpdates: ProjectUpdate[] = [];
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        let reshaped = false;
+        vscodeBoundary.__fireTextChange = (changed: any, changes: any[]) => {
+          if (changed !== document || reshaped) return fireTextChange(changed, changes);
+          reshaped = true;
+          // Inserting the same character at either edge has the same result.
+          fireTextChange(changed, [{ rangeOffset: 0, rangeLength: 0, text: 'a' }]);
+        };
+        project.on('update', (event: ProjectUpdate) => {
+          if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+        });
+        const changes = [{ offset: 2, deleteCount: 0, insertText: 'a' }];
+        if (notebookCell) project.applyCellTextChanges(key, 'a', changes, REMOTE_ORIGIN);
+        else project.applyTextChanges(key, changes, REMOTE_ORIGIN);
+        await synchronizer.prepareWorkingCopy();
+        assert.equal(document.getText(), 'aaa');
+        assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), 'aaa');
+        assert.equal(localUpdates.length, 0);
+      } finally {
+        vscodeBoundary.__fireTextChange = fireTextChange;
+        synchronizer.dispose(); project.destroy();
+      }
+    });
+  }
+
   it('keeps IDs through middle insertion, first deletion, and movement', async () => {
     const root = path.resolve('/tmp/pair-editor-stable');
     const notebook = fakeNotebook(root, [fakeCell('A', 'a'), fakeCell('B', 'b')]);
@@ -998,6 +1100,7 @@ function fakeCell(source: string, id?: string): any {
     uri: new vscodeBoundary.Uri(`/cell/${handle}`, 'vscode-notebook-cell'),
     languageId: 'python',
     text: source,
+    version: 1,
     getText() { return this.text; },
     positionAt(offset: number) { return offset; },
   };
@@ -1016,6 +1119,7 @@ function fakeTextDocument(absolutePath: string, source: string): any {
   return {
     uri: vscodeBoundary.Uri.file(absolutePath),
     text: source,
+    version: 1,
     saveCount: 0,
     getText() { return this.text; },
     positionAt(offset: number) { return offset; },

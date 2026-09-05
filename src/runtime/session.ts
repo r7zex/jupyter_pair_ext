@@ -6271,7 +6271,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     this.internalWorkingWrites.set(relativePath, recent);
     const hash = createHash('sha256').update(bytes).digest('hex');
-    return recent.some((entry) => entry.hash === hash);
+    const matches = recent.some((entry) => entry.hash === hash);
+    // Once external content is observed, restoring earlier bytes is a new edit.
+    if (!matches) this.internalWorkingWrites.delete(relativePath);
+    return matches;
   }
 }
 

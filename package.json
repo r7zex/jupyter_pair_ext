@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, direct WebRTC, and redundant Nostr/MQTT relay fallback.",
-  "version": "0.5.13",
+  "version": "0.5.14",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {

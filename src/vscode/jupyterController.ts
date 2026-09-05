@@ -63,6 +63,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.disposables.push(
       this.controller,
       vscode.workspace.onDidOpenNotebookDocument(claim),
+      vscode.window.onDidChangeActiveNotebookEditor(this.selectActiveController),
     );
   }
 
@@ -78,6 +79,22 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         this.controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
       }
     }
+    this.selectActiveController(vscode.window.activeNotebookEditor);
+  }
+
+  private readonly selectActiveController = (editor: vscode.NotebookEditor | undefined): void => {
+    if (!editor || !this.runtime?.notebookKey(editor.notebook.uri)) return;
+    // Affinity alone does not bind the controller to a newly activated notebook.
+    void this.selectController(editor).catch((error: unknown) => {
+      this.log.appendLine(`[error] Could not restore Pair Notebook kernel selection: ${String(error)}`);
+    });
+  };
+
+  private async selectController(editor: vscode.NotebookEditor): Promise<void> {
+    const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
+      id: 'pair-notebook-jupyter', extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
+    });
+    if (selected !== true) throw new Error('VS Code could not select the Pair Notebook kernel.');
   }
 
   public setSynchronizer(synchronizer: EditorSynchronizer | undefined): void {
@@ -105,10 +122,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     if (!runtime.notebookKey(editor.notebook.uri)) throw new Error('The active notebook is outside the Pair Notebook working copy.');
     const cells = editor.notebook.getCells(editor.selection).filter((cell) => cell.kind === vscode.NotebookCellKind.Code);
     if (!cells.length) throw new Error('Select a Python code cell first.');
-    const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
-      id: 'pair-notebook-jupyter', extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
-    });
-    if (selected !== true) throw new Error('VS Code could not select the Pair Notebook kernel.');
+    await this.selectController(editor);
     await this.execute(cells, editor.notebook);
   }
 
