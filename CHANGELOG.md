@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.16 - 2026-09-06 (multi-event editor echo race repair)
+
+- Reworks editor echo recognition around the exact displayed baseline and immutable text deltas, so one remote VS Code edit split across multiple change events is consumed exactly once instead of being republished as fresh local text. Fixes #12.
+- Preserves genuine local typing before, between, or after split remote events; rejected workspace edits replay against the correct displayed baseline, and interleavings with no intermediate remote-target state are reconciled from the actual editor text instead of stale offsets.
+- Adds file and notebook-cell regressions for characters, newlines, line joins, version jumps, hidden intermediate targets, rejected edits, second-peer convergence, idempotent wire replay, and repeated split-echo interleavings.
+
+Installed VS Code UI and physical two-computer acceptance remain separate checks.
+
 ## 0.5.15 - 2026-09-06 (departure cleanup and connection progress)
 
 - Sends an authenticated departure notice before transport shutdown, so relay-only participants disappear immediately from other session views while unexpected route loss keeps its bounded recovery lease. Fixes #13.
