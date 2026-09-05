@@ -91,59 +91,84 @@ function findWindowsOctocodeShim() {
     .find(Boolean);
 }
 
-function runOctocode(tool, payload) {
+function executeOctocode(tool, payload) {
   const queryJson = JSON.stringify(payload);
-  let child;
 
   if (process.platform === 'win32') {
     const octocodeShim = findWindowsOctocodeShim();
     const comspec = process.env.ComSpec || 'cmd.exe';
-
-    // On Windows, launch the npm .cmd shim through cmd.exe. This is the same
-    // path that works interactively and avoids relying on Octocode's internal
-    // JS entrypoint/bootstrap details.
-    child = spawnSync(
+    return spawnSync(
       comspec,
       ['/d', '/c', octocodeShim, 'tools', tool, '--queries', queryJson, '--compact'],
       {
-        stdio: 'inherit',
+        encoding: 'utf8',
         windowsHide: true,
         shell: false,
         env: process.env,
         timeout: 45000,
       }
     );
-  } else {
-    const command = process.env.OCTOCODE_CLI_PATH || 'octocode';
-    child = spawnSync(
-      command,
-      ['tools', tool, '--queries', queryJson, '--compact'],
-      {
-        stdio: 'inherit',
-        shell: false,
-        env: process.env,
-        timeout: 45000,
-      }
-    );
   }
 
-  if (child.error) {
-    if (child.error.code === 'ETIMEDOUT') {
-      fail('Octocode timed out after 45 seconds.', 1);
+  const command = process.env.OCTOCODE_CLI_PATH || 'octocode';
+  return spawnSync(
+    command,
+    ['tools', tool, '--queries', queryJson, '--compact'],
+    {
+      encoding: 'utf8',
+      shell: false,
+      env: process.env,
+      timeout: 45000,
     }
-    fail(`Failed to launch Octocode: ${child.error.message}`, 1);
+  );
+}
+
+function emitResult(result) {
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+}
+
+function isUnknownTool(result) {
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  return /Unknown tool:/i.test(output);
+}
+
+function runOctocode(candidates) {
+  for (let i = 0; i < candidates.length; i += 1) {
+    const { tool, payload } = candidates[i];
+    const child = executeOctocode(tool, payload);
+
+    if (child.error) {
+      if (child.error.code === 'ETIMEDOUT') {
+        fail('Octocode timed out after 45 seconds.', 1);
+      }
+      fail(`Failed to launch Octocode: ${child.error.message}`, 1);
+    }
+
+    // Octocode v18.4 exposes ghSearch for tree/code/repository operations,
+    // while newer builds split those operations into dedicated tools. Try the
+    // installed v18.4 surface first and fall back only when the tool itself is
+    // unavailable. Do not hide real query/provider errors.
+    if (isUnknownTool(child) && i + 1 < candidates.length) {
+      continue;
+    }
+
+    emitResult(child);
+    process.exit(child.status ?? 1);
   }
 
-  process.exit(child.status ?? 1);
+  fail('No compatible Octocode tool was available.', 1);
 }
 
 function usage() {
   console.log(`Windows-safe Octocode wrapper for Codex Desktop.
 
-The wrapper builds Octocode query JSON inside Node and runs the installed
-Octocode CLI with the current canonical tool names. On Windows it launches
-octocode.cmd through cmd.exe to avoid PowerShell/cmd JSON-quoting issues and
-internal CLI entrypoint/bootstrap differences.
+The wrapper builds Octocode query JSON inside Node. On Windows it launches the
+installed octocode.cmd through cmd.exe, which avoids PowerShell/cmd JSON quoting
+problems and avoids depending on Octocode internal JS entrypoints.
+
+It supports the installed Octocode v18.4 tool inventory (ghSearch) and falls
+back to the newer split GitHub tool names when necessary.
 
 Usage:
   node scripts/octocode-query.mjs tree --owner OWNER --repo REPO [--path PATH] [--depth 1] [--page-size 100]
@@ -172,18 +197,40 @@ const branch = options.branch;
 
 switch (command) {
   case 'tree': {
-    runOctocode(
-      'ghViewRepoStructure',
-      omitUndefined({
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: options.path ?? '',
-        branch,
-        maxDepth: intOption(options, 'depth', 1),
-        itemsPerPage: intOption(options, 'page-size', 100),
-        page: intOption(options, 'page', undefined),
-      })
-    );
+    const owner = required(options, 'owner');
+    const repo = required(options, 'repo');
+    const path = options.path;
+    const maxDepth = intOption(options, 'depth', 1);
+    const pageSize = intOption(options, 'page-size', 100);
+    const page = intOption(options, 'page', undefined);
+
+    runOctocode([
+      {
+        tool: 'ghSearch',
+        payload: omitUndefined({
+          operation: 'tree',
+          owner,
+          repo,
+          path,
+          branch,
+          maxDepth,
+          pageSize,
+          page,
+        }),
+      },
+      {
+        tool: 'ghViewRepoStructure',
+        payload: omitUndefined({
+          owner,
+          repo,
+          path: path ?? '',
+          branch,
+          maxDepth,
+          itemsPerPage: pageSize,
+          page,
+        }),
+      },
+    ]);
     break;
   }
 
@@ -192,20 +239,43 @@ switch (command) {
     if (!Array.isArray(keywords) || keywords.length === 0) {
       fail('code requires at least one --keyword');
     }
-    runOctocode(
-      'ghSearchCode',
-      omitUndefined({
-        keywords,
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: options.path,
-        extension: options.extension,
-        filename: options.filename,
-        match: options.match,
-        page: intOption(options, 'page', undefined),
-        limit: intOption(options, 'page-size', 10),
-      })
-    );
+
+    const owner = required(options, 'owner');
+    const repo = required(options, 'repo');
+    const pageSize = intOption(options, 'page-size', 10);
+    const page = intOption(options, 'page', undefined);
+
+    runOctocode([
+      {
+        tool: 'ghSearch',
+        payload: omitUndefined({
+          operation: 'code',
+          keywords,
+          owner,
+          repo,
+          path: options.path,
+          extension: options.extension,
+          filename: options.filename,
+          match: options.match,
+          pageSize,
+          page,
+        }),
+      },
+      {
+        tool: 'ghSearchCode',
+        payload: omitUndefined({
+          keywords,
+          owner,
+          repo,
+          path: options.path,
+          extension: options.extension,
+          filename: options.filename,
+          match: options.match,
+          limit: pageSize,
+          page,
+        }),
+      },
+    ]);
     break;
   }
 
@@ -214,61 +284,84 @@ switch (command) {
     if (!Array.isArray(keywords) || keywords.length === 0) {
       fail('repos requires at least one --keyword');
     }
-    runOctocode(
-      'ghSearchRepos',
-      omitUndefined({
-        keywords,
-        owner: options.owner,
-        language: options.language,
-        page: intOption(options, 'page', undefined),
-        limit: intOption(options, 'page-size', 10),
-      })
-    );
+
+    const pageSize = intOption(options, 'page-size', 10);
+    const page = intOption(options, 'page', undefined);
+
+    runOctocode([
+      {
+        tool: 'ghSearch',
+        payload: omitUndefined({
+          operation: 'repositories',
+          keywords,
+          owner: options.owner,
+          language: options.language,
+          pageSize,
+          page,
+        }),
+      },
+      {
+        tool: 'ghSearchRepos',
+        payload: omitUndefined({
+          keywords,
+          owner: options.owner,
+          language: options.language,
+          limit: pageSize,
+          page,
+        }),
+      },
+    ]);
     break;
   }
 
   case 'symbols': {
-    runOctocode(
-      'ghGetFileContent',
-      omitUndefined({
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: required(options, 'path'),
-        branch,
-        minify: 'symbols',
-      })
-    );
+    runOctocode([
+      {
+        tool: 'ghGetFileContent',
+        payload: omitUndefined({
+          owner: required(options, 'owner'),
+          repo: required(options, 'repo'),
+          path: required(options, 'path'),
+          branch,
+          minify: 'symbols',
+        }),
+      },
+    ]);
     break;
   }
 
   case 'match': {
-    runOctocode(
-      'ghGetFileContent',
-      omitUndefined({
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: required(options, 'path'),
-        branch,
-        matchString: required(options, 'text'),
-        matchStringIsRegex: boolOption(options, 'regex', false),
-        contextLines: intOption(options, 'context', 8),
-      })
-    );
+    runOctocode([
+      {
+        tool: 'ghGetFileContent',
+        payload: omitUndefined({
+          owner: required(options, 'owner'),
+          repo: required(options, 'repo'),
+          path: required(options, 'path'),
+          branch,
+          matchString: required(options, 'text'),
+          matchStringIsRegex: boolOption(options, 'regex', false),
+          contextLines: intOption(options, 'context', 8),
+        }),
+      },
+    ]);
     break;
   }
 
   case 'range': {
-    runOctocode(
-      'ghGetFileContent',
-      omitUndefined({
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: required(options, 'path'),
-        branch,
-        startLine: intOption(options, 'start'),
-        endLine: intOption(options, 'end'),
-      })
-    );
+    runOctocode([
+      {
+        tool: 'ghGetFileContent',
+        payload: omitUndefined({
+          owner: required(options, 'owner'),
+          repo: required(options, 'repo'),
+          path: required(options, 'path'),
+          branch,
+          startLine: intOption(options, 'start'),
+          endLine: intOption(options, 'end'),
+        }),
+      },
+    ]);
     break;
   }
 
@@ -279,17 +372,19 @@ switch (command) {
       fail('--minify must be none, standard, or symbols');
     }
 
-    runOctocode(
-      'ghGetFileContent',
-      omitUndefined({
-        owner: required(options, 'owner'),
-        repo: required(options, 'repo'),
-        path: required(options, 'path'),
-        branch,
-        fullContent: fullContent || undefined,
-        minify: fullContent ? undefined : minify,
-      })
-    );
+    runOctocode([
+      {
+        tool: 'ghGetFileContent',
+        payload: omitUndefined({
+          owner: required(options, 'owner'),
+          repo: required(options, 'repo'),
+          path: required(options, 'path'),
+          branch,
+          fullContent: fullContent || undefined,
+          minify: fullContent ? undefined : minify,
+        }),
+      },
+    ]);
     break;
   }
 
