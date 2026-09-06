@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.18 - 2026-09-06 (relay recovery handshake repair)
+
+- Allows a fresh relay handshake after one-sided route loss while suppressing duplicate handshake echoes for the admitted nonce.
+- Adds regression coverage for stale route recovery, fresh negotiation, duplicate suppression and incumbent proof verification.
+
 ## 0.5.17 - 2026-09-06 (editor baseline, teardown and latency repairs)
 
 - Reconciles stale open text buffers before interpreting local offsets. Preserves typing during initial binding and already-unsaved editor contents without out-of-range recovery or line loss.
