@@ -67,7 +67,8 @@ interface PendingTextEdit {
 }
 
 export class EditorSynchronizer implements vscode.Disposable {
-  private disposed = false;
+  private explicitlyDisposed = false;
+  private get disposed(): boolean { return this.explicitlyDisposed || this.project.isDestroyed; }
   private readonly disposables: vscode.Disposable[] = [];
   private readonly textReplicas = new Map<string, EditorTextReplica>();
   private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
@@ -120,8 +121,8 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   public dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
+    if (this.explicitlyDisposed) return;
+    this.explicitlyDisposed = true;
     for (const replica of this.textReplicas.values()) replica.dispose();
     this.textReplicas.clear();
     this.project.off('update', this.onProjectUpdate);

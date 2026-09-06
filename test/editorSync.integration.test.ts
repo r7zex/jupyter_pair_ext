@@ -1452,8 +1452,8 @@ describe('EditorSynchronizer initial baselines and rebased line locks', () => {
 
 
 describe('EditorSynchronizer teardown cancellation', () => {
-  for (const notebookCell of [false, true]) for (const inFlight of [false, true]) {
-    it('does not revive project state after disposal cell='+notebookCell+' inFlight='+inFlight, async () => {
+  for (const notebookCell of [false, true]) for (const inFlight of [false, true]) for (const terminalFirst of [false, true]) {
+    it('does not revive project state after disposal cell='+notebookCell+' inFlight='+inFlight+' terminalFirst='+terminalFirst, async () => {
       const root = path.resolve('/tmp/pair-disposed-editor');
       const notebook = fakeNotebook(root, [fakeCell('abc\nnext', 'a'), fakeCell('keep second', 'b')]);
       const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'abc\nnext');
@@ -1479,12 +1479,13 @@ describe('EditorSynchronizer teardown cancellation', () => {
           await waitFor(() => entered, 1000, 'native edit pending during shutdown');
           change();
         }
-        synchronizer.dispose();
+        if (terminalFirst) synchronizer.dispose();
         project.destroy();
         release?.();
         await new Promise<void>((resolve) => setImmediate(resolve));
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.deepEqual(project.keys(), []);
+        if (!terminalFirst) synchronizer.dispose();
         assert.equal((synchronizer as any).textReplicas.size, 0);
         assert.equal(project.listenerCount('update'), 0);
         assert.deepEqual(messages, []);

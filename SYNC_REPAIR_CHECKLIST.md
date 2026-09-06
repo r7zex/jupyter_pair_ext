@@ -13,6 +13,6 @@ Validation distinguishes deterministic VS Code boundary tests from installed UI 
 
 First pair: 85 focused tests passed; TypeScript and lint passed. The new integration matrix produces 11 failures against the original sync implementation and passes after repair. Initial text rebasing uses the already-pinned `diff` 8.0.3 package with a bounded diff timeout.
 
-Second pair: 94 focused tests passed, including cancelled queued/in-flight work, independent lagging cells, spare renames, and rejection isolation. An in-memory regression through actual `SessionRuntime.leave()` with a simulated final backing-write failure retains both notebook cells and creates no project/replica after teardown.
+Second pair: 98 focused tests passed, including cancelled queued/in-flight work, both project-destroy/terminal-event orderings, independent lagging cells, spare renames, and rejection isolation. An in-memory regression through actual `SessionRuntime.leave()` with a simulated final backing-write failure retains both notebook cells and creates no project/replica after teardown. The synchronizer stops as soon as the project is destroyed, including the interval before its terminal callback runs.
 
 The 1,000-cell / 10 MB source benchmark used 10.2 MB per remote keystroke before repair (median 63.6 ms). After one full warmup snapshot, six incremental edits encoded 4.9 KB each and took 10.1-18.0 ms. These measurements cover the local production replica path, not installed VS Code UI latency.

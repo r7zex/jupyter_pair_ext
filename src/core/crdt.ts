@@ -118,6 +118,10 @@ export function normalizeNotebookUpdateScope(value: unknown): NotebookUpdateScop
 export type GarbageCollectionGuard = (now: number) => boolean;
 
 export class CollaborativeProject extends EventEmitter {
+  private destroyed = false;
+
+  public get isDestroyed(): boolean { return this.destroyed; }
+
   private readonly documents = new Map<string, ProjectDocument>();
   private readonly normalizing = new Set<Y.Doc>();
   private readonly unreferencedSince = new Map<string, Map<string, number>>();
@@ -667,6 +671,7 @@ export class CollaborativeProject extends EventEmitter {
   }
 
   public destroy(): void {
+    this.destroyed = true;
     for (const entry of this.documents.values()) entry.doc.destroy();
     this.documents.clear();
     this.unreferencedSince.clear();
