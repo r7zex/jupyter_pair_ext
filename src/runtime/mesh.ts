@@ -327,6 +327,7 @@ interface HandshakeProof {
 interface ConnectedPeer {
   transportPeerId: string;
   identity: PeerIdentity;
+  handshakeNonce?: string;
   purpose: PeerConnectionPurpose;
   connectedAt: number;
   lastSeen: number;
@@ -2131,16 +2132,19 @@ public improvablePeerIds(): string[] {
     rawHs: unknown,
     rawPr: unknown,
   ): void {
+    const parsed = kind === 'hs' ? this.parseHandshake(rawHs) : undefined;
+    if (parsed && (parsed.sessionId !== this.options.sessionId || parsed.peer.peerId !== fromPeerId)) return;
     let negotiation = this.relayNegotiations.get(fromPeerId);
     if (!negotiation) {
       if (kind !== 'hs') {
         // A proof without a locally started negotiation is meaningless.
         return;
       }
-      // A relay handshake can be echoed by every subscribed relay client.
-      // Once this identity already has a route, a late hs is only a duplicate
-      // and must not start another negotiation or compete with the live route.
-      if (this.identityToTransport.has(fromPeerId)) return;
+      // Suppress only the handshake that admitted this relay connection.
+      // A new nonce may be recovery after one-sided route loss; a remaining
+      // local route entry does not prove that the remote side is connected.
+      const admitted = this.connections.get(RELAY_TRANSPORT_PREFIX + fromPeerId);
+      if (parsed && admitted?.handshakeNonce === parsed.nonce) return;
       if (!this.hasRelayCandidateCapacity(fromPeerId)) return;
       // An inbound hs IS the announcement of a new relay-only peer.
       // Role is derived from stable peer IDs on both sides. Treating every
@@ -2148,9 +2152,7 @@ public improvablePeerIds(): string[] {
       // lexically higher peer is the only side that starts fallback.
       negotiation = this.createRelayNegotiation(fromPeerId);
     }
-    if (kind === 'hs') {
-      const parsed = this.parseHandshake(rawHs);
-      if (parsed.sessionId !== this.options.sessionId || parsed.peer.peerId !== fromPeerId) return;
+    if (parsed) {
       // Do not replace a handshake while its proof is in flight. Public
       // relays can deliver a newer retry before an older proof; mixing those
       // two transcripts caused false identity failures on healthy sessions.
@@ -2556,6 +2558,7 @@ public improvablePeerIds(): string[] {
     const connection: ConnectedPeer = {
       transportPeerId,
       identity: handshake.peer,
+      handshakeNonce: handshake.nonce,
       purpose: handshake.purpose,
       connectedAt: Date.now(),
       lastSeen: Date.now(),
