@@ -38,6 +38,14 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for routed frame delivery.');
+    await sleep(20);
+  }
+}
+
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -183,13 +191,13 @@ describe('make-before-break route optimization', function () {
 
       // Application frames keep flowing before and during the attempt.
       two.guest.sendTo('host-mbb', 'probePing', {}, Buffer.from('before-attempt'));
-      await sleep(100);
+      await waitFor(() => two.receivedAtHost.some((frame) => frame.payload === 'before-attempt'));
       assert.ok(two.receivedAtHost.some((frame) => frame.payload === 'before-attempt'));
 
       assert.equal(two.host.tryImproveRoute('guest-mbb'), true);
       await sleep(200);
       two.guest.sendTo('host-mbb', 'probePing', {}, Buffer.from('during-attempt'));
-      await sleep(150);
+      await waitFor(() => two.receivedAtHost.some((frame) => frame.payload === 'during-attempt'));
       assert.ok(two.receivedAtHost.some((frame) => frame.payload === 'during-attempt'),
         'the working relay route stopped delivering during optimization');
 
@@ -200,7 +208,7 @@ describe('make-before-break route optimization', function () {
 
       // The old route survived untouched.
       two.guest.sendTo('host-mbb', 'probePing', {}, Buffer.from('after-cancel'));
-      await sleep(150);
+      await waitFor(() => two.receivedAtHost.some((frame) => frame.payload === 'after-cancel'));
       assert.ok(two.receivedAtHost.some((frame) => frame.payload === 'after-cancel'));
       assert.equal(two.host.peerRuntime().find((peer) => peer.peerId === 'guest-mbb')?.route, 'Relay');
       assert.equal(two.guestDisconnectedEvents, 0);
