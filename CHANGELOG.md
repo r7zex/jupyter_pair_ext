@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.17 - 2026-09-06 (editor baseline, teardown and latency repairs)
+
+- Reconciles stale open text buffers before interpreting local offsets. Preserves typing during initial binding and already-unsaved editor contents without out-of-range recovery or line loss.
+- Maps displayed text positions to canonical Yjs positions before checking participant line locks, preventing remote line shifts from rejecting input on an unlocked line.
+- Cancels queued editor work and stops pending continuations after disposal or document closure. Shutdown and failed final persistence cannot recreate destroyed project state or replace notebooks with empty snapshots.
+- Reuses a bounded spare text replica through incremental Yjs updates after warmup, avoiding a full notebook source clone per remote keystroke. Rejected local merges are excluded from reuse.
+- Adds regression coverage for initial binding, line locks, teardown, independent lagging cells, renames and replica reuse.
+
+Installed VS Code UI and physical two-computer acceptance remain separate checks.
+
 ## 0.5.16 - 2026-09-06 (multi-event editor echo race repair)
 
 - Reworks editor echo recognition around the exact displayed baseline and immutable text deltas, so one remote VS Code edit split across multiple change events is consumed exactly once instead of being republished as fresh local text. Fixes #12.

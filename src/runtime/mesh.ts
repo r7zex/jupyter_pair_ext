@@ -2137,6 +2137,10 @@ public improvablePeerIds(): string[] {
         // A proof without a locally started negotiation is meaningless.
         return;
       }
+      // A relay handshake can be echoed by every subscribed relay client.
+      // Once this identity already has a route, a late hs is only a duplicate
+      // and must not start another negotiation or compete with the live route.
+      if (this.identityToTransport.has(fromPeerId)) return;
       if (!this.hasRelayCandidateCapacity(fromPeerId)) return;
       // An inbound hs IS the announcement of a new relay-only peer.
       // Role is derived from stable peer IDs on both sides. Treating every
@@ -2151,12 +2155,15 @@ public improvablePeerIds(): string[] {
       // relays can deliver a newer retry before an older proof; mixing those
       // two transcripts caused false identity failures on healthy sessions.
       if (negotiation.remoteHs && negotiation.remoteHs.nonce !== parsed.nonce) return;
+      const firstRemoteHandshake = !negotiation.remoteHs;
       negotiation.remoteHs = parsed;
-      // Always re-answer with our own handshake: both sides may start the
-      // negotiation simultaneously and the first copy can arrive before the
-      // other side registered the negotiation.
-      negotiation.sentLocalHs = true;
-      this.sendRelayEnvelope(fromPeerId, { k: 'hs', hs: negotiation.localHs });
+      // Answer the first remote handshake so an inbound-only fallback can
+      // complete. Re-answering every echoed hs creates an unbounded event
+      // exchange and delays the application frames queued behind it.
+      if (firstRemoteHandshake) {
+        negotiation.sentLocalHs = true;
+        this.sendRelayEnvelope(fromPeerId, { k: 'hs', hs: negotiation.localHs });
+      }
     } else if (typeof rawPr === 'object' && rawPr !== null) {
       negotiation.remoteProof = this.parseHandshakeProof(rawPr);
     } else {
