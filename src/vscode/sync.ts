@@ -24,10 +24,11 @@ import {
 import { safeRelativePath } from '../core/persistence';
 import { classifyFile, normalizeNotebookMetadata, shouldTrackProjectPath } from '../core/projectFiles';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
+import { OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import { EditorTextReplica } from './editorTextReplica';
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
-const NOTEBOOK_CELL_STATE_COALESCE_MS = 75;
+const NOTEBOOK_CELL_STATE_COALESCE_MS = OUTPUT_STATE_CADENCE_MS;
 
 export interface NotebookCellRenderRequest {
   outputs: readonly vscode.NotebookCellOutput[];
@@ -66,6 +67,13 @@ interface PendingTextEdit {
   readonly events: BufferedTextEvent[];
 }
 
+interface TextRenderGuard {
+  readonly version: number;
+  readonly text: string;
+}
+
+class EditorPolicyRejection extends Error {}
+
 export class EditorSynchronizer implements vscode.Disposable {
   private explicitlyDisposed = false;
   private get disposed(): boolean { return this.explicitlyDisposed || this.project.isDestroyed; }
@@ -73,13 +81,17 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly textReplicas = new Map<string, EditorTextReplica>();
   private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
   private readonly initialTextBaselines = new Map<string, string>();
+  private readonly documentTextBaselines = new Map<string, string>();
   private readonly textRenders = new Map<string, Promise<void>>();
   private readonly applyingNotebooks = new Set<string>();
+  private readonly structuralNotebookApplies = new Set<string>();
   private readonly textObservers = new Map<string, (event: Y.YTextEvent) => void>();
   private readonly textApplyQueues = new Map<string, Promise<void>>();
   private readonly notebookApplyQueues = new Map<string, Promise<void>>();
   private readonly pendingNotebookCellStates = new Map<string, Set<string>>();
   private readonly notebookCellStateTimers = new Map<string, NodeJS.Timeout>();
+  private readonly notebookCellStateFlushQueued = new Set<string>();
+  private readonly immediateNotebookCellStateFlushes = new Set<string>();
   private readonly notebookBindings = new WeakMap<vscode.NotebookDocument, Promise<void>>();
   private readonly boundNotebooks = new WeakSet<vscode.NotebookDocument>();
   private readonly displayedStructures = new WeakMap<vscode.NotebookDocument, Array<Pick<CellSnapshot, 'id' | 'kind' | 'language'>>>();
@@ -101,6 +113,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         this.textReplicas.get(uri)?.dispose();
         this.textReplicas.delete(uri);
         this.initialTextBaselines.delete(uri);
+        this.documentTextBaselines.delete(uri);
       }),
       vscode.workspace.onDidOpenNotebookDocument((notebook) => {
         void this.whenNotebookReady(notebook).catch((error) => {
@@ -134,11 +147,15 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.textObservers.clear();
     for (const timer of this.notebookCellStateTimers.values()) clearTimeout(timer);
     this.notebookCellStateTimers.clear();
+    this.notebookCellStateFlushQueued.clear();
+    this.immediateNotebookCellStateFlushes.clear();
     this.pendingNotebookCellStates.clear();
     this.initialTextBaselines.clear();
+    this.documentTextBaselines.clear();
     this.pendingTextEdits.clear();
     this.textRenders.clear();
     this.textApplyQueues.clear();
+    this.structuralNotebookApplies.clear();
     this.notebookApplyQueues.clear();
     for (const disposable of this.disposables) disposable.dispose();
   }
@@ -221,6 +238,7 @@ export class EditorSynchronizer implements vscode.Disposable {
 
   private readonly onProjectUpdate = (event: ProjectUpdate): void => {
     if (this.disposed || event.origin !== REMOTE_ORIGIN || event.kind !== 'notebook') return;
+    if (event.scope?.type === 'cellText' && this.applyRemoteNotebookCellText(event.key, event.scope.cellId)) return;
     this.enqueueNotebookApply(event.key, async () => {
       const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === event.key);
       if (!notebook) return;
@@ -248,9 +266,13 @@ export class EditorSynchronizer implements vscode.Disposable {
           return;
         }
         case 'cellOutputs':
-        case 'cellExecution':
           this.scheduleNotebookCellStateApply(event.key, scope.cellId);
           return;
+        case 'cellExecution': {
+          const terminal = this.project.notebookCellSnapshot(event.key, scope.cellId)?.execution?.success !== undefined;
+          this.scheduleNotebookCellStateApply(event.key, scope.cellId, terminal);
+          return;
+        }
         case 'cellMetadata':
           await this.applyNotebookCellMetadata(notebook, event.key, scope.cellId);
           return;
@@ -266,6 +288,28 @@ export class EditorSynchronizer implements vscode.Disposable {
     });
   };
 
+  /** Text remains responsive while a slow NotebookController output render is in flight. */
+  private applyRemoteNotebookCellText(key: string, cellId: string): boolean {
+    const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
+    if (!notebook) return true;
+    // A structural replacement can invalidate NotebookCell/TextDocument
+    // identities. In that rare window, preserve ordering through the normal
+    // notebook queue; output-only renders never enter this guard.
+    if (this.structuralNotebookApplies.has(notebook.uri.toString())) return false;
+    const located = this.findNotebookCellByStableId(notebook, cellId);
+    if (!located) return false;
+    let source: string;
+    try {
+      source = this.project.cellSource(key, cellId).toString();
+    } catch {
+      return true;
+    }
+    void this.applyText(located.cell.document, source).catch((error) => {
+      if (!this.disposed) this.log.appendLine(`[error] Failed to apply prioritized remote cell text for ${key}: ${formatError(error)}`);
+    });
+    return true;
+  }
+
   private enqueueNotebookApply(key: string, task: () => Promise<void>): void {
     if (this.disposed) return;
     const previous = this.notebookApplyQueues.get(key) ?? Promise.resolve();
@@ -280,11 +324,50 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   /** Output events can arrive many times per kernel message. Render only the newest cell state. */
-  private scheduleNotebookCellStateApply(key: string, cellId: string): void {
+  private scheduleNotebookCellStateApply(key: string, cellId: string, immediate = false): void {
     const cells = this.pendingNotebookCellStates.get(key) ?? new Set<string>();
     cells.add(cellId);
     this.pendingNotebookCellStates.set(key, cells);
-    if (this.notebookCellStateTimers.has(key)) return;
+    if (immediate) {
+      this.immediateNotebookCellStateFlushes.add(key);
+      const timer = this.notebookCellStateTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.notebookCellStateTimers.delete(key);
+      this.flushPendingNotebookCellStates(key);
+      return;
+    }
+    if (this.notebookCellStateFlushQueued.has(key)) return;
+    this.armNotebookCellStateTimer(key);
+  }
+
+  private flushPendingNotebookCellStates(key: string): void {
+    if (this.notebookCellStateFlushQueued.has(key) || !this.pendingNotebookCellStates.get(key)?.size) return;
+    this.notebookCellStateFlushQueued.add(key);
+    this.enqueueNotebookApply(key, async () => {
+      try {
+        const pending = this.pendingNotebookCellStates.get(key);
+        this.pendingNotebookCellStates.delete(key);
+        this.immediateNotebookCellStateFlushes.delete(key);
+        if (!pending?.size) return;
+        const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
+        if (!notebook) return;
+        // Read canonical CRDT state only now, after the burst has collapsed. No
+        // obsolete intermediate iopub/output/execution snapshot is replayed.
+        for (const pendingCellId of pending) {
+          await this.applyNotebookCellState(notebook, key, pendingCellId);
+        }
+      } finally {
+        this.notebookCellStateFlushQueued.delete(key);
+        if (this.pendingNotebookCellStates.get(key)?.size) {
+          if (this.immediateNotebookCellStateFlushes.has(key)) this.flushPendingNotebookCellStates(key);
+          else this.armNotebookCellStateTimer(key);
+        }
+      }
+    });
+  }
+
+  private armNotebookCellStateTimer(key: string): void {
+    if (this.disposed || this.notebookCellStateTimers.has(key) || this.notebookCellStateFlushQueued.has(key)) return;
     const timer = setTimeout(() => {
       this.notebookCellStateTimers.delete(key);
       this.flushPendingNotebookCellStates(key);
@@ -292,29 +375,15 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.notebookCellStateTimers.set(key, timer);
   }
 
-  private flushPendingNotebookCellStates(key: string): void {
-    const pending = this.pendingNotebookCellStates.get(key);
-    this.pendingNotebookCellStates.delete(key);
-    if (!pending?.size) return;
-    this.enqueueNotebookApply(key, async () => {
-      const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
-      if (!notebook) return;
-      // Read canonical CRDT state only now, after the burst has collapsed. No
-      // obsolete intermediate iopub/output/execution snapshot is replayed.
-      for (const pendingCellId of pending) {
-        await this.applyNotebookCellState(notebook, key, pendingCellId);
-      }
-    });
-  }
-
   private async drainPendingNotebookCellStates(key: string): Promise<void> {
-    const timer = this.notebookCellStateTimers.get(key);
-    if (timer) {
-      clearTimeout(timer);
+    for (;;) {
+      const timer = this.notebookCellStateTimers.get(key);
+      if (timer) clearTimeout(timer);
       this.notebookCellStateTimers.delete(key);
+      this.flushPendingNotebookCellStates(key);
+      await (this.notebookApplyQueues.get(key) ?? Promise.resolve());
+      if (!this.pendingNotebookCellStates.get(key)?.size && !this.notebookCellStateFlushQueued.has(key)) return;
     }
-    this.flushPendingNotebookCellStates(key);
-    await (this.notebookApplyQueues.get(key) ?? Promise.resolve());
   }
 
   private async applyNotebookCellState(
@@ -668,8 +737,11 @@ export class EditorSynchronizer implements vscode.Disposable {
   private onTextChanged(event: vscode.TextDocumentChangeEvent): void {
     if (this.disposed) return;
     const document = event.document;
+    const uri = document.uri.toString();
+    const baseline = this.documentTextBaselines.get(uri);
+    this.documentTextBaselines.set(uri, document.getText());
     if (document.uri.scheme === 'vscode-notebook-cell') {
-      this.onNotebookCellTextChanged(event);
+      this.onNotebookCellTextChanged(event, baseline);
       return;
     }
     const key = this.keyForUri(document.uri);
@@ -688,19 +760,28 @@ export class EditorSynchronizer implements vscode.Disposable {
       }
       this.publishTextChanges(document, key, undefined, changes);
     } catch (error) {
+      const detail = `Rejected unsafe text editor update for ${key}: ${formatError(error)}`;
+      if (this.recoverRejectedText(document, this.textReplicas.get(uri), error, detail, baseline, changes)) return;
       this.restoreRejectedText(
         document,
         this.project.text(key).toString(),
-        `Rejected unsafe text editor update for ${key}: ${formatError(error)}`,
+        detail,
       );
     }
   }
 
-  private async applyText(document: vscode.TextDocument, target: string): Promise<void> {
+  private async applyText(
+    document: vscode.TextDocument,
+    target: string,
+    guard?: TextRenderGuard,
+  ): Promise<void> {
     if (this.disposed || document.isClosed) return;
     const uri = document.uri.toString();
     const previous = this.textRenders.get(uri) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() => this.renderText(document, target));
+    const next = previous.catch(() => undefined).then(() => {
+      if (guard && (document.version !== guard.version || document.getText() !== guard.text)) return;
+      return this.renderText(document, target);
+    });
     this.textRenders.set(uri, next);
     try { await next; } finally {
       if (this.textRenders.get(uri) === next) this.textRenders.delete(uri);
@@ -722,6 +803,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       if (current === target) {
         if (replica) this.replaceTextReplica(uri, replica);
         this.initialTextBaselines.delete(uri);
+        this.documentTextBaselines.set(uri, current);
         return;
       }
       const edit = minimalEdit(current, target);
@@ -755,6 +837,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           else this.publishBufferedTextEvents(document, displayed, pending.baseline, pending.events);
         }
         if (replica && this.textReplicas.get(uri) !== replica) replica.dispose();
+        if (!this.disposed && !document.isClosed) this.documentTextBaselines.set(uri, document.getText());
       }
       if (this.disposed || document.isClosed) return;
       if (!applied) {
@@ -776,6 +859,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private rememberText(document: vscode.TextDocument, key: string, cellId?: string): void {
     if (this.disposed || document.isClosed) return;
     const uri = document.uri.toString();
+    this.documentTextBaselines.set(uri, document.getText());
     if (this.textReplicas.has(uri)) return;
     const replica = new EditorTextReplica(this.project, key, cellId);
     this.replaceTextReplica(uri, replica);
@@ -800,7 +884,10 @@ export class EditorSynchronizer implements vscode.Disposable {
       try {
         if (rebased.length) this.publishTextChanges(document, replica.key, replica.cellId, rebased);
       } catch (error) {
-        this.restoreRejectedText(document, this.canonicalSourceForReplica(replica), formatError(error));
+        const detail = formatError(error);
+        if (!this.recoverRejectedText(document, replica, error, detail, state, buffered.changes)) {
+          this.restoreRejectedText(document, this.canonicalSourceForReplica(replica), detail);
+        }
         return;
       }
       state = buffered.after;
@@ -823,10 +910,12 @@ export class EditorSynchronizer implements vscode.Disposable {
       try {
         this.publishTextChanges(document, replica.key, replica.cellId, buffered.changes);
       } catch (error) {
+        const detail = `Rejected unsafe buffered editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`;
+        if (this.recoverRejectedText(document, replica, error, detail, state, buffered.changes)) return;
         this.restoreRejectedText(
           document,
           this.canonicalSourceForReplica(replica),
-          `Rejected unsafe buffered editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`,
+          detail,
         );
         return;
       }
@@ -849,10 +938,12 @@ export class EditorSynchronizer implements vscode.Disposable {
     try {
       this.publishTextChanges(document, replica.key, replica.cellId, [change]);
     } catch (error) {
+      const detail = `Rejected unsafe post-apply editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`;
+      if (this.recoverRejectedText(document, replica, error, detail, current, [change])) return;
       this.restoreRejectedText(
         document,
         this.canonicalSourceForReplica(replica),
-        `Rejected unsafe post-apply editor update for ${replica.key}${replica.cellId ? ` cell ${replica.cellId}` : ''}: ${formatError(error)}`,
+        detail,
       );
     }
   }
@@ -891,7 +982,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const lineLock = this.lineLockGuard?.(key, cellId, guardedChanges.map((change) => ({
       rangeOffset: change.offset, rangeLength: change.deleteCount,
     })), canonical.toString());
-    if (lineLock) throw new Error(lineLock);
+    if (lineLock) throw new EditorPolicyRejection(lineLock);
     if (replica && replica.source() !== canonical.toString()) {
       replica.edit(changes);
     } else {
@@ -1018,8 +1109,9 @@ export class EditorSynchronizer implements vscode.Disposable {
     }
   }
 
-  private onNotebookCellTextChanged(event: vscode.TextDocumentChangeEvent): void {
+  private onNotebookCellTextChanged(event: vscode.TextDocumentChangeEvent, baseline?: string): void {
     let canonicalSource: string | undefined;
+    let changes: TextChange[] = [];
     try {
       if (!event.contentChanges.length || this.capturePendingTextEvent(event)) return;
       for (const notebook of vscode.workspace.notebookDocuments) {
@@ -1033,19 +1125,24 @@ export class EditorSynchronizer implements vscode.Disposable {
           return;
         }
         canonicalSource = this.project.cellSource(key, cellId).toString();
-        const changes = event.contentChanges.map((change) => ({
+        changes = event.contentChanges.map((change) => ({
           offset: change.rangeOffset,
           deleteCount: change.rangeLength,
           insertText: change.text,
         }));
-        const baseline = this.initialTextBaselines.get(event.document.uri.toString());
-        if (baseline !== undefined) this.publishInitialTextEvents(event.document, baseline, [{ changes, after: event.document.getText() }]);
+        const initialBaseline = this.initialTextBaselines.get(event.document.uri.toString());
+        if (initialBaseline !== undefined) this.publishInitialTextEvents(event.document, initialBaseline, [{ changes, after: event.document.getText() }]);
         else this.publishTextChanges(event.document, key, cellId, changes);
         return;
       }
     } catch (error) {
       const detail = `Rejected unsafe notebook cell update: ${formatError(error)}`;
-      if (canonicalSource !== undefined) this.restoreRejectedText(event.document, canonicalSource, detail);
+      if (canonicalSource !== undefined) {
+        const replica = this.textReplicas.get(event.document.uri.toString());
+        if (!this.recoverRejectedText(event.document, replica, error, detail, baseline, changes)) {
+          this.restoreRejectedText(event.document, canonicalSource, detail);
+        }
+      }
       else {
         this.log.appendLine(`[error] ${detail}`);
         this.warnRejectedEditorUpdate(detail);
@@ -1053,10 +1150,42 @@ export class EditorSynchronizer implements vscode.Disposable {
     }
   }
 
+  private recoverRejectedText(
+    document: vscode.TextDocument,
+    replica: EditorTextReplica | undefined,
+    error: unknown,
+    detail: string,
+    baseline?: string,
+    changes?: readonly TextChange[],
+  ): boolean {
+    if (this.disposed || document.isClosed || !replica || error instanceof EditorPolicyRejection
+      || !isRecoverableTextBaselineError(error)) return false;
+    const displayed = replica.source();
+    const current = document.getText();
+    const canonical = this.canonicalSourceForReplica(replica);
+    try {
+      const exactEvent = baseline !== undefined && changes !== undefined
+        && applyBufferedTextChanges(baseline, changes) === current;
+      const before = exactEvent ? baseline! : displayed;
+      const localChanges = exactEvent ? changes! : [minimalEdit(displayed, current)];
+      const rebased = rebaseInitialTextChanges(before, canonical, localChanges);
+      const fresh = new EditorTextReplica(this.project, replica.key, replica.cellId);
+      this.replaceTextReplica(document.uri.toString(), fresh);
+      this.initialTextBaselines.delete(document.uri.toString());
+      if (rebased.length) this.publishTextChanges(document, fresh.key, fresh.cellId, rebased);
+      this.log.appendLine(`[debug] Rebased editor text after stale baseline: ${detail}`);
+      return true;
+    } catch (recoveryError) {
+      this.log.appendLine(`[error] Could not rebase rejected editor update: ${formatError(recoveryError)}`);
+      return false;
+    }
+  }
+
   private restoreRejectedText(document: vscode.TextDocument, canonical: string, detail: string): void {
     if (this.disposed || document.isClosed) return;
     this.log.appendLine(`[error] ${detail}`);
-    void this.applyText(document, canonical).catch((error) => {
+    const guard = { version: document.version, text: document.getText() };
+    void this.applyText(document, canonical, guard).catch((error) => {
       this.log.appendLine(`[error] Could not restore rejected editor update: ${formatError(error)}`);
     });
     this.warnRejectedEditorUpdate(detail);
@@ -1083,6 +1212,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const structuralEditorState = splice ? this.captureStructuralEditorState(notebook) : undefined;
     let structureApplied = false;
     const uri = notebook.uri.toString();
+    this.structuralNotebookApplies.add(uri);
     this.applyingNotebooks.add(uri);
     try {
       if (splice) {
@@ -1216,6 +1346,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       }
     } finally {
       this.applyingNotebooks.delete(uri);
+      this.structuralNotebookApplies.delete(uri);
     }
   }
 
@@ -1423,4 +1554,10 @@ function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecoverableTextBaselineError(error: unknown): boolean {
+  const message = formatError(error);
+  return message.includes('Text change is outside')
+    || message.includes('Cannot map displayed position');
 }

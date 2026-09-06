@@ -23,7 +23,12 @@ class TextReplicaPool {
     // Large outputs are collected immediately and never copied per editor.
     this.template.applyRemoteUpdate(this.key, event.kind, event.update);
     this.stripRichState();
-    this.revision += 1;
+    // Rich notebook state does not invalidate a displayed source snapshot.
+    // Its clocks are still consumed so a later text delta remains applicable.
+    if (event.kind !== 'notebook' || !event.scope
+      || event.scope.type === 'cellText' || event.scope.type === 'structure') {
+      this.revision += 1;
+    }
   };
 
   private stripRichState(): void {

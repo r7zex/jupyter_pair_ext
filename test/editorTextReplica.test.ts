@@ -2,6 +2,38 @@ import assert from 'node:assert/strict';
 import { CollaborativeProject } from '../src/core/crdt';
 import { EditorTextReplica } from '../src/vscode/editorTextReplica';
 
+describe('displayed text replica scope stability', () => {
+  it('does not rebuild source versions for output, execution, or metadata updates', () => {
+    const canonical = new CollaborativeProject();
+    canonical.ensureNotebook('work.ipynb', {
+      metadata: {},
+      cells: [{ id: 'cell', kind: 2, language: 'python', source: 'value', metadata: {}, outputs: [] }],
+    });
+    const before = new EditorTextReplica(canonical, 'work.ipynb', 'cell');
+
+    canonical.setCellOutputs('work.ipynb', 'cell', [{
+      metadata: {},
+      items: [{ mime: 'text/plain', dataBase64: Buffer.from('output').toString('base64') }],
+    }]);
+    canonical.setCellExecution('work.ipynb', 'cell', { requestId: 'request', executionOrder: 1 });
+    canonical.setCellMetadata('work.ipynb', 'cell', { label: 'stable' });
+    const afterRichState = new EditorTextReplica(canonical, 'work.ipynb', 'cell');
+
+    assert.equal(afterRichState.project, before.project);
+    assert.equal(afterRichState.source(), 'value');
+
+    canonical.applyCellTextChanges('work.ipynb', 'cell', [{ offset: 5, deleteCount: 0, insertText: '!' }]);
+    const afterText = new EditorTextReplica(canonical, 'work.ipynb', 'cell');
+    assert.notEqual(afterText.project, before.project);
+    assert.equal(afterText.source(), 'value!');
+
+    before.dispose();
+    afterRichState.dispose();
+    afterText.dispose();
+    canonical.destroy();
+  });
+});
+
 describe('displayed text replica sharing', () => {
   it('loads a rich notebook once and shares source-only versions across its cells', () => {
     const canonical = new CollaborativeProject();

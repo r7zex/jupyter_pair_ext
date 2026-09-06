@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from '../core/atomicFile';
+import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import * as Y from 'yjs';
 import {
   Awareness,
@@ -314,6 +315,7 @@ interface ExecutionOwner {
   accepted: boolean;
   cellId?: string | undefined;
   outputState?: JupyterRenderState | undefined;
+  outputTask?: CadencedTask | undefined;
   startedAt?: number | undefined;
   events?: RemoteExecutionEventRecord[] | undefined;
   eventBytes?: number | undefined;
@@ -2157,6 +2159,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     for (const owner of this.executionOwners.values()) {
       if (owner.replayTimer) clearTimeout(owner.replayTimer);
+      owner.outputTask?.dispose();
     }
     this.executionOwners.clear();
     this.kernelCommandWindows.clear();
@@ -2332,6 +2335,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (owner.peerId !== peer.peerId) continue;
         void this.kernels.get(owner.notebookKey)?.interrupt().catch(() => undefined);
         if (owner.replayTimer) clearTimeout(owner.replayTimer);
+        owner.outputTask?.dispose();
         this.executionOwners.delete(requestId);
       }
       for (const [requestId, completed] of [...this.completedRemoteExecutions]) {
@@ -5732,6 +5736,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       executionOwner.startedAt = Date.now();
       this.project.setCellExecution(notebookKey, executionOwner.cellId, { requestId });
       this.project.setCellOutputs(notebookKey, executionOwner.cellId, []);
+      const owner = executionOwner;
+      owner.outputTask = new CadencedTask(
+        OUTPUT_STATE_CADENCE_MS,
+        () => {
+          if (this.closed || this.project.isDestroyed || !owner.outputState || !owner.cellId) return;
+          this.project.setCellOutputs(owner.notebookKey, owner.cellId, snapshotJupyterOutputs(owner.outputState));
+        },
+        (error) => {
+          this.log.appendLine(`[error] Deferred remote Jupyter output publish: ${formatError(error)}`);
+        },
+      );
     }
     executionOwner.accepted = true;
     this.recordExecutionDiagnostic('execution-accepted', requestId, sourceId, 'execution-accepted', {
@@ -5784,11 +5799,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               });
             }
             if (authoritative.outputsChanged) {
-              this.project.setCellOutputs(
-                executionOwner.notebookKey,
-                executionOwner.cellId,
-                snapshotJupyterOutputs(executionOwner.outputState),
-              );
+              executionOwner.outputTask?.schedule();
             }
           }
           try {
@@ -5833,24 +5844,47 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       };
     }
     if (executionOwner.outputState && executionOwner.cellId) {
-      appendJupyterFailureToState(executionOwner.outputState, result);
-      this.project.setCellOutputs(
-        executionOwner.notebookKey,
-        executionOwner.cellId,
-        snapshotJupyterOutputs(executionOwner.outputState),
-      );
-      const resultCount = Number(result.content.execution_count);
-      const executionOrder = executionOwner.outputState.executionOrder
-        ?? (Number.isFinite(resultCount) ? resultCount : undefined);
-      this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
-        requestId,
-        ...(executionOrder !== undefined ? { executionOrder } : {}),
-        success: result.success,
-        timing: {
-          startTime: executionOwner.startedAt ?? Date.now(),
-          endTime: Date.now(),
-        },
-      });
+      try {
+        appendJupyterFailureToState(executionOwner.outputState, result);
+        if (executionOwner.outputTask && !this.closed && !this.project.isDestroyed) {
+          executionOwner.outputTask.schedule();
+          try {
+            await executionOwner.outputTask.flush();
+          } catch (error) {
+            this.log.appendLine(`[error] Final remote Jupyter output publish: ${formatError(error)}`);
+            result = {
+              requestId,
+              success: false,
+              content: { status: 'error', ename: 'OutputPublishError', evalue: formatError(error) },
+            };
+          }
+        }
+        const resultCount = Number(result.content.execution_count);
+        const executionOrder = executionOwner.outputState.executionOrder
+          ?? (Number.isFinite(resultCount) ? resultCount : undefined);
+        try {
+          if (!this.closed && !this.project.isDestroyed) {
+            this.project.setCellExecution(executionOwner.notebookKey, executionOwner.cellId, {
+              requestId,
+              ...(executionOrder !== undefined ? { executionOrder } : {}),
+              success: result.success,
+              timing: {
+                startTime: executionOwner.startedAt ?? Date.now(),
+                endTime: Date.now(),
+              },
+            });
+          }
+        } catch (error) {
+          this.log.appendLine(`[error] Final remote Jupyter execution publish: ${formatError(error)}`);
+          result = {
+            requestId,
+            success: false,
+            content: { status: 'error', ename: 'OutputPublishError', evalue: formatError(error) },
+          };
+        }
+      } finally {
+        executionOwner.outputTask?.dispose();
+      }
     }
     this.recordExecutionDiagnostic('execution-completed', requestId, sourceId, 'execution-completed', {
       ...(executionOwner.cellId ? { cellId: executionOwner.cellId } : {}),

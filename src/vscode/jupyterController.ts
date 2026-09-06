@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { CellExecutionSnapshot } from '../core/crdt';
+import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import { PerNotebookExecutionQueue } from '../core/executionQueue';
 import { JupyterKernelEvent } from '../core/pythonKernel';
 import { SessionRuntime } from '../runtime/session';
@@ -14,7 +15,6 @@ import {
   createJupyterRenderState,
   estimateKernelEventBytes,
   snapshotJupyterOutputs,
-  type JupyterOutputOperation,
   type JupyterRenderState,
 } from './jupyterOutputState';
 
@@ -269,6 +269,18 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       runtime.project.setCellExecution(notebookKey, cellId, {});
     }
     const state = createJupyterRenderState();
+    const outputTask = new CadencedTask(
+      OUTPUT_STATE_CADENCE_MS,
+      async () => {
+        await execution.replaceOutput([...state.outputs]);
+        if (authoritativePublisher) {
+          runtime.project.setCellOutputs(notebookKey, cellId, snapshotJupyterOutputs(state));
+        }
+      },
+      (error) => {
+        this.log.appendLine(`[error] Deferred Jupyter output render: ${formatError(error)}`);
+      },
+    );
     let renderQueue = Promise.resolve();
     let pendingRenderEvents = 0;
     let pendingRenderBytes = 0;
@@ -301,6 +313,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
               event,
               authoritativePublisher,
               executionRequestId,
+              outputTask,
             ))
             .finally(() => {
               pendingRenderEvents -= 1;
@@ -320,6 +333,10 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       let renderFailure: unknown;
       try {
         await renderQueue;
+        // Retry the latest complete snapshot even if a prior background render
+        // failed after consuming its pending marker.
+        outputTask.schedule();
+        await outputTask.flush();
       } catch (error) {
         renderFailure = error;
       }
@@ -329,9 +346,11 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       if (!result) throw new Error('Jupyter execution ended without a result.');
       success = result.success;
       const failureOperations = appendJupyterFailureToState(state, result);
-      await this.applyOutputOperations(execution, failureOperations);
+      if (failureOperations.length) {
+        outputTask.schedule();
+        await outputTask.flush();
+      }
       if (authoritativePublisher) {
-        runtime.project.setCellOutputs(notebookKey, cellId, snapshotJupyterOutputs(state));
         runtime.project.setCellExecution(notebookKey, cellId, {
           ...(executionRequestId ? { requestId: executionRequestId } : {}),
           executionOrder: execution.executionOrder,
@@ -347,12 +366,17 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
           traceback: error instanceof Error ? error.stack : undefined,
         },
       };
-      await this.applyOutputOperations(execution, appendJupyterFailureToState(state, failure));
-      if (authoritativePublisher) {
-        runtime.project.setCellOutputs(notebookKey, cellId, snapshotJupyterOutputs(state));
+      if (appendJupyterFailureToState(state, failure).length) {
+        outputTask.schedule();
+        try {
+          await outputTask.flush();
+        } catch (renderError) {
+          this.log.appendLine(`[error] Final Jupyter output render: ${formatError(renderError)}`);
+        }
       }
       this.log.appendLine(`[error] Jupyter execution: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
+      outputTask.dispose();
       execution.end(success, Date.now());
       // Keep the latest remote request identity for this cell after the
       // terminal result. CRDT propagation and executeResult use independent
@@ -371,6 +395,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     event: JupyterKernelEvent,
     authoritativePublisher: boolean,
     executionRequestId: string | undefined,
+    outputTask: CadencedTask,
   ): Promise<void> {
     if (event.type === 'inputRequest') {
       runtime.reportWaitingForInput(notebookKey);
@@ -411,29 +436,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         );
       }
     }
-    await this.applyOutputOperations(execution, update.operations);
-    if (authoritativePublisher && update.outputsChanged) {
-      runtime.project.setCellOutputs(
-        notebookKey,
-        this.requireCellId(runtime, execution.cell),
-        snapshotJupyterOutputs(state),
-      );
-    }
-  }
-
-  private async applyOutputOperations(
-    execution: vscode.NotebookCellExecution,
-    operations: readonly JupyterOutputOperation[],
-  ): Promise<void> {
-    for (const operation of operations) {
-      if (operation.type === 'clear') {
-        await execution.clearOutput();
-      } else if (operation.type === 'append') {
-        await execution.appendOutput(operation.output);
-      } else {
-        await execution.replaceOutputItems(operation.items, operation.output);
-      }
-    }
+    if (update.outputsChanged) outputTask.schedule();
   }
 
   private requireCellId(runtime: SessionRuntime, cell: vscode.NotebookCell): string {

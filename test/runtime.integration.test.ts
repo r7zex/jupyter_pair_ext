@@ -2552,10 +2552,12 @@ describe('compute and lifecycle regression coverage', () => {
           type: 'iopub', requestId, messageType: 'execute_input',
           content: { execution_count: 9 },
         });
-        onEvent({
-          type: 'iopub', requestId, messageType: 'stream',
-          content: { name: 'stdout', text: 'AUTHORITATIVE OUTPUT\n' },
-        });
+        for (let index = 0; index < 20; index += 1) {
+          onEvent({
+            type: 'iopub', requestId, messageType: 'stream',
+            content: { name: 'stdout', text: `OUTPUT ${index}\n` },
+          });
+        }
         return { requestId, success: true, content: { status: 'ok', execution_count: 9 } };
       };
 
@@ -2580,13 +2582,14 @@ describe('compute and lifecycle regression coverage', () => {
       assert.deepEqual(thirdCell.outputs, hostCell.outputs);
       assert.deepEqual(thirdCell.execution, hostCell.execution);
       assert.equal(
-        Buffer.from(thirdCell.outputs[0]!.items[0]!.dataBase64, 'base64').toString('utf8'),
-        'AUTHORITATIVE OUTPUT\n',
+        thirdCell.outputs.map((output) => output.items.map((item) =>
+          Buffer.from(item.dataBase64, 'base64').toString('utf8')).join('')).join(''),
+        Array.from({ length: 20 }, (_, index) => `OUTPUT ${index}\n`).join(''),
       );
       assert.equal(thirdCell.execution?.requestId, 'authoritative-output-request');
       assert.equal(thirdCell.execution?.executionOrder, 9);
       assert.equal(thirdCell.execution?.success, true);
-      assert.ok(outputScopeUpdates >= 1, 'host publishes authoritative output state from kernel events');
+      assert.equal(outputScopeUpdates, 2, 'host publishes only initial and final CRDT output state for a short burst');
       assert.ok(executionScopeUpdates >= 2, 'host publishes running/order/final execution state');
 
       const beforeReplay = JSON.stringify(thirdCell.outputs);

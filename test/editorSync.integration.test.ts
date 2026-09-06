@@ -508,6 +508,68 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
+  it('prioritizes cell text and bounds output backlog while a renderer is slow', async () => {
+    const root = path.resolve('/tmp/pair-editor-output-text-priority');
+    const target = fakeCell('TYPE', 'a');
+    const notebook = fakeNotebook(root, [target]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const remote = new CollaborativeProject();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const calls: any[] = [];
+    const renderer = {
+      renderRemoteCellState: async (cell: any, request: any) => {
+        calls.push(request);
+        if (calls.length === 1) await blocked;
+        if (request.outputsChanged) cell.outputs = [...request.outputs];
+        if (request.executionChanged) cell.executionSummary = request.execution;
+      },
+    };
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, renderer);
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      remote.applyRemoteUpdate('work.ipynb', 'notebook', project.encodeUpdate('work.ipynb'), { type: 'structure' });
+      const updates: ProjectUpdate[] = [];
+      remote.on('update', (event: ProjectUpdate) => {
+        if (event.origin !== REMOTE_ORIGIN) updates.push(event);
+      });
+      remote.setCellOutputs('work.ipynb', 'a', [{
+        metadata: {}, items: [{ mime: 'text/plain', dataBase64: Buffer.from('first').toString('base64') }],
+      }]);
+      applyUpdates(project, updates.splice(0));
+      await waitFor(() => calls.length === 1, 1200, 'first delayed output render');
+
+      remote.applyCellTextChanges('work.ipynb', 'a', [
+        { offset: 4, deleteCount: 0, insertText: '!' },
+      ]);
+      applyUpdates(project, updates.splice(0));
+      await waitFor(() => target.document.getText() === 'TYPE!', 300, 'prioritized text render');
+
+      for (let index = 0; index < 10; index += 1) {
+        remote.setCellOutputs('work.ipynb', 'a', [{
+          metadata: {},
+          items: [{ mime: 'text/plain', dataBase64: Buffer.from(`latest-${index}`).toString('base64') }],
+        }]);
+      }
+      remote.setCellExecution('work.ipynb', 'a', { requestId: 'request', success: true });
+      applyUpdates(project, updates.splice(0));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(calls.length, 1, 'a blocked renderer has at most one queued follow-up');
+
+      release();
+      await waitFor(() => calls.length === 2, 1000, 'terminal output render');
+      assert.equal(target.document.getText(), 'TYPE!');
+      assert.equal(Buffer.from(calls[1].outputs[0].items[0].data).toString('utf8'), 'latest-9');
+      assert.equal(calls[1].execution.success, true);
+    } finally {
+      release();
+      synchronizer.dispose();
+      remote.destroy();
+      project.destroy();
+    }
+  });
+
   it('does not lose a terminal execution update that arrives inside the coalescing window', async () => {
     const root = path.resolve('/tmp/pair-editor-execution-terminal-coalesce');
     const target = fakeCell('TARGET', 'target');
@@ -1038,6 +1100,62 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       }]);
       await waitFor(() => notebook.cells[0].document.text === 'safe', 1000, 'rejected cell restoration');
       assert.equal(project.notebookSnapshot('work.ipynb').cells[0]!.source, 'safe');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('rebases a valid notebook edit when its displayed source baseline is stale', async () => {
+    const root = path.resolve('/tmp/pair-editor-stale-baseline-rebase');
+    const notebook = fakeNotebook(root, [fakeCell('safe', 'stable')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const document = notebook.cells[0].document;
+      const replica = (synchronizer as any).textReplicas.get(document.uri.toString());
+      replica.project.applyCellTextChanges('work.ipynb', 'stable', [
+        { offset: 1, deleteCount: 3, insertText: '' },
+      ]);
+
+      document.text = 'safe!';
+      vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 4, rangeLength: 0, text: '!' }]);
+
+      await waitFor(
+        () => project.notebookSnapshot('work.ipynb').cells[0]!.source === 'safe!',
+        1000,
+        'stale baseline rebase',
+      );
+      assert.equal(document.text, 'safe!');
+      assert.equal((synchronizer as any).textReplicas.get(document.uri.toString()).source(), 'safe!');
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('does not let a queued stale restore overwrite newer typing', async () => {
+    const root = path.resolve('/tmp/pair-editor-stale-restore');
+    const notebook = fakeNotebook(root, [fakeCell('safe', 'stable')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const document = notebook.cells[0].document;
+      let release!: () => void;
+      const blocker = new Promise<void>((resolve) => { release = resolve; });
+      (synchronizer as any).textRenders.set(document.uri.toString(), blocker);
+      (synchronizer as any).restoreRejectedText(document, 'safe', 'synthetic rejection');
+
+      document.text = 'safe!';
+      document.version += 1;
+      release();
+      await (synchronizer as any).textRenders.get(document.uri.toString());
+
+      assert.equal(document.text, 'safe!');
     } finally {
       synchronizer.dispose();
       project.destroy();
