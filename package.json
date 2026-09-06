@@ -261,6 +261,7 @@
     "@noble/secp256k1": "^3.1.0",
     "@trystero-p2p/core": "^0.25.3",
     "debug": "^4.4.3",
+    "diff": "8.0.3",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "mqtt": "^5.15.2",

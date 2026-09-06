@@ -105,6 +105,26 @@ export class EditorTextReplica {
   }
   public source(): string { return this.sourceIn(this.project); }
 
+  public canonicalChanges(changes: readonly TextChange[]): TextChange[] {
+    const displayed = this.cellId ? this.project.cellSource(this.key, this.cellId) : this.project.text(this.key);
+    const canonical = this.cellId ? this.canonical.cellSource(this.key, this.cellId) : this.canonical.text(this.key);
+    if (displayed.toString() === canonical.toString()) return [...changes];
+    const position = (offset: number, association: number): number => {
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > displayed.length) {
+        throw new Error(`Text change is outside displayed ${this.key}.`);
+      }
+      const relative = Y.createRelativePositionFromTypeIndex(displayed, offset, association);
+      const absolute = Y.createAbsolutePositionFromRelativePosition(relative, canonical.doc!);
+      if (!absolute || absolute.type !== canonical) throw new Error(`Cannot map displayed position in ${this.key}.`);
+      return absolute.index;
+    };
+    return changes.map((change) => {
+      const offset = position(change.offset, 0);
+      const end = change.deleteCount ? position(change.offset + change.deleteCount, -1) : offset;
+      return { offset, deleteCount: Math.max(0, end - offset), insertText: change.insertText };
+    });
+  }
+
   public adopt(version: SharedVersion): void {
     if (version === this.version) return;
     const previous = this.version;

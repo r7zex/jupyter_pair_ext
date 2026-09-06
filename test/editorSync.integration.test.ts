@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import Module from 'node:module';
 import path from 'node:path';
+import * as Y from 'yjs';
 import { CollaborativeProject, ProjectUpdate } from '../src/core/crdt';
 import { REMOTE_ORIGIN } from '../src/core/types';
 
@@ -1342,3 +1343,109 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+
+describe('EditorSynchronizer initial baselines and rebased line locks', () => {
+  it('retains pre-existing unsaved text while establishing the shared baseline', async () => {
+    const root = path.resolve('/tmp/pair-dirty-initial-binding');
+    const document = fakeTextDocument(path.join(root, 'notes.txt'), 'unsaved\nwork');
+    document.isDirty = true;
+    vscodeBoundary.__resetText(document);
+    const project = new CollaborativeProject();
+    project.ensureText('notes.txt', 'saved');
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.prepareWorkingCopy();
+      assert.equal(document.text, 'unsaved\nwork');
+      assert.equal(project.text('notes.txt').toString(), document.text);
+      document.text += '!';
+      vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 12, rangeLength: 0, text: '!' }]);
+      assert.equal(project.text('notes.txt').toString(), 'unsaved\nwork!');
+    } finally { synchronizer.dispose(); project.destroy(); }
+  });
+
+  for (const pending of [false, true]) for (const scenario of [
+    { initial: 'abc', canonical: 'Rabc', offset: 3, insert: '!', expected: 'Rabc!' },
+    { initial: 'abc\nnext', canonical: 'x', offset: 8, insert: '\n!', expected: 'x\n!' },
+    { initial: 'one two', canonical: '#one two!', offset: 4, insert: '\nX', expected: '#one \nXtwo!' },
+  ]) {
+    it('preserves initial binding input '+JSON.stringify(scenario.expected)+' pending='+pending, async () => {
+      const root = path.resolve('/tmp/pair-initial-binding');
+      const document = fakeTextDocument(path.join(root, 'notes.txt'), scenario.initial);
+      vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const peer = new CollaborativeProject();
+      project.ensureText('notes.txt', scenario.canonical);
+      peer.applyRemoteUpdate('notes.txt', 'text', project.encodeUpdate('notes.txt'));
+      const messages: string[] = [];
+      const updates: ProjectUpdate[] = [];
+      project.on('update', (event: ProjectUpdate) => { if (event.origin !== REMOTE_ORIGIN) updates.push(event); });
+      let release: (() => void) | undefined;
+      let entered = false;
+      if (pending) vscodeBoundary.__beforeApplyEdit = async () => {
+        vscodeBoundary.__beforeApplyEdit = undefined;
+        entered = true;
+        await new Promise<void>((resolve) => { release = resolve; });
+      };
+      const synchronizer = new EditorSynchronizer(project, root, { appendLine: (value: string) => messages.push(value) } as any);
+      try {
+        if (pending) await waitFor(() => entered, 1000, 'initial edit pending');
+        document.text = scenario.initial.slice(0, scenario.offset) + scenario.insert + scenario.initial.slice(scenario.offset);
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: scenario.offset, rangeLength: 0, text: scenario.insert }]);
+        release?.();
+        await synchronizer.prepareWorkingCopy();
+        assert.equal(document.text, scenario.expected);
+        assert.equal(project.text('notes.txt').toString(), scenario.expected);
+        assert.equal((synchronizer as any).textReplicas.get(document.uri.toString()).source(), scenario.expected);
+        assert.equal(updates.length, 1, 'only actual typing may be published');
+        for (const event of updates) peer.applyRemoteUpdate(event.key, event.kind, event.update);
+        assert.equal(peer.text('notes.txt').toString(), scenario.expected);
+        assert.deepEqual(messages, []);
+      } finally { release?.(); synchronizer.dispose(); project.destroy(); peer.destroy(); }
+    });
+  }
+
+  for (const notebookCell of [false, true]) for (const pending of [false, true]) for (const locked of [false, true]) {
+    it('checks shifted line locks against canonical positions cell='+notebookCell+' pending='+pending+' locked='+locked, async () => {
+      const root = path.resolve('/tmp/pair-rebased-line-lock');
+      const initial = 'aaa\nbbb\nccc';
+      const notebook = fakeNotebook(root, [fakeCell(initial, 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), initial);
+      if (notebookCell) vscodeBoundary.__reset(notebook); else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+      const source = () => notebookCell ? project.cellSource(key, 'a') : project.text(key);
+      let guardCalls = 0;
+      const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, undefined, (_key: string, _cellId: string | undefined, changes: readonly { rangeOffset: number; rangeLength: number }[]) => {
+        guardCalls += 1;
+        const position = Y.createAbsolutePositionFromRelativePosition(anchor, source().doc!)!;
+        assert.equal(position.index, 4);
+        return changes.some((change) => change.rangeOffset >= position.index) ? 'Line is currently selected by Other.' : undefined;
+      });
+      if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+      const anchor = Y.createRelativePositionFromTypeIndex(source(), 8);
+      let release: (() => void) | undefined;
+      let entered = false;
+      if (pending) vscodeBoundary.__beforeApplyEdit = async () => {
+        vscodeBoundary.__beforeApplyEdit = undefined;
+        entered = true;
+        await new Promise<void>((resolve) => { release = resolve; });
+      };
+      try {
+        const changes = [{ offset: 0, deleteCount: 4, insertText: '' }];
+        if (notebookCell) project.applyCellTextChanges(key, 'a', changes, REMOTE_ORIGIN);
+        else project.applyTextChanges(key, changes, REMOTE_ORIGIN);
+        if (pending) await waitFor(() => entered, 1000, 'remote edit pending');
+        const offset = locked ? 9 : 5;
+        document.text = initial.slice(0, offset) + '!' + initial.slice(offset);
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: offset, rangeLength: 0, text: '!' }]);
+        release?.();
+        await synchronizer.prepareWorkingCopy();
+        const expected = locked ? 'bbb\nccc' : 'b!bb\nccc';
+        assert.equal(document.text, expected);
+        assert.equal(source().toString(), expected);
+        assert.ok(guardCalls > 0);
+      } finally { release?.(); synchronizer.dispose(); project.destroy(); }
+    });
+  }
+});

@@ -25,6 +25,7 @@ import { safeRelativePath } from '../core/persistence';
 import { classifyFile, normalizeNotebookMetadata, shouldTrackProjectPath } from '../core/projectFiles';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
 import { EditorTextReplica } from './editorTextReplica';
+import { rebaseInitialTextChanges } from './initialTextChanges';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = 75;
 
@@ -68,6 +69,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly textReplicas = new Map<string, EditorTextReplica>();
   private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
+  private readonly initialTextBaselines = new Map<string, string>();
   private readonly textRenders = new Map<string, Promise<void>>();
   private readonly applyingNotebooks = new Set<string>();
   private readonly textObservers = new Map<string, (event: Y.YTextEvent) => void>();
@@ -95,6 +97,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const uri = document.uri.toString();
         this.textReplicas.get(uri)?.dispose();
         this.textReplicas.delete(uri);
+        this.initialTextBaselines.delete(uri);
       }),
       vscode.workspace.onDidOpenNotebookDocument((notebook) => {
         void this.whenNotebookReady(notebook).catch((error) => {
@@ -613,6 +616,9 @@ export class EditorSynchronizer implements vscode.Disposable {
       ? this.project.text(key)
       : this.project.ensureText(key, document.getText(), LOCAL_EDITOR_ORIGIN);
     this.rememberText(document, key);
+    if (this.initialTextBaselines.has(document.uri.toString())) {
+      this.enqueueTextApply(key, () => this.applyText(document, this.project.text(key).toString()));
+    }
     if (this.textObservers.has(key)) return;
     const observer = (event: Y.YTextEvent) => {
       if (event.transaction.origin !== REMOTE_ORIGIN) return;
@@ -634,18 +640,17 @@ export class EditorSynchronizer implements vscode.Disposable {
     const key = this.keyForUri(document.uri);
     if (!key || !event.contentChanges.length || this.capturePendingTextEvent(event)) return;
     if (this.project.kindOf(key) !== 'text') return;
-    const canonicalSource = this.project.text(key).toString();
-    const lineLock = this.lineLockGuard?.(key, undefined, event.contentChanges, canonicalSource);
-    if (lineLock) {
-      this.restoreRejectedText(document, canonicalSource, lineLock);
-      return;
-    }
     const changes: TextChange[] = event.contentChanges.map((change) => ({
       offset: change.rangeOffset,
       deleteCount: change.rangeLength,
       insertText: change.text,
     }));
     try {
+      const baseline = this.initialTextBaselines.get(document.uri.toString());
+      if (baseline !== undefined) {
+        this.publishInitialTextEvents(document, baseline, [{ changes, after: document.getText() }]);
+        return;
+      }
       this.publishTextChanges(document, key, undefined, changes);
     } catch (error) {
       this.restoreRejectedText(
@@ -679,6 +684,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       const current = document.getText();
       if (current === target) {
         if (replica) this.replaceTextReplica(uri, replica);
+        this.initialTextBaselines.delete(uri);
         return;
       }
       const edit = minimalEdit(current, target);
@@ -697,6 +703,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       } finally {
         this.pendingTextEdits.delete(uri);
         if (applied) {
+          this.initialTextBaselines.delete(uri);
           if (replica) this.replaceTextReplica(uri, replica);
           const echoEnd = findRemoteEchoEnd(pending);
           if (replica && echoEnd >= 0) {
@@ -705,7 +712,8 @@ export class EditorSynchronizer implements vscode.Disposable {
             this.publishPostApplyText(document, replica, document.getText());
           }
         } else if (displayed) {
-          this.publishBufferedTextEvents(document, displayed, pending.baseline, pending.events);
+          if (this.initialTextBaselines.has(uri)) this.publishInitialTextEvents(document, pending.baseline, pending.events);
+          else this.publishBufferedTextEvents(document, displayed, pending.baseline, pending.events);
         }
         if (replica && this.textReplicas.get(uri) !== replica) replica.dispose();
       }
@@ -727,7 +735,35 @@ export class EditorSynchronizer implements vscode.Disposable {
 
   private rememberText(document: vscode.TextDocument, key: string, cellId?: string): void {
     const uri = document.uri.toString();
-    if (!this.textReplicas.has(uri)) this.replaceTextReplica(uri, new EditorTextReplica(this.project, key, cellId));
+    if (this.textReplicas.has(uri)) return;
+    const replica = new EditorTextReplica(this.project, key, cellId);
+    this.replaceTextReplica(uri, replica);
+    if (replica.source() === document.getText()) return;
+    if (document.isDirty) {
+      // An already edited buffer is local work, not a stale saved projection.
+      this.publishPostApplyText(document, replica, document.getText());
+    } else {
+      this.initialTextBaselines.set(uri, document.getText());
+    }
+  }
+
+  private publishInitialTextEvents(document: vscode.TextDocument, baseline: string, events: readonly BufferedTextEvent[]): void {
+    const replica = this.textReplicas.get(document.uri.toString());
+    if (!replica) return;
+    let state = baseline;
+    for (const buffered of events) {
+      const changes = applyBufferedTextChanges(state, buffered.changes) === buffered.after
+        ? buffered.changes : [minimalEdit(state, buffered.after)];
+      const rebased = rebaseInitialTextChanges(state, replica.source(), changes);
+      this.initialTextBaselines.set(document.uri.toString(), buffered.after);
+      try {
+        if (rebased.length) this.publishTextChanges(document, replica.key, replica.cellId, rebased);
+      } catch (error) {
+        this.restoreRejectedText(document, this.canonicalSourceForReplica(replica), formatError(error));
+        return;
+      }
+      state = buffered.after;
+    }
   }
 
   private publishBufferedTextEvents(
@@ -741,20 +777,6 @@ export class EditorSynchronizer implements vscode.Disposable {
       const next = applyBufferedTextChanges(state, buffered.changes);
       if (next === undefined || next !== buffered.after || replica.source() !== state) {
         this.publishPostApplyText(document, replica, document.getText());
-        return;
-      }
-      const canonicalSource = this.canonicalSourceForReplica(replica);
-      const lineLock = this.lineLockGuard?.(
-        replica.key,
-        replica.cellId,
-        buffered.changes.map((change) => ({
-          rangeOffset: change.offset,
-          rangeLength: change.deleteCount,
-        })),
-        canonicalSource,
-      );
-      if (lineLock) {
-        this.restoreRejectedText(document, canonicalSource, lineLock);
         return;
       }
       try {
@@ -783,17 +805,6 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (current === value) return;
     const change = minimalEdit(current, value);
     if (!change.deleteCount && !change.insertText) return;
-    const canonicalSource = this.canonicalSourceForReplica(replica);
-    const lineLock = this.lineLockGuard?.(
-      replica.key,
-      replica.cellId,
-      [{ rangeOffset: change.offset, rangeLength: change.deleteCount }],
-      canonicalSource,
-    );
-    if (lineLock) {
-      this.restoreRejectedText(document, canonicalSource, lineLock);
-      return;
-    }
     try {
       this.publishTextChanges(document, replica.key, replica.cellId, [change]);
     } catch (error) {
@@ -835,6 +846,11 @@ export class EditorSynchronizer implements vscode.Disposable {
     const uri = document.uri.toString();
     const replica = this.textReplicas.get(uri);
     const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
+    const guardedChanges = this.lineLockGuard && replica ? replica.canonicalChanges(changes) : changes;
+    const lineLock = this.lineLockGuard?.(key, cellId, guardedChanges.map((change) => ({
+      rangeOffset: change.offset, rangeLength: change.deleteCount,
+    })), canonical.toString());
+    if (lineLock) throw new Error(lineLock);
     if (replica && replica.source() !== canonical.toString()) {
       replica.edit(changes);
     } else {
@@ -972,17 +988,14 @@ export class EditorSynchronizer implements vscode.Disposable {
           return;
         }
         canonicalSource = this.project.cellSource(key, cellId).toString();
-        const lineLock = this.lineLockGuard?.(key, cellId, event.contentChanges, canonicalSource);
-        if (lineLock) {
-          this.restoreRejectedText(event.document, canonicalSource, lineLock);
-          return;
-        }
         const changes = event.contentChanges.map((change) => ({
           offset: change.rangeOffset,
           deleteCount: change.rangeLength,
           insertText: change.text,
         }));
-        this.publishTextChanges(event.document, key, cellId, changes);
+        const baseline = this.initialTextBaselines.get(event.document.uri.toString());
+        if (baseline !== undefined) this.publishInitialTextEvents(event.document, baseline, [{ changes, after: event.document.getText() }]);
+        else this.publishTextChanges(event.document, key, cellId, changes);
         return;
       }
     } catch (error) {
