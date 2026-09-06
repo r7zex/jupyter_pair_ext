@@ -1449,3 +1449,49 @@ describe('EditorSynchronizer initial baselines and rebased line locks', () => {
     });
   }
 });
+
+
+describe('EditorSynchronizer teardown cancellation', () => {
+  for (const notebookCell of [false, true]) for (const inFlight of [false, true]) {
+    it('does not revive project state after disposal cell='+notebookCell+' inFlight='+inFlight, async () => {
+      const root = path.resolve('/tmp/pair-disposed-editor');
+      const notebook = fakeNotebook(root, [fakeCell('abc\nnext', 'a'), fakeCell('keep second', 'b')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'abc\nnext');
+      if (notebookCell) vscodeBoundary.__reset(notebook); else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const messages: string[] = [];
+      const synchronizer = new EditorSynchronizer(project, root, { appendLine: (line: string) => messages.push(line) } as any);
+      if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+      let release: (() => void) | undefined;
+      let entered = false;
+      if (inFlight) vscodeBoundary.__beforeApplyEdit = async () => {
+        vscodeBoundary.__beforeApplyEdit = undefined;
+        entered = true;
+        await new Promise<void>((resolve) => { release = resolve; });
+      };
+      const change = () => {
+        if (notebookCell) project.applyCellTextChanges('work.ipynb', 'a', [{ offset: 0, deleteCount: 0, insertText: 'R' }], REMOTE_ORIGIN);
+        else project.applyTextChanges('notes.txt', [{ offset: 0, deleteCount: 0, insertText: 'R' }], REMOTE_ORIGIN);
+      };
+      try {
+        change();
+        if (inFlight) {
+          await waitFor(() => entered, 1000, 'native edit pending during shutdown');
+          change();
+        }
+        synchronizer.dispose();
+        project.destroy();
+        release?.();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(project.keys(), []);
+        assert.equal((synchronizer as any).textReplicas.size, 0);
+        assert.equal(project.listenerCount('update'), 0);
+        assert.deepEqual(messages, []);
+        if (notebookCell) assert.equal(notebook.cellCount, 2);
+        if (!inFlight) assert.equal(document.text, 'abc\nnext');
+        else assert.equal(document.text, 'Rabc\nnext', 'only the already submitted native edit can finish');
+      } finally { release?.(); synchronizer.dispose(); project.destroy(); }
+    });
+  }
+});

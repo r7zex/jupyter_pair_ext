@@ -60,12 +60,14 @@ interface BufferedTextEvent {
 }
 
 interface PendingTextEdit {
+  readonly document: vscode.TextDocument;
   readonly baseline: string;
   readonly target: string;
   readonly events: BufferedTextEvent[];
 }
 
 export class EditorSynchronizer implements vscode.Disposable {
+  private disposed = false;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly textReplicas = new Map<string, EditorTextReplica>();
   private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
@@ -118,21 +120,31 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     for (const replica of this.textReplicas.values()) replica.dispose();
     this.textReplicas.clear();
     this.project.off('update', this.onProjectUpdate);
     this.project.off('documentRenamed', this.onDocumentRenamed);
     this.project.off('documentDeleted', this.onDocumentDeleted);
-    for (const [key, observer] of this.textObservers) this.project.text(key).unobserve(observer);
+    for (const [key, observer] of this.textObservers) {
+      if (this.project.kindOf(key) === 'text') this.project.text(key).unobserve(observer);
+    }
     this.textObservers.clear();
     for (const timer of this.notebookCellStateTimers.values()) clearTimeout(timer);
     this.notebookCellStateTimers.clear();
     this.pendingNotebookCellStates.clear();
+    this.initialTextBaselines.clear();
+    this.pendingTextEdits.clear();
+    this.textRenders.clear();
+    this.textApplyQueues.clear();
+    this.notebookApplyQueues.clear();
     for (const disposable of this.disposables) disposable.dispose();
   }
 
   /** Waits until stable CRDT cell IDs are attached before execution starts. */
   public whenNotebookReady(notebook: vscode.NotebookDocument): Promise<void> {
+    if (this.disposed || notebook.isClosed) return Promise.resolve();
     if (this.boundNotebooks.has(notebook)) return Promise.resolve();
     const active = this.notebookBindings.get(notebook);
     if (active) return active;
@@ -156,6 +168,7 @@ export class EditorSynchronizer implements vscode.Disposable {
 
   /** Materializes every open document before local execution needs a physical filesystem snapshot. */
   public async prepareWorkingCopy(): Promise<void> {
+    if (this.disposed) return;
     const keys = new Set<string>();
     for (const notebook of vscode.workspace.notebookDocuments) {
       const key = this.keyForUri(notebook.uri);
@@ -170,15 +183,19 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async persistOpenWorkingCopy(relativePath: string, forceSave: boolean): Promise<boolean> {
+    if (this.disposed) return true;
     const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === relativePath);
     if (notebook) {
       await this.whenNotebookReady(notebook);
+      if (this.disposed || notebook.isClosed) return true;
       await this.drainPendingNotebookCellStates(relativePath);
+      if (this.disposed || notebook.isClosed) return true;
       // Persistence never invokes a full notebook snapshot merely because a
       // flush happened. Reconcile fields narrowly; full snapshot is reachable
       // only if this proves an actual structural mismatch.
       await this.applyUnscopedNotebookReconciliation(notebook, relativePath);
       await this.ensureStableCellIds(notebook);
+      if (this.disposed || notebook.isClosed) return true;
       if (forceSave && !await notebook.save()) {
         throw new Error(`VS Code could not save ${relativePath}.`);
       }
@@ -190,7 +207,9 @@ export class EditorSynchronizer implements vscode.Disposable {
       : undefined;
     if (document) {
       await (this.textApplyQueues.get(relativePath) ?? Promise.resolve());
+      if (this.disposed || document.isClosed) return true;
       await this.applyText(document, this.project.text(relativePath).toString());
+      if (this.disposed || document.isClosed) return true;
       if (forceSave && !await document.save()) {
         throw new Error(`VS Code could not save ${relativePath}.`);
       }
@@ -200,7 +219,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private readonly onProjectUpdate = (event: ProjectUpdate): void => {
-    if (event.origin !== REMOTE_ORIGIN || event.kind !== 'notebook') return;
+    if (this.disposed || event.origin !== REMOTE_ORIGIN || event.kind !== 'notebook') return;
     this.enqueueNotebookApply(event.key, async () => {
       const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === event.key);
       if (!notebook) return;
@@ -247,8 +266,10 @@ export class EditorSynchronizer implements vscode.Disposable {
   };
 
   private enqueueNotebookApply(key: string, task: () => Promise<void>): void {
+    if (this.disposed) return;
     const previous = this.notebookApplyQueues.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(task).catch((error) => {
+    const next = previous.catch(() => undefined).then(() => this.disposed ? undefined : task()).catch((error) => {
+      if (this.disposed) return;
       this.log.appendLine(`[error] Failed to apply queued remote notebook update for ${key}: ${formatError(error)}`);
     });
     this.notebookApplyQueues.set(key, next);
@@ -301,6 +322,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     cellId: string,
     executionMode: 'live' | 'snapshot' = 'live',
   ): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const target = this.project.notebookCellSnapshot(key, cellId);
     const located = this.findNotebookCellByStableId(notebook, cellId);
     if (!target || !located) return;
@@ -353,6 +375,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookCellMetadata(notebook: vscode.NotebookDocument, key: string, cellId: string): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const target = this.project.notebookCellSnapshot(key, cellId);
     const located = this.findNotebookCellByStableId(notebook, cellId);
     if (!target || !located) return;
@@ -373,6 +396,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookMetadata(notebook: vscode.NotebookDocument, key: string): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const current = normalizeNotebookMetadata(notebook.metadata);
     const target = normalizeNotebookMetadata(this.project.notebookMetadata(key));
     if (sameJson(current, target)) return;
@@ -534,6 +558,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     key: string,
     reason: string,
   ): Promise<boolean> {
+    if (this.disposed || notebook.isClosed) return true;
     const snapshot = this.project.notebookSnapshot(key);
     const currentStructure = notebook.getCells().map((cell) => ({
       id: this.cellIds.knownId(cell, metadataCellId(cell.metadata)) ?? '',
@@ -550,21 +575,28 @@ export class EditorSynchronizer implements vscode.Disposable {
     notebook: vscode.NotebookDocument,
     key: string,
   ): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     if (await this.applyStructuralRecoveryIfNeeded(notebook, key, 'unscoped state-vector reconciliation')) return;
+    if (this.disposed || notebook.isClosed) return;
     const snapshot = this.project.notebookSnapshot(key);
     for (const target of snapshot.cells) {
       const located = this.findNotebookCellByStableId(notebook, target.id);
       if (!located) continue;
       await this.applyText(located.cell.document, target.source);
+      if (this.disposed || notebook.isClosed) return;
       await this.applyNotebookCellMetadata(notebook, key, target.id);
+      if (this.disposed || notebook.isClosed) return;
       await this.applyNotebookCellState(notebook, key, target.id, 'snapshot');
+      if (this.disposed || notebook.isClosed) return;
     }
     await this.applyNotebookMetadata(notebook, key);
   }
 
   private enqueueTextApply(key: string, task: () => Promise<void>): void {
+    if (this.disposed) return;
     const previous = this.textApplyQueues.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(task).catch((error) => {
+    const next = previous.catch(() => undefined).then(() => this.disposed ? undefined : task()).catch((error) => {
+      if (this.disposed) return;
       this.log.appendLine(`[error] Failed to apply queued remote text update for ${key}: ${formatError(error)}`);
     });
     this.textApplyQueues.set(key, next);
@@ -606,6 +638,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   };
 
   private bindTextDocument(document: vscode.TextDocument): void {
+    if (this.disposed || document.isClosed) return;
     if (document.uri.scheme === 'vscode-notebook-cell') return;
     const key = this.keyForUri(document.uri);
     if (!key) return;
@@ -632,6 +665,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private onTextChanged(event: vscode.TextDocumentChangeEvent): void {
+    if (this.disposed) return;
     const document = event.document;
     if (document.uri.scheme === 'vscode-notebook-cell') {
       this.onNotebookCellTextChanged(event);
@@ -662,6 +696,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyText(document: vscode.TextDocument, target: string): Promise<void> {
+    if (this.disposed || document.isClosed) return;
     const uri = document.uri.toString();
     const previous = this.textRenders.get(uri) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(() => this.renderText(document, target));
@@ -674,6 +709,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   private async renderText(document: vscode.TextDocument, fallback: string): Promise<void> {
     const uri = document.uri.toString();
     for (;;) {
+      if (this.disposed || document.isClosed) return;
       const displayed = this.textReplicas.get(uri);
       if (displayed) {
         const canonical = displayed.cellId ? this.project.cellSource(displayed.key, displayed.cellId) : this.project.text(displayed.key);
@@ -695,14 +731,16 @@ export class EditorSynchronizer implements vscode.Disposable {
         edit.insertText,
       );
       const version = document.version;
-      const pending: PendingTextEdit = { baseline: current, target, events: [] };
+      const pending: PendingTextEdit = { document, baseline: current, target, events: [] };
       this.pendingTextEdits.set(uri, pending);
       let applied = false;
       try {
         applied = await vscode.workspace.applyEdit(workspaceEdit);
       } finally {
         this.pendingTextEdits.delete(uri);
-        if (applied) {
+        if (this.disposed || document.isClosed) {
+          replica?.dispose();
+        } else if (applied) {
           this.initialTextBaselines.delete(uri);
           if (replica) this.replaceTextReplica(uri, replica);
           const echoEnd = findRemoteEchoEnd(pending);
@@ -717,6 +755,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         }
         if (replica && this.textReplicas.get(uri) !== replica) replica.dispose();
       }
+      if (this.disposed || document.isClosed) return;
       if (!applied) {
         if (document.version !== version) continue;
         throw new Error(`VS Code rejected remote edit for ${document.uri.fsPath}`);
@@ -734,6 +773,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private rememberText(document: vscode.TextDocument, key: string, cellId?: string): void {
+    if (this.disposed || document.isClosed) return;
     const uri = document.uri.toString();
     if (this.textReplicas.has(uri)) return;
     const replica = new EditorTextReplica(this.project, key, cellId);
@@ -828,7 +868,7 @@ export class EditorSynchronizer implements vscode.Disposable {
 
   private capturePendingTextEvent(event: vscode.TextDocumentChangeEvent): boolean {
     const pending = this.pendingTextEdits.get(event.document.uri.toString());
-    if (!pending) return false;
+    if (!pending || pending.document !== event.document) return false;
     // Capture immutable offsets plus the exact resulting text while this
     // editor version is current. Never replay a live event object later.
     pending.events.push({
@@ -869,10 +909,12 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async bindNotebook(notebook: vscode.NotebookDocument): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const key = this.keyForUri(notebook.uri);
     if (!key) return;
     if (!this.project.has(key)) {
       await this.ensureStableCellIds(notebook);
+      if (this.disposed || notebook.isClosed) return;
       this.project.ensureNotebook(key, this.snapshotFromNotebook(notebook));
       this.rememberStructure(notebook);
     } else {
@@ -891,8 +933,10 @@ export class EditorSynchronizer implements vscode.Disposable {
         if (this.project.hasNotebookCell(key, cellId)) this.rememberText(cell.document, key, cellId);
       }
       await this.applyUnscopedNotebookReconciliation(notebook, key);
+      if (this.disposed || notebook.isClosed) return;
     }
     await this.ensureStableCellIds(notebook);
+    if (this.disposed || notebook.isClosed) return;
     this.rememberStructure(notebook);
     for (const cell of notebook.getCells()) {
       const cellId = this.cellIds.idFor(cell, metadataCellId(cell.metadata));
@@ -1009,6 +1053,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private restoreRejectedText(document: vscode.TextDocument, canonical: string, detail: string): void {
+    if (this.disposed || document.isClosed) return;
     this.log.appendLine(`[error] ${detail}`);
     void this.applyText(document, canonical).catch((error) => {
       this.log.appendLine(`[error] Could not restore rejected editor update: ${formatError(error)}`);
@@ -1026,6 +1071,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async applyNotebookSnapshot(notebook: vscode.NotebookDocument, snapshot: NotebookSnapshot): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const currentCells = notebook.getCells();
     const currentStructure = currentCells.map((cell, index) => ({
       id: this.cellIds.knownId(cell, metadataCellId(cell.metadata)) ?? `unidentified:${index}`,
@@ -1047,6 +1093,7 @@ export class EditorSynchronizer implements vscode.Disposable {
           splice.cells.map(toNotebookCellData),
         )]);
         if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook structure.');
+        if (this.disposed || notebook.isClosed) return;
         this.remapStableCellIdsAfterStructure(notebook);
         structureApplied = true;
       }
@@ -1055,6 +1102,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const located = this.findNotebookCellByStableId(notebook, target.id);
         if (!located) continue;
         await this.applyText(located.cell.document, target.source);
+        if (this.disposed || notebook.isClosed) return;
       }
 
       const notebookEdits: vscode.NotebookEdit[] = [];
@@ -1097,6 +1145,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const edit = new vscode.WorkspaceEdit();
         edit.set(notebook.uri, notebookEdits);
         if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook metadata update.');
+        if (this.disposed || notebook.isClosed) return;
       }
 
       if (stateRenders.length) {
@@ -1107,12 +1156,13 @@ export class EditorSynchronizer implements vscode.Disposable {
         } else {
           for (const state of stateRenders) {
             await this.cellStateRenderer.renderRemoteCellState(state.cell, state.request);
+            if (this.disposed || notebook.isClosed) return;
           }
         }
       }
     } finally {
       try {
-        if (structureApplied) this.restoreStructuralEditorState(notebook, structuralEditorState);
+        if (structureApplied && !this.disposed && !notebook.isClosed) this.restoreStructuralEditorState(notebook, structuralEditorState);
       } finally {
         this.applyingNotebooks.delete(uri);
       }
@@ -1138,6 +1188,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private async ensureStableCellIds(notebook: vscode.NotebookDocument): Promise<void> {
+    if (this.disposed || notebook.isClosed) return;
     const edits: vscode.NotebookEdit[] = [];
     const seen = new Set<string>();
     for (let index = 0; index < notebook.cellCount; index += 1) {

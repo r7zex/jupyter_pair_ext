@@ -1,7 +1,7 @@
 import * as Y from 'yjs';
 import { CollaborativeProject, ProjectUpdate, TextChange } from '../core/crdt';
 
-interface SharedVersion { project: CollaborativeProject; revision: number; references: number }
+interface SharedVersion { project: CollaborativeProject; revision: number; references: number; reusable: boolean }
 
 /** One source-only template per open document, shared by its displayed cells. */
 class TextReplicaPool {
@@ -9,6 +9,7 @@ class TextReplicaPool {
   private readonly template = new CollaborativeProject();
   private revision = 0;
   private latest: SharedVersion | undefined;
+  private spare: SharedVersion | undefined;
 
   public constructor(public readonly canonical: CollaborativeProject, public key: string, private readonly notebook: boolean) {
     this.template.applyRemoteUpdate(key, notebook ? 'notebook' : 'text', canonical.encodeUpdate(key));
@@ -39,30 +40,50 @@ class TextReplicaPool {
   }
 
   public version(): SharedVersion {
-    if (this.latest?.revision === this.revision) return this.latest;
+    if (this.latest?.revision === this.revision && this.latest.reusable) return this.latest;
     const previous = this.latest;
-    const project = new CollaborativeProject();
-    project.applyRemoteUpdate(this.key, this.notebook ? 'notebook' : 'text', this.template.encodeUpdate(this.key));
-    this.latest = { project, revision: this.revision, references: 0 };
+    const spare = this.spare;
+    this.spare = undefined;
+    const project = spare?.project ?? new CollaborativeProject();
+    const stateVector = spare ? Y.encodeStateVector(this.notebook
+      ? project.ensureNotebook(this.key) : project.text(this.key).doc!) : undefined;
+    try {
+      project.applyRemoteUpdate(this.key, this.notebook ? 'notebook' : 'text', this.template.encodeUpdate(this.key, stateVector));
+    } catch (error) {
+      project.destroy();
+      throw error;
+    }
+    this.latest = { project, revision: this.revision, references: 0, reusable: true };
     // Unchanged displayed sources can share the new version immediately. Only
     // cells with unapplied source changes retain an older source-only version.
     for (const member of this.members) {
       if (member.cellId && !project.hasNotebookCell(this.key, member.cellId)) continue;
       if (member.source() === member.sourceIn(project)) member.adopt(this.latest);
     }
-    if (previous && !previous.references) previous.project.destroy();
+    if (previous && !previous.references) this.recycle(previous);
     return this.latest;
   }
 
   public release(version: SharedVersion): void {
     version.references -= 1;
-    if (!version.references && version !== this.latest) version.project.destroy();
+    if (!version.references && version !== this.latest) this.recycle(version);
+  }
+
+  private recycle(version: SharedVersion): void {
+    if (this.spare === version) return;
+    if (!version.reusable) {
+      version.project.destroy();
+      return;
+    }
+    this.spare?.project.destroy();
+    this.spare = version;
   }
 
   public rename(key: string): void {
     const previousKey = this.key;
     const versions = new Set([...this.members].map((member) => member.version));
     if (this.latest) versions.add(this.latest);
+    if (this.spare) versions.add(this.spare);
     this.template.renameDocument(previousKey, key);
     for (const version of versions) version.project.renameDocument(previousKey, key);
     this.key = key;
@@ -75,6 +96,7 @@ class TextReplicaPool {
     this.canonical.off('update', this.onUpdate);
     this.template.destroy();
     this.latest?.project.destroy();
+    this.spare?.project.destroy();
     replicaPools.get(this.canonical)?.delete(this.key);
   }
 }
@@ -134,6 +156,7 @@ export class EditorTextReplica {
   }
 
   public edit(changes: readonly TextChange[]): void {
+    this.version.reusable = false;
     const updates: Uint8Array[] = [];
     const capture = (event: ProjectUpdate) => updates.push(event.update);
     this.project.on('update', capture);
@@ -143,6 +166,7 @@ export class EditorTextReplica {
     } finally { this.project.off('update', capture); }
     // Template pruning and historical deletion sets never cross this boundary.
     if (updates.length) this.canonical.mergeEditorText(this.key, this.cellId, Y.mergeUpdates(updates));
+    this.version.reusable = true;
   }
 
   public accept(update: Uint8Array): void {
