@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.19 - 2026-09-06 (notebook synchronization stability)
+
+- Limits notebook output publication and rendering to two updates per second while immediately flushing terminal execution state.
+- Keeps cell text responsive during output bursts, rebases valid typing from stale editor baselines, and prevents delayed recovery from overwriting newer input.
+- Avoids source-replica invalidation for output-only changes and adds regression coverage for slow renderers, transient failures, stale baselines, and bounded CRDT output publication.
+
 ## 0.5.18 - 2026-09-06 (relay recovery handshake repair)
 
 - Allows a fresh relay handshake after one-sided route loss while suppressing duplicate handshake echoes for the admitted nonce.
