@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import * as Y from 'yjs';
 import {
@@ -29,6 +30,7 @@ import { EditorTextReplica } from './editorTextReplica';
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = OUTPUT_STATE_CADENCE_MS;
+const REMOTE_TEXT_QUARANTINE_MS = 100;
 
 export interface NotebookCellRenderRequest {
   outputs: readonly vscode.NotebookCellOutput[];
@@ -43,27 +45,26 @@ export interface NotebookCellStateRenderer {
   isManagingCellState?(cell: vscode.NotebookCell): boolean;
 }
 
-interface LineTouchChange {
-  readonly rangeOffset: number;
-  readonly rangeLength: number;
-}
-
-export type LineLockGuard = (
-  key: string,
-  cellId: string | undefined,
-  changes: readonly LineTouchChange[],
-  canonicalSource: string,
-) => string | undefined;
-
 interface BufferedTextEvent {
   readonly changes: TextChange[];
   readonly after: string;
 }
 
+export interface EditorTextIntentRequest {
+  readonly key: string;
+  readonly cellId: string | undefined;
+  readonly baseline: string;
+  readonly changes: readonly TextChange[];
+  readonly result: string;
+}
+
+/** Returns true when the host protocol owns canonical publication. */
+export type EditorTextIntentPublisher = (request: EditorTextIntentRequest) => boolean;
+
 interface PendingTextEdit {
+  readonly id: number;
   readonly document: vscode.TextDocument;
   readonly baseline: string;
-  readonly target: string;
   readonly events: BufferedTextEvent[];
 }
 
@@ -72,7 +73,13 @@ interface TextRenderGuard {
   readonly text: string;
 }
 
-class EditorPolicyRejection extends Error {}
+interface ProjectionQuarantine {
+  readonly document: vscode.TextDocument;
+  readonly target: string;
+  readonly renderId: number;
+  readonly expiresAt: number;
+  readonly timer: NodeJS.Timeout;
+}
 
 export class EditorSynchronizer implements vscode.Disposable {
   private explicitlyDisposed = false;
@@ -82,6 +89,8 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly pendingTextEdits = new Map<string, PendingTextEdit>();
   private readonly initialTextBaselines = new Map<string, string>();
   private readonly documentTextBaselines = new Map<string, string>();
+  private nextTextRenderId = 1;
+  private readonly projectionQuarantines = new Map<string, ProjectionQuarantine>();
   private readonly textRenders = new Map<string, Promise<void>>();
   private readonly applyingNotebooks = new Set<string>();
   private readonly structuralNotebookApplies = new Set<string>();
@@ -103,13 +112,14 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly log: vscode.OutputChannel,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
-    private readonly lineLockGuard?: LineLockGuard,
+    private readonly textIntentPublisher?: EditorTextIntentPublisher,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
       vscode.workspace.onDidChangeTextDocument((event) => this.onTextChanged(event)),
       vscode.workspace.onDidCloseTextDocument((document) => {
         const uri = document.uri.toString();
+        this.clearProjectionQuarantine(uri);
         this.textReplicas.get(uri)?.dispose();
         this.textReplicas.delete(uri);
         this.initialTextBaselines.delete(uri);
@@ -150,6 +160,8 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.notebookCellStateFlushQueued.clear();
     this.immediateNotebookCellStateFlushes.clear();
     this.pendingNotebookCellStates.clear();
+    for (const quarantine of this.projectionQuarantines.values()) clearTimeout(quarantine.timer);
+    this.projectionQuarantines.clear();
     this.initialTextBaselines.clear();
     this.documentTextBaselines.clear();
     this.pendingTextEdits.clear();
@@ -745,7 +757,8 @@ export class EditorSynchronizer implements vscode.Disposable {
       return;
     }
     const key = this.keyForUri(document.uri);
-    if (!key || !event.contentChanges.length || this.capturePendingTextEvent(event)) return;
+    if (!key || !event.contentChanges.length || this.capturePendingTextEvent(event)
+      || this.suppressProjectionTail(event)) return;
     if (this.project.kindOf(key) !== 'text') return;
     const changes: TextChange[] = event.contentChanges.map((change) => ({
       offset: change.rangeOffset,
@@ -814,7 +827,9 @@ export class EditorSynchronizer implements vscode.Disposable {
         edit.insertText,
       );
       const version = document.version;
-      const pending: PendingTextEdit = { document, baseline: current, target, events: [] };
+      const pending: PendingTextEdit = {
+        id: this.nextTextRenderId++, document, baseline: current, events: [],
+      };
       this.pendingTextEdits.set(uri, pending);
       let applied = false;
       try {
@@ -826,11 +841,18 @@ export class EditorSynchronizer implements vscode.Disposable {
         } else if (applied) {
           this.initialTextBaselines.delete(uri);
           if (replica) this.replaceTextReplica(uri, replica);
-          const echoEnd = findRemoteEchoEnd(pending);
-          if (replica && echoEnd >= 0) {
-            this.publishBufferedTextEvents(document, replica, target, pending.events.slice(echoEnd + 1));
-          } else if (replica && document.getText() !== target) {
-            this.publishPostApplyText(document, replica, document.getText());
+          this.armProjectionQuarantine(document, target, pending.id);
+          if (document.getText() !== target) {
+            // VS Code does not expose edit authorship. Every event emitted while
+            // applyEdit is in flight therefore belongs to the projection
+            // transaction, including formatter/notebook normalization tails.
+            // Never promote that ambiguous tail into shared CRDT authorship.
+            this.log.appendLine(
+              `[debug] Suppressed ${pending.events.length} editor transition(s) during remote text render `
+              + `${pending.id} for ${replica?.key ?? document.uri.fsPath}; `
+              + `baseline=${textDigest(pending.baseline)} target=${textDigest(target)} `
+              + `result=${textDigest(document.getText())}.`,
+            );
           }
         } else if (displayed) {
           if (this.initialTextBaselines.has(uri)) this.publishInitialTextEvents(document, pending.baseline, pending.events);
@@ -846,7 +868,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       }
       // A later canonical transaction or local keystroke may have arrived while
       // VS Code applied this version. Reconcile again before releasing the queue.
-      if (!displayed) return;
+      if (!displayed && document.getText() === target) return;
     }
   }
 
@@ -854,6 +876,74 @@ export class EditorSynchronizer implements vscode.Disposable {
     const previous = this.textReplicas.get(uri);
     if (previous !== replica) previous?.dispose();
     this.textReplicas.set(uri, replica);
+  }
+
+  private armProjectionQuarantine(document: vscode.TextDocument, target: string, renderId: number): void {
+    const uri = document.uri.toString();
+    this.clearProjectionQuarantine(uri);
+    const expiresAt = Date.now() + REMOTE_TEXT_QUARANTINE_MS;
+    const timer = setTimeout(() => {
+      const current = this.projectionQuarantines.get(uri);
+      if (current?.renderId === renderId) this.projectionQuarantines.delete(uri);
+    }, REMOTE_TEXT_QUARANTINE_MS);
+    timer.unref?.();
+    this.projectionQuarantines.set(uri, { document, target, renderId, expiresAt, timer });
+  }
+
+  private clearProjectionQuarantine(uri: string): void {
+    const quarantine = this.projectionQuarantines.get(uri);
+    if (quarantine) clearTimeout(quarantine.timer);
+    this.projectionQuarantines.delete(uri);
+  }
+
+  private suppressProjectionTail(event: vscode.TextDocumentChangeEvent): boolean {
+    const uri = event.document.uri.toString();
+    const quarantine = this.projectionQuarantines.get(uri);
+    if (!quarantine || quarantine.document !== event.document) return false;
+    if (Date.now() >= quarantine.expiresAt) {
+      this.clearProjectionQuarantine(uri);
+      return false;
+    }
+    this.log.appendLine(
+      `[debug] Suppressed delayed editor transition during remote text render ${quarantine.renderId} `
+      + `for ${event.document.uri.fsPath}; target=${textDigest(this.currentCanonicalText(event.document, quarantine.target))} `
+      + `result=${textDigest(event.document.getText())}.`,
+    );
+    // Canonical state may have advanced after this quarantine was armed. Always
+    // restore the latest authority value so an older render cannot overwrite a
+    // newer accepted operation while its delayed editor tail is being removed.
+    void this.applyText(event.document, this.currentCanonicalText(event.document, quarantine.target)).catch((error) => {
+      this.log.appendLine(`[error] Could not restore a delayed projection tail: ${formatError(error)}`);
+    });
+    return true;
+  }
+
+  private currentCanonicalText(document: vscode.TextDocument, fallback: string): string {
+    const replica = this.textReplicas.get(document.uri.toString());
+    if (replica) return this.canonicalSourceForReplica(replica);
+    const key = this.keyForUri(document.uri);
+    try {
+      if (key && this.project.has(key) && this.project.kindOf(key) === 'text') {
+        return this.project.text(key).toString();
+      }
+    } catch { /* use the immutable render fallback if the project was concurrently torn down */ }
+    return fallback;
+  }
+
+  /** Maps a displayed editor offset through its Yjs replica into canonical text. */
+  public canonicalOffsetForDocument(document: vscode.TextDocument, offset: number): number | undefined {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > document.getText().length) return undefined;
+    const replica = this.textReplicas.get(document.uri.toString());
+    if (replica) {
+      try {
+        return replica.canonicalChanges([{ offset, deleteCount: 0, insertText: '' }])[0]?.offset;
+      } catch {
+        return undefined;
+      }
+    }
+    const key = this.keyForUri(document.uri);
+    if (!key || !this.project.has(key) || this.project.kindOf(key) !== 'text') return undefined;
+    return this.project.text(key).toString() === document.getText() ? offset : undefined;
   }
 
   private rememberText(document: vscode.TextDocument, key: string, cellId?: string): void {
@@ -976,13 +1066,19 @@ export class EditorSynchronizer implements vscode.Disposable {
 
   private publishTextChanges(document: vscode.TextDocument, key: string, cellId: string | undefined, changes: TextChange[]): void {
     const uri = document.uri.toString();
-    const replica = this.textReplicas.get(uri);
+    let replica = this.textReplicas.get(uri);
     const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
-    const guardedChanges = this.lineLockGuard && replica ? replica.canonicalChanges(changes) : changes;
-    const lineLock = this.lineLockGuard?.(key, cellId, guardedChanges.map((change) => ({
-      rangeOffset: change.offset, rangeLength: change.deleteCount,
-    })), canonical.toString());
-    if (lineLock) throw new EditorPolicyRejection(lineLock);
+    const baseline = replica?.source() ?? canonical.toString();
+    const result = applyBufferedTextChanges(baseline, changes);
+    if (result !== undefined && this.textIntentPublisher?.({ key, cellId, baseline, changes: [...changes], result })) {
+      if (!replica) {
+        this.rememberText(document, key, cellId);
+        replica = this.textReplicas.get(uri);
+      }
+      if (!replica) throw new Error(`Cannot create an optimistic editor replica for ${key}.`);
+      replica.editLocal(changes);
+      return;
+    }
     if (replica && replica.source() !== canonical.toString()) {
       replica.edit(changes);
     } else {
@@ -1113,7 +1209,8 @@ export class EditorSynchronizer implements vscode.Disposable {
     let canonicalSource: string | undefined;
     let changes: TextChange[] = [];
     try {
-      if (!event.contentChanges.length || this.capturePendingTextEvent(event)) return;
+      if (!event.contentChanges.length || this.capturePendingTextEvent(event)
+        || this.suppressProjectionTail(event)) return;
       for (const notebook of vscode.workspace.notebookDocuments) {
         const cell = notebook.getCells().find((candidate) => candidate.document.uri.toString() === event.document.uri.toString());
         if (!cell) continue;
@@ -1158,8 +1255,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     baseline?: string,
     changes?: readonly TextChange[],
   ): boolean {
-    if (this.disposed || document.isClosed || !replica || error instanceof EditorPolicyRejection
-      || !isRecoverableTextBaselineError(error)) return false;
+    if (this.disposed || document.isClosed || !replica || !isRecoverableTextBaselineError(error)) return false;
     const displayed = replica.source();
     const current = document.getText();
     const canonical = this.canonicalSourceForReplica(replica);
@@ -1439,19 +1535,6 @@ function assertNeverNotebookScope(scope: never): never {
   throw new Error(`Unhandled notebook update scope: ${JSON.stringify(scope)}`);
 }
 
-function findRemoteEchoEnd(pending: PendingTextEdit): number {
-  let state = pending.baseline;
-  let lastTarget = -1;
-  for (let index = 0; index < pending.events.length; index += 1) {
-    const buffered = pending.events[index]!;
-    const next = applyBufferedTextChanges(state, buffered.changes);
-    if (next === undefined || next !== buffered.after) return lastTarget;
-    state = next;
-    if (state === pending.target) lastTarget = index;
-  }
-  return lastTarget;
-}
-
 function applyBufferedTextChanges(value: string, changes: readonly TextChange[]): string | undefined {
   const ascending = [...changes].sort((left, right) =>
     left.offset - right.offset || left.deleteCount - right.deleteCount);
@@ -1468,6 +1551,10 @@ function applyBufferedTextChanges(value: string, changes: readonly TextChange[])
     next = `${next.slice(0, change.offset)}${change.insertText}${next.slice(change.offset + change.deleteCount)}`;
   }
   return next;
+}
+
+function textDigest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16);
 }
 
 function minimalEdit(current: string, target: string): TextChange {

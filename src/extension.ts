@@ -447,12 +447,10 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       output,
       runtime.notebookCellIds,
       notebookController,
-      (key, cellId, changes, canonicalSource) => runtime?.lineLockMessage(
-        key,
-        cellId,
-        changes,
-        canonicalSource,
-      ),
+      (request) => runtime?.stageEditorTextIntent(request) ?? false,
+    );
+    runtime.setEditorLineAnchorResolver(
+      (document, offset) => synchronizer?.canonicalOffsetForDocument(document, offset),
     );
     runtime.setWorkingCopyWriter(
       (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),

@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import Module from 'node:module';
 import path from 'node:path';
-import * as Y from 'yjs';
 import { CollaborativeProject, ProjectUpdate } from '../src/core/crdt';
 import { REMOTE_ORIGIN } from '../src/core/types';
 
@@ -76,6 +75,11 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
         const source = () => (notebookCell ? project.cellSource('work.ipynb', 'a') : project.text('notes.txt')).toString();
         await waitFor(() => document.getText() === local.expected, 1000, 'rebased editor text');
         assert.equal(source(), local.expected);
+        await waitFor(
+          () => !(synchronizer as any).projectionQuarantines.has(document.uri.toString()),
+          1000,
+          'rebased render idle checkpoint',
+        );
         document.text = `${local.expected}!`;
         vscodeBoundary.__fireTextChange(document, [{ rangeOffset: local.expected.length, rangeLength: 0, text: '!' }]);
         assert.equal(source(), `${local.expected}!`);
@@ -88,8 +92,8 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
   }
 
   for (const notebookCell of [false, true]) for (const inserted of [')', '\n', 'r']) {
-    for (const typeAfterEcho of [false, true]) {
-      it(`consumes a split remote ${JSON.stringify(inserted)} echo in a ${notebookCell ? 'cell' : 'file'} with subsequent typing=${typeAfterEcho}`, async () => {
+    for (const ambiguousTail of [false, true]) {
+      it(`contains a split remote ${JSON.stringify(inserted)} echo in a ${notebookCell ? 'cell' : 'file'} with ambiguous tail=${ambiguousTail}`, async () => {
         const root = path.resolve('/tmp/pair-editor-split-echo');
         const initial = 'print(a';
         const notebook = fakeNotebook(root, [fakeCell(initial, 'a')]);
@@ -114,7 +118,6 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
           else peer.applyTextChanges(key, changes);
           const remoteUpdate = peer.encodeUpdate(key);
           const target = `#${initial}${inserted}`;
-          const expected = `${target}${typeAfterEcho ? '!' : ''}`;
           let split = false;
           vscodeBoundary.__fireTextChange = (changed: any, contentChanges: any[]) => {
             if (changed !== document || split) return fireTextChange(changed, contentChanges);
@@ -124,7 +127,7 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
             fireTextChange(changed, changes.map((change) => ({
               rangeOffset: change.offset, rangeLength: change.deleteCount, text: change.insertText,
             })));
-            if (typeAfterEcho) {
+            if (ambiguousTail) {
               changed.text += '!';
               fireTextChange(changed, [{ rangeOffset: target.length, rangeLength: 0, text: '!' }]);
             }
@@ -134,15 +137,29 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
           });
           project.applyRemoteUpdate(key, kind, remoteUpdate, notebookCell ? { type: 'cellText', cellId: 'a' } : undefined);
           await synchronizer.prepareWorkingCopy();
-          assert.equal(document.getText(), expected);
-          assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), expected);
-          assert.equal(localUpdates.length, typeAfterEcho ? 1 : 0, 'only actual typing may publish a new update');
+          assert.equal(document.getText(), target, 'ambiguous render-tail input is restored to the host target');
+          assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), target);
+          assert.equal(localUpdates.length, 0, 'a render transaction never creates a local update');
+          applyUpdates(peer, localUpdates);
+          assert.equal((notebookCell ? peer.cellSource(key, 'a') : peer.text(key)).toString(), target);
+
+          await waitFor(
+            () => !(synchronizer as any).projectionQuarantines.has(document.uri.toString()),
+            1000,
+            'remote render idle checkpoint',
+          );
+          document.text += '!';
+          fireTextChange(document, [{ rangeOffset: target.length, rangeLength: 0, text: '!' }]);
+          const expected = `${target}!`;
+          assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), expected,
+            'typing after the remote render remains a local edit');
+          assert.equal(localUpdates.length, 1);
           applyUpdates(peer, localUpdates);
           assert.equal((notebookCell ? peer.cellSource(key, 'a') : peer.text(key)).toString(), expected);
           project.applyRemoteUpdate(key, kind, remoteUpdate);
           await synchronizer.prepareWorkingCopy();
           assert.equal(document.getText(), expected, 'wire replay must remain idempotent');
-          assert.equal(localUpdates.length, typeAfterEcho ? 1 : 0);
+          assert.equal(localUpdates.length, 1);
         } finally {
           vscodeBoundary.__fireTextChange = fireTextChange;
           synchronizer.dispose(); project.destroy(); peer.destroy();
@@ -1162,32 +1179,213 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     }
   });
 
-  it('restores a notebook cell before publishing a change to another participant-selected line', async () => {
+  it('keeps participant selection advisory while publishing notebook text', async () => {
     const root = path.resolve('/tmp/pair-editor-line-lock');
     const notebook = fakeNotebook(root, [fakeCell('locked', 'stable')]);
     vscodeBoundary.__reset(notebook);
     const project = new CollaborativeProject();
-    const synchronizer = new EditorSynchronizer(
-      project,
-      root,
-      logger(),
-      undefined,
-      undefined,
-      () => 'Line is currently selected by Guest.',
-    );
+    const synchronizer = new EditorSynchronizer(project, root, logger());
     try {
       await synchronizer.whenNotebookReady(notebook);
       notebook.cells[0].document.text = 'attempted overwrite';
       vscodeBoundary.__fireTextChange(notebook.cells[0].document, [{
         rangeOffset: 0, rangeLength: 6, text: 'attempted overwrite',
       }]);
-      await waitFor(() => notebook.cells[0].document.text === 'locked', 1000, 'line-lock restoration');
-      assert.equal(project.notebookSnapshot('work.ipynb').cells[0]!.source, 'locked');
+      assert.equal(notebook.cells[0].document.text, 'attempted overwrite');
+      assert.equal(project.notebookSnapshot('work.ipynb').cells[0]!.source, 'attempted overwrite');
     } finally {
       synchronizer.dispose();
       project.destroy();
     }
   });
+
+  for (const notebookCell of [false, true]) {
+    it(`keeps guest ${notebookCell ? 'cell' : 'file'} input outside canonical CRDT until host acknowledgement`, async () => {
+      const root = path.resolve('/tmp/pair-editor-host-authority');
+      const notebook = fakeNotebook(root, [fakeCell('a', 'stable')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'a');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const intents: any[] = [];
+      const synchronizer = new EditorSynchronizer(
+        project, root, logger(), undefined, undefined,
+        (request: any) => { intents.push(request); return true; },
+      );
+      const host = new CollaborativeProject();
+      const localUpdates: ProjectUpdate[] = [];
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        else await synchronizer.prepareWorkingCopy();
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const kind = notebookCell ? 'notebook' : 'text';
+        host.applyRemoteUpdate(key, kind, project.encodeUpdate(key));
+        project.on('update', (event: ProjectUpdate) => {
+          if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+        });
+
+        document.text = 'a!';
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 1, rangeLength: 0, text: '!' }]);
+
+        assert.equal(intents.length, 1);
+        assert.equal(intents[0].baseline, 'a');
+        assert.equal(intents[0].result, 'a!');
+        assert.equal((notebookCell ? project.cellSource(key, 'stable') : project.text(key)).toString(), 'a',
+          'guest input does not mutate canonical state');
+        assert.equal((synchronizer as any).textReplicas.get(document.uri.toString()).source(), 'a!');
+        assert.equal(localUpdates.length, 0);
+
+        const change = [{ offset: 1, deleteCount: 0, insertText: '!' }];
+        if (notebookCell) host.applyCellTextChanges(key, 'stable', change);
+        else host.applyTextChanges(key, change);
+        project.applyRemoteUpdate(key, kind, host.encodeUpdate(key),
+          notebookCell ? { type: 'cellText', cellId: 'stable' } : undefined);
+        await synchronizer.prepareWorkingCopy();
+
+        assert.equal(document.text, 'a!');
+        assert.equal((notebookCell ? project.cellSource(key, 'stable') : project.text(key)).toString(), 'a!');
+        assert.equal(localUpdates.length, 0, 'host acknowledgement remains a remote update');
+      } finally {
+        synchronizer.dispose(); project.destroy(); host.destroy();
+      }
+    });
+  }
+
+  for (const notebookCell of [false, true]) {
+    it(`contains a delayed post-apply projection tail in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+      const root = path.resolve('/tmp/pair-editor-delayed-tail');
+      const notebook = fakeNotebook(root, [fakeCell('ab', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'ab');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      const localUpdates: ProjectUpdate[] = [];
+      let delayedTailFired = false;
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const kind = notebookCell ? 'notebook' : 'text';
+        project.on('update', (event: ProjectUpdate) => {
+          if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+        });
+        vscodeBoundary.__afterApplyEditResolved = () => {
+          delayedTailFired = true;
+          document.text = 'a\n\nb';
+          vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 2, rangeLength: 0, text: '\n' }]);
+        };
+        const remote = new CollaborativeProject();
+        remote.applyRemoteUpdate(key, kind, project.encodeUpdate(key));
+        const changes = [{ offset: 1, deleteCount: 0, insertText: '\n' }];
+        if (notebookCell) remote.applyCellTextChanges(key, 'a', changes);
+        else remote.applyTextChanges(key, changes);
+        project.applyRemoteUpdate(key, kind, remote.encodeUpdate(key),
+          notebookCell ? { type: 'cellText', cellId: 'a' } : undefined);
+
+        await waitFor(() => delayedTailFired && document.text === 'a\nb', 1000, 'delayed projection repair');
+        await synchronizer.prepareWorkingCopy();
+        assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), 'a\nb');
+        assert.equal(localUpdates.length, 0, 'delayed projection tail cannot become shared text');
+        remote.destroy();
+      } finally {
+        vscodeBoundary.__afterApplyEditResolved = undefined;
+        synchronizer.dispose(); project.destroy();
+      }
+    });
+  }
+
+  for (const notebookCell of [false, true]) {
+    it(`restores the latest canonical ${notebookCell ? 'cell' : 'file'} after a stale projection tail`, async () => {
+      const root = path.resolve('/tmp/pair-editor-latest-canonical-tail');
+      const notebook = fakeNotebook(root, [fakeCell('ab', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'ab');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const kind = notebookCell ? 'notebook' : 'text';
+        const remote = new CollaborativeProject();
+        remote.applyRemoteUpdate(key, kind, project.encodeUpdate(key));
+        const newline = [{ offset: 1, deleteCount: 0, insertText: '\n' }];
+        if (notebookCell) remote.applyCellTextChanges(key, 'a', newline);
+        else remote.applyTextChanges(key, newline);
+        project.applyRemoteUpdate(key, kind, remote.encodeUpdate(key),
+          notebookCell ? { type: 'cellText', cellId: 'a' } : undefined);
+        await synchronizer.prepareWorkingCopy();
+        assert.equal(document.text, 'a\nb');
+        assert.ok((synchronizer as any).projectionQuarantines.has(document.uri.toString()));
+
+        const newer = [{ offset: 0, deleteCount: 0, insertText: 'H' }];
+        if (notebookCell) project.applyCellTextChanges(key, 'a', newer);
+        else project.applyTextChanges(key, newer);
+        document.text = 'a\n\nb';
+        vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 2, rangeLength: 0, text: '\n' }]);
+
+        await waitFor(() => document.text === 'Ha\nb', 1000, 'latest canonical projection repair');
+        assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), 'Ha\nb');
+        remote.destroy();
+      } finally {
+        synchronizer.dispose(); project.destroy();
+      }
+    });
+  }
+
+  for (const notebookCell of [false, true]) for (const tail of [
+    { name: 'newline', result: 'a\n\nb', changes: [{ rangeOffset: 2, rangeLength: 0, text: '\n' }] },
+    { name: 'deletion', result: 'ab', changes: [{ rangeOffset: 1, rangeLength: 1, text: '' }] },
+    { name: 'indentation', result: 'a\n  b', changes: [{ rangeOffset: 2, rangeLength: 0, text: '  ' }] },
+    { name: 'auto-closing bracket', result: 'a\nb)', changes: [{ rangeOffset: 3, rangeLength: 0, text: ')' }] },
+    { name: 'multi-change', result: '(a\nb)', changes: [
+      { rangeOffset: 0, rangeLength: 0, text: '(' },
+      { rangeOffset: 3, rangeLength: 0, text: ')' },
+    ] },
+  ]) {
+    it(`contains an ambiguous ${tail.name} projection tail in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+      const root = path.resolve('/tmp/pair-editor-tail-shapes');
+      const notebook = fakeNotebook(root, [fakeCell('ab', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'ab');
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const peer = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      const fireTextChange = vscodeBoundary.__fireTextChange;
+      const localUpdates: ProjectUpdate[] = [];
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const kind = notebookCell ? 'notebook' : 'text';
+        peer.applyRemoteUpdate(key, kind, project.encodeUpdate(key));
+        let injected = false;
+        vscodeBoundary.__fireTextChange = (changed: any, changes: any[]) => {
+          fireTextChange(changed, changes);
+          if (changed !== document || injected) return;
+          injected = true;
+          changed.text = tail.result;
+          fireTextChange(changed, tail.changes);
+        };
+        project.on('update', (event: ProjectUpdate) => {
+          if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+        });
+        const remoteChanges = [{ offset: 1, deleteCount: 0, insertText: '\n' }];
+        if (notebookCell) peer.applyCellTextChanges(key, 'a', remoteChanges);
+        else peer.applyTextChanges(key, remoteChanges);
+        project.applyRemoteUpdate(key, kind, peer.encodeUpdate(key),
+          notebookCell ? { type: 'cellText', cellId: 'a' } : undefined);
+        await synchronizer.prepareWorkingCopy();
+
+        assert.equal(document.text, 'a\nb');
+        assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), 'a\nb');
+        assert.equal(localUpdates.length, 0);
+      } finally {
+        vscodeBoundary.__fireTextChange = fireTextChange;
+        synchronizer.dispose(); project.destroy(); peer.destroy();
+      }
+    });
+  }
 });
 
 function applyUpdates(project: CollaborativeProject, updates: ProjectUpdate[]): void {
@@ -1350,6 +1548,11 @@ function createNotebookVscodeBoundary(): any {
             }
           }
         }
+        const afterResolved = boundary.__afterApplyEditResolved;
+        if (afterResolved) {
+          boundary.__afterApplyEditResolved = undefined;
+          setTimeout(() => afterResolved(edit), 0);
+        }
         return true;
       },
     },
@@ -1365,6 +1568,7 @@ function createNotebookVscodeBoundary(): any {
     __textEdits: [] as any[],
     __rejectEdits: false,
     __beforeApplyEdit: undefined as undefined | ((edit: WorkspaceEdit) => Promise<void>),
+    __afterApplyEditResolved: undefined as undefined | ((edit: WorkspaceEdit) => void),
     __reset: (notebook: any) => {
       boundary.workspace.notebookDocuments = [notebook];
       boundary.workspace.textDocuments = [];
@@ -1372,6 +1576,7 @@ function createNotebookVscodeBoundary(): any {
       boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
+      boundary.__afterApplyEditResolved = undefined;
       boundary.window.activeNotebookEditor = undefined;
       boundary.window.activeTextEditor = undefined;
       boundary.window.visibleNotebookEditors = [];
@@ -1384,6 +1589,7 @@ function createNotebookVscodeBoundary(): any {
       boundary.__textEdits = [];
       boundary.__rejectEdits = false;
       boundary.__beforeApplyEdit = undefined;
+      boundary.__afterApplyEditResolved = undefined;
       boundary.window.activeNotebookEditor = undefined;
       boundary.window.activeTextEditor = undefined;
       boundary.window.visibleNotebookEditors = [];
@@ -1463,7 +1669,45 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
 }
 
 
-describe('EditorSynchronizer initial baselines and rebased line locks', () => {
+describe('EditorSynchronizer initial baselines and concurrent remote edits', () => {
+  for (const notebookCell of [false, true]) {
+    it(`maps a divergent ${notebookCell ? 'cell' : 'file'} line start through the displayed replica`, async () => {
+      const root = path.resolve('/tmp/pair-editor-presence-map');
+      const initial = 'one\ntarget';
+      const notebook = fakeNotebook(root, [fakeCell(initial, 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), initial);
+      if (notebookCell) vscodeBoundary.__reset(notebook);
+      else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      let release!: () => void;
+      let entered = false;
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        else await synchronizer.prepareWorkingCopy();
+        vscodeBoundary.__beforeApplyEdit = async () => {
+          vscodeBoundary.__beforeApplyEdit = undefined;
+          entered = true;
+          await new Promise<void>((resolve) => { release = resolve; });
+        };
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const changes = [{ offset: 0, deleteCount: 0, insertText: 'new\n' }];
+        if (notebookCell) project.applyCellTextChanges(key, 'a', changes, REMOTE_ORIGIN);
+        else project.applyTextChanges(key, changes, REMOTE_ORIGIN);
+        await waitFor(() => entered, 1000, 'pending presence mapping render');
+
+        assert.equal(document.text, initial);
+        assert.equal(synchronizer.canonicalOffsetForDocument(document, 4), 8,
+          'displayed line start follows the same logical Yjs position in canonical text');
+        release();
+        await synchronizer.prepareWorkingCopy();
+      } finally {
+        release?.();
+        synchronizer.dispose(); project.destroy();
+      }
+    });
+  }
+
   it('retains pre-existing unsaved text while establishing the shared baseline', async () => {
     const root = path.resolve('/tmp/pair-dirty-initial-binding');
     const document = fakeTextDocument(path.join(root, 'notes.txt'), 'unsaved\nwork');
@@ -1523,8 +1767,8 @@ describe('EditorSynchronizer initial baselines and rebased line locks', () => {
     });
   }
 
-  for (const notebookCell of [false, true]) for (const pending of [false, true]) for (const locked of [false, true]) {
-    it('checks shifted line locks against canonical positions cell='+notebookCell+' pending='+pending+' locked='+locked, async () => {
+  for (const notebookCell of [false, true]) for (const pending of [false, true]) for (const offset of [5, 9]) {
+    it('rebases typing without selection locks cell='+notebookCell+' pending='+pending+' offset='+offset, async () => {
       const root = path.resolve('/tmp/pair-rebased-line-lock');
       const initial = 'aaa\nbbb\nccc';
       const notebook = fakeNotebook(root, [fakeCell(initial, 'a')]);
@@ -1533,15 +1777,8 @@ describe('EditorSynchronizer initial baselines and rebased line locks', () => {
       const project = new CollaborativeProject();
       const key = notebookCell ? 'work.ipynb' : 'notes.txt';
       const source = () => notebookCell ? project.cellSource(key, 'a') : project.text(key);
-      let guardCalls = 0;
-      const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, undefined, (_key: string, _cellId: string | undefined, changes: readonly { rangeOffset: number; rangeLength: number }[]) => {
-        guardCalls += 1;
-        const position = Y.createAbsolutePositionFromRelativePosition(anchor, source().doc!)!;
-        assert.equal(position.index, 4);
-        return changes.some((change) => change.rangeOffset >= position.index) ? 'Line is currently selected by Other.' : undefined;
-      });
+      const synchronizer = new EditorSynchronizer(project, root, logger());
       if (notebookCell) await synchronizer.whenNotebookReady(notebook);
-      const anchor = Y.createRelativePositionFromTypeIndex(source(), 8);
       let release: (() => void) | undefined;
       let entered = false;
       if (pending) vscodeBoundary.__beforeApplyEdit = async () => {
@@ -1554,15 +1791,13 @@ describe('EditorSynchronizer initial baselines and rebased line locks', () => {
         if (notebookCell) project.applyCellTextChanges(key, 'a', changes, REMOTE_ORIGIN);
         else project.applyTextChanges(key, changes, REMOTE_ORIGIN);
         if (pending) await waitFor(() => entered, 1000, 'remote edit pending');
-        const offset = locked ? 9 : 5;
         document.text = initial.slice(0, offset) + '!' + initial.slice(offset);
         vscodeBoundary.__fireTextChange(document, [{ rangeOffset: offset, rangeLength: 0, text: '!' }]);
         release?.();
         await synchronizer.prepareWorkingCopy();
-        const expected = locked ? 'bbb\nccc' : 'b!bb\nccc';
+        const expected = offset === 9 ? 'bbb\nc!cc' : 'b!bb\nccc';
         assert.equal(document.text, expected);
         assert.equal(source().toString(), expected);
-        assert.ok(guardCalls > 0);
       } finally { release?.(); synchronizer.dispose(); project.destroy(); }
     });
   }

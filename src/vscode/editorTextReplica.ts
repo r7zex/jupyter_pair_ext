@@ -161,6 +161,14 @@ export class EditorTextReplica {
   }
 
   public edit(changes: readonly TextChange[]): void {
+    const updates = this.editLocal(changes);
+    // Template pruning and historical deletion sets never cross this boundary.
+    if (updates.length) this.canonical.mergeEditorText(this.key, this.cellId, Y.mergeUpdates(updates));
+    this.version.reusable = true;
+  }
+
+  /** Applies optimistic guest input without granting it canonical CRDT authorship. */
+  public editLocal(changes: readonly TextChange[]): Uint8Array[] {
     this.version.reusable = false;
     const updates: Uint8Array[] = [];
     const capture = (event: ProjectUpdate) => updates.push(event.update);
@@ -169,9 +177,7 @@ export class EditorTextReplica {
       if (this.cellId) this.project.applyCellTextChanges(this.key, this.cellId, changes);
       else this.project.applyTextChanges(this.key, changes);
     } finally { this.project.off('update', capture); }
-    // Template pruning and historical deletion sets never cross this boundary.
-    if (updates.length) this.canonical.mergeEditorText(this.key, this.cellId, Y.mergeUpdates(updates));
-    this.version.reusable = true;
+    return updates;
   }
 
   public accept(update: Uint8Array): void {

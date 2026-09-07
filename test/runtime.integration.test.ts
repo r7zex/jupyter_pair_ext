@@ -8,7 +8,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
 import { CollaborativeProject } from '../src/core/crdt';
-import { formatInvite, parseInvite } from '../src/core/types';
+import { formatInvite, parseInvite, REMOTE_ORIGIN } from '../src/core/types';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
@@ -426,7 +426,14 @@ describe('production SessionRuntime integration', () => {
 
       // A guest changes a dependency while the host editor owns its unsaved
       // working copy. Background persistence must not save it; execution must.
-      peer.project.replaceText('notes.txt', 'guest dependency');
+      const dependencyBaseline = peer.project.text('notes.txt').toString();
+      assert.equal(peer.stageEditorTextIntent({
+        key: 'notes.txt',
+        cellId: undefined,
+        baseline: dependencyBaseline,
+        changes: [{ offset: 0, deleteCount: dependencyBaseline.length, insertText: 'guest dependency' }],
+        result: 'guest dependency',
+      }), true);
       await waitFor(() => host.project.text('notes.txt').toString() === 'guest dependency', 3000, 'dependency convergence');
       host.setWorkingCopyWriter(async (key: string) => key === 'notes.txt', async () => {
         await writeFile(path.join(hostFolder, 'notes.txt'), host.project.text('notes.txt').toString());
@@ -2958,7 +2965,12 @@ describe('compute and lifecycle regression coverage', () => {
       await peer.start();
       await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'session-end peer online');
 
-      peer.project.ensureText('last-edit.txt', 'peer final edit');
+      const finalEditPath = path.join(peerFolder, 'last-edit.txt');
+      await writeFile(finalEditPath, 'peer final edit', 'utf8');
+      await peer.onLocalFile(fakeVscode.Uri.file(finalEditPath), 'create');
+      await waitFor(() => host.project.has('last-edit.txt')
+        && host.project.text('last-edit.txt').toString() === 'peer final edit',
+      5000, 'host-authoritative final guest edit');
       const endedBy = new Promise<any>((resolve) => peer.once('sessionEnded', resolve));
       const peerClosed = onceEvent(peer, 'closed');
       const hostClosed = onceEvent(host, 'closed');
@@ -3672,6 +3684,214 @@ describe('large reconnect metadata', () => {
       assert.ok(frames.every((frame) => Buffer.byteLength(JSON.stringify(frame), 'utf8') < 600 * 1024));
     } finally {
       await (runtime as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('host-authoritative text intents', () => {
+  it('retains a bounded guest intent when the host route is unavailable and retries it on recovery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-queue-'));
+    const guest = new SessionRuntime(descriptor({
+      sessionId: 'text-authority-queue', role: 'peer', peerId: 'guest', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath,
+    }), 'text-authority-queue-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    try {
+      guest.project.ensureText('notes.txt', 'a', REMOTE_ORIGIN);
+      (guest as any).transport.sendTo = () => { throw new Error('route unavailable'); };
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: 'a',
+        changes: [{ offset: 1, deleteCount: 0, insertText: '!' }], result: 'a!',
+      }), true);
+      assert.equal(guest.project.text('notes.txt').toString(), 'a');
+      assert.equal((guest as any).pendingTextIntents.size, 1);
+
+      const sent: any[] = [];
+      (guest as any).transport.sendTo = (_peerId: string, type: string, meta: unknown, payload: Uint8Array) => {
+        sent.push({ type, meta, payload });
+        return 'message';
+      };
+      (guest as any).flushPendingTextIntents();
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].type, 'textEditIntent');
+      assert.ok(sent[0].payload.byteLength >= 4);
+      assert.equal((guest as any).pendingTextIntents.size, 1,
+        'intent remains pending until an authenticated host acknowledgement');
+    } finally {
+      await (guest as any).disposeAsync();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes guest text through the real encrypted runtime route', async function () {
+    this.timeout(30_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-route-'));
+    const extensionRoot = path.join(root, 'extension');
+    const hostFolder = path.join(root, 'host');
+    const guestFolder = path.join(root, 'guest');
+    await Promise.all([
+      mkdir(extensionRoot, { recursive: true }),
+      mkdir(hostFolder, { recursive: true }),
+      mkdir(guestFolder, { recursive: true }),
+    ]);
+    await writeFile(path.join(hostFolder, 'notes.txt'), 'a', 'utf8');
+    const token = 'text-authority-route-token-that-is-long-enough';
+    const sessionId = `text-authority-route-${Date.now()}`;
+    const host = new SessionRuntime(descriptor({
+      sessionId, role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: hostFolder,
+      pythonPath: process.execPath,
+    }), token, context(extensionRoot), logger());
+    let guest: any;
+    try {
+      await host.start();
+      guest = new SessionRuntime(descriptor({
+        sessionId, role: 'peer', peerId: 'guest', hostPeerId: 'host', workingFolder: guestFolder,
+        pythonPath: process.execPath, knownPeers: [{ ...host.descriptor.localPeer }],
+      }), token, context(extensionRoot), logger());
+      await guest.start();
+      await waitFor(() => guest.project.has('notes.txt') && guest.project.text('notes.txt').toString() === 'a',
+        5000, 'guest authoritative baseline');
+      let guestAuthoredCanonicalUpdates = 0;
+      guest.project.on('update', (event: any) => {
+        if (event.origin !== REMOTE_ORIGIN) guestAuthoredCanonicalUpdates += 1;
+      });
+
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: 'a',
+        changes: [{ offset: 1, deleteCount: 0, insertText: '!' }], result: 'a!',
+      }), true);
+      assert.equal(guest.project.text('notes.txt').toString(), 'a');
+      await waitFor(() => host.project.text('notes.txt').toString() === 'a!'
+        && guest.project.text('notes.txt').toString() === 'a!', 5000, 'host-authoritative routed edit');
+      assert.equal(guestAuthoredCanonicalUpdates, 0);
+      assert.equal(guest.pendingTextIntents.size, 0);
+    } finally {
+      if (guest) guest.descriptor.mode = 'host-only';
+      host.descriptor.mode = 'host-only';
+      await Promise.allSettled([host.leave(), guest?.leave?.()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps guest edits non-canonical, rebases stale intent queues, and rejects direct guest text updates', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-'));
+    const host = new SessionRuntime(descriptor({
+      sessionId: 'text-authority', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: path.join(root, 'host'), pythonPath: process.execPath,
+    }), 'text-authority-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    const guest = new SessionRuntime(descriptor({
+      sessionId: 'text-authority', role: 'peer', peerId: 'guest', hostPeerId: 'host',
+      workingFolder: path.join(root, 'guest'), pythonPath: process.execPath,
+      knownPeers: [{ ...host.descriptor.localPeer }],
+    }), 'text-authority-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    const toHost: Array<{ frame: any; sourceId: string }> = [];
+    const toGuest: Array<{ frame: any; sourceId: string }> = [];
+    const queue = (target: Array<{ frame: any; sourceId: string }>, sourceId: string,
+      type: string, meta: any = {}, payload: Uint8Array = new Uint8Array()) => {
+      target.push({ frame: { type, meta, payload }, sourceId });
+      return 'message';
+    };
+    const drain = async () => {
+      for (let turns = 0; (toHost.length || toGuest.length) && turns < 100; turns += 1) {
+        while (toHost.length) {
+          const next = toHost.shift()!;
+          await (host as any).onMessage(next.frame, next.sourceId);
+        }
+        while (toGuest.length) {
+          const next = toGuest.shift()!;
+          await (guest as any).onMessage(next.frame, next.sourceId);
+        }
+      }
+      assert.equal(toHost.length + toGuest.length, 0, 'text-authority protocol reaches quiescence');
+    };
+    try {
+      host.project.ensureText('notes.txt', 'a', REMOTE_ORIGIN);
+      guest.project.applyRemoteUpdate('notes.txt', 'text', host.project.encodeUpdate('notes.txt'));
+      (host as any).installProjectHandlers();
+      (guest as any).installProjectHandlers();
+      (guest as any).transport.sendTo = (_peerId: string, type: string, meta?: any, payload?: Uint8Array) =>
+        queue(toHost, 'guest', type, meta, payload);
+      (guest as any).transport.broadcast = () => { throw new Error('guest must not broadcast canonical text'); };
+      (host as any).transport.sendTo = (_peerId: string, type: string, meta?: any, payload?: Uint8Array) =>
+        queue(toGuest, 'host', type, meta, payload);
+      (host as any).transport.broadcast = (type: string, meta?: any, payload?: Uint8Array) =>
+        queue(toGuest, 'host', type, meta, payload);
+
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: 'a',
+        changes: [{ offset: 1, deleteCount: 0, insertText: '!' }], result: 'a!',
+      }), true);
+      assert.equal(guest.project.text('notes.txt').toString(), 'a', 'guest canonical state waits for host');
+      await drain();
+      assert.equal(host.project.text('notes.txt').toString(), 'a!');
+      assert.equal(guest.project.text('notes.txt').toString(), 'a!');
+      assert.equal((guest as any).pendingTextIntents.size, 0);
+
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: 'a!',
+        changes: [{ offset: 2, deleteCount: 0, insertText: '?' }], result: 'a!?',
+      }), true);
+      host.project.applyTextChanges('notes.txt', [{ offset: 0, deleteCount: 0, insertText: 'H' }]);
+      await drain();
+      assert.equal(host.project.text('notes.txt').toString(), 'Ha!?', 'stale guest intent is rebased by the host protocol');
+      assert.equal(guest.project.text('notes.txt').toString(), 'Ha!?');
+      assert.equal((guest as any).pendingTextIntents.size, 0);
+
+      host.project.ensureNotebook('work.ipynb', {
+        metadata: {},
+        cells: [{ id: 'cell-a', kind: 2, language: 'python', source: 'x', metadata: {}, outputs: [] }],
+      }, REMOTE_ORIGIN);
+      guest.project.applyRemoteUpdate('work.ipynb', 'notebook', host.project.encodeUpdate('work.ipynb'), { type: 'structure' });
+      assert.equal(guest.project.cellSource('work.ipynb', 'cell-a').toString(), 'x');
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'work.ipynb', cellId: 'cell-a', baseline: 'x',
+        changes: [{ offset: 1, deleteCount: 0, insertText: '\n' }], result: 'x\n',
+      }), true);
+      await drain();
+      assert.equal(host.project.cellSource('work.ipynb', 'cell-a').toString(), 'x\n');
+      assert.equal(guest.project.cellSource('work.ipynb', 'cell-a').toString(), 'x\n');
+
+      const orderedBaseline = host.project.text('notes.txt').toString();
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: orderedBaseline,
+        changes: [{ offset: orderedBaseline.length, deleteCount: 0, insertText: '1' }],
+        result: `${orderedBaseline}1`,
+      }), true);
+      assert.equal(guest.stageEditorTextIntent({
+        key: 'notes.txt', cellId: undefined, baseline: `${orderedBaseline}1`,
+        changes: [{ offset: orderedBaseline.length + 1, deleteCount: 0, insertText: '2' }],
+        result: `${orderedBaseline}12`,
+      }), true);
+      assert.equal(toHost.length, 2);
+      const firstIntent = toHost[0]!;
+      toHost.reverse();
+      await drain();
+      assert.equal(host.project.text('notes.txt').toString(), `${orderedBaseline}12`,
+        'out-of-order delivery is rejected, retried with stable operation ids, and serialized once');
+      assert.equal(guest.project.text('notes.txt').toString(), `${orderedBaseline}12`);
+      await (host as any).onMessage(firstIntent.frame, firstIntent.sourceId);
+      await drain();
+      assert.equal(host.project.text('notes.txt').toString(), `${orderedBaseline}12`,
+        'a replayed accepted operation id is idempotent');
+
+      const rogue = new CollaborativeProject();
+      let rogueUpdate: Uint8Array | undefined;
+      rogue.applyRemoteUpdate('notes.txt', 'text', host.project.encodeUpdate('notes.txt'));
+      rogue.on('update', (event: any) => { rogueUpdate = event.update; });
+      rogue.applyTextChanges('notes.txt', [{ offset: 0, deleteCount: 0, insertText: 'ROGUE' }]);
+      await (host as any).onMessage({
+        type: 'projectUpdate',
+        meta: {
+          key: 'notes.txt', kind: 'text',
+          fileState: (host as any).effectiveFileState('notes.txt'),
+        },
+        payload: rogueUpdate!,
+      }, 'guest');
+      assert.equal(host.project.text('notes.txt').toString(), `${orderedBaseline}12`,
+        'host refuses direct guest-authored text CRDT updates');
+      rogue.destroy();
+    } finally {
+      await Promise.allSettled([(host as any).disposeAsync(), (guest as any).disposeAsync()]);
       await rm(root, { recursive: true, force: true });
     }
   });

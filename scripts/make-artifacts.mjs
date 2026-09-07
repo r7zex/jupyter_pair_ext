@@ -40,6 +40,11 @@ function collectFiles(directory, relative = '') {
   const files = [];
   for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
     const relativePath = relative ? `${relative}/${item.name}` : item.name;
+    const lowerName = item.name.toLowerCase();
+    // A linked Git worktree stores `.git` as a file, while a normal checkout
+    // stores it as a directory. Exclude repository/runtime internals by path
+    // segment before branching on the filesystem entry type.
+    if (EXCLUDED_DIRECTORIES.has(lowerName)) continue;
     if (item.isSymbolicLink()) {
       throw new Error(`Refusing to package symbolic link: ${relativePath}`);
     }
@@ -47,12 +52,10 @@ function collectFiles(directory, relative = '') {
       if (isSensitiveArtifactPath(relativePath)) {
         throw new Error(`Refusing to package sensitive directory: ${relativePath}`);
       }
-      if (EXCLUDED_DIRECTORIES.has(item.name.toLowerCase())) continue;
       if (relativePath === 'out/src' || relativePath === 'out/test') continue;
       files.push(...collectFiles(path.join(directory, item.name), relativePath));
       continue;
     }
-    const lowerName = item.name.toLowerCase();
     if (isSensitiveArtifactPath(relativePath)) {
       throw new Error(`Refusing to package sensitive file: ${relativePath}`);
     }
@@ -148,7 +151,8 @@ async function main() {
   const zipEntries = await listEntries(zipPath);
   const bad = zipEntries.filter((entry) => !entry.startsWith('pair-notebook/'));
   if (bad.length) throw new Error(`ZIP has entries outside the top-level directory: ${bad.slice(0, 5).join(', ')}`);
-  const forbidden = zipEntries.filter((entry) => /node_modules\/|__pycache__\/|\.venv\/|\/venv\/|\.pytest_cache\/|\.mypy_cache\/|\.ruff_cache\//i.test(entry));
+  const forbidden = zipEntries.filter((entry) => entry.split('/')
+    .some((segment) => EXCLUDED_DIRECTORIES.has(segment.toLowerCase())));
   if (forbidden.length) throw new Error(`ZIP contains excluded content: ${forbidden.slice(0, 5).join(', ')}`);
   const sensitiveZipEntries = sensitiveArchiveEntries(zipEntries);
   if (sensitiveZipEntries.length) throw new Error(`ZIP contains sensitive files: ${sensitiveZipEntries.join(', ')}`);

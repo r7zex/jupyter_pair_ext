@@ -1032,7 +1032,7 @@ describe('repair regressions', () => {
     (transport as any).routeUpgrades.set(identity.peerId, upgrade);
     const admitted = (transport as any).assertPeerCanJoin(identity, candidateTransportId);
     (transport as any).pendingHandshakes.set(candidateTransportId, {
-      version: 5,
+      version: 6,
       sessionId: 'late-upgrade-handshake',
       purpose: 'runtime',
       peer: admitted,
@@ -1637,7 +1637,7 @@ describe('repair regressions', () => {
     });
     const projectedKey = generateIdentityCredentials().publicKey;
     const parsed = (transport as any).parseHandshake({
-      version: 5,
+      version: 6,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: {
@@ -1651,7 +1651,7 @@ describe('repair regressions', () => {
       peerId: 'projected', displayName: 'Projected', joinOrder: 1, identityKey: projectedKey,
     });
     assert.throws(() => (transport as any).parseHandshake({
-      version: 3,
+      version: 5,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: parsed.peer,

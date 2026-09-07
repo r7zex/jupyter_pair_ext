@@ -61,6 +61,7 @@ const fakeVscode: any = {
   NotebookCellKind: { Markup: 1, Code: 2 },
   NotebookCellStatusBarAlignment: { Left: 1 },
   NotebookCellStatusBarItem: class {},
+  Position: class { public constructor(public readonly line: number, public readonly character: number) {} },
   OverviewRulerLane: { Right: 4 },
   DecorationRangeBehavior: { OpenOpen: 0 },
   Range: class { public constructor(public readonly start: unknown, public readonly end: unknown) {} },
@@ -280,7 +281,7 @@ describe('semantic presence publication', () => {
     } finally { destroy(runtime); }
   });
 
-  it('keeps a remote line lock on the same logical line after inserted lines', () => {
+  it('keeps advisory remote line presence on the same logical line after inserted lines', () => {
     const root = path.join(os.tmpdir(), 'pair-line-lock-anchor');
     const runtime = new SessionRuntime(descriptor({ role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: root }),
       'line-lock-token-that-is-long-enough', context(root), logger());
@@ -299,16 +300,47 @@ describe('semantic presence publication', () => {
         shareCursor: true,
       });
       (runtime as any).acceptAwarenessUpdate(encodeAwarenessUpdate(source, [source.clientID]), 'guest');
-      assert.match(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 4, rangeLength: 0 }], 'one\ntarget\nlast') ?? '', /Guest/);
+      const remote = [...runtime.awareness.getStates().values()]
+        .find((value: any) => value?.peer?.peerId === 'guest') as any;
+      assert.equal(runtime.resolvePresenceLineOffset(remote), 4);
 
       runtime.project.applyTextChanges('work.py', [{ offset: 0, deleteCount: 0, insertText: 'new\n' }]);
       const shifted = runtime.project.text('work.py').toString();
-      assert.equal(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 8, rangeLength: 0 }], shifted), 'Line is currently selected by Guest.');
-      assert.equal(runtime.lineLockMessage('work.py', undefined, [{ rangeOffset: 0, rangeLength: 0 }], shifted), undefined);
+      assert.equal(runtime.resolvePresenceLineOffset(remote), 8);
+      assert.equal(shifted, 'new\none\ntarget\nlast');
     } finally {
       source.destroy();
       destroy(runtime);
     }
+  });
+
+  it('maps a divergent displayed line through the editor replica before publishing presence', () => {
+    const root = path.join(os.tmpdir(), 'pair-presence-replica-map');
+    const runtime = new SessionRuntime(descriptor({ role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: root }),
+      'presence-replica-map-token-that-is-long-enough', context(root), logger());
+    try {
+      runtime.project.ensureText('work.py', 'new\none\ntarget');
+      const document = {
+        uri: Uri.file(path.join(root, 'work.py')),
+        getText: () => 'one\ntarget',
+        offsetAt: (position: { line: number }) => position.line === 1 ? 4 : 0,
+      };
+      fakeVscode.window.activeTextEditor = {
+        document,
+        selection: { active: { line: 1, character: 0 }, anchor: { line: 1, character: 0 } },
+      };
+      runtime.setEditorLineAnchorResolver((_document: any, offset: number) => offset === 4 ? 8 : undefined);
+      (runtime as any).updatePresence();
+      const state = semanticState(runtime);
+      assert.ok(state.activeLineAnchor);
+      assert.equal(runtime.resolvePresenceLineOffset(state), 8);
+
+      runtime.setEditorLineAnchorResolver(undefined);
+      (runtime as any).semanticPresencePublished = false;
+      (runtime as any).updatePresence();
+      assert.equal(semanticState(runtime).activeLineAnchor, undefined,
+        'a divergent raw editor offset is never encoded directly against canonical text');
+    } finally { destroy(runtime); }
   });
 });
 

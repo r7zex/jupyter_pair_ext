@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.20 - 2026-09-07 (host-authoritative text synchronization)
+
+- Routes guest file and notebook-cell edits through idempotent host-authoritative intents carrying an operation ID, base revision/digest, immutable deltas, and a Yjs state vector. Stale queues repair from the host, rebase in order, and retry with the same operation IDs after route recovery.
+- Keeps remote `WorkspaceEdit` events projection-only, contains delayed formatter/notebook tails, and always restores the latest canonical text so a stale render cannot publish phantom newlines or overwrite a newer accepted operation.
+- Removes selection-derived hard line locks and destructive rollback from the write path. Participant line presence remains advisory and maps displayed editor offsets back to canonical CRDT anchors.
+- Rejects direct guest-authored canonical text updates, preserves bounded pending intents while the pinned host is unavailable, and covers encrypted routing, stale bases, reordered delivery, replay/idempotence, closed files, render-tail shapes, and presence mapping with deterministic regressions.
+- Advances admission to protocol v6. It is intentionally incompatible with protocol-v5 and older clients; every participant in a session must update to Pair Notebook 0.5.20.
+
+Automated validation does not replace installed VS Code and physical two-computer acceptance.
+
 ## 0.5.19 - 2026-09-06 (notebook synchronization stability)
 
 - Limits notebook output publication and rendering to two updates per second while immediately flushing terminal execution state.

@@ -38,7 +38,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`preserves typing after a multi-event remote echo exactly once in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`suppresses an ambiguous post-target event in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'print(a',
@@ -88,7 +88,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`preserves a local append when the successful remote target event is hidden in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`suppresses an ambiguous append when the remote target event is hidden in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'abc',
@@ -97,12 +97,12 @@ describe('EditorSynchronizer multi-event echo stress', () => {
         intermediateTexts: [],
         target: 'Rabc',
         hiddenLocalChange: { offset: 4, deleteCount: 0, insertText: '!' },
-        expected: 'Rabc!',
+        projectionResult: 'Rabc!',
         versionJump: 2,
       });
     });
 
-    it(`preserves a hidden-target local newline insertion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`suppresses an ambiguous hidden-target newline insertion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'onetwo',
@@ -111,12 +111,12 @@ describe('EditorSynchronizer multi-event echo stress', () => {
         intermediateTexts: [],
         target: '@onetwo',
         hiddenLocalChange: { offset: 4, deleteCount: 0, insertText: '\n' },
-        expected: '@one\ntwo',
+        projectionResult: '@one\ntwo',
         versionJump: 1,
       });
     });
 
-    it(`preserves a hidden-target local newline deletion without rejected recovery in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`suppresses an ambiguous hidden-target newline deletion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: '#x\nnext',
@@ -125,13 +125,14 @@ describe('EditorSynchronizer multi-event echo stress', () => {
         intermediateTexts: [],
         target: '@#x\nnext',
         hiddenLocalChange: { offset: 3, deleteCount: 1, insertText: '' },
-        expected: '@#xnext',
+        projectionResult: '@#xnext',
         versionJump: 4,
       });
     });
   }
 
-  it('survives repeated split-echo interleavings without duplicate CRDT publications', async () => {
+  it('survives repeated split-echo interleavings without duplicate CRDT publications', async function () {
+    this.timeout(30_000);
     const inserts = [')', '\n', 'r'];
     for (let iteration = 0; iteration < 120; iteration += 1) {
       const notebookCell = iteration % 2 === 0;
@@ -165,7 +166,7 @@ interface Scenario {
   target: string;
   localAfter?: string;
   hiddenLocalChange?: TextChange;
-  expected?: string;
+  projectionResult?: string;
   versionJump?: number;
 }
 
@@ -202,8 +203,8 @@ async function runScenario(options: Scenario): Promise<void> {
       split = true;
       if (options.hiddenLocalChange) {
         const local = options.hiddenLocalChange;
-        if (!options.expected) throw new Error('hidden local change requires expected text');
-        changed.text = options.expected;
+        if (!options.projectionResult) throw new Error('hidden local change requires a projection result');
+        changed.text = options.projectionResult;
         changed.version += options.versionJump ?? 0;
         originalFire(changed, [{
           rangeOffset: local.offset,
@@ -237,11 +238,11 @@ async function runScenario(options: Scenario): Promise<void> {
     );
     await synchronizer.prepareWorkingCopy();
 
-    const expected = options.expected ?? `${options.target}${options.localAfter ?? ''}`;
-    const expectedLocalUpdates = options.localAfter !== undefined || options.hiddenLocalChange ? 1 : 0;
+    const expected = options.target;
+    const expectedLocalUpdates = 0;
     const source = options.notebookCell ? project.cellSource(key, 'a').toString() : project.text(key).toString();
     const displayed = (synchronizer as any).textReplicas.get(document.uri.toString())?.source();
-    assert.equal(document.getText(), expected, 'editor must retain one remote edit plus real local typing');
+    assert.equal(document.getText(), expected, 'editor must discard every ambiguous render-transaction tail');
     assert.equal(source, expected, 'canonical CRDT must equal the editor');
     assert.equal(displayed, expected, 'displayed Yjs replica must share the same baseline');
     assert.equal(localUpdates.length, expectedLocalUpdates,
@@ -266,6 +267,8 @@ async function runScenario(options: Scenario): Promise<void> {
     assert.equal((synchronizer as any).textReplicas.get(document.uri.toString())?.source(), expected,
       'wire replay must not desynchronize the displayed replica');
 
+    await waitFor(() => !(synchronizer as any).projectionQuarantines.has(document.uri.toString()),
+      1000, 'projection quarantine expiry');
     document.text = `${expected}Z`;
     originalFire(document, [{ rangeOffset: expected.length, rangeLength: 0, text: 'Z' }]);
     const followup = options.notebookCell ? project.cellSource(key, 'a').toString() : project.text(key).toString();
@@ -281,6 +284,14 @@ async function runScenario(options: Scenario): Promise<void> {
     synchronizer.dispose();
     project.destroy();
     peer.destroy();
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}.`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
 }
 

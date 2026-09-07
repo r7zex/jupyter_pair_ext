@@ -32,8 +32,10 @@ import {
 import {
   CollaborativeProject,
   DocumentKind,
+  MAX_CELL_SOURCE_BYTES,
   MAX_TEXT_DOCUMENT_BYTES,
   ProjectUpdate,
+  TextChange,
   normalizeNotebookUpdateScope,
 } from '../core/crdt';
 import {
@@ -94,6 +96,7 @@ import {
   validateDisplayName,
 } from '../core/types';
 import { WireFrame } from '../core/wire';
+import { rebaseTextChanges } from '../core/textChanges';
 import {
   DEFAULT_TRANSFER_CHUNK_SIZE,
   expectedTransferChunkBytes,
@@ -206,6 +209,28 @@ interface RenameOrigin {
   at: number;
 }
 
+interface TextAuthorityState {
+  revision: number;
+  digest: string;
+}
+
+interface PendingTextIntent {
+  operationId: string;
+  key: string;
+  cellId: string | undefined;
+  baseline: string;
+  changes: TextChange[];
+  result: string;
+  baseRevision: number;
+  retainedBytes: number;
+}
+
+interface TextIntentChangeShape {
+  offset: number;
+  deleteCount: number;
+  insertBytes: number;
+}
+
 /** Small chunks let live edits overtake bulk transfers instead of waiting behind megabytes of buffered data. */
 const BINARY_CHUNK_SIZE = DEFAULT_TRANSFER_CHUNK_SIZE;
 /** How many recent snapshot file transfers stay retransmittable for lossy relay routes. */
@@ -226,6 +251,10 @@ const MAX_SNAPSHOT_CHECKPOINT_BYTES = 32 * 1024 * 1024;
 const SNAPSHOT_CHECKPOINT_TIMEOUT_MS = 120_000;
 const MAX_AWARENESS_CLIENTS_PER_UPDATE = 32;
 const MAX_REMOTE_REVISION_ADVANCE = 1_000_000;
+const MAX_PENDING_TEXT_INTENTS = 4096;
+const MAX_PENDING_TEXT_INTENT_BYTES = 64 * 1024 * 1024;
+const MAX_TEXT_INTENT_CHANGES = 4096;
+const MAX_COMPLETED_TEXT_INTENTS = 8192;
 const MAX_EXECUTION_MANIFEST_ENTRIES = 50_000;
 const MAX_PENDING_BARRIER_AUTHORIZATIONS = 128;
 const BARRIER_AUTHORIZATION_TIMEOUT_MS = 60_000;
@@ -593,6 +622,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly suppressedDeletes = new Map<string, number>();
   /** Last accepted rename per logical source path, used to resolve rename/rename conflicts. */
   private readonly renameOrigins = new Map<string, RenameOrigin>();
+  private readonly textAuthorityStates = new Map<string, TextAuthorityState>();
+  private readonly pendingTextIntents = new Map<string, PendingTextIntent>();
+  private readonly completedTextIntents = new Map<string, true>();
+  private pendingTextIntentBytes = 0;
 
   private readonly kernels = new Map<string, JupyterKernel>();
   private readonly kernelLastUsed = new Map<string, number>();
@@ -642,6 +675,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private initialized = false;
   private initialStateReceived = false;
   private recoveringHost: boolean;
+  private editorLineAnchorResolver: ((document: vscode.TextDocument, offset: number) => number | undefined) | undefined;
   private waitingForHostFolder = false;
   private messageQueue: Promise<void> = Promise.resolve();
   private backgroundMessageQueue: Promise<void> = Promise.resolve();
@@ -1614,36 +1648,56 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   /**
-   * Rejects local edits that touch another participant's selected line. The
-   * CRDT-relative anchor keeps that lock on the same logical line when a peer
-   * inserts new lines above it. If two peers select the same line concurrently,
-   * the stable join order breaks the tie instead of blocking both editors.
+   * Stages guest editor input for host serialization. The displayed replica may
+   * advance optimistically, but the guest's canonical project is not mutated.
    */
-  public lineLockMessage(
-    key: string,
-    cellId: string | undefined,
-    changes: readonly { rangeOffset: number; rangeLength: number }[],
-    canonicalSource: string,
-  ): string | undefined {
-    if (!changes.length) return undefined;
-    const states = this.snapshot().awareness;
-    const own = states.find((state) => state.peer.peerId === this.descriptor.localPeer.peerId);
-    const ownStart = own ? this.presenceLineStart(own, canonicalSource) : undefined;
-    for (const state of states) {
-      if (state.peer.peerId === this.descriptor.localPeer.peerId
-        || state.shareCursor === false
-        || state.activeFile !== key
-        || state.activeNotebookCellId !== cellId) continue;
-      const lockedStart = this.presenceLineStart(state, canonicalSource);
-      if (lockedStart === undefined) continue;
-      // A simultaneous selection is resolved consistently on every peer.
-      if (ownStart === lockedStart && comparePeerPriority(this.descriptor.localPeer, state.peer) < 0) continue;
-      const lockedEnd = lineEndOffset(canonicalSource, lockedStart);
-      if (changes.some((change) => changeTouchesLine(change, lockedStart, lockedEnd))) {
-        return `Line is currently selected by ${state.peer.displayName}.`;
-      }
+  public stageEditorTextIntent(request: {
+    key: string;
+    cellId: string | undefined;
+    baseline: string;
+    changes: readonly TextChange[];
+    result: string;
+  }): boolean {
+    if (this.coordinator.isCurrentHost() && !this.recoveringHost) return false;
+    if (this.closed) throw new Error('Cannot edit text after the collaboration session has closed.');
+    const key = normalizedTrackedPath(request.key);
+    if (!key || key !== request.key) throw new Error('Editor text intent has an invalid project path.');
+    if (request.cellId !== undefined && !PEER_ID_PATTERN.test(request.cellId)) {
+      throw new Error('Editor text intent has an invalid notebook cell id.');
     }
-    return undefined;
+    const limit = request.cellId ? MAX_CELL_SOURCE_BYTES : MAX_TEXT_DOCUMENT_BYTES;
+    if (Buffer.byteLength(request.baseline, 'utf8') > limit || Buffer.byteLength(request.result, 'utf8') > limit) {
+      throw new Error('Editor text intent exceeds the collaborative source-size limit.');
+    }
+    const changes = request.changes.map((change) => ({ ...change }));
+    if (!changes.length || changes.length > MAX_TEXT_INTENT_CHANGES
+      || applyTextIntentChanges(request.baseline, changes, limit) !== request.result) {
+      throw new Error('Editor text intent does not reproduce the displayed result.');
+    }
+    const retainedBytes = Buffer.byteLength(request.baseline, 'utf8')
+      + changes.reduce((total, change) => total + Buffer.byteLength(change.insertText, 'utf8') + 24, 0);
+    if (this.pendingTextIntents.size >= MAX_PENDING_TEXT_INTENTS
+      || this.pendingTextIntentBytes + retainedBytes > MAX_PENDING_TEXT_INTENT_BYTES) {
+      throw new Error('Pending host text-intent queue is full.');
+    }
+    const target = textAuthorityTarget(key, request.cellId);
+    const previous = [...this.pendingTextIntents.values()].reverse()
+      .find((pending) => textAuthorityTarget(pending.key, pending.cellId) === target);
+    const state = this.textAuthorityState(key, request.cellId, request.baseline);
+    const pending: PendingTextIntent = {
+      operationId: newId(),
+      key,
+      cellId: request.cellId,
+      baseline: request.baseline,
+      changes,
+      result: request.result,
+      baseRevision: previous ? nextTextAuthorityRevision(previous.baseRevision) : state.revision,
+      retainedBytes,
+    };
+    this.pendingTextIntents.set(pending.operationId, pending);
+    this.pendingTextIntentBytes += retainedBytes;
+    this.sendPendingTextIntent(pending);
+    return true;
   }
 
   public async refreshHardware(): Promise<void> {
@@ -2143,6 +2197,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(closedError());
     }
     this.pendingTransfers.clear();
+    this.pendingTextIntents.clear();
+    this.pendingTextIntentBytes = 0;
+    this.completedTextIntents.clear();
+    this.textAuthorityStates.clear();
     for (const pending of this.pendingSnapshotCheckpoints.values()) {
       clearTimeout(pending.timer);
       pending.reject(closedError());
@@ -2220,6 +2278,281 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (failures.length) throw failures[0];
   }
 
+  private textSource(key: string, cellId: string | undefined): string | undefined {
+    if (!this.project.has(key)) return undefined;
+    try {
+      if (cellId !== undefined) return this.project.cellSource(key, cellId).toString();
+      return this.project.kindOf(key) === 'text' ? this.project.text(key).toString() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private textAuthorityState(key: string, cellId: string | undefined, fallback = ''): TextAuthorityState {
+    const target = textAuthorityTarget(key, cellId);
+    const digest = canonicalCellTextDigest(this.textSource(key, cellId) ?? fallback);
+    const existing = this.textAuthorityStates.get(target);
+    if (!existing) {
+      const initial = { revision: 0, digest };
+      this.textAuthorityStates.set(target, initial);
+      return initial;
+    }
+    if (existing.digest === digest) return existing;
+    const refreshed = {
+      revision: this.coordinator.isCurrentHost() ? nextTextAuthorityRevision(existing.revision) : existing.revision,
+      digest,
+    };
+    this.textAuthorityStates.set(target, refreshed);
+    return refreshed;
+  }
+
+  private advanceTextAuthority(event: ProjectUpdate): TextAuthorityState | undefined {
+    const target = projectUpdateTextTarget(event.kind, event.scope);
+    if (!target || !this.coordinator.isCurrentHost()) return undefined;
+    const source = this.textSource(event.key, target.cellId);
+    if (source === undefined) return undefined;
+    const id = textAuthorityTarget(event.key, target.cellId);
+    const previous = this.textAuthorityStates.get(id);
+    const state = {
+      revision: nextTextAuthorityRevision(previous?.revision ?? 0),
+      digest: canonicalCellTextDigest(source),
+    };
+    this.textAuthorityStates.set(id, state);
+    return state;
+  }
+
+  private sendPendingTextIntent(pending: PendingTextIntent): void {
+    const hostId = this.coordinator.clock.hostId;
+    const stateVector = this.project.has(pending.key)
+      ? this.project.encodeStateVector(pending.key) : new Uint8Array();
+    const encoded = encodeTextIntentChanges(pending.changes, stateVector);
+    try {
+      this.transport.sendTo(hostId, 'textEditIntent', {
+        operationId: pending.operationId,
+        key: pending.key,
+        ...(pending.cellId ? { cellId: pending.cellId } : {}),
+        baseRevision: pending.baseRevision,
+        baseDigest: canonicalCellTextDigest(pending.baseline),
+        resultDigest: canonicalCellTextDigest(pending.result),
+        changes: encoded.shapes,
+      }, encoded.payload);
+    } catch (error) {
+      this.log.appendLine(`[debug] Queued text intent ${pending.operationId} until the Session Host route recovers: ${formatError(error)}`);
+    }
+  }
+
+  private flushPendingTextIntents(): void {
+    if (this.coordinator.isCurrentHost() || this.closed) return;
+    for (const pending of this.pendingTextIntents.values()) this.sendPendingTextIntent(pending);
+  }
+
+  private removePendingTextIntent(operationId: string): PendingTextIntent | undefined {
+    const pending = this.pendingTextIntents.get(operationId);
+    if (!pending) return undefined;
+    this.pendingTextIntents.delete(operationId);
+    this.pendingTextIntentBytes = Math.max(0, this.pendingTextIntentBytes - pending.retainedBytes);
+    return pending;
+  }
+
+  private requestTextState(key: string, cellId: string | undefined): void {
+    if (this.coordinator.isCurrentHost() || this.closed) return;
+    try {
+      this.transport.sendTo(this.coordinator.clock.hostId, 'textStateRequest', {
+        key,
+        ...(cellId ? { cellId } : {}),
+      }, this.project.has(key) ? this.project.encodeStateVector(key) : new Uint8Array());
+    } catch (error) {
+      this.log.appendLine(`[debug] Deferred host text-state request for ${key}: ${formatError(error)}`);
+    }
+  }
+
+  private sendAuthoritativeTextState(
+    peerId: string,
+    type: 'textEditAccepted' | 'textEditRejected' | 'textStateSnapshot',
+    key: string,
+    cellId: string | undefined,
+    operationId?: string,
+    update?: Uint8Array,
+    remoteStateVector?: Uint8Array,
+  ): void {
+    const source = this.textSource(key, cellId);
+    if (source === undefined || !this.project.has(key)) return;
+    const kind = cellId ? 'notebook' : 'text';
+    const state = this.textAuthorityState(key, cellId, source);
+    this.transport.sendTo(peerId, type, {
+      key,
+      kind,
+      ...(cellId ? { cellId } : {}),
+      ...(operationId ? { operationId } : {}),
+      textRevision: state.revision,
+      textDigest: state.digest,
+    }, update ?? this.project.encodeUpdate(key, remoteStateVector));
+  }
+
+  private acceptTextEditIntent(frame: WireFrame, sourceId: string): void {
+    if (!this.coordinator.isCurrentHost() || this.recoveringHost || sourceId === this.descriptor.localPeer.peerId) return;
+    const target = normalizeTextIntentTarget(frame.meta);
+    const operationId = String(frame.meta.operationId ?? '');
+    const baseRevision = Number(frame.meta.baseRevision);
+    const baseDigest = String(frame.meta.baseDigest ?? '');
+    const resultDigest = String(frame.meta.resultDigest ?? '');
+    if (!target || !TRANSFER_ID_PATTERN.test(operationId) || !isSafeTextRevision(baseRevision)
+      || !isTextDigest(baseDigest) || !isTextDigest(resultDigest)) {
+      throw new Error(`Peer ${sourceId} sent a malformed text edit intent.`);
+    }
+    const decoded = decodeTextIntentChanges(frame.meta.changes, frame.payload);
+    if (!decoded) throw new Error(`Peer ${sourceId} sent malformed text edit intent content.`);
+    const completedKey = `${sourceId}:${operationId}`;
+    if (this.completedTextIntents.has(completedKey)) {
+      this.sendAuthoritativeTextState(
+        sourceId, 'textEditAccepted', target.key, target.cellId, operationId, undefined, decoded.stateVector,
+      );
+      return;
+    }
+    if (target.cellId) {
+      if (!this.project.has(target.key) || this.project.kindOf(target.key) !== 'notebook'
+        || !this.project.hasNotebookCell(target.key, target.cellId)) {
+        throw new Error(`Peer ${sourceId} targeted an unknown notebook cell.`);
+      }
+    } else if (!this.project.has(target.key)) {
+      const fileState = this.effectiveFileState(target.key);
+      if (!fileState || fileState.deleted || fileState.kind !== 'text') {
+        throw new Error(`Peer ${sourceId} targeted an unknown text document.`);
+      }
+      this.project.ensureText(target.key);
+    } else if (this.project.kindOf(target.key) !== 'text') {
+      throw new Error(`Peer ${sourceId} sent a text intent for a non-text document.`);
+    }
+    const current = this.textSource(target.key, target.cellId);
+    if (current === undefined) throw new Error(`Cannot resolve host text for ${target.key}.`);
+    const state = this.textAuthorityState(target.key, target.cellId, current);
+    if (state.digest !== baseDigest) {
+      this.sendAuthoritativeTextState(
+        sourceId, 'textEditRejected', target.key, target.cellId, operationId, undefined, decoded.stateVector,
+      );
+      return;
+    }
+    if (state.revision !== baseRevision) {
+      this.log.appendLine(`[debug] Accepted text intent ${operationId} by matching digest after revision ${baseRevision} -> ${state.revision}.`);
+    }
+    const limit = target.cellId ? MAX_CELL_SOURCE_BYTES : MAX_TEXT_DOCUMENT_BYTES;
+    const changes = decoded.changes;
+    const result = applyTextIntentChanges(current, changes, limit);
+    if (result === undefined || canonicalCellTextDigest(result) !== resultDigest) {
+      throw new Error(`Peer ${sourceId} sent inconsistent text edit intent content.`);
+    }
+    let acceptedUpdate: ProjectUpdate | undefined;
+    const capture = (event: ProjectUpdate) => {
+      const updateTarget = projectUpdateTextTarget(event.kind, event.scope);
+      if (event.origin !== REMOTE_ORIGIN && event.key === target.key && updateTarget?.cellId === target.cellId) {
+        acceptedUpdate = event;
+      }
+    };
+    this.project.on('update', capture);
+    try {
+      if (target.cellId) this.project.applyCellTextChanges(target.key, target.cellId, changes);
+      else this.project.applyTextChanges(target.key, changes);
+    } finally {
+      this.project.off('update', capture);
+    }
+    const applied = this.textSource(target.key, target.cellId);
+    if (applied === undefined || canonicalCellTextDigest(applied) !== resultDigest) {
+      throw new Error(`Host text serialization produced an unexpected result for ${target.key}.`);
+    }
+    const refreshed = this.textAuthorityState(target.key, target.cellId, applied);
+    if (refreshed.digest !== resultDigest) {
+      throw new Error(`Host text authority digest did not advance for ${target.key}.`);
+    }
+    this.completedTextIntents.set(completedKey, true);
+    while (this.completedTextIntents.size > MAX_COMPLETED_TEXT_INTENTS) {
+      const oldest = this.completedTextIntents.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.completedTextIntents.delete(oldest);
+    }
+    this.sendAuthoritativeTextState(
+      sourceId,
+      'textEditAccepted',
+      target.key,
+      target.cellId,
+      operationId,
+      acceptedUpdate?.update,
+    );
+  }
+
+  private acceptAuthoritativeTextState(frame: WireFrame, sourceId: string): void {
+    if (sourceId !== this.coordinator.clock.hostId || this.coordinator.isCurrentHost()) return;
+    const target = normalizeTextIntentTarget(frame.meta);
+    const revision = Number(frame.meta.textRevision);
+    const digest = String(frame.meta.textDigest ?? '');
+    const operationId = frame.meta.operationId === undefined ? undefined : String(frame.meta.operationId);
+    if (!target || !isSafeTextRevision(revision) || !isTextDigest(digest)
+      || (operationId !== undefined && !TRANSFER_ID_PATTERN.test(operationId))) {
+      throw new Error('Session Host sent malformed authoritative text state.');
+    }
+    const kind: DocumentKind = target.cellId ? 'notebook' : 'text';
+    const scope: ProjectUpdate['scope'] = target.cellId ? { type: 'cellText', cellId: target.cellId } : undefined;
+    if (frame.payload.byteLength) this.project.applyRemoteUpdate(target.key, kind, frame.payload, scope);
+    const source = this.textSource(target.key, target.cellId);
+    if (source === undefined || canonicalCellTextDigest(source) !== digest) {
+      this.requestTextState(target.key, target.cellId);
+      return;
+    }
+    const state = { revision, digest };
+    this.textAuthorityStates.set(textAuthorityTarget(target.key, target.cellId), state);
+    if (frame.type === 'textEditAccepted' && operationId) {
+      const pending = this.pendingTextIntents.get(operationId);
+      if (pending && pending.key === target.key && pending.cellId === target.cellId) {
+        this.removePendingTextIntent(operationId);
+      }
+      return;
+    }
+    if (frame.type === 'textEditRejected' && operationId && !this.pendingTextIntents.has(operationId)) return;
+    this.rebasePendingTextIntents(target.key, target.cellId, source, state);
+  }
+
+  private rebasePendingTextIntents(
+    key: string,
+    cellId: string | undefined,
+    canonical: string,
+    state: TextAuthorityState,
+  ): void {
+    const target = textAuthorityTarget(key, cellId);
+    const stale = [...this.pendingTextIntents.values()]
+      .filter((pending) => textAuthorityTarget(pending.key, pending.cellId) === target);
+    if (!stale.length) return;
+    const replacements: PendingTextIntent[] = [];
+    let baseline = canonical;
+    let revision = state.revision;
+    try {
+      for (const pending of stale) {
+        const changes = rebaseTextChanges(pending.baseline, baseline, pending.changes);
+        const limit = cellId ? MAX_CELL_SOURCE_BYTES : MAX_TEXT_DOCUMENT_BYTES;
+        const result = applyTextIntentChanges(baseline, changes, limit);
+        if (result === undefined) throw new Error('Rebased intent exceeds the collaborative text limit.');
+        if (changes.length && result !== baseline) {
+          replacements.push({
+            // Keep the logical id across retries. A late copy of the original
+            // frame is then deduplicated if either representation was accepted.
+            operationId: pending.operationId, key, cellId, baseline, changes, result, baseRevision: revision,
+            retainedBytes: Buffer.byteLength(baseline, 'utf8')
+              + changes.reduce((total, change) => total + Buffer.byteLength(change.insertText, 'utf8') + 24, 0),
+          });
+          revision = nextTextAuthorityRevision(revision);
+        }
+        baseline = result;
+      }
+    } catch (error) {
+      this.log.appendLine(`[error] Could not rebase queued text intents for ${key}: ${formatError(error)}`);
+      return;
+    }
+    for (const pending of stale) this.removePendingTextIntent(pending.operationId);
+    for (const pending of replacements) {
+      this.pendingTextIntents.set(pending.operationId, pending);
+      this.pendingTextIntentBytes += pending.retainedBytes;
+      this.sendPendingTextIntent(pending);
+    }
+  }
+
   private installProjectHandlers(): void {
     // Cell payload collection is irreversible, so the CRDT layer asks the
     // runtime whether every known participant is currently present.
@@ -2230,9 +2563,21 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.project.on('update', (event: ProjectUpdate) => {
       if (event.origin !== REMOTE_ORIGIN && !this.endingSession) {
         try {
+          const textTarget = projectUpdateTextTarget(event.kind, event.scope);
+          if (textTarget && !this.coordinator.isCurrentHost()) {
+            this.log.appendLine(`[error] Blocked a non-host canonical text update for ${event.key}; requesting host repair.`);
+            this.requestTextState(event.key, textTarget.cellId);
+            return;
+          }
           const fileState = this.ensureLiveFileState(event.key, event.kind);
+          const authority = this.advanceTextAuthority(event);
           this.transport.broadcast('projectUpdate', {
             key: event.key, kind: event.kind, scope: event.scope, fileState,
+            ...(authority ? {
+              textRevision: authority.revision,
+              textDigest: authority.digest,
+              ...(textTarget?.cellId ? { textCellId: textTarget.cellId } : {}),
+            } : {}),
           }, event.update);
         } catch (error) {
           this.log.appendLine(`[error] Could not publish project update for ${event.key}: ${formatError(error)}`);
@@ -2279,6 +2624,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }
         this.sendRuntimePresence(peer.peerId);
         this.replayRemoteExecutionsForPeer(peer.peerId);
+        if (peer.peerId === this.coordinator.clock.hostId) this.flushPendingTextIntents();
       } catch (error) {
         this.log.appendLine(`[error] Failed to initialize peer ${peer.displayName}: ${formatError(error)}`);
       }
@@ -2397,6 +2743,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transport.on('routeChanged', (peer: PeerIdentity, from: string, to: string) => {
       this.log.appendLine(`[debug] Route to ${peer.displayName} changed: ${from} -> ${to}`);
       this.emit('connectionUpdated', { kind: 'route-changed', peerId: peer.peerId, from, to });
+      if (peer.peerId === this.coordinator.clock.hostId) this.flushPendingTextIntents();
     });
     this.transport.on('remoteRouteStatus', (peerId: string, status: string) => {
       this.emit('connectionUpdated', { kind: 'remote-status', peerId, status });
@@ -2607,6 +2954,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             }
           }
           break;
+        case 'textEditIntent':
+          this.acceptTextEditIntent(frame, sourceId);
+          break;
+        case 'textEditAccepted':
+        case 'textEditRejected':
+        case 'textStateSnapshot':
+          this.acceptAuthoritativeTextState(frame, sourceId);
+          break;
+        case 'textStateRequest': {
+          if (!this.coordinator.isCurrentHost() || sourceId === this.descriptor.localPeer.peerId) break;
+          const target = normalizeTextIntentTarget(frame.meta);
+          if (!target) throw new Error(`Peer ${sourceId} requested malformed text state.`);
+          this.sendAuthoritativeTextState(
+            sourceId, 'textStateSnapshot', target.key, target.cellId, undefined, undefined, frame.payload,
+          );
+          break;
+        }
         case 'projectUpdate':
         case 'stateDocument':
         case 'stateDiff': {
@@ -2626,7 +2990,28 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
                 throw new Error(`Peer ${sourceId} sent an unscoped notebook project update.`);
               }
             }
+            const textTarget = projectUpdateTextTarget(kind, scope);
+            if (frame.type === 'projectUpdate' && textTarget
+              && sourceId !== this.coordinator.clock.hostId) {
+              this.log.appendLine(`[error] Refused non-host text update for ${key} from ${sourceId}.`);
+              if (this.coordinator.isCurrentHost()) {
+                this.sendAuthoritativeTextState(sourceId, 'textStateSnapshot', key, textTarget.cellId);
+              }
+              break;
+            }
             this.project.applyRemoteUpdate(key, kind, frame.payload, scope);
+            if (frame.type === 'projectUpdate' && textTarget
+              && sourceId === this.coordinator.clock.hostId && !this.coordinator.isCurrentHost()) {
+              const revision = Number(frame.meta.textRevision);
+              const digest = String(frame.meta.textDigest ?? '');
+              const source = this.textSource(key, textTarget.cellId);
+              if (isSafeTextRevision(revision) && isTextDigest(digest) && source !== undefined
+                && canonicalCellTextDigest(source) === digest) {
+                this.textAuthorityStates.set(textAuthorityTarget(key, textTarget.cellId), { revision, digest });
+              } else {
+                this.requestTextState(key, textTarget.cellId);
+              }
+            }
           }
           break;
         }
@@ -3692,10 +4077,22 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   ): string | undefined {
     if (line === undefined || typeof document.offsetAt !== 'function') return undefined;
     try {
-      return encodeRelativeOffset(this.presenceText(key, cellId) ?? new Y.Text(), document.offsetAt(new vscode.Position(line, 0)));
+      const canonical = this.presenceText(key, cellId);
+      if (!canonical) return undefined;
+      const displayedOffset = document.offsetAt(new vscode.Position(line, 0));
+      const canonicalOffset = this.editorLineAnchorResolver
+        ? this.editorLineAnchorResolver(document, displayedOffset)
+        : document.getText() === canonical.toString() ? displayedOffset : undefined;
+      return canonicalOffset === undefined ? undefined : encodeRelativeOffset(canonical, canonicalOffset);
     } catch {
       return undefined;
     }
+  }
+
+  public setEditorLineAnchorResolver(
+    resolver: ((document: vscode.TextDocument, offset: number) => number | undefined) | undefined,
+  ): void {
+    this.editorLineAnchorResolver = resolver;
   }
 
   private publishResourcePresence(peerId?: string): void {
@@ -3776,12 +4173,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     } catch {
       return undefined;
     }
-  }
-
-  private presenceLineStart(state: PresenceState, source: string): number | undefined {
-    const offset = this.resolvePresenceLineOffset(state)
-      ?? offsetForLine(source, state.activeLine);
-    return offset === undefined ? undefined : lineStartOffset(source, offset);
   }
 
   private async onCreatedFromExplorer(uri: vscode.Uri): Promise<void> {
@@ -3930,6 +4321,21 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (kind === 'text' && decodedText !== undefined) {
       this.deleteBinaryVersions(relativePath);
       const value = decodedText;
+      if (!this.coordinator.isCurrentHost()) {
+        const baseline = this.project.has(relativePath) && this.project.kindOf(relativePath) === 'text'
+          ? this.project.text(relativePath).toString() : '';
+        if (baseline !== value) {
+          const change = minimalTextIntentChange(baseline, value);
+          this.stageEditorTextIntent({
+            key: relativePath,
+            cellId: undefined,
+            baseline,
+            changes: [change],
+            result: value,
+          });
+        }
+        return;
+      }
       if (!this.project.has(relativePath) || this.project.kindOf(relativePath) !== 'text') {
         this.project.deleteDocument(relativePath);
         this.project.ensureText(relativePath);
@@ -3939,6 +4345,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     } else if (kind === 'notebook' && notebookSnapshot) {
       this.deleteBinaryVersions(relativePath);
       const snapshot = notebookSnapshot;
+      if (!this.coordinator.isCurrentHost()) {
+        this.log.appendLine(
+          `[error] Ignored a closed notebook disk mutation for ${relativePath}; `
+          + 'guest notebook changes must pass through the host-authoritative editor protocol.',
+        );
+        this.storage?.schedule(relativePath);
+        return;
+      }
       if (!this.project.has(relativePath) || this.project.kindOf(relativePath) !== 'notebook') {
         this.project.deleteDocument(relativePath);
         this.project.ensureNotebook(relativePath, snapshot);
@@ -6374,44 +6788,6 @@ function lineFromSelection(position: unknown): number | undefined {
   return typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : undefined;
 }
 
-function offsetForLine(source: string, line: number | undefined): number | undefined {
-  if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 0) return undefined;
-  let offset = 0;
-  for (let index = 0; index < line; index += 1) {
-    const newline = source.indexOf('\n', offset);
-    if (newline < 0) return undefined;
-    offset = newline + 1;
-  }
-  return offset;
-}
-
-function lineStartOffset(source: string, offset: number): number {
-  const bounded = Math.max(0, Math.min(source.length, offset));
-  const newline = source.lastIndexOf('\n', Math.max(0, bounded - 1));
-  return newline + 1;
-}
-
-function lineEndOffset(source: string, start: number): number {
-  const newline = source.indexOf('\n', start);
-  return newline < 0 ? source.length : newline + 1;
-}
-
-function changeTouchesLine(
-  change: { rangeOffset: number; rangeLength: number },
-  lineStart: number,
-  lineEnd: number,
-): boolean {
-  const start = Math.max(0, change.rangeOffset);
-  const end = Math.max(start, start + change.rangeLength);
-  return change.rangeLength === 0
-    ? start >= lineStart && start <= lineEnd
-    : start < lineEnd && end > lineStart;
-}
-
-function comparePeerPriority(left: PeerIdentity, right: PeerIdentity): number {
-  return left.joinOrder - right.joinOrder || left.peerId.localeCompare(right.peerId);
-}
-
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -6948,6 +7324,124 @@ function cellTextRevisionSequence(revision: string): number | undefined {
 
 function canonicalCellTextDigest(source: string): string {
   return createHash('sha256').update(source, 'utf8').digest('hex');
+}
+
+function textAuthorityTarget(key: string, cellId: string | undefined): string {
+  return JSON.stringify([key, cellId ?? null]);
+}
+
+function projectUpdateTextTarget(
+  kind: DocumentKind,
+  scope: ProjectUpdate['scope'],
+): { cellId: string | undefined } | undefined {
+  if (kind === 'text') return { cellId: undefined };
+  return scope?.type === 'cellText' ? { cellId: scope.cellId } : undefined;
+}
+
+function normalizeTextIntentTarget(meta: Record<string, unknown>): { key: string; cellId: string | undefined } | undefined {
+  const key = normalizedTrackedPath(String(meta.key ?? ''));
+  if (!key) return undefined;
+  if (meta.cellId === undefined) return { key, cellId: undefined };
+  const cellId = String(meta.cellId);
+  return PEER_ID_PATTERN.test(cellId) ? { key, cellId } : undefined;
+}
+
+function isTextDigest(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
+}
+
+function isSafeTextRevision(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function nextTextAuthorityRevision(value: number): number {
+  if (!isSafeTextRevision(value) || value >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('Host text revision reached its supported limit.');
+  }
+  return value + 1;
+}
+
+function encodeTextIntentChanges(changes: readonly TextChange[], stateVector: Uint8Array): {
+  shapes: TextIntentChangeShape[];
+  payload: Uint8Array;
+} {
+  const chunks: Buffer[] = [];
+  const shapes = changes.map((change) => {
+    const bytes = Buffer.from(change.insertText, 'utf8');
+    chunks.push(bytes);
+    return { offset: change.offset, deleteCount: change.deleteCount, insertBytes: bytes.byteLength };
+  });
+  const prefix = Buffer.allocUnsafe(4);
+  prefix.writeUInt32BE(stateVector.byteLength, 0);
+  return { shapes, payload: Buffer.concat([prefix, Buffer.from(stateVector), ...chunks]) };
+}
+
+function decodeTextIntentChanges(raw: unknown, payload: Uint8Array): {
+  changes: TextChange[];
+  stateVector: Uint8Array;
+} | undefined {
+  if (!Array.isArray(raw) || !raw.length || raw.length > MAX_TEXT_INTENT_CHANGES || payload.byteLength < 4) {
+    return undefined;
+  }
+  const buffer = Buffer.from(payload);
+  const stateVectorBytes = buffer.readUInt32BE(0);
+  if (stateVectorBytes > 4 * 1024 * 1024 || stateVectorBytes > buffer.byteLength - 4) return undefined;
+  const stateVector = buffer.subarray(4, 4 + stateVectorBytes);
+  const changes: TextChange[] = [];
+  let cursor = 4 + stateVectorBytes;
+  for (const value of raw) {
+    if (!isPlainRecord(value)) return undefined;
+    const offset = Number(value.offset);
+    const deleteCount = Number(value.deleteCount);
+    const insertBytes = Number(value.insertBytes);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(deleteCount) || deleteCount < 0
+      || !Number.isSafeInteger(insertBytes) || insertBytes < 0 || cursor + insertBytes > payload.byteLength) {
+      return undefined;
+    }
+    const bytes = Buffer.from(payload.subarray(cursor, cursor + insertBytes));
+    const insertText = bytes.toString('utf8');
+    if (!Buffer.from(insertText, 'utf8').equals(bytes)) return undefined;
+    changes.push({ offset, deleteCount, insertText });
+    cursor += insertBytes;
+  }
+  return cursor === payload.byteLength ? { changes, stateVector } : undefined;
+}
+
+function applyTextIntentChanges(
+  value: string,
+  changes: readonly TextChange[],
+  byteLimit: number,
+): string | undefined {
+  const ascending = [...changes].sort((left, right) =>
+    left.offset - right.offset || left.deleteCount - right.deleteCount);
+  let previousEnd = 0;
+  for (const change of ascending) {
+    if (!Number.isSafeInteger(change.offset) || !Number.isSafeInteger(change.deleteCount)
+      || change.offset < 0 || change.deleteCount < 0 || typeof change.insertText !== 'string'
+      || change.offset + change.deleteCount > value.length || change.offset < previousEnd) return undefined;
+    previousEnd = change.offset + change.deleteCount;
+  }
+  let next = value;
+  for (const change of [...ascending].reverse()) {
+    next = `${next.slice(0, change.offset)}${change.insertText}${next.slice(change.offset + change.deleteCount)}`;
+  }
+  return Buffer.byteLength(next, 'utf8') <= byteLimit ? next : undefined;
+}
+
+function minimalTextIntentChange(current: string, target: string): TextChange {
+  let start = 0;
+  while (start < current.length && start < target.length && current[start] === target[start]) start += 1;
+  let currentEnd = current.length;
+  let targetEnd = target.length;
+  while (currentEnd > start && targetEnd > start && current[currentEnd - 1] === target[targetEnd - 1]) {
+    currentEnd -= 1;
+    targetEnd -= 1;
+  }
+  return {
+    offset: start,
+    deleteCount: currentEnd - start,
+    insertText: target.slice(start, targetEnd),
+  };
 }
 
 function normalizeLightweightExecutionRequest(meta: Record<string, unknown>): LightweightExecutionRequest | undefined {

@@ -4,7 +4,7 @@
 
 The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port. New invites include the current pinned host epoch, which bootstrap and runtime admission preserve after voluntary transfers; legacy invites without it default to epoch zero.
 
-Before Trystero admits a peer, Pair Notebook 0.5.9 exchanges a protocol-v5 handshake containing:
+Before Trystero admits a peer, Pair Notebook 0.5.20 exchanges a protocol-v6 handshake containing:
 
 - session ID;
 - connection purpose (`runtime` or `bootstrap`);
@@ -16,7 +16,7 @@ Before Trystero admits a peer, Pair Notebook 0.5.9 exchanges a protocol-v5 hands
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v5 is first released in Pair Notebook 0.5.9. It retains v4's authenticated emergency-relay envelope and adds the host-canonical lightweight execution request as an admission boundary. It is intentionally incompatible with protocol-v4 and older clients so a mixed-version session cannot interpret execution frames under different contracts. Incompatible peers are rejected during admission; every participant must run a protocol-v5-compatible release.
+Protocol v6 is first released in Pair Notebook 0.5.20. It retains v5's authenticated emergency-relay envelope and host-canonical lightweight execution request, then adds host-authoritative text intents as an admission boundary. It is intentionally incompatible with protocol-v5 and older clients so a mixed-version session cannot interpret text ownership under different contracts. Incompatible peers are rejected during admission; every participant must run Pair Notebook 0.5.20 or later.
 
 ## Frames and delivery
 
@@ -40,6 +40,10 @@ Only after the snapshot succeeds does the extension save the peer descriptor and
 
 Runtime peers exchange Yjs state vectors and only missing document updates. Filesystem state contains tombstones, directory entries, binary hashes/versions, and deterministic author/version tie breakers. Binary transfers are isolated by `(sourceId, transferId)` and are published atomically after hash verification.
 
+The current Session Host is the canonical text authority. A guest applies typing only to its optimistic displayed replica and sends a bounded intent containing a stable operation ID, document/cell identity, base host revision and digest, immutable deltas, resulting digest, and its Yjs state vector. The host validates and serializes an intent once, broadcasts the resulting canonical CRDT update, and acknowledges the same operation ID. Reordered or stale intents receive an authoritative state-vector diff and are rebased in original queue order without changing their operation IDs. Direct guest-authored canonical text updates are rejected and repaired from host state.
+
+Every VS Code text event emitted while a remote `WorkspaceEdit` is in flight belongs to that projection transaction and cannot create a new shared operation. A short post-resolution quarantine contains delayed formatter or notebook-model tails and restores the latest host-canonical source. Digest mismatch and reconnect reconciliation request host state; loss of the pinned host queues guest intents and never elects a temporary text authority.
+
 Notebook changes carry semantic scopes. `cellText`, `cellMetadata`, `cellOutputs`, `cellExecution`, and `notebookMetadata` are applied narrowly by stable cell ID without replacing neighboring cells. A missing/unscoped historical state-vector merge is reconciled field-by-field unless the canonical and editor structures are provably inconsistent. `NotebookEdit.replaceCells` is reserved for the minimal structural splice (insert/delete/reorder or structural recovery); it is not a metadata/output/execution hot-path primitive.
 
 Open VS Code documents are persisted through the editor API. Background persistence reconciles open documents without calling `save()`. `NotebookDocument.save()` and `TextDocument.save()` are invoked only when an explicit filesystem materialization/barrier requests `prepareWorkingCopy()`, such as host Save, host transfer, session-end fencing, local execution that needs the physical workspace, or an explicit legacy execution barrier.
@@ -62,7 +66,7 @@ Kernel control frames enter a separate serialized runtime queue, so an unfinishe
 
 ## Presence and resources
 
-New peers publish semantic presence only: participant identity, active file, stable notebook cell ID, active **line**, and a CRDT-relative line-start anchor. The anchor follows the same logical line when text is inserted above it. Exact cursors, columns, selections, names, and colors are not rendered; a selected line is highlighted and edits to it are rejected for other participants. Legacy exact cursor data remains receive-only compatibility and is not rendered.
+New peers publish semantic presence only: participant identity, active file, stable notebook cell ID, active **line**, and a CRDT-relative line-start anchor. Displayed editor offsets are mapped through the local text replica before the canonical anchor is created, so the anchor follows the same logical line when text is inserted above it. Exact cursors, columns, selections, names, and colors are not rendered; selected-line highlighting is advisory and never rejects or rolls back text. Legacy exact cursor data remains receive-only compatibility and is not rendered.
 
 Resource/hardware/kernel telemetry is separate from semantic awareness. Resource sampling emits dedicated resource frames with its own rate limit; hardware and kernel status use their dedicated frames. Those updates can refresh the dashboard but do not change `activeLine`, do not republish semantic awareness, and do not move a selected-line highlight.
 

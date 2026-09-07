@@ -114,6 +114,13 @@ describe('audit regressions', () => {
       };
       const packageScript = manifest.scripts?.package ?? '';
       assert.match(packageScript, /make-artifacts\.mjs --preflight-only.*vsce package/);
+      const artifactScript = await readFile(path.resolve(__dirname, '../../scripts/make-artifacts.mjs'), 'utf8');
+      const entryExclusion = artifactScript.indexOf('if (EXCLUDED_DIRECTORIES.has(lowerName)) continue;');
+      const entryTypeBranch = artifactScript.indexOf('if (item.isSymbolicLink())');
+      assert.ok(entryExclusion >= 0 && entryExclusion < entryTypeBranch,
+        'worktree .git files must be excluded before filesystem entry-type branching');
+      assert.match(artifactScript,
+        /zipEntries\.filter\(\(entry\) => entry\.split\('\/'\)[^]*EXCLUDED_DIRECTORIES\.has\(segment\.toLowerCase\(\)\)\)/);
       const vscodeIgnore = await readFile(path.resolve(__dirname, '../../.vscodeignore'), 'utf8');
       assert.match(vscodeIgnore, /^\*\*\/\.env\.!\(example\|sample\|template\)$/m);
       assert.doesNotMatch(vscodeIgnore, /^\*\*\/\.env\.\*$/m);
