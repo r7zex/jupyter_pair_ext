@@ -191,6 +191,21 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
+  test('keeps immediate local typing on a different line during projection quarantine', async () => {
+  const harness = await createTextHarness('remote = 0\nlocal = 0');
+  try {
+    harness.project.applyTextChanges(harness.key, [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
+    await waitFor(() => harness.document.getText() === 'remote = 1\nlocal = 0', 3_000, 'remote first-line projection');
+    assert.equal((harness.synchronizer as any).projectionQuarantines.has(harness.document.uri.toString()), true);
+    const edit = new vscode.WorkspaceEdit();
+    edit.insert(harness.document.uri, harness.document.lineAt(1).range.end, ' + 1');
+    assert.equal(await vscode.workspace.applyEdit(edit), true);
+    await waitFor(() => harness.project.text(harness.key).toString() === 'remote = 1\nlocal = 0 + 1', 3_000,
+      'different-line local edit during quarantine');
+    assert.equal(harness.document.getText(), 'remote = 1\nlocal = 0 + 1');
+  } finally { await harness.dispose(); }
+});
+
   test('authors genuine local typing after the projection-tail quarantine has expired', async () => {
     const harness = await createTextHarness('alpha');
     try {
