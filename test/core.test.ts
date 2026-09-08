@@ -396,6 +396,32 @@ describe('authenticated session termination marker', () => {
 });
 
 describe('Pair Notebook CRDT', () => {
+  it('converges simultaneous same-position notebook newlines under reordered replay', () => {
+    const [a, b] = pairedNotebookProjects();
+    const updatesA = captureLocalUpdates(a);
+    const updatesB = captureLocalUpdates(b);
+    try {
+      a.applyCellTextChanges('article.ipynb', 'cell-a', [
+        { offset: 1, deleteCount: 0, insertText: '\n' },
+      ]);
+      b.applyCellTextChanges('article.ipynb', 'cell-a', [
+        { offset: 1, deleteCount: 0, insertText: '\n' },
+      ]);
+
+      for (const update of [...updatesB].reverse()) a.applyRemoteUpdate('article.ipynb', 'notebook', update);
+      for (const update of [...updatesA].reverse()) b.applyRemoteUpdate('article.ipynb', 'notebook', update);
+      for (const update of updatesA) b.applyRemoteUpdate('article.ipynb', 'notebook', update);
+      for (const update of updatesB) a.applyRemoteUpdate('article.ipynb', 'notebook', update);
+
+      const sourceA = a.cellSource('article.ipynb', 'cell-a').toString();
+      const sourceB = b.cellSource('article.ipynb', 'cell-a').toString();
+      assert.equal(sourceA, sourceB);
+      assert.equal([...sourceA].filter((character) => character === '\n').length, 2);
+    } finally {
+      a.destroy();
+      b.destroy();
+    }
+  });
   it('merges simultaneous Y.Text insertions on two peers', () => {
     const [a, b] = pairedTextProjects('abc');
     const updatesA: Uint8Array[] = [];
@@ -1032,7 +1058,7 @@ describe('repair regressions', () => {
     (transport as any).routeUpgrades.set(identity.peerId, upgrade);
     const admitted = (transport as any).assertPeerCanJoin(identity, candidateTransportId);
     (transport as any).pendingHandshakes.set(candidateTransportId, {
-      version: 6,
+      version: 7,
       sessionId: 'late-upgrade-handshake',
       purpose: 'runtime',
       peer: admitted,
@@ -1637,7 +1663,7 @@ describe('repair regressions', () => {
     });
     const projectedKey = generateIdentityCredentials().publicKey;
     const parsed = (transport as any).parseHandshake({
-      version: 6,
+      version: 7,
       sessionId: 'peer-directory',
       purpose: 'runtime',
       peer: {

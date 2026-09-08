@@ -4,7 +4,7 @@
 
 The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port. New invites include the current pinned host epoch, which bootstrap and runtime admission preserve after voluntary transfers; legacy invites without it default to epoch zero.
 
-Before Trystero admits a peer, Pair Notebook 0.5.20 exchanges a protocol-v6 handshake containing:
+Before Trystero admits a peer, Pair Notebook 0.5.21 exchanges a protocol-v7 handshake containing:
 
 - session ID;
 - connection purpose (`runtime` or `bootstrap`);
@@ -16,7 +16,7 @@ Before Trystero admits a peer, Pair Notebook 0.5.20 exchanges a protocol-v6 hand
 
 Both sides sign one canonical transcript containing the session, connection purposes, identities, keys, and nonces. Admission verifies the remote signature and rejects an incompatible session, malformed identity, changed pinned key/order, duplicate application peer ID, self-identity claim, or normalized display-name collision. The invite pins the initial host key before discovery; the transport binds every later frame's `sourceId` to the admitted connection identity.
 
-Protocol v6 is first released in Pair Notebook 0.5.20. It retains v5's authenticated emergency-relay envelope and host-canonical lightweight execution request, then adds host-authoritative text intents as an admission boundary. It is intentionally incompatible with protocol-v5 and older clients so a mixed-version session cannot interpret text ownership under different contracts. Incompatible peers are rejected during admission; every participant must run Pair Notebook 0.5.20 or later.
+Protocol v7 is first released in Pair Notebook 0.5.21. It retains the authenticated emergency-relay envelope and host-canonical lightweight execution request while restoring local-first Yjs text authorship. It is intentionally incompatible with protocol-v6 and older clients so a mixed-version session cannot interpret text ownership under different contracts. Incompatible peers are rejected during admission; every participant must run Pair Notebook 0.5.21 or later.
 
 ## Frames and delivery
 
@@ -40,9 +40,9 @@ Only after the snapshot succeeds does the extension save the peer descriptor and
 
 Runtime peers exchange Yjs state vectors and only missing document updates. Filesystem state contains tombstones, directory entries, binary hashes/versions, and deterministic author/version tie breakers. Binary transfers are isolated by `(sourceId, transferId)` and are published atomically after hash verification.
 
-The current Session Host is the canonical text authority. A guest applies typing only to its optimistic displayed replica and sends a bounded intent containing a stable operation ID, document/cell identity, base host revision and digest, immutable deltas, resulting digest, and its Yjs state vector. The host validates and serializes an intent once, broadcasts the resulting canonical CRDT update, and acknowledges the same operation ID. Reordered or stale intents receive an authoritative state-vector diff and are rebased in original queue order without changing their operation IDs. Direct guest-authored canonical text updates are rejected and repaired from host state.
+Every participant applies genuine editor typing immediately to its local canonical `Y.Text`. The resulting Yjs project update is broadcast over the realtime route and applied by the host and peers. Yjs updates are idempotent, so redundant relay/direct delivery and a later echo cannot duplicate a character or newline. Concurrent operations converge at the stable file or notebook-cell text scope; state-vector exchange supplies missing updates after reconnect. The current Session Host remains authoritative for durable persistence, execution, snapshots, and explicit host transfer, but is not a synchronous per-keystroke text gate.
 
-Every VS Code text event emitted while a remote `WorkspaceEdit` is in flight belongs to that projection transaction and cannot create a new shared operation. A short post-resolution quarantine contains delayed formatter or notebook-model tails and restores the latest host-canonical source. Digest mismatch and reconnect reconciliation request host state; loss of the pinned host queues guest intents and never elects a temporary text authority.
+Every VS Code text event emitted while a remote `WorkspaceEdit` is in flight belongs to that projection transaction and cannot create a new shared operation. A short post-resolution quarantine contains delayed formatter or notebook-model tails and restores the latest canonical Yjs source. Local editor transactions bypass the projection path and update canonical text synchronously. Reconnect reconciliation exchanges state vectors; loss of a route can delay distribution but does not make already visible local typing wait for a remote acknowledgement.
 
 Notebook changes carry semantic scopes. `cellText`, `cellMetadata`, `cellOutputs`, `cellExecution`, and `notebookMetadata` are applied narrowly by stable cell ID without replacing neighboring cells. A missing/unscoped historical state-vector merge is reconciled field-by-field unless the canonical and editor structures are provably inconsistent. `NotebookEdit.replaceCells` is reserved for the minimal structural splice (insert/delete/reorder or structural recovery); it is not a metadata/output/execution hot-path primitive.
 

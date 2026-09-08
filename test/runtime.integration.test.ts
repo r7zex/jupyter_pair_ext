@@ -427,13 +427,11 @@ describe('production SessionRuntime integration', () => {
       // A guest changes a dependency while the host editor owns its unsaved
       // working copy. Background persistence must not save it; execution must.
       const dependencyBaseline = peer.project.text('notes.txt').toString();
-      assert.equal(peer.stageEditorTextIntent({
-        key: 'notes.txt',
-        cellId: undefined,
-        baseline: dependencyBaseline,
-        changes: [{ offset: 0, deleteCount: dependencyBaseline.length, insertText: 'guest dependency' }],
-        result: 'guest dependency',
-      }), true);
+      peer.project.applyTextChanges('notes.txt', [{
+        offset: 0,
+        deleteCount: dependencyBaseline.length,
+        insertText: 'guest dependency',
+      }]);
       await waitFor(() => host.project.text('notes.txt').toString() === 'guest dependency', 3000, 'dependency convergence');
       host.setWorkingCopyWriter(async (key: string) => key === 'notes.txt', async () => {
         await writeFile(path.join(hostFolder, 'notes.txt'), host.project.text('notes.txt').toString());
@@ -3689,7 +3687,7 @@ describe('large reconnect metadata', () => {
   });
 });
 
-describe('host-authoritative text intents', () => {
+describe('local-first text replication and legacy text intents', () => {
   it('retains a bounded guest intent when the host route is unavailable and retries it on recovery', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-queue-'));
     const guest = new SessionRuntime(descriptor({
@@ -3723,7 +3721,7 @@ describe('host-authoritative text intents', () => {
     }
   });
 
-  it('serializes guest text through the real encrypted runtime route', async function () {
+  it('replicates local-first guest text through the real encrypted runtime route', async function () {
     this.timeout(30_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-route-'));
     const extensionRoot = path.join(root, 'extension');
@@ -3756,14 +3754,12 @@ describe('host-authoritative text intents', () => {
         if (event.origin !== REMOTE_ORIGIN) guestAuthoredCanonicalUpdates += 1;
       });
 
-      assert.equal(guest.stageEditorTextIntent({
-        key: 'notes.txt', cellId: undefined, baseline: 'a',
-        changes: [{ offset: 1, deleteCount: 0, insertText: '!' }], result: 'a!',
-      }), true);
-      assert.equal(guest.project.text('notes.txt').toString(), 'a');
+      guest.project.applyTextChanges('notes.txt', [{ offset: 1, deleteCount: 0, insertText: '!' }]);
+      assert.equal(guest.project.text('notes.txt').toString(), 'a!',
+        'the local canonical CRDT advances before the network round trip');
       await waitFor(() => host.project.text('notes.txt').toString() === 'a!'
-        && guest.project.text('notes.txt').toString() === 'a!', 5000, 'host-authoritative routed edit');
-      assert.equal(guestAuthoredCanonicalUpdates, 0);
+        && guest.project.text('notes.txt').toString() === 'a!', 5000, 'local-first routed edit');
+      assert.equal(guestAuthoredCanonicalUpdates, 1);
       assert.equal(guest.pendingTextIntents.size, 0);
     } finally {
       if (guest) guest.descriptor.mode = 'host-only';
@@ -3773,7 +3769,7 @@ describe('host-authoritative text intents', () => {
     }
   });
 
-  it('keeps guest edits non-canonical, rebases stale intent queues, and rejects direct guest text updates', async () => {
+  it('keeps legacy intent replay idempotent and accepts direct guest CRDT updates', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-text-authority-'));
     const host = new SessionRuntime(descriptor({
       sessionId: 'text-authority', role: 'host', peerId: 'host', hostPeerId: 'host',
@@ -3887,8 +3883,8 @@ describe('host-authoritative text intents', () => {
         },
         payload: rogueUpdate!,
       }, 'guest');
-      assert.equal(host.project.text('notes.txt').toString(), `${orderedBaseline}12`,
-        'host refuses direct guest-authored text CRDT updates');
+      assert.match(host.project.text('notes.txt').toString(), /ROGUE/,
+        'authenticated guest CRDT text updates participate in local-first convergence');
       rogue.destroy();
     } finally {
       await Promise.allSettled([(host as any).disposeAsync(), (guest as any).disposeAsync()]);

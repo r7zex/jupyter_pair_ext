@@ -1251,6 +1251,46 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
     });
   }
 
+  it('keeps later local typing visible when an earlier Yjs update is echoed', async () => {
+    const root = path.resolve('/tmp/pair-editor-local-first-echo');
+    const notebook = fakeNotebook(root, [fakeCell('a', 'stable')]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const host = new CollaborativeProject();
+    const localUpdates: ProjectUpdate[] = [];
+    const synchronizer = new EditorSynchronizer(project, root, logger());
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      host.applyRemoteUpdate('work.ipynb', 'notebook', project.encodeUpdate('work.ipynb'));
+      project.on('update', (event: ProjectUpdate) => {
+        if (event.origin !== REMOTE_ORIGIN) localUpdates.push(event);
+      });
+      const document = notebook.cells[0].document;
+
+      document.text = 'a!';
+      vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 1, rangeLength: 0, text: '!' }]);
+      document.text = 'a!?';
+      vscodeBoundary.__fireTextChange(document, [{ rangeOffset: 2, rangeLength: 0, text: '?' }]);
+
+      assert.equal(project.cellSource('work.ipynb', 'stable').toString(), 'a!?',
+        'local canonical text advances before transport');
+      assert.equal(localUpdates.length, 2);
+      host.applyRemoteUpdate('work.ipynb', 'notebook', localUpdates[0]!.update, {
+        type: 'cellText', cellId: 'stable',
+      });
+      project.applyRemoteUpdate('work.ipynb', 'notebook', host.encodeUpdate('work.ipynb'), {
+        type: 'cellText', cellId: 'stable',
+      });
+      await (synchronizer as any).textRenders.get(document.uri.toString());
+
+      assert.equal(document.text, 'a!?', 'an earlier network echo must not repaint over later local typing');
+      assert.equal(project.cellSource('work.ipynb', 'stable').toString(), 'a!?');
+      assert.equal((synchronizer as any).textReplicas.get(document.uri.toString()).source(), 'a!?');
+    } finally {
+      synchronizer.dispose(); project.destroy(); host.destroy();
+    }
+  });
+
   for (const notebookCell of [false, true]) {
     it(`contains a delayed post-apply projection tail in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       const root = path.resolve('/tmp/pair-editor-delayed-tail');

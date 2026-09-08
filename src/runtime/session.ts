@@ -2564,11 +2564,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (event.origin !== REMOTE_ORIGIN && !this.endingSession) {
         try {
           const textTarget = projectUpdateTextTarget(event.kind, event.scope);
-          if (textTarget && !this.coordinator.isCurrentHost()) {
-            this.log.appendLine(`[error] Blocked a non-host canonical text update for ${event.key}; requesting host repair.`);
-            this.requestTextState(event.key, textTarget.cellId);
-            return;
-          }
           const fileState = this.ensureLiveFileState(event.key, event.kind);
           const authority = this.advanceTextAuthority(event);
           this.transport.broadcast('projectUpdate', {
@@ -2991,14 +2986,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               }
             }
             const textTarget = projectUpdateTextTarget(kind, scope);
-            if (frame.type === 'projectUpdate' && textTarget
-              && sourceId !== this.coordinator.clock.hostId) {
-              this.log.appendLine(`[error] Refused non-host text update for ${key} from ${sourceId}.`);
-              if (this.coordinator.isCurrentHost()) {
-                this.sendAuthoritativeTextState(sourceId, 'textStateSnapshot', key, textTarget.cellId);
-              }
-              break;
-            }
             this.project.applyRemoteUpdate(key, kind, frame.payload, scope);
             if (frame.type === 'projectUpdate' && textTarget
               && sourceId === this.coordinator.clock.hostId && !this.coordinator.isCurrentHost()) {
@@ -4321,21 +4308,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (kind === 'text' && decodedText !== undefined) {
       this.deleteBinaryVersions(relativePath);
       const value = decodedText;
-      if (!this.coordinator.isCurrentHost()) {
-        const baseline = this.project.has(relativePath) && this.project.kindOf(relativePath) === 'text'
-          ? this.project.text(relativePath).toString() : '';
-        if (baseline !== value) {
-          const change = minimalTextIntentChange(baseline, value);
-          this.stageEditorTextIntent({
-            key: relativePath,
-            cellId: undefined,
-            baseline,
-            changes: [change],
-            result: value,
-          });
-        }
-        return;
-      }
       if (!this.project.has(relativePath) || this.project.kindOf(relativePath) !== 'text') {
         this.project.deleteDocument(relativePath);
         this.project.ensureText(relativePath);
@@ -4345,14 +4317,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     } else if (kind === 'notebook' && notebookSnapshot) {
       this.deleteBinaryVersions(relativePath);
       const snapshot = notebookSnapshot;
-      if (!this.coordinator.isCurrentHost()) {
-        this.log.appendLine(
-          `[error] Ignored a closed notebook disk mutation for ${relativePath}; `
-          + 'guest notebook changes must pass through the host-authoritative editor protocol.',
-        );
-        this.storage?.schedule(relativePath);
-        return;
-      }
       if (!this.project.has(relativePath) || this.project.kindOf(relativePath) !== 'notebook') {
         this.project.deleteDocument(relativePath);
         this.project.ensureNotebook(relativePath, snapshot);
@@ -7426,22 +7390,6 @@ function applyTextIntentChanges(
     next = `${next.slice(0, change.offset)}${change.insertText}${next.slice(change.offset + change.deleteCount)}`;
   }
   return Buffer.byteLength(next, 'utf8') <= byteLimit ? next : undefined;
-}
-
-function minimalTextIntentChange(current: string, target: string): TextChange {
-  let start = 0;
-  while (start < current.length && start < target.length && current[start] === target[start]) start += 1;
-  let currentEnd = current.length;
-  let targetEnd = target.length;
-  while (currentEnd > start && targetEnd > start && current[currentEnd - 1] === target[targetEnd - 1]) {
-    currentEnd -= 1;
-    targetEnd -= 1;
-  }
-  return {
-    offset: start,
-    deleteCount: currentEnd - start,
-    insertText: target.slice(start, targetEnd),
-  };
 }
 
 function normalizeLightweightExecutionRequest(meta: Record<string, unknown>): LightweightExecutionRequest | undefined {

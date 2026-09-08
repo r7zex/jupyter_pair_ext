@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.21 - 2026-09-08 (local-first text synchronization)
+
+- Applies genuine file and notebook-cell typing to the local canonical Yjs text immediately, then transports the same idempotent CRDT update without waiting for a host acknowledgement or repainting an intermediate host prefix.
+- Preserves later local keystrokes when earlier updates echo through the network and restores direct multi-peer Yjs convergence for concurrent inserts, deletes, line splits, and same-position newlines.
+- Keeps the `v0.5.20` remote-projection and delayed-tail quarantine, stale-render guards, semantic notebook scopes, and advisory participant line highlights without restoring destructive line locks.
+- Advances admission to protocol v7 so local-first peers cannot mix with protocol-v6 clients that assign text authorship through host-authoritative intents. Every participant in a session must update to Pair Notebook 0.5.21.
+
+Automated validation does not replace installed VS Code and physical two-computer acceptance.
+
 ## 0.5.20 - 2026-09-07 (host-authoritative text synchronization)
 
 - Routes guest file and notebook-cell edits through idempotent host-authoritative intents carrying an operation ID, base revision/digest, immutable deltas, and a Yjs state vector. Stale queues repair from the host, rebase in order, and retry with the same operation IDs after route recovery.
