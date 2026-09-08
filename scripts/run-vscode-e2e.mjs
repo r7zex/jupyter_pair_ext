@@ -2,7 +2,7 @@ import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -53,12 +53,16 @@ try {
 
 async function runWithTestElectron(args) {
   let testElectron;
+  const explicitModule = process.env.PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH?.trim();
+  const moduleSpecifier = explicitModule
+    ? pathToFileURL(path.resolve(projectRoot, explicitModule)).href
+    : '@vscode/test-electron';
   try {
-    testElectron = await import('@vscode/test-electron');
+    testElectron = await import(moduleSpecifier);
   } catch (error) {
     throw new Error(
       'PAIR_NOTEBOOK_E2E_DRIVER=test-electron requires @vscode/test-electron. '
-      + 'CI installs it ephemerally without changing production dependencies.',
+      + 'Install it outside the production dependency tree or set PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH.',
       { cause: error },
     );
   }
