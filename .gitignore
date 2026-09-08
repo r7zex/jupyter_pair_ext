@@ -4,6 +4,7 @@ node_modules/
 # extension entrypoint from packaging entirely.)
 out/*
 !out/extension.js
+.vscode-test/
 *.vsix
 *.zip
 __pycache__/
