@@ -9,6 +9,7 @@ export function run(): Promise<void> {
     slow: 2_000,
   });
   mocha.addFile(path.resolve(__dirname, '..', 'extensionHost.e2e.js'));
+  mocha.addFile(path.resolve(__dirname, '..', 'notebookHost.e2e.js'));
 
   return new Promise((resolve, reject) => {
     try {
