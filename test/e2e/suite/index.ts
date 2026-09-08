@@ -10,7 +10,8 @@ export function run(): Promise<void> {
   });
   // Controller/notebook suites intentionally run before extension activation so
   // they can instantiate the production controller id without colliding with
-  // the singleton registered by activate().
+  // the singleton registered by activate(). Keep this order identical across
+  // the Windows, Linux, macOS, and minimum-VS-Code matrix jobs.
   mocha.addFile(path.resolve(__dirname, '..', 'controllerHost.e2e.js'));
   mocha.addFile(path.resolve(__dirname, '..', 'notebookHost.e2e.js'));
   mocha.addFile(path.resolve(__dirname, '..', 'extensionHost.e2e.js'));
