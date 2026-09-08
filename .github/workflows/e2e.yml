@@ -54,14 +54,15 @@ jobs:
         run: npm ci
 
       - name: Install isolated VS Code E2E driver
-        # Keep the downloaded Electron test driver out of package.json/package-lock.json.
-        # It is test infrastructure only; production/runtime dependencies stay unchanged.
-        run: npm install --no-save --package-lock=false @vscode/test-electron@3.1.0
+        # The driver has its own node_modules tree. `npm ci` remains the exact
+        # package-lock installation used to compile and exercise project code.
+        run: npm install --prefix .e2e-driver --no-save --package-lock=false @vscode/test-electron@3.1.0
 
       - name: Run real VS Code Extension Host E2E on Linux
         if: runner.os == 'Linux'
         env:
           PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
           PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
         run: xvfb-run -a npm run test:e2e
@@ -70,6 +71,7 @@ jobs:
         if: runner.os != 'Linux'
         env:
           PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
           PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
         run: npm run test:e2e
