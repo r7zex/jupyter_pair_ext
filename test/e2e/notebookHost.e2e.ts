@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { CollaborativeProject } from '../../src/core/crdt';
+import { normalizeNotebookMetadata } from '../../src/core/projectFiles';
 import { REMOTE_ORIGIN } from '../../src/core/types';
 import { EditorSynchronizer } from '../../src/vscode/sync';
 
@@ -146,12 +147,13 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
     try {
       harness.project.setNotebookMetadata(harness.key, { pairNotebookE2E: 'remote' }, REMOTE_ORIGIN);
       await waitFor(
-        () => harness.notebook.metadata.pairNotebookE2E === 'remote',
+        () => normalizeNotebookMetadata(harness.notebook.metadata).pairNotebookE2E === 'remote',
         3_000,
         'remote notebook metadata projection',
       );
       assert.equal(harness.notebook.cellCount, 1);
       assert.equal(harness.notebook.cellAt(0).document.getText(), 'value = 1');
+      assert.equal(normalizeNotebookMetadata(harness.notebook.metadata).pairNotebookE2E, 'remote');
     } finally {
       await harness.dispose();
     }
