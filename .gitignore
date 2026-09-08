@@ -5,6 +5,7 @@ node_modules/
 out/*
 !out/extension.js
 .vscode-test/
+.e2e-driver/
 *.vsix
 *.zip
 __pycache__/
