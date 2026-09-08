@@ -276,7 +276,11 @@ async function createTextHarness(
       project.destroy();
       log.dispose();
       if (!document.isClosed) {
-        await document.save().catch(() => false);
+        try {
+          await document.save();
+        } catch {
+          // Cleanup is best-effort; assertions have already completed.
+        }
         if (!document.isClosed) {
           await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
           await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
