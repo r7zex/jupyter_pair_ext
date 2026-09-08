@@ -1,0 +1,77 @@
+name: VS Code Extension Host E2E
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extension-host:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows / VS Code stable
+            os: windows-latest
+            vscode: stable
+          - label: Linux / VS Code stable
+            os: ubuntu-latest
+            vscode: stable
+          - label: macOS / VS Code stable
+            os: macos-latest
+            vscode: stable
+          - label: Linux / VS Code 1.95.0 minimum
+            os: ubuntu-latest
+            vscode: 1.95.0
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked project dependencies
+        run: npm ci
+
+      - name: Install isolated VS Code E2E driver
+        # The driver has its own node_modules tree. `npm ci` remains the exact
+        # package-lock installation used to compile and exercise project code.
+        run: npm install --prefix .e2e-driver --no-save --package-lock=false @vscode/test-electron@3.1.0
+
+      - name: Run real VS Code Extension Host E2E on Linux
+        if: runner.os == 'Linux'
+        env:
+          PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
+          PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
+          PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+        run: xvfb-run -a npm run test:e2e
+
+      - name: Run real VS Code Extension Host E2E
+        if: runner.os != 'Linux'
+        env:
+          PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
+          PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
+          PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+        run: npm run test:e2e
