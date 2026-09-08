@@ -7,7 +7,11 @@ import { spawn, spawnSync } from 'node:child_process';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionTestsPath = path.join(projectRoot, 'out', 'test', 'e2e', 'suite', 'index.js');
-const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-vscode-e2e-'));
+// VS Code creates IPC sockets below --user-data-dir. macOS limits UNIX socket
+// paths to roughly 104 bytes, while os.tmpdir() on hosted runners lives under
+// a long /var/folders/... prefix. Keep the E2E root deliberately short there.
+const tempBase = process.platform === 'darwin' ? '/tmp' : os.tmpdir();
+const tempRoot = await mkdtemp(path.join(tempBase, 'pn-e2e-'));
 const workspaceDir = path.join(tempRoot, 'workspace');
 const userDataDir = path.join(tempRoot, 'user-data');
 const extensionsDir = path.join(tempRoot, 'extensions');
