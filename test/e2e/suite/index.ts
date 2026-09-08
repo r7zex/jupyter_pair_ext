@@ -8,8 +8,12 @@ export function run(): Promise<void> {
     timeout: 15_000,
     slow: 2_000,
   });
-  mocha.addFile(path.resolve(__dirname, '..', 'extensionHost.e2e.js'));
+  // Controller/notebook suites intentionally run before extension activation so
+  // they can instantiate the production controller id without colliding with
+  // the singleton registered by activate().
+  mocha.addFile(path.resolve(__dirname, '..', 'controllerHost.e2e.js'));
   mocha.addFile(path.resolve(__dirname, '..', 'notebookHost.e2e.js'));
+  mocha.addFile(path.resolve(__dirname, '..', 'extensionHost.e2e.js'));
 
   return new Promise((resolve, reject) => {
     try {
