@@ -64,3 +64,11 @@ The repair must preserve the current scoped/minimal synchronization model.
 ## Validation boundary
 
 Deterministic regressions can prove the queue, deletion, late-event, kernel-failure, watchdog, teardown, and notebook-isolation invariants in the repository. Packaging and CI can independently verify the shipped code. Installed VS Code and two-physical-computer acceptance remain separate manual evidence and must not be inferred from headless tests.
+
+## Implemented resolution
+
+Pair Notebook 0.5.23 retires the precise cell-state handle before a minimal structural splice, interrupts an active execution when that cell is locally removed, ignores late state addressed to the retired object, and places a five-second upper bound on a VS Code-owned state-render promise. A five-second stable-ID audit is a second recovery path for a missed or previously failed structural notification; it performs no edit when structure already matches.
+
+The authoritative controller now publishes a terminal failed execution when the runtime throws, provided the canonical cell still exists. If the cell was already deleted, the failure path does not recreate it.
+
+The original implementation failed all three initial combined regressions: structural replacement timed out behind the running render, the controller had no removed-cell retirement operation, and kernel failure left `success` undefined. After the repair, the expanded seven-regression matrix passes, as do the 191 editor synchronization, replay/teardown, runtime routing, host-loss, execution, and controller integration tests.

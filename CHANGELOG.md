@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.23 - 2026-09-08 (running-cell deletion recovery)
+
+- Retires the exact local or mirrored `NotebookCellExecution` before its cell is structurally removed, interrupts a deleted active execution, and ignores late state for the retired cell object.
+- Prevents a stuck VS Code output/execution render from blocking later notebook structure forever, while retaining per-cell state coalescing and minimal stable-ID structural splices.
+- Audits open notebook structure by stable cell ID every five seconds and schedules a minimal repair only when the editor projection differs from canonical CRDT state; matching notebooks receive no edits or refresh.
+- Publishes authoritative `success:false` execution state when the kernel/runtime fails, so participants do not retain a permanent remote-running indicator.
+- Keeps protocol v7, local-first text convergence, scoped notebook updates, output cadence, editor selections, and unaffected cell objects unchanged.
+
+Automated validation does not replace installed VS Code and physical two-computer acceptance.
+
 ## 0.5.22 - 2026-09-08 (selected-line presence stability)
 
 - Anchors each whole-line collaborator decoration to a collapsed line-start range, preventing VS Code from visually moving or expanding the highlight when a newline is inserted or deleted in the same cell.

@@ -35,6 +35,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly mirroredExecutions = new Map<vscode.NotebookCell, MirroredExecutionState>();
   private remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
   private readonly activeExecutions = new WeakSet<vscode.NotebookCell>();
+  private readonly activeExecutionHandles = new Map<vscode.NotebookCell, vscode.NotebookCellExecution>();
+  private readonly retiredCellStates = new WeakSet<vscode.NotebookCell>();
 
   public constructor(private readonly log: vscode.OutputChannel) {
     this.controller = vscode.notebooks.createNotebookController(
@@ -69,6 +71,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   public setRuntime(runtime: SessionRuntime | undefined): void {
     if (this.runtime !== runtime) this.runtimeGeneration += 1;
+    if (this.runtime && this.runtime !== runtime) this.finishActiveExecutions();
     if (!runtime) {
       this.finishMirroredExecutions();
       this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
@@ -105,6 +108,43 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     return this.activeExecutions.has(cell) || this.mirroredExecutions.has(cell);
   }
 
+  public releaseCellState(cell: vscode.NotebookCell): void {
+    this.retiredCellStates.add(cell);
+    this.remoteExecutionRequestIds.delete(cell);
+    const mirrored = this.mirroredExecutions.get(cell);
+    if (mirrored) {
+      try {
+        mirrored.execution.end(undefined);
+      } catch (error) {
+        this.log.appendLine(`[error] Could not retire removed mirrored execution: ${formatError(error)}`);
+      } finally {
+        this.mirroredExecutions.delete(cell);
+      }
+    }
+    const active = this.activeExecutionHandles.get(cell);
+    if (!active) return;
+    try {
+      active.end(undefined);
+    } catch (error) {
+      this.log.appendLine(`[error] Could not retire removed local execution: ${formatError(error)}`);
+    } finally {
+      this.activeExecutionHandles.delete(cell);
+      this.activeExecutions.delete(cell);
+    }
+    const runtime = this.runtime;
+    let key: string | undefined;
+    try {
+      key = runtime?.notebookKey(cell.notebook.uri);
+    } catch (error) {
+      this.log.appendLine(`[error] Could not locate removed executing cell: ${formatError(error)}`);
+    }
+    if (runtime && key) {
+      void runtime.interruptNotebook(key).catch((error) => {
+        this.log.appendLine(`[error] Could not interrupt execution for removed cell: ${formatError(error)}`);
+      });
+    }
+  }
+
   public async restartActive(): Promise<void> {
     const editor = vscode.window.activeNotebookEditor;
     if (!editor) throw new Error('Open a Pair Notebook notebook first.');
@@ -128,6 +168,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   public dispose(): void {
     this.runtimeGeneration += 1;
+    this.finishActiveExecutions();
     this.finishMirroredExecutions();
     this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
     for (const disposable of this.disposables) disposable.dispose();
@@ -148,6 +189,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     request: NotebookCellRenderRequest,
   ): Promise<void> {
     if (!request.outputsChanged && !request.executionChanged) return;
+    if (this.retiredCellStates.has(cell)) return;
     const target: CellExecutionSnapshot | undefined = request.execution;
     const liveRequestId = this.remoteExecutionRequestIds.get(cell);
     if (liveRequestId && target?.requestId === liveRequestId) {
@@ -202,6 +244,18 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       }
     }
     this.mirroredExecutions.clear();
+  }
+
+  private finishActiveExecutions(): void {
+    for (const [cell, execution] of this.activeExecutionHandles) {
+      try {
+        execution.end(undefined);
+      } catch {
+        // Best effort during controller/session disposal.
+      }
+      this.activeExecutions.delete(cell);
+    }
+    this.activeExecutionHandles.clear();
   }
 
   private cancelQueuedExecution(notebook: vscode.NotebookDocument): void {
@@ -260,6 +314,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       execution.end(false, Date.now());
       return;
     }
+    this.activeExecutionHandles.set(cell, execution);
     const authoritativePublisher = runtime.computeForNotebook(notebookKey).executorId
       === runtime.descriptor.localPeer.peerId;
     execution.start(Date.now());
@@ -286,7 +341,22 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     let pendingRenderBytes = 0;
     let renderOverflow: Error | undefined;
     let executionRequestId: string | undefined;
+    let terminalExecutionPublished = false;
     let success = false;
+    const publishTerminalExecution = (terminalSuccess: boolean): void => {
+      if (terminalExecutionPublished || !authoritativePublisher) return;
+      try {
+        if (!runtime.project.hasNotebookCell(notebookKey, cellId)) return;
+        runtime.project.setCellExecution(notebookKey, cellId, {
+          ...(executionRequestId ? { requestId: executionRequestId } : {}),
+          executionOrder: execution.executionOrder,
+          success: terminalSuccess,
+        });
+        terminalExecutionPublished = true;
+      } catch (error) {
+        this.log.appendLine(`[error] Could not publish terminal Jupyter execution: ${formatError(error)}`);
+      }
+    };
     try {
       let result: Awaited<ReturnType<SessionRuntime['executeCell']>> | undefined;
       let executionFailure: unknown;
@@ -350,14 +420,9 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         outputTask.schedule();
         await outputTask.flush();
       }
-      if (authoritativePublisher) {
-        runtime.project.setCellExecution(notebookKey, cellId, {
-          ...(executionRequestId ? { requestId: executionRequestId } : {}),
-          executionOrder: execution.executionOrder,
-          success,
-        });
-      }
+      publishTerminalExecution(success);
     } catch (error) {
+      publishTerminalExecution(false);
       const failure = {
         success: false,
         content: {
@@ -377,7 +442,10 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       this.log.appendLine(`[error] Jupyter execution: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       outputTask.dispose();
-      execution.end(success, Date.now());
+      if (this.activeExecutionHandles.get(cell) === execution) {
+        execution.end(success, Date.now());
+        this.activeExecutionHandles.delete(cell);
+      }
       // Keep the latest remote request identity for this cell after the
       // terminal result. CRDT propagation and executeResult use independent
       // delivery paths, so the authoritative final echo may arrive later.

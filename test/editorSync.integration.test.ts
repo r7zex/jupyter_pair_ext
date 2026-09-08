@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import Module from 'node:module';
 import path from 'node:path';
 import { CollaborativeProject, ProjectUpdate } from '../src/core/crdt';
-import { REMOTE_ORIGIN } from '../src/core/types';
+import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../src/core/types';
 
 const vscodeBoundary = createNotebookVscodeBoundary();
 const moduleWithLoader = Module as typeof Module & {
@@ -809,6 +809,173 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
       assert.equal(replacements[0].cells.length, 0);
       assert.equal(notebook.cells[0], a);
       assert.equal(notebook.cells[1], c);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('retires execution state when the running cell is deleted locally', async () => {
+    const root = path.resolve('/tmp/pair-editor-local-running-cell-delete');
+    const running = fakeCell('while True: pass', 'running');
+    const tail = fakeCell('TAIL', 'tail');
+    const notebook = fakeNotebook(root, [running, tail]);
+    vscodeBoundary.__reset(notebook);
+    const released: any[] = [];
+    const renderer: any = {
+      ...fakeCellStateRenderer(),
+      releaseCellState: (cell: any) => { released.push(cell); },
+    };
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, renderer);
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      notebook.cells.splice(0, 1);
+      reindex(notebook);
+
+      vscodeBoundary.__fireNotebookChange(notebook, true, [running]);
+
+      assert.deepEqual(released, [running]);
+      assert.equal(project.hasNotebookCell('work.ipynb', 'running'), false);
+      assert.equal(project.hasNotebookCell('work.ipynb', 'tail'), true);
+    } finally {
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('preempts a stuck running-cell render before applying its deletion and replacement', async () => {
+    const root = path.resolve('/tmp/pair-editor-running-cell-delete');
+    const running = fakeCell('while True: pass', 'running');
+    const tail = fakeCell('TAIL', 'tail');
+    const notebook = fakeNotebook(root, [running, tail]);
+    vscodeBoundary.__reset(notebook);
+    let renderStarted = false;
+    let released = false;
+    let releaseRender: () => void = () => undefined;
+    const blockedRender = new Promise<void>((resolve) => { releaseRender = resolve; });
+    const renderer: any = {
+      renderRemoteCellState: async (cell: any, request: any) => {
+        if (cell === running && request.execution?.success === undefined) {
+          renderStarted = true;
+          await blockedRender;
+        }
+      },
+      releaseCellState: (cell: any) => {
+        if (cell !== running) return;
+        released = true;
+        releaseRender();
+      },
+    };
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, renderer);
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      project.setCellExecution('work.ipynb', 'running', {
+        requestId: 'hung-kernel', executionOrder: 1,
+      }, REMOTE_ORIGIN);
+      await waitFor(() => renderStarted, 1000, 'running-cell render');
+
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [
+          { id: 'replacement', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] },
+          snapshot.cells[1]!,
+        ],
+      }, REMOTE_ORIGIN);
+      project.applyCellTextChanges('work.ipynb', 'replacement', [
+        { offset: 3, deleteCount: 0, insertText: '-AFTER' },
+      ], REMOTE_ORIGIN);
+
+      await waitFor(() => notebook.cells.map((cell: any) => cell.metadata.pairNotebookCellId).join(',')
+        === 'replacement,tail', 1000, 'running-cell deletion and replacement');
+      assert.equal(notebook.cells[0].document.getText(), 'NEW-AFTER');
+      assert.equal(released, true, 'the stale execution is retired before the structural queue waits for it');
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1, 'the recovery remains one minimal structural splice');
+    } finally {
+      releaseRender();
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('bounds a renderer that stays stuck even after deleted-cell retirement', async () => {
+    const root = path.resolve('/tmp/pair-editor-running-cell-render-timeout');
+    const running = fakeCell('while True: pass', 'running');
+    const tail = fakeCell('TAIL', 'tail');
+    const notebook = fakeNotebook(root, [running, tail]);
+    vscodeBoundary.__reset(notebook);
+    let renderStarted = false;
+    const renderer: any = {
+      renderRemoteCellState: async (cell: any, request: any) => {
+        if (cell === running && request.execution?.success === undefined) {
+          renderStarted = true;
+          await new Promise<void>(() => undefined);
+        }
+      },
+      releaseCellState: () => undefined,
+    };
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = ((handler: (...args: any[]) => void, timeout?: number, ...args: any[]) =>
+      originalSetTimeout(handler, timeout === 5_000 ? 25 : timeout, ...args)) as typeof setTimeout;
+    const project = new CollaborativeProject();
+    const synchronizer = new EditorSynchronizer(project, root, logger(), undefined, renderer);
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      project.setCellExecution('work.ipynb', 'running', {
+        requestId: 'uninterruptible-render', executionOrder: 1,
+      }, REMOTE_ORIGIN);
+      await waitFor(() => renderStarted, 1000, 'uninterruptible running-cell render');
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [snapshot.cells[1]!],
+      }, REMOTE_ORIGIN);
+
+      await waitFor(() => notebook.cells.length === 1
+        && notebook.cells[0]?.metadata.pairNotebookCellId === 'tail', 1000, 'bounded render fallback');
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      synchronizer.dispose();
+      project.destroy();
+    }
+  });
+
+  it('heals a missed structural notification with the periodic stable-ID audit', async () => {
+    const root = path.resolve('/tmp/pair-editor-structure-audit');
+    const stale = fakeCell('STALE', 'stale');
+    const tail = fakeCell('TAIL', 'tail');
+    const notebook = fakeNotebook(root, [stale, tail]);
+    vscodeBoundary.__reset(notebook);
+    const project = new CollaborativeProject();
+    const originalSetInterval = global.setInterval;
+    global.setInterval = ((handler: (...args: any[]) => void, timeout?: number, ...args: any[]) =>
+      originalSetInterval(handler, timeout === 5_000 ? 20 : timeout, ...args)) as typeof setInterval;
+    let synchronizer: any;
+    try {
+      synchronizer = new EditorSynchronizer(project, root, logger(), undefined, fakeCellStateRenderer());
+    } finally {
+      global.setInterval = originalSetInterval;
+    }
+    try {
+      await synchronizer.whenNotebookReady(notebook);
+      const snapshot = project.notebookSnapshot('work.ipynb');
+      project.reconcileNotebook('work.ipynb', {
+        ...snapshot,
+        cells: [
+          { id: 'replacement', kind: 2, language: 'python', source: 'NEW', metadata: {}, outputs: [] },
+          snapshot.cells[1]!,
+        ],
+      }, LOCAL_EDITOR_ORIGIN);
+      assert.equal(notebook.cells[0], stale, 'the synthetic missed notification leaves the editor stale');
+
+      await waitFor(() => notebook.cells[0]?.metadata.pairNotebookCellId === 'replacement',
+        1000, 'structural audit repair');
+      assert.equal(notebook.cells[0].document.getText(), 'NEW');
+      const replacements = vscodeBoundary.__notebookEdits.filter((edit: any) => edit.type === 'replaceCells');
+      assert.equal(replacements.length, 1, 'the audit applies only the minimal structural splice');
     } finally {
       synchronizer.dispose();
       project.destroy();
@@ -1635,10 +1802,10 @@ function createNotebookVscodeBoundary(): any {
       boundary.window.visibleNotebookEditors = [];
       boundary.window.visibleTextEditors = [];
     },
-    __fireNotebookChange: (notebook: any, structural: boolean) => {
+    __fireNotebookChange: (notebook: any, structural: boolean, removedCells: any[] = []) => {
       for (const callback of handlers.changeNotebook ?? []) callback({
         notebook,
-        contentChanges: structural ? [{}] : [],
+        contentChanges: structural ? [{ removedCells }] : [],
         cellChanges: [],
         metadata: undefined,
       });

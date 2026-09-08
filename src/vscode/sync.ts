@@ -30,6 +30,8 @@ import { EditorTextReplica } from './editorTextReplica';
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = OUTPUT_STATE_CADENCE_MS;
+const NOTEBOOK_CELL_STATE_RENDER_TIMEOUT_MS = 5_000;
+const NOTEBOOK_STRUCTURE_AUDIT_MS = 5_000;
 const REMOTE_TEXT_QUARANTINE_MS = 100;
 
 export interface NotebookCellRenderRequest {
@@ -43,6 +45,7 @@ export interface NotebookCellRenderRequest {
 export interface NotebookCellStateRenderer {
   renderRemoteCellState(cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void>;
   isManagingCellState?(cell: vscode.NotebookCell): boolean;
+  releaseCellState?(cell: vscode.NotebookCell): void;
 }
 
 interface BufferedTextEvent {
@@ -101,9 +104,11 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly notebookCellStateTimers = new Map<string, NodeJS.Timeout>();
   private readonly notebookCellStateFlushQueued = new Set<string>();
   private readonly immediateNotebookCellStateFlushes = new Set<string>();
+  private readonly pendingStructuralNotebookReconciliations = new Set<string>();
   private readonly notebookBindings = new WeakMap<vscode.NotebookDocument, Promise<void>>();
   private readonly boundNotebooks = new WeakSet<vscode.NotebookDocument>();
   private readonly displayedStructures = new WeakMap<vscode.NotebookDocument, Array<Pick<CellSnapshot, 'id' | 'kind' | 'language'>>>();
+  private readonly notebookStructureAuditTimer: NodeJS.Timeout;
   private lastRejectedEditorWarningAt = 0;
 
   public constructor(
@@ -141,11 +146,17 @@ export class EditorSynchronizer implements vscode.Disposable {
         this.log.appendLine(`[error] Failed to bind notebook ${notebook.uri.fsPath}: ${formatError(error)}`);
       });
     }
+    this.notebookStructureAuditTimer = setInterval(
+      () => this.auditNotebookStructures(),
+      NOTEBOOK_STRUCTURE_AUDIT_MS,
+    );
+    this.notebookStructureAuditTimer.unref?.();
   }
 
   public dispose(): void {
     if (this.explicitlyDisposed) return;
     this.explicitlyDisposed = true;
+    clearInterval(this.notebookStructureAuditTimer);
     for (const replica of this.textReplicas.values()) replica.dispose();
     this.textReplicas.clear();
     this.project.off('update', this.onProjectUpdate);
@@ -160,6 +171,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.notebookCellStateFlushQueued.clear();
     this.immediateNotebookCellStateFlushes.clear();
     this.pendingNotebookCellStates.clear();
+    this.pendingStructuralNotebookReconciliations.clear();
     for (const quarantine of this.projectionQuarantines.values()) clearTimeout(quarantine.timer);
     this.projectionQuarantines.clear();
     this.initialTextBaselines.clear();
@@ -251,8 +263,17 @@ export class EditorSynchronizer implements vscode.Disposable {
   private readonly onProjectUpdate = (event: ProjectUpdate): void => {
     if (this.disposed || event.origin !== REMOTE_ORIGIN || event.kind !== 'notebook') return;
     if (event.scope?.type === 'cellText' && this.applyRemoteNotebookCellText(event.key, event.scope.cellId)) return;
+    const openNotebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === event.key);
+    if (event.scope?.type === 'structure') {
+      if (openNotebook) this.requestStructuralNotebookReconciliation(openNotebook, event.key, 'remote structure scope');
+      return;
+    }
+    if (!event.scope && openNotebook
+      && this.requestStructuralNotebookReconciliation(openNotebook, event.key, 'unscoped state-vector reconciliation')) return;
     this.enqueueNotebookApply(event.key, async () => {
-      const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === event.key);
+      const notebook = openNotebook ?? vscode.workspace.notebookDocuments.find(
+        (candidate) => this.keyForUri(candidate.uri) === event.key,
+      );
       if (!notebook) return;
       const scope: NotebookUpdateScope | undefined = event.scope;
       if (!scope) {
@@ -292,7 +313,6 @@ export class EditorSynchronizer implements vscode.Disposable {
           await this.applyNotebookMetadata(notebook, event.key);
           return;
         case 'structure':
-          await this.applyStructuralRecoveryIfNeeded(notebook, event.key, 'remote structure scope');
           return;
         default:
           assertNeverNotebookScope(scope);
@@ -432,13 +452,17 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.applyingNotebooks.add(uri);
     try {
       try {
-        await this.cellStateRenderer.renderRemoteCellState(current, {
-          outputs: target.outputs.map(toNotebookOutput),
-          execution: target.execution,
-          outputsChanged,
-          executionChanged,
-          executionMode,
-        });
+        await withTimeout(
+          this.cellStateRenderer.renderRemoteCellState(current, {
+            outputs: target.outputs.map(toNotebookOutput),
+            execution: target.execution,
+            outputsChanged,
+            executionChanged,
+            executionMode,
+          }),
+          NOTEBOOK_CELL_STATE_RENDER_TIMEOUT_MS,
+          `Notebook cell state render timed out for ${key} cell ${cellId}.`,
+        );
       } catch (error) {
         if (outputsChanged) {
           this.log.appendLine(
@@ -633,6 +657,80 @@ export class EditorSynchronizer implements vscode.Disposable {
         }
       }
     }
+  }
+
+  private auditNotebookStructures(): void {
+    if (this.disposed) return;
+    for (const notebook of vscode.workspace.notebookDocuments) {
+      const key = this.keyForUri(notebook.uri);
+      if (key && this.project.kindOf(key) === 'notebook') {
+        this.requestStructuralNotebookReconciliation(notebook, key, 'periodic stable-ID audit');
+      }
+    }
+  }
+
+  private requestStructuralNotebookReconciliation(
+    notebook: vscode.NotebookDocument,
+    key: string,
+    reason: string,
+  ): boolean {
+    if (this.disposed || notebook.isClosed) return false;
+    let needed: boolean;
+    try {
+      needed = this.prepareNotebookForStructuralReconciliation(notebook, key);
+    } catch (error) {
+      if (!this.disposed) {
+        this.log.appendLine(`[error] Failed to inspect notebook structure for ${key}: ${formatError(error)}`);
+      }
+      return false;
+    }
+    if (!needed) return false;
+    if (this.pendingStructuralNotebookReconciliations.has(key)) return true;
+    this.pendingStructuralNotebookReconciliations.add(key);
+    const uri = notebook.uri.toString();
+    this.structuralNotebookApplies.add(uri);
+    this.enqueueNotebookApply(key, async () => {
+      try {
+        await this.applyStructuralRecoveryIfNeeded(notebook, key, reason);
+      } finally {
+        this.pendingStructuralNotebookReconciliations.delete(key);
+        this.structuralNotebookApplies.delete(uri);
+      }
+    });
+    return true;
+  }
+
+  private prepareNotebookForStructuralReconciliation(
+    notebook: vscode.NotebookDocument,
+    key: string,
+    snapshot = this.project.notebookSnapshot(key),
+  ): boolean {
+    const currentCells = notebook.getCells();
+    const currentStructure = currentCells.map((cell) => ({
+      id: this.cellIds.knownId(cell, metadataCellId(cell.metadata)) ?? '',
+      kind: cell.kind,
+      language: cell.document.languageId,
+    }));
+    const splice = minimalNotebookSplice(currentStructure, snapshot.cells);
+    if (!splice) return false;
+    const pending = this.pendingNotebookCellStates.get(key);
+    for (const cell of currentCells.slice(splice.start, splice.start + splice.deleteCount)) {
+      const cellId = this.cellIds.knownId(cell, metadataCellId(cell.metadata));
+      if (cellId) pending?.delete(cellId);
+      try {
+        this.cellStateRenderer?.releaseCellState?.(cell);
+      } catch (error) {
+        this.log.appendLine(`[error] Failed to retire removed notebook cell state for ${key}: ${formatError(error)}`);
+      }
+    }
+    if (pending && pending.size === 0) {
+      this.pendingNotebookCellStates.delete(key);
+      this.immediateNotebookCellStateFlushes.delete(key);
+      const timer = this.notebookCellStateTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.notebookCellStateTimers.delete(key);
+    }
+    return true;
   }
 
   private async applyStructuralRecoveryIfNeeded(
@@ -1137,6 +1235,15 @@ export class EditorSynchronizer implements vscode.Disposable {
     if (!key || this.applyingNotebooks.has(event.notebook.uri.toString())) return;
 
     if (event.contentChanges.length) {
+      for (const change of event.contentChanges) {
+        for (const removedCell of change.removedCells ?? []) {
+          try {
+            this.cellStateRenderer?.releaseCellState?.(removedCell);
+          } catch (error) {
+            this.log.appendLine(`[error] Failed to retire locally removed notebook cell state for ${key}: ${formatError(error)}`);
+          }
+        }
+      }
       try {
         this.reconcileEditorStructure(event.notebook, key);
         void this.ensureStableCellIds(event.notebook).catch((error) => {
@@ -1146,11 +1253,11 @@ export class EditorSynchronizer implements vscode.Disposable {
         const detail = `Rejected unsafe notebook structural update: ${formatError(error)}`;
         this.log.appendLine(`[error] ${detail}`);
         this.log.appendLine(`[structural-recovery] ${key}: local structural validation failed; restoring canonical structure.`);
-        this.enqueueNotebookApply(key, () => this.applyStructuralRecoveryIfNeeded(
+        this.requestStructuralNotebookReconciliation(
           event.notebook,
           key,
           'local structural validation failed',
-        ).then(() => undefined));
+        );
         this.warnRejectedEditorUpdate(detail);
       }
     }
@@ -1312,6 +1419,8 @@ export class EditorSynchronizer implements vscode.Disposable {
     this.applyingNotebooks.add(uri);
     try {
       if (splice) {
+        const key = this.keyForUri(notebook.uri);
+        if (key) this.prepareNotebookForStructuralReconciliation(notebook, key, snapshot);
         const edit = new vscode.WorkspaceEdit();
         // The only normal production replaceCells call. The range is the
         // minimal structural splice computed from stable logical cell IDs.
@@ -1382,7 +1491,17 @@ export class EditorSynchronizer implements vscode.Disposable {
           );
         } else {
           for (const state of stateRenders) {
-            await this.cellStateRenderer.renderRemoteCellState(state.cell, state.request);
+            try {
+              await withTimeout(
+                this.cellStateRenderer.renderRemoteCellState(state.cell, state.request),
+                NOTEBOOK_CELL_STATE_RENDER_TIMEOUT_MS,
+                `Notebook snapshot state render timed out for ${notebook.uri.fsPath}.`,
+              );
+            } catch (error) {
+              this.log.appendLine(
+                `[error] Failed to render notebook snapshot cell state for ${notebook.uri.fsPath}: ${formatError(error)}`,
+              );
+            }
             if (this.disposed || notebook.isClosed) return;
           }
         }
@@ -1392,6 +1511,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         if (structureApplied && !this.disposed && !notebook.isClosed) this.restoreStructuralEditorState(notebook, structuralEditorState);
       } finally {
         this.applyingNotebooks.delete(uri);
+        this.structuralNotebookApplies.delete(uri);
       }
     }
   }
@@ -1442,7 +1562,6 @@ export class EditorSynchronizer implements vscode.Disposable {
       }
     } finally {
       this.applyingNotebooks.delete(uri);
-      this.structuralNotebookApplies.delete(uri);
     }
   }
 
@@ -1637,6 +1756,21 @@ function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
     };
   }
   return result;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function formatError(error: unknown): string {

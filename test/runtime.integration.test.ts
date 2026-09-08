@@ -1298,6 +1298,138 @@ describe('remote NotebookController rendering', () => {
       pairController.dispose();
     }
   });
+
+  it('retires a mirrored running execution when its cell is structurally deleted', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('remote-render-delete');
+    const cell = fakeCell('while True: pass', notebook);
+    try {
+      await pairController.renderRemoteCellState(cell, {
+        outputs: [],
+        execution: { requestId: 'hung-kernel', executionOrder: 9 },
+        outputsChanged: false,
+        executionChanged: true,
+        executionMode: 'live',
+      });
+      const running = fakeVscode.__executions.at(-1);
+      assert.equal(running.ended, false);
+      assert.equal(pairController.isManagingCellState(cell), true);
+
+      pairController.releaseCellState(cell);
+
+      assert.equal(running.ended, true);
+      assert.equal(running.endSuccess, undefined);
+      assert.equal(pairController.isManagingCellState(cell), false);
+      const handlesAfterRelease = fakeVscode.__executions.length;
+      await pairController.renderRemoteCellState(cell, {
+        outputs: [],
+        execution: { requestId: 'hung-kernel', executionOrder: 9, success: false },
+        outputsChanged: false,
+        executionChanged: true,
+        executionMode: 'live',
+      });
+      assert.equal(fakeVscode.__executions.length, handlesAfterRelease,
+        'a late terminal event cannot recreate execution state for a removed cell object');
+    } finally {
+      pairController.dispose();
+    }
+  });
+
+  it('publishes terminal failure when an authoritative kernel execution throws', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('authoritative-kernel-failure');
+    const cell = fakeCell('raise SystemExit()', notebook);
+    const executionUpdates: any[] = [];
+    const runtime: any = {
+      descriptor: { localPeer: { peerId: 'host' } },
+      notebookKey: () => 'work.ipynb',
+      notebookCellId: () => 'cell-a',
+      computeForNotebook: () => ({ executorId: 'host' }),
+      executeCell: async (
+        _key: string,
+        _cellId: string,
+        _code: string,
+        _onEvent: (event: any) => void,
+        onRequestId: (requestId: string) => void,
+      ) => {
+        onRequestId('kernel-failure-request');
+        throw new Error('kernel process exited');
+      },
+      project: {
+        on: () => undefined,
+        off: () => undefined,
+        hasNotebookCell: () => true,
+        setCellOutputs: () => undefined,
+        setCellExecution: (_key: string, _cellId: string, execution: any) => {
+          executionUpdates.push({ ...execution });
+        },
+      },
+    };
+    try {
+      pairController.setRuntime(runtime);
+      const controller = fakeVscode.__controllers.at(-1);
+      await controller.executeHandler([cell], notebook);
+      assert.equal(executionUpdates.at(-1)?.requestId, 'kernel-failure-request');
+      assert.equal(executionUpdates.at(-1)?.success, false);
+    } finally {
+      pairController.dispose();
+    }
+  });
+
+  it('interrupts an active execution when its cell is deleted and does not end it twice', async () => {
+    const pairController = new PairNotebookController(logger());
+    const notebook = notebookForController('active-cell-delete');
+    const cell = fakeCell('while True: pass', notebook);
+    let cellExists = true;
+    let interruptCount = 0;
+    let finishExecution!: (value: any) => void;
+    const runtime: any = {
+      descriptor: { localPeer: { peerId: 'host' } },
+      notebookKey: () => 'work.ipynb',
+      notebookCellId: () => 'cell-a',
+      computeForNotebook: () => ({ executorId: 'host' }),
+      interruptNotebook: async () => { interruptCount += 1; },
+      executeCell: async (
+        _key: string,
+        _cellId: string,
+        _code: string,
+        _onEvent: (event: any) => void,
+        onRequestId: (requestId: string) => void,
+      ) => {
+        onRequestId('deleted-cell-request');
+        return new Promise((resolve) => { finishExecution = resolve; });
+      },
+      project: {
+        on: () => undefined,
+        off: () => undefined,
+        hasNotebookCell: () => cellExists,
+        setCellOutputs: () => undefined,
+        setCellExecution: () => undefined,
+      },
+    };
+    try {
+      pairController.setRuntime(runtime);
+      const controller = fakeVscode.__controllers.at(-1);
+      const executionIndex = fakeVscode.__executions.length;
+      const runningTask = controller.executeHandler([cell], notebook);
+      await waitFor(() => fakeVscode.__executions[executionIndex]?.started === true,
+        1000, 'active execution start');
+      const execution = fakeVscode.__executions[executionIndex];
+      cellExists = false;
+
+      pairController.releaseCellState(cell);
+
+      await waitFor(() => interruptCount === 1, 1000, 'deleted-cell interrupt');
+      assert.equal(execution.ended, true);
+      assert.equal(execution.endSuccess, undefined);
+      finishExecution({ requestId: 'deleted-cell-request', success: true, content: { status: 'ok' } });
+      await runningTask;
+      assert.equal(execution.endSuccess, undefined,
+        'completion after deletion must not end the retired VS Code execution a second time');
+    } finally {
+      pairController.dispose();
+    }
+  });
 });
 
 describe('compute and lifecycle regression coverage', () => {
