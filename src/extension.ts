@@ -12,7 +12,14 @@ import {
   validateIdentityPrivateKey,
   validateIdentityPublicKey,
 } from './core/identity';
-import { isSystemSuspendGap, runConfirmedSessionRestore } from './core/manualSessionRestore';
+import {
+  createPendingSessionLaunch,
+  normalizePendingSessionLaunch,
+  pendingSessionLaunchMatches,
+  runConfirmedSessionRestore,
+  sameWorkspacePath,
+  shouldLeaveForSystemSuspend,
+} from './core/manualSessionRestore';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
 import { copyProject } from './core/projectFiles';
 import {
@@ -68,6 +75,7 @@ const MAX_SESSION_MARKER_BYTES = 64 * 1024 * 1024;
 const MAX_RESTORED_PEERS = 255;
 const LIFECYCLE_WATCHDOG_INTERVAL_MS = 1_000;
 const SYSTEM_SUSPEND_GAP_MS = 15_000;
+const PENDING_SESSION_LAUNCH_KEY = 'pairNotebook.pendingSessionLaunch';
 
 let runtime: SessionRuntime | undefined;
 let synchronizer: EditorSynchronizer | undefined;
@@ -87,6 +95,7 @@ let lastLifecycleDiagnostics: LifecycleDiagnosticEvent[] = [];
 let workspaceSessionRestore: Promise<void> | undefined;
 let localSessionExit: Promise<void> | undefined;
 let lifecycleWatchdog: NodeJS.Timeout | undefined;
+let lifecycleReadyRuntime: SessionRuntime | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -209,9 +218,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
   startLifecycleWatchdog(context);
-  // A marker is recoverable state, not permission to reconnect. Activation may
-  // offer a continuation action, but network activity starts only after the
-  // user explicitly confirms it.
+  // Start/Join may authorize one continuation across the folder reload in this
+  // editor session. Every other marker remains manual-only.
   offerWorkspaceSessionRestore(context);
 }
 
@@ -219,6 +227,7 @@ export function deactivate(): Thenable<void> | undefined {
   if (statusTimer) clearInterval(statusTimer);
   if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
   lifecycleWatchdog = undefined;
+  lifecycleReadyRuntime = undefined;
   synchronizer?.dispose();
   presence?.dispose();
   notebookController?.dispose();
@@ -305,7 +314,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
   await rememberProject(context, descriptor).catch((error) => {
     output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
   });
-  await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(workingFolder), false);
+  await openSessionWorkingFolder(context, descriptor);
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {
@@ -404,7 +413,23 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
   await rememberProject(context, descriptor).catch((error) => {
     output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
   });
-  await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(workingFolder), false);
+  await openSessionWorkingFolder(context, descriptor);
+}
+
+async function openSessionWorkingFolder(
+  context: vscode.ExtensionContext,
+  descriptor: SessionDescriptor,
+): Promise<void> {
+  await context.globalState.update(
+    PENDING_SESSION_LAUNCH_KEY,
+    createPendingSessionLaunch(descriptor, vscode.env.sessionId),
+  );
+  try {
+    await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(descriptor.workingFolder), false);
+  } catch (error) {
+    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
+    throw error;
+  }
 }
 
 async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promise<void> {
@@ -509,6 +534,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     runtime.on('terminal', (event: SessionTerminalLifecycle) => {
       const closedRuntime = runtime;
       const reason = event.reason;
+      if (lifecycleReadyRuntime === closedRuntime) lifecycleReadyRuntime = undefined;
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
       synchronizer?.dispose();
@@ -573,6 +599,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
         void showLocalRouteFailedMessage();
       }
     });
+    lifecycleReadyRuntime = runtime;
     startStatusUpdates();
     const restored = runtime.snapshot();
     if (restored.waitingForHostFolder) {
@@ -584,6 +611,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
   } catch (error) {
     output.appendLine(`[error] Session startup failed: ${formatError(error)}`);
     const startupTerminal = runtime?.terminalLifecycle();
+    lifecycleReadyRuntime = undefined;
     await runtime?.leave().catch(() => undefined);
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
@@ -606,27 +634,71 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
 }
 
 function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
-  runUiBackground('Workspace session continuation offer', async () => {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) return;
-    try {
-      const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
-      if (!marker.isFile()) return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-      output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
-      return;
-    }
-    await runConfirmedSessionRestore(
-      async () => await vscode.window.showInformationMessage(
-        'Pair Notebook: в этой папке найдена сохранённая сессия. Подключение начнётся только по вашему выбору.',
-        'Подключиться',
-      ) === 'Подключиться',
-      async () => {
-        if (!runtime) await startWorkspaceSessionRestore(context);
-      },
-    );
+  let continuationScheduled = false;
+  const continueWhenTrusted = () => {
+    if (!vscode.workspace.isTrusted || continuationScheduled) return;
+    continuationScheduled = true;
+    runUiBackground('Workspace session continuation offer', async () => {
+      const folder = vscode.workspace.workspaceFolders?.[0];
+      if (!folder) return;
+      try {
+        const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
+        if (!marker.isFile()) return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
+        return;
+      }
+      if (await consumePendingSessionLaunch(context, folder.uri.fsPath)) {
+        await startWorkspaceSessionRestore(context);
+        return;
+      }
+      await runConfirmedSessionRestore(
+        async () => await vscode.window.showInformationMessage(
+          'Pair Notebook: в этой папке найдена сохранённая сессия. Подключение начнётся только по вашему выбору.',
+          'Подключиться',
+        ) === 'Подключиться',
+        async () => {
+          if (!runtime) await startWorkspaceSessionRestore(context);
+        },
+      );
+    });
+  };
+  if (vscode.workspace.isTrusted) {
+    continueWhenTrusted();
+    return;
+  }
+  output.appendLine('[info] Waiting for Workspace Trust before continuing a Pair Notebook session.');
+  const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust(() => {
+    trustSubscription.dispose();
+    continueWhenTrusted();
   });
+  context.subscriptions.push(trustSubscription);
+}
+
+async function consumePendingSessionLaunch(
+  context: vscode.ExtensionContext,
+  workspaceFolder: string,
+): Promise<boolean> {
+  const stored = context.globalState.get<unknown>(PENDING_SESSION_LAUNCH_KEY);
+  if (stored === undefined) return false;
+  const pending = normalizePendingSessionLaunch(stored);
+  if (!pending || pending.editorSessionId !== vscode.env.sessionId) {
+    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
+    return false;
+  }
+  if (!sameWorkspacePath(pending.workingFolder, workspaceFolder)) return false;
+  let descriptor: SessionDescriptor;
+  try {
+    const markerBytes = await readBoundedRegularFile(path.join(workspaceFolder, MARKER), MAX_SESSION_MARKER_BYTES);
+    descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), workspaceFolder);
+  } catch (error) {
+    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
+    output.appendLine(`[error] Could not validate pending session launch: ${formatError(error)}`);
+    return false;
+  }
+  await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
+  return pendingSessionLaunchMatches(pending, descriptor, vscode.env.sessionId);
 }
 
 function startWorkspaceSessionRestore(context: vscode.ExtensionContext): Promise<void> {
@@ -645,14 +717,27 @@ function startWorkspaceSessionRestore(context: vscode.ExtensionContext): Promise
 function startLifecycleWatchdog(context: vscode.ExtensionContext): void {
   if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
   let previousTickAt = Date.now();
+  let previousReadyRuntime: SessionRuntime | undefined;
   lifecycleWatchdog = setInterval(() => {
     const currentTickAt = Date.now();
     const gap = currentTickAt - previousTickAt;
     const leftAt = previousTickAt;
+    const currentReadyRuntime = vscode.workspace.isTrusted && runtime === lifecycleReadyRuntime
+      ? runtime
+      : undefined;
+    const suspendedRuntime = shouldLeaveForSystemSuspend(
+      previousReadyRuntime,
+      currentReadyRuntime,
+      leftAt,
+      currentTickAt,
+      SYSTEM_SUSPEND_GAP_MS,
+    ) ? currentReadyRuntime : undefined;
     previousTickAt = currentTickAt;
-    if (!isSystemSuspendGap(leftAt, currentTickAt, SYSTEM_SUSPEND_GAP_MS) || !runtime || localSessionExit) return;
+    previousReadyRuntime = currentReadyRuntime;
+    if (!suspendedRuntime || localSessionExit) return;
     output.appendLine(`[lifecycle] Detected a ${gap}ms extension-host suspension; leaving the active session.`);
     runUiBackground('System-suspend session leave', async () => {
+      if (runtime !== suspendedRuntime || localSessionExit) return;
       await leaveActiveSession(context, leftAt, 'system-suspend');
       const choice = await vscode.window.showWarningMessage(
         'Pair Notebook: компьютер был приостановлен, поэтому активная сессия закрыта локально. Переподключитесь вручную через «Недавние проекты».',
@@ -680,6 +765,7 @@ async function leaveActiveSession(
   if (localSessionExit) return localSessionExit;
   const active = runtime;
   if (!active) return;
+  if (lifecycleReadyRuntime === active) lifecycleReadyRuntime = undefined;
   localSessionExit = (async () => {
     try {
       await rememberProject(context, active.descriptor, { leftAt });

@@ -8,7 +8,7 @@ Guest execution synchronizes project dependencies before request retries, then m
 
 | Component | Responsibility |
 | --- | --- |
-| `extension.ts` | VS Code commands, name/invite prompts, folder selection, explicit-confirmation session restore, shutdown/suspend leave, and UI lifecycle |
+| `extension.ts` | VS Code commands, name/invite prompts, folder selection, trust-gated one-use Start/Join continuation, manual restore, shutdown/suspend leave, and UI lifecycle |
 | `DashboardProvider` | Non-empty startup fallback, command bridge, state rendering, Recent Session exit metadata, and host-pause controls |
 | `MeshTransport` | Nostr/MQTT discovery, authenticated handshakes, WebRTC actions, redundant emergency relays, queues, RTT, and metrics |
 | `SessionRuntime` | CRDT/filesystem synchronization, pinned host authority, execution barriers, persistence ownership, and pause/resume |

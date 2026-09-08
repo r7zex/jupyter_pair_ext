@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.25 - 2026-09-09 (trusted Start/Join continuation)
+
+- Preserves the explicit Start/Join intent across the isolated-folder reload and continues it once after Workspace Trust is granted in the same VS Code editor session.
+- Keeps restart, extension reinstall, unrelated marker activation, and Recent Session recovery manual-only by binding the one-use handoff to the target session, participant, folder, and editor session ID without storing credentials.
+- Arms system-suspend detection only after session startup and editor bindings finish, and requires the same ready runtime on both sides of the timer gap so Trust/reload/startup delays cannot immediately eject a new session.
+- Adds regression coverage for trust gating, stale editor-session rejection, one-use handoff identity, and startup-gap containment.
+
+Automated validation does not replace an installed-VSIX trust prompt, real suspend/resume, and physical two-computer acceptance.
+
 ## 0.5.24 - 2026-09-08 (explicit session resume lifecycle)
 
 - Stops treating extension activation, VS Code restart, or extension reinstall as permission to reconnect. A saved workspace marker now produces a confirmation offer and starts no session/network runtime until the user explicitly chooses to connect.

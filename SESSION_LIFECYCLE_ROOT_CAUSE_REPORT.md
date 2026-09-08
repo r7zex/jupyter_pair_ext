@@ -91,3 +91,17 @@ Required correction:
 - Persist a non-secret, one-use Start/Join handoff bound to the target session, peer, working folder, and `vscode.env.sessionId`. Consume it only after the target workspace is trusted. Because the editor session id changes when VS Code is restarted, stale close/uninstall/reopen paths cannot use this automatic continuation and remain manual-only.
 - Arm suspend detection only after `runtime.start()` and all editor bindings finish, and only when the same ready runtime was observed on both sides of the timer gap. Startup, Trust, and runtime replacement gaps must never trigger `leave()`.
 - Explicitly wait for Workspace Trust before consuming a handoff or offering manual restoration.
+
+### Implemented 0.5.25 correction
+
+- Start/Join stores only `{ editorSessionId, sessionId, peerId, workingFolder }`, then opens the isolated folder. After Trust, activation validates all four fields against the marker, deletes the handoff before starting, and continues the already authorized launch once.
+- Missing, malformed, mismatched, or previous-editor-session handoffs cannot bypass `runConfirmedSessionRestore()` and are cleared when stale. Tokens and private identity keys remain exclusively in SecretStorage.
+- `lifecycleReadyRuntime` is assigned only after `SessionRuntime.start()`, synchronizer/controller/presence binding, and terminal handlers are installed. The watchdog requires referential equality between the ready runtime seen on consecutive ticks before treating a timer gap as suspend.
+- Activation explicitly waits for `vscode.workspace.isTrusted` and subscribes once to `onDidGrantWorkspaceTrust` when necessary.
+
+### 0.5.25 validation evidence
+
+- `npm.cmd run artifacts`: 523 passing tests; TypeScript compile, ESLint, final source preflight (140 packageable files), VSIX validation (26 entries), and complete ZIP validation (140 entries) passed.
+- `npm.cmd run test:e2e` with the installed VS Code executable: 22 passed, 1 known pending (`#19`).
+- `python -m unittest discover -s test -p jupyter_bridge_unit.py -v`: 7/7 passed.
+- `npm.cmd audit --omit=dev`: 0 vulnerabilities.

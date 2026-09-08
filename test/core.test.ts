@@ -28,7 +28,14 @@ import {
   validateIdentityPublicKey,
   verifyIdentityTranscript,
 } from '../src/core/identity';
-import { isSystemSuspendGap, runConfirmedSessionRestore } from '../src/core/manualSessionRestore';
+import {
+  createPendingSessionLaunch,
+  isSystemSuspendGap,
+  normalizePendingSessionLaunch,
+  pendingSessionLaunchMatches,
+  runConfirmedSessionRestore,
+  shouldLeaveForSystemSuspend,
+} from '../src/core/manualSessionRestore';
 import { StableCellIdRegistry, matchInitialCellIds, minimalNotebookSplice } from '../src/core/notebookIdentity';
 import { JupyterKernelEvent, PythonKernel, kernelLaunchSpec } from '../src/core/pythonKernel';
 import {
@@ -2024,9 +2031,29 @@ describe('compute launch and recent projects', () => {
     assert.equal(isSystemSuspendGap(1_000, 15_999, 15_000), false);
     assert.equal(isSystemSuspendGap(1_000, 16_000, 15_000), true);
     assert.equal(isSystemSuspendGap(16_000, 1_000, 15_000), false);
+    const readyRuntime = {};
+    assert.equal(shouldLeaveForSystemSuspend(undefined, readyRuntime, 1_000, 20_000, 15_000), false);
+    assert.equal(shouldLeaveForSystemSuspend({}, readyRuntime, 1_000, 20_000, 15_000), false);
+    assert.equal(shouldLeaveForSystemSuspend(readyRuntime, readyRuntime, 1_000, 15_999, 15_000), false);
+    assert.equal(shouldLeaveForSystemSuspend(readyRuntime, readyRuntime, 1_000, 16_000, 15_000), true);
   });
 
-  it('offers workspace continuation on activation without starting a restore', async () => {
+  it('binds an explicit folder handoff to one editor session without storing secrets', () => {
+    const descriptor = {
+      sessionId: 'session-a',
+      workingFolder: path.join(os.tmpdir(), 'pair-pending-session'),
+      localPeer: { peerId: 'host-a', displayName: 'Host', joinOrder: 0, identityKey: 'identity-a' },
+    };
+    const created = createPendingSessionLaunch(descriptor, 'editor-session-a');
+    assert.deepEqual(normalizePendingSessionLaunch(created), created);
+    assert.equal(Object.hasOwn(created, 'token'), false);
+    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-session-a'), true);
+    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-session-b'), false);
+    assert.equal(pendingSessionLaunchMatches(created, { ...descriptor, sessionId: 'session-b' }, 'editor-session-a'), false);
+    assert.equal(normalizePendingSessionLaunch({ ...created, editorSessionId: '' }), undefined);
+  });
+
+  it('waits for Workspace Trust and keeps stale activation manual-only', async () => {
     const source = await readFile(path.join(process.cwd(), 'src', 'extension.ts'), 'utf8');
     const activateSource = source.slice(
       source.indexOf('export async function activate'),
@@ -2038,8 +2065,16 @@ describe('compute launch and recent projects', () => {
       source.indexOf('function offerWorkspaceSessionRestore'),
       source.indexOf('function startWorkspaceSessionRestore'),
     );
+    assert.match(offerSource, /vscode\.workspace\.isTrusted/);
+    assert.match(offerSource, /onDidGrantWorkspaceTrust/);
+    assert.match(offerSource, /consumePendingSessionLaunch/);
     assert.match(offerSource, /runConfirmedSessionRestore/);
     assert.match(offerSource, /showInformationMessage/);
+    const handoffSource = source.slice(
+      source.indexOf('async function openSessionWorkingFolder'),
+      source.indexOf('async function restoreWorkspaceSession'),
+    );
+    assert.match(handoffSource, /createPendingSessionLaunch\(descriptor, vscode\.env\.sessionId\)/);
   });
 
   it('terminates a bridge that emits an oversized protocol line', async () => {

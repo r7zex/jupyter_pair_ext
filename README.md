@@ -81,7 +81,8 @@ Passive diagnostics run automatically with ordinary user permissions: adapter cl
 2. Select **Start session**.
 3. Enter the participant name other people should see.
 4. Select the folder the host will own and persist. A separate extension-managed working copy opens automatically.
-5. Copy the invite and send it only to trusted participants.
+5. If VS Code asks for Workspace Trust in that isolated folder, select **Trust**. Pair Notebook then completes this one Start action automatically.
+6. Copy the invite and send it only to trusted participants.
 
 The host is the only participant that writes the canonical backing folder. A Dropbox, OneDrive, or other synchronized folder can be selected, but the cloud-storage provider is not used for live transport.
 
@@ -89,7 +90,7 @@ The host is the only participant that writes the canonical backing folder. A Dro
 
 1. Install the VSIX and open the Pair Notebook panel.
 2. Select **Join**, paste the complete `pair-notebook://` invite, and enter your name.
-3. Wait for the host snapshot to finish.
+3. Wait for the host snapshot to finish. If VS Code asks for Workspace Trust after opening the isolated copy, select **Trust**; the already requested Join continues once automatically.
 
 A joining participant is never asked for a project folder. Pair Notebook creates an isolated working copy under the local application-data directory, opens it, and keeps it synchronized with the session. The participant name is validated and must be unique within the live room.
 
@@ -99,9 +100,9 @@ The original host remains the host across heartbeat delays, signalling failures,
 
 - Host authority changes only when the current host selects **Transfer Host** and the selected participant completes the authenticated prepare/commit/finalize transfer.
 - If the host route disappears, guests keep the current runtime during the bounded route-recovery window. If the host is still unreachable afterwards, guests leave the active runtime without deleting their isolated working copy, credentials, or Recent Projects entry.
-- Extension activation, VS Code restart, and extension reinstall never reconnect by themselves. A saved workspace marker only offers a **Connect** action; the session runtime and network reconnect start after that explicit confirmation.
+- A Start/Join action may continue once after its isolated folder becomes trusted, but only in the same VS Code editor session and for the exact saved session, participant, and folder. Extension activation, VS Code restart, extension reinstall, and unrelated markers never reconnect by themselves; they only offer a manual **Connect** action.
 - Opening an entry from **Recent Projects** explicitly retries the same pinned host identity. If its folder is already open, Pair Notebook reconnects in place; otherwise it opens the isolated folder and asks for confirmation after the VS Code reload.
-- Graceful VS Code shutdown and a detected system-suspend gap leave the active runtime locally and record the exit. Recent Sessions show the Session Host nickname, relative minutes/hours/days since exit, and the exact `dd/mm/yy` date.
+- Graceful VS Code shutdown and a detected system-suspend gap leave the active runtime locally and record the exit. Suspend detection is armed only after startup completes, so folder Trust and startup delays cannot eject a new runtime. Recent Sessions show the Session Host nickname, relative minutes/hours/days since exit, and the exact `dd/mm/yy` date.
 - Simply choosing **Leave Session** never transfers authority. Guests cannot replace an absent host; after a host-route loss they can only retry the same pinned host from Recent Projects.
 - Continuous atomic host persistence uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
 - During an explicit transfer, every participant sees a paused state. Persistence, invitations, and notebook execution remain disabled until the new host prepares storage.
