@@ -45,7 +45,7 @@ The dashboard narrows the entry back to only `name`, `folder`, and `at` (`src/vs
 ## Repair invariants
 
 1. Extension activation alone must never start a session runtime or network reconnect.
-2. After Start/Join switches into the isolated folder, activation may offer a continuation action from the local marker, but it may not connect automatically. Recent Session selection is an explicit reconnect action.
+2. Start/Join is itself an explicit authorization to continue once into the newly opened isolated folder in the same VS Code editor session. A marker found after an editor restart, extension reinstall, or unrelated activation remains manual-only. Recent Session selection is also an explicit reconnect action.
 3. Graceful VS Code shutdown and detected system suspend must perform a local leave, retain recoverable marker/SecretStorage state for manual reconnect, and update the Recent Session exit metadata. Explicit Leave records the same metadata but keeps its existing credential-revocation semantics.
 4. An authenticated remote `session-ended` remains terminal: its marker/secret/recent entry must be removed and it must not be reconnectable.
 5. Every recent entry must include a stable host display name and a last-left timestamp. UI must show the host name, relative age in minutes/hours/days, and `dd/mm/yy`.
@@ -77,3 +77,17 @@ The dashboard narrows the entry back to only `name`, `folder`, and `at` (`src/vs
 - `npm.cmd audit --omit=dev`: 0 vulnerabilities.
 
 Automated proof covers the implementation, confirmation gate, timer-gap simulation, packaging, regression suite, and real VS Code Extension Host APIs. Installing the generated VSIX through the UI, real Windows lid-close/resume, and a physical two-computer network remain acceptance boundaries rather than claims made by this report.
+
+## 0.5.24 post-release regression localization (2026-09-09)
+
+The first repair made two lifecycle states indistinguishable and introduced a startup regression:
+
+1. `startSession()` and `joinSession()` save a valid marker and then call `vscode.openFolder()` to enter the isolated working copy. Workspace Trust can disable Pair Notebook during that folder transition. No durable, one-use record preserves the already explicit Start/Join intent across the extension-host reload, so the next activation treats the brand-new launch as an old session and diverts it into the manual reconnect path.
+2. `restoreWorkspaceSession()` assigns the module-level `runtime` before `runtime.start()` finishes. The lifecycle watchdog measures its timer baseline from extension activation and closes whenever a later tick sees both a 15-second gap and any `runtime`. It does not prove that the same fully started runtime was active before the gap. A Trust/reload/startup stall can therefore be misclassified as system suspend and immediately call `leave()` on the session that is still starting.
+3. The activation path does not explicitly gate continuation on `vscode.workspace.isTrusted` or resume it from `onDidGrantWorkspaceTrust`; it relies only on the manifest's unsupported-workspace behavior. That leaves the Start/Join handoff coupled to VS Code's trust-driven extension reload timing.
+
+Required correction:
+
+- Persist a non-secret, one-use Start/Join handoff bound to the target session, peer, working folder, and `vscode.env.sessionId`. Consume it only after the target workspace is trusted. Because the editor session id changes when VS Code is restarted, stale close/uninstall/reopen paths cannot use this automatic continuation and remain manual-only.
+- Arm suspend detection only after `runtime.start()` and all editor bindings finish, and only when the same ready runtime was observed on both sides of the timer gap. Startup, Trust, and runtime replacement gaps must never trigger `leave()`.
+- Explicitly wait for Workspace Trust before consuming a handoff or offering manual restoration.
