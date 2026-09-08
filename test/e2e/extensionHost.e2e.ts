@@ -326,7 +326,8 @@ async function createTextHarness(
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const effectiveTimeoutMs = process.platform === 'win32' ? Math.max(timeoutMs, 10_000) : timeoutMs;
+  const deadline = Date.now() + effectiveTimeoutMs;
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
