@@ -161,7 +161,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
       harness.project.on('update', onUpdate);
       try {
         harness.project.replaceText(harness.key, '#print(a\n', REMOTE_ORIGIN);
-        await waitFor(() => harness.document.getText() === '#print(a\n', 3_000, 'remote newline projection into VS Code');
+        await waitFor(() => normalizeEol(harness.document.getText()) === '#print(a\n', 3_000, 'remote newline projection into VS Code');
         await delay(250);
         assert.equal(harness.project.text(harness.key).toString(), '#print(a\n');
         assert.equal(nonRemoteUpdates, 0, 'a remote newline projection must not create a local newline echo');
@@ -195,8 +195,12 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
   const harness = await createTextHarness('remote = 0\nlocal = 0');
   try {
     harness.project.applyTextChanges(harness.key, [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
-    await waitFor(() => harness.document.getText() === 'remote = 1\nlocal = 0', 3_000, 'remote first-line projection');
-    assert.equal((harness.synchronizer as any).projectionQuarantines.has(harness.document.uri.toString()), true);
+    await waitFor(
+      () => (harness.synchronizer as any).projectionQuarantines.has(harness.document.uri.toString()),
+      3_000,
+      'post-projection guard to arm before different-line file edit',
+    );
+    assert.equal(normalizeEol(harness.document.getText()), 'remote = 1\nlocal = 0');
     const edit = new vscode.WorkspaceEdit();
     edit.insert(harness.document.uri, harness.document.lineAt(1).range.end, ' + 1');
     assert.equal(await vscode.workspace.applyEdit(edit), true);
@@ -339,6 +343,10 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
   }
   const detail = lastError instanceof Error ? ` Last error: ${lastError.message}` : '';
   throw new Error(`Timed out waiting for ${label}.${detail}`);
+}
+
+function normalizeEol(value: string): string {
+  return value.replace(/\r\n/g, '\n');
 }
 
 function delay(ms: number): Promise<void> {

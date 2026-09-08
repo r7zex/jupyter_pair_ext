@@ -39,11 +39,11 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
       edit.insert(cell.document.uri, cell.document.positionAt(cell.document.getText().length), '\nvalue += 1');
       assert.equal(await vscode.workspace.applyEdit(edit), true);
       await waitFor(
-        () => harness.project.cellSource(harness.key, stableId).toString() === 'value = 1\nvalue += 1',
+        () => normalizeEol(harness.project.cellSource(harness.key, stableId).toString()) === 'value = 1\nvalue += 1',
         3_000,
         'real notebook-cell edit to reach canonical source',
       );
-      assert.equal(cell.document.getText(), 'value = 1\nvalue += 1');
+      assert.equal(normalizeEol(cell.document.getText()), 'value = 1\nvalue += 1');
     } finally {
       await harness.dispose();
     }
@@ -263,6 +263,10 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
   }
   const detail = lastError instanceof Error ? ` Last error: ${lastError.message}` : '';
   throw new Error(`Timed out waiting for ${label}.${detail}`);
+}
+
+function normalizeEol(value: string): string {
+  return value.replace(/\r\n/g, '\n');
 }
 
 function delay(ms: number): Promise<void> {
