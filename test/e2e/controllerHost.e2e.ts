@@ -40,9 +40,11 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
       });
 
       await waitFor(
-        () => cell.outputs.length === 1 && cell.executionSummary?.executionOrder === 17,
-        3_000,
-        'remote output and execution summary to render',
+        () => cell.outputs.length === 1
+          && cell.executionSummary?.executionOrder === 17
+          && cell.executionSummary?.success === true,
+        5_000,
+        'remote output and terminal execution summary to render',
       );
       assert.equal(cell.outputs.length, 1);
       assert.equal(cell.outputs[0]?.items.length, 1);
