@@ -1,0 +1,105 @@
+name: Apply line-scoped projection quarantine v3
+
+on:
+  push:
+    branches: [codex/line-scoped-quarantine]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: codex/line-scoped-quarantine
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Reuse validated patch recipe and fix notebook E2E synchronization
+        shell: python
+        run: |
+          from pathlib import Path
+          from textwrap import dedent
+
+          recipe = Path('.github/workflows/apply-line-scoped-quarantine-v2.yml').read_text(encoding='utf-8')
+          marker = '      - name: Apply line-scoped guard and regressions\n        shell: python\n        run: |\n'
+          start = recipe.index(marker) + len(marker)
+          end = recipe.index('\n      - run: npm ci', start)
+          code = dedent(recipe[start:end])
+          exec(compile(code, '<line-scoped-quarantine-recipe>', 'exec'), {})
+
+          # A real NotebookDocument can expose the projected text before
+          # workspace.applyEdit() resolves and armProjectionQuarantine() runs.
+          # Wait for the guard rather than racing that Promise boundary.
+          p = Path('test/e2e/notebookHost.e2e.ts')
+          s = p.read_text(encoding='utf-8')
+          old = '''    assert.equal((harness.synchronizer as any).projectionQuarantines.has(cell.document.uri.toString()), true);
+              const edit = new vscode.WorkspaceEdit();'''
+          new = '''    await waitFor(
+                () => (harness.synchronizer as any).projectionQuarantines.has(cell.document.uri.toString()),
+                1_000,
+                'post-projection guard to arm before different-line cell edit',
+              );
+              const edit = new vscode.WorkspaceEdit();'''
+          if old not in s:
+              raise SystemExit('notebook E2E guard assertion was not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+
+          # A remote deletion that consumes newline(s) touches both sides of the
+          # join. Protect the larger of removed/inserted line spans; this keeps
+          # newline-tail suppression conservative while ordinary different-line
+          # edits remain outside the guard.
+          p = Path('src/vscode/sync.ts')
+          s = p.read_text(encoding='utf-8')
+          old = 'const quarantineEndLine = quarantineStartLine + countLineBreaks(edit.insertText);'
+          new = '''const quarantineEndLine = quarantineStartLine + Math.max(
+                countLineBreaks(current.slice(edit.offset, edit.offset + edit.deleteCount)),
+                countLineBreaks(edit.insertText),
+              );'''
+          if old not in s:
+              raise SystemExit('remote quarantine end-line calculation was not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+      - run: npm ci
+      - run: python -m pip install jupyter_client==8.6.3 ipykernel==6.29.5
+      - name: Compile
+        run: npm run compile
+      - name: Full unit/integration suite
+        run: npm test
+      - name: Install isolated E2E driver
+        run: npm install --prefix .e2e-driver --no-save --package-lock=false @vscode/test-electron@3.1.0
+      - name: Exclude unrelated controller E2E from focused validation
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('test/e2e/suite/index.ts'); s = p.read_text(encoding='utf-8')
+          p.write_text(s.replace("  mocha.addFile(path.resolve(__dirname, '..', 'controllerHost.e2e.js'));\n", ''), encoding='utf-8')
+      - name: Real VS Code 1.95 editor/notebook E2E
+        env:
+          PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
+          PAIR_NOTEBOOK_E2E_VSCODE_VERSION: 1.95.0
+          PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+        run: xvfb-run -a npm run test:e2e
+      - name: Commit validated fix only
+        shell: bash
+        run: |
+          git checkout -- test/e2e/suite/index.ts
+          git rm .github/workflows/apply-line-scoped-quarantine-v2.yml
+          git rm .github/workflows/apply-line-scoped-quarantine-v3.yml
+          git add src/vscode/sync.ts test/e2e/extensionHost.e2e.ts test/e2e/notebookHost.e2e.ts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(sync): scope projection quarantine to remote lines"
+          git push origin HEAD:codex/line-scoped-quarantine
