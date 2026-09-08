@@ -36,7 +36,7 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
         },
         outputsChanged: true,
         executionChanged: true,
-        executionMode: 'replay',
+        executionMode: 'snapshot',
       });
 
       await waitFor(
@@ -76,7 +76,7 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
       const started = Date.now();
       await controller.renderRemoteCellState(cell, {
         outputs: [new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.text('first', 'text/plain')])],
-        execution: { executionOrder: 3, timing: { startTime: started } },
+        execution: { executionOrder: 3, timing: { startTime: started, endTime: started } },
         outputsChanged: true,
         executionChanged: true,
         executionMode: 'live',
