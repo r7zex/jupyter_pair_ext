@@ -2,32 +2,42 @@
 
 Date: 2026-09-09
 
-Status: implementation plan based on the current `main` / `v0.5.26` code path and the observed installed-VSIX failure.
+Status: root-cause analysis + implementation specification for the current `main` / `v0.5.26` startup path.
 
-## Goal
-
-Make **Start Session** and **Join Session** deterministic even when the isolated Pair Notebook working folder opens in VS Code Restricted Mode and Pair Notebook is completely disabled there for an arbitrary amount of time.
-
-Required behavior:
-
-1. User starts or joins from a trusted workspace.
-2. Pair Notebook creates/downloads the isolated working copy and persists all local session state needed to continue.
-3. `vscode.openFolder()` opens the isolated working folder.
-4. If VS Code marks that folder untrusted, Pair Notebook may be completely disabled. This must be treated as a normal lifecycle state, not as an error.
-5. The user may wait **at least one hour** before pressing **Trust**.
-6. After Trust, Pair Notebook activates again, recognizes the exact unfinished Start/Join operation, and continues that same session automatically. It must not create a second session, show a stale-session reconnect prompt, or lose the requested launch.
-7. A transient network/VPN/proxy/relay outage must not destroy a freshly created host session or convert it into a dead Recent Session. The same session must remain retryable.
-8. Existing protocol-v7 CRDT/text/notebook synchronization semantics must remain unchanged.
-
-The implementation must be correct even if Pair Notebook does **not execute at all** while the target workspace is untrusted.
+This document is intentionally stricter than the previous `0.5.24`–`0.5.26` fixes. The goal is not another timing workaround. The goal is to make **Start Session** and **Join Session** correct across a real VS Code process boundary, Workspace Trust delay, extension-host restart, and transient network failure **without changing protocol-v7 synchronization semantics**.
 
 ---
 
-# 1. Verified facts from the current repository
+# 0. Required product behavior
 
-## 1.1 `v0.5.23` worked by relying on durable state and post-Trust activation
+The target behavior is:
 
-In `v0.5.23`, `package.json` declared:
+1. User presses **Start Session** or **Join Session** in a trusted source workspace.
+2. Pair Notebook creates/downloads the isolated working copy and persists the exact launch intent.
+3. Pair Notebook calls `vscode.openFolder()` for the isolated folder.
+4. VS Code may open that folder in Restricted Mode and may completely disable Pair Notebook.
+5. The user may leave the folder untrusted for one hour, several hours, close/reopen VS Code, or let the extension host restart.
+6. When that exact folder is eventually trusted and Pair Notebook is activated again, it must continue the **same** launch:
+   - same `sessionId`;
+   - same `projectId`;
+   - same local `peerId` and identity key;
+   - same working folder;
+   - same host authority;
+   - no second session card;
+   - no stale-session confirmation prompt;
+   - no dependency on in-memory state left by the source window.
+7. A temporary VPN/proxy/Nostr/MQTT/WebRTC outage must not destroy a freshly prepared session. It must remain retryable under the same session identity.
+8. Existing CRDT/Yjs/notebook/output/execution synchronization stays out of scope unless a separate failing test proves a sync defect.
+
+The release must not claim this is guaranteed merely because unit tests pass. The guarantee is the combination of the state-machine invariants below **plus an installed-VSIX Workspace Trust acceptance gate**.
+
+---
+
+# 1. Verified root causes in the current repository
+
+## 1.1 `v0.5.23` is the last known good lifecycle baseline
+
+`v0.5.23` declared:
 
 ```json
 "capabilities": {
@@ -37,112 +47,209 @@ In `v0.5.23`, `package.json` declared:
 }
 ```
 
-and activation unconditionally called `startWorkspaceSessionRestore(context)`. Start/Join saved the descriptor and then opened the isolated working folder.
+and activation called `startWorkspaceSessionRestore(context)` after the target folder opened. Start/Join persisted the marker and SecretStorage credentials before `vscode.openFolder()`.
 
-This meant Restricted Mode could disable Pair Notebook, but after the user granted Trust, normal extension activation could read the persisted marker/SecretStorage state and restore the session.
+That implementation had an over-eager automatic restore problem for old sessions, but it accidentally had one important property that the later fixes lost: **the newly requested launch could survive the Trust boundary using durable state rather than an in-memory handoff**.
 
-Reference:
+References:
 
 - `v0.5.23/package.json`
 - `v0.5.23/src/extension.ts`
+- `SESSION_LIFECYCLE_ROOT_CAUSE_REPORT.md`
 
-## 1.2 The regression starts in `0.5.24`
+## 1.2 `0.5.24` changed a durable workflow into a consent/lifecycle workflow and introduced the regression
 
-The current repository's own `SESSION_LIFECYCLE_ROOT_CAUSE_REPORT.md` identifies `v0.5.23` as the baseline and documents the post-release `0.5.24` regression: Start/Join opened the isolated folder, but the new lifecycle rules no longer preserved the explicit Start/Join intent correctly across the folder/trust transition.
+The repository's own lifecycle report identifies `v0.5.23` as baseline and documents the `0.5.24` regression. The core issue is that two different cases became entangled:
 
-`0.5.25` then attempted an in-memory/`vscode.env.sessionId` handoff, which was also insufficient.
+- a **fresh explicit Start/Join already authorized by the user**;
+- an **old marker from a previous session**, which must remain manual-only.
 
-## 1.3 `0.5.26` still depends on an in-memory claim during the Trust interval
+The correct fix is not to make every marker automatic again. It is to persist a durable proof that a specific marker belongs to an unfinished explicit Start/Join.
 
-Current flow:
+## 1.3 `0.5.26` still destroys the only durable launch evidence before Trust
+
+Current path:
 
 ```text
 startSession()/joinSession()
   -> saveDescriptor(...)
   -> rememberProject(...)
   -> openSessionWorkingFolder(...)
-  -> write PENDING_SESSION_LAUNCH_KEY
+  -> globalState[PENDING_SESSION_LAUNCH_KEY] = pending launch
   -> vscode.openFolder(...)
 
-new target-folder activation
+new target activation
   -> offerWorkspaceSessionRestore(...)
   -> claimPendingSessionLaunch(...)
   -> DELETE PENDING_SESSION_LAUNCH_KEY
-  -> keep `claimedLaunch` only in extension-host memory
-  -> wait for vscode.workspace.isTrusted / onDidGrantWorkspaceTrust
+  -> keep claimedLaunch only in extension-host memory
+  -> wait for Workspace Trust
   -> startWorkspaceSessionRestore(...)
 ```
 
-The critical flaw is the transition:
+The unsafe transition is:
 
 ```text
-durable globalState record
-       ↓ deleted before Trust
-in-memory claimedLaunch
+DURABLE launch intent
+      ↓ deleted
+RAM-only claimedLaunch
+      ↓
+wait for Trust
 ```
 
-If the extension is disabled, unloaded, restarted, or its extension host is replaced before Trust, the only automatic-launch evidence is gone.
+That means correctness still depends on the extension host remaining alive for the whole Restricted Mode interval.
 
-This is incompatible with the required behavior "Trust may be granted an hour later".
+The user requirement is the opposite: **Restricted Mode must be allowed to kill Pair Notebook completely for an arbitrary delay**.
 
-Relevant current files:
+Relevant files:
 
 - `src/extension.ts`
 - `src/core/manualSessionRestore.ts`
 - `WORKSPACE_TRUST_SESSION_START_ROOT_CAUSE.md`
 
-## 1.4 Current `manualSessionRestore.ts` uses undocumented process environment as correctness state
+## 1.4 `vscode.openFolder()` is itself a hard process boundary
 
-`currentEditorProcessIdentity()` hashes `VSCODE_PID` plus `VSCODE_IPC_HOOK`/`VSCODE_IPC_HOOK_CLI`.
+VS Code documents that opening a folder in the same window shuts down the current extension host process and starts a new one for the new folder/workspace.
 
-Those process environment variables are not the public Workspace Trust API. They may be useful diagnostics, but session-start correctness should not depend on them.
+Official reference:
 
-VS Code publicly documents `vscode.env.sessionId`, but only guarantees that it identifies the current editor session and changes when the editor is started. It is not a durable launch transaction identifier.
+https://code.visualstudio.com/api/references/commands#_built-in-commands
 
-Reference: VS Code API `env.sessionId` documentation:
+Therefore **no line executed after a successful same-window `vscode.openFolder()` call may be required for correctness**.
 
-https://code.visualstudio.com/api/references/vscode-api
+Treat `openFolder()` as a one-way handoff/commit boundary:
 
-## 1.5 Current E2E cannot catch the real Trust regression
+```text
+persist everything required
+        ↓
+vscode.openFolder(target)
+        ↓
+old extension host may disappear immediately
+```
 
-`scripts/run-vscode-e2e.mjs` launches VS Code with:
+This is broader than Workspace Trust. Even in a trusted target folder, the source extension-host lifetime cannot be part of the protocol.
+
+## 1.5 The current process-identity binding is unsuitable as correctness state
+
+`currentEditorProcessIdentity()` hashes `VSCODE_PID` and `VSCODE_IPC_HOOK` / `VSCODE_IPC_HOOK_CLI`. Those values are not the public Workspace Trust contract. `vscode.env.sessionId` is also an editor-session identifier, not a durable Start/Join transaction identifier.
+
+These values can remain in diagnostics, but they must not decide whether a valid explicit Start/Join is resumed.
+
+A one-hour delay, extension-host restart, VS Code restart, or process replacement must not invalidate the launch.
+
+## 1.6 The current single `PENDING_SESSION_LAUNCH_KEY` is also a multi-window correctness hazard
+
+The current design stores one global pending launch. Two VS Code windows can therefore race or overwrite the only record.
+
+A fresh launch is already naturally namespaced by:
+
+```text
+sessionId + local peerId
+```
+
+The durable intent should be stored with that session's existing SecretStorage record, not in one process-global singleton.
+
+## 1.7 `saveDescriptor()` already gives us a stronger durable anchor than globalState
+
+Current `saveDescriptor()` does:
+
+```text
+SecretStorage(sessionId, peerId) = { token, identityPrivateKey }
+      ↓
+atomic write of .pair-notebook-session.json
+      ↓
+rollback SecretStorage if marker write fails normally
+```
+
+The current key is already unique:
+
+```text
+pairNotebook.sessionToken.<sessionId>.<peerId>
+```
+
+Current stored value is version 1:
+
+```ts
+interface StoredSessionSecret {
+  version: 1;
+  token: string;
+  identityPrivateKey?: string;
+}
+```
+
+This is the best place to attest an unfinished explicit Start/Join, because:
+
+- it survives extension-host death and long Trust delays;
+- workspace files cannot forge SecretStorage;
+- it is already bound to the exact `sessionId` + local `peerId`;
+- it avoids a second global singleton correctness store.
+
+## 1.8 Current `rememberProject()` runs too early and creates ghost Recent Sessions
+
+`startSession()` / `joinSession()` call `rememberProject()` before the target workspace successfully restores and before `SessionRuntime.start()` reaches usable state.
+
+So an attempt can fail before a session ever existed as a usable collaboration runtime, yet still become a Recent Session card. Repeating Start creates the repeated `project_test` entries observed in the UI.
+
+A pending launch is not a historical session. It must not be promoted to Recent until startup commits.
+
+## 1.9 Current Trust E2E explicitly disables Workspace Trust
+
+`scripts/run-vscode-e2e.mjs` currently includes:
 
 ```text
 --disable-workspace-trust
 ```
 
-Therefore the real Start -> `openFolder` -> Restricted Mode -> disabled extension -> delayed Trust -> reactivation path is excluded from the existing E2E environment.
+That means the real failure path is not exercised:
 
-This explains why Extension Host E2E can pass while the installed VSIX still fails at the Trust boundary.
+```text
+Start
+ -> openFolder
+ -> Restricted Mode
+ -> extension disabled/limited
+ -> delayed Trust
+ -> extension re-enabled
+ -> activation
+ -> continue exact pending launch
+```
 
-VS Code's official testing documentation explicitly says trusted and untrusted Workspace Trust behavior must be tested separately; trust cannot be programmatically granted/revoked from a normal extension test.
+VS Code's official testing guide explicitly says trusted and untrusted Workspace Trust scenarios need separate runs and that normal extension tests cannot programmatically grant/revoke Trust.
+
+Official reference:
+
+https://code.visualstudio.com/api/working-with-extensions/testing-extension#testing-workspace-trust-behavior
+
+## 1.10 VS Code explicitly allows the extension to disappear in Restricted Mode
+
+Official Workspace Trust documentation says extensions unsupported in Restricted Mode are disabled and their commands/UI disappear. Users can trust the folder later; VS Code's own trust enablement test plan verifies that extensions disabled by the Trust requirement become enabled after Trust is granted.
 
 References:
 
-- `scripts/run-vscode-e2e.mjs`
-- https://code.visualstudio.com/api/working-with-extensions/testing-extension
+- https://code.visualstudio.com/api/extension-guides/workspace-trust
+- https://code.visualstudio.com/docs/editing/workspaces/workspace-trust
+- https://github.com/microsoft/vscode/issues/128004
 
-## 1.6 `local-route-failed` is a second, independent startup problem
+Therefore the Pair Notebook design must work when `onDidGrantWorkspaceTrust` never fires because Pair Notebook was not running at all.
 
-The visible warning
+## 1.11 `local-route-failed` is a second independent startup defect
 
-```text
-Pair Notebook: локальный сетевой маршрут не удалось запустить...
-```
-
-comes from this exact boundary:
+Current runtime startup contains this terminal boundary:
 
 ```text
-restoreWorkspaceSession()
-  -> SessionRuntime.start()
+SessionRuntime.start()
   -> MeshTransport.start()
   -> throw
   -> disposeAsync('local-route-failed')
 ```
 
-This is not a CRDT/editor synchronization failure.
+Inside `MeshTransport.start()` the primary Trystero room is created and then the code awaits:
 
-`MeshTransport.start()` currently awaits `startRelayFallback()`, and `startRelayFallback()` awaits `RedundantFrameRelay.waitUntilReady(15_000)`. If neither emergency relay family becomes ready, startup throws and the entire fresh runtime becomes terminal.
+```text
+startRelayFallback()
+  -> RedundantFrameRelay.waitUntilReady(15_000)
+```
+
+If neither emergency relay family becomes ready, startup throws. A temporary infrastructure/VPN/proxy failure therefore destroys the new runtime instead of leaving the same local session retryable.
 
 Relevant files:
 
@@ -150,652 +257,1028 @@ Relevant files:
 - `src/runtime/mesh.ts`
 - `src/runtime/redundantFrameRelay.ts`
 
-## 1.7 Failed fresh launches are persisted too early
+## 1.12 Guest startup has a second retryability problem after delayed Trust
 
-`startSession()` currently calls `rememberProject(context, descriptor)` **before** the newly opened target workspace has successfully restored and before `SessionRuntime.start()` has reached ready state.
+`downloadProjectSnapshot()` happens **before** the target folder handoff. It is a bootstrap transport with `purpose: 'bootstrap'`; if the host cannot be reached there, Join already fails in the trusted source workspace and no pending target launch should be committed. This part is a good boundary and should remain.
 
-Therefore a fresh session that never successfully starts can still appear in Recent Sessions and leave behind marker/SecretStorage/working-copy state. Repeating Start creates multiple dead-looking entries.
-
-This is a lifecycle bug, not expected history behavior.
-
----
-
-# 2. Workspace Trust contract to design against
-
-Official VS Code Workspace Trust behavior:
-
-- `untrustedWorkspaces.supported: false` means the extension remains disabled until Trust is granted.
-- `untrustedWorkspaces.supported: "limited"` means the extension may remain active with limited functionality.
-- users can override an extension's untrusted-workspace support level with `extensions.supportUntrustedWorkspaces`.
-- users may leave a workspace in Restricted Mode and trust it later.
-- `vscode.workspace.isTrusted` and `vscode.workspace.onDidGrantWorkspaceTrust` are available to extensions that are actually running.
-
-Reference:
-
-https://code.visualstudio.com/api/extension-guides/workspace-trust
-
-Therefore **correctness must not depend on `onDidGrantWorkspaceTrust` firing**. The extension may be completely disabled while untrusted, either by its own manifest or by a user's override.
-
-The durable state written before `vscode.openFolder()` must be sufficient for a later trusted activation to resume the exact requested launch.
-
----
-
-# 3. Target architecture
-
-## 3.1 Core rule
-
-Treat Workspace Trust as a process boundary:
+But after snapshot bootstrap, the target folder may remain untrusted for an hour. Once it is trusted, `SessionRuntime.start()` for a guest does:
 
 ```text
-trusted source activation
-      |
-      | persist complete, non-secret launch transaction
-      v
-vscode.openFolder(target)
-      |
-      | extension may disappear completely for minutes/hours
-      v
-Restricted Mode
-      |
-      | user grants Trust whenever they choose
-      v
-fresh trusted extension activation
-      |
-      | re-read durable launch transaction
-      v
-continue exact Start/Join once
+transport.connect(host)
+  -> wait for initial project state
+  -> 45 second timeout if host does not provide state
 ```
 
-No correctness state may exist only in memory between `openFolder()` and Trust.
+That timeout is currently a generic startup failure. For a delayed Trust scenario it must be classified as **host temporarily unavailable**, not as a reason to destroy the pending Join identity.
 
-## 3.2 Recommended manifest behavior
+Relevant files:
 
-For maximum determinism and minimum security surface, use:
+- `src/runtime/bootstrap.ts`
+- `src/runtime/session.ts`
+
+---
+
+# 2. Non-negotiable invariants
+
+The implementation is correct only if all of these are true.
+
+## T1 — Trust independence
+
+A valid fresh Start/Join remains resumable if Pair Notebook executes zero code between `openFolder()` and the eventual Trust grant.
+
+## T2 — No time dependency
+
+A valid fresh Start/Join does not expire merely because the user waited one hour. Prefer **no time-based automatic invalidation at all**. Pending intent ends only by:
+
+- successful startup commit;
+- explicit Cancel;
+- authenticated `session-ended` / known terminal invalidation;
+- irrecoverable integrity mismatch or missing credentials.
+
+Do not use a 15 min / 1 h / 24 h TTL as the correctness mechanism. Clock changes and long user delays must not change identity semantics.
+
+## T3 — At-most-one local startup attempt
+
+The same `(sessionId, peerId, workingFolder)` cannot be started concurrently by two VS Code windows.
+
+## T4 — At-least-once retry until commit
+
+If the extension host crashes after Trust but before startup commits, the same pending launch remains available on the next activation.
+
+Together T3 + T4 give effectively-once startup **commit** semantics without pretending the actual network side effects are transactional.
+
+## T5 — No automatic old-session reconnect
+
+A marker without an authenticated pending-launch intent stays manual-only.
+
+## T6 — No networking before Trust
+
+`SessionRuntime`, Trystero, WebRTC, Nostr/MQTT relay, filesystem synchronization, and Python execution must not start while `vscode.workspace.isTrusted === false`.
+
+## T7 — No ghost Recent Session
+
+A launch is not added to normal Recent Sessions until the first successful startup commit.
+
+## T8 — Network outage preserves identity
+
+A network/VPN/proxy/relay outage before first ready state never creates a new session ID, peer ID, keypair, or working folder.
+
+## T9 — Sync protocol isolation
+
+No fix in this plan changes protocol-v7 CRDT ownership, Yjs text updates, notebook stable-cell IDs, output synchronization, execution synchronization, or wire compatibility.
+
+## T10 — Fail closed on integrity mismatch
+
+A marker that does not match its SecretStorage-attested launch record must never auto-start network activity.
+
+---
+
+# 3. Recommended durable design: SecretStorage-attested launch intent
+
+The previous plan proposed `PendingSessionLaunchV3` in globalState. A deeper review shows a stronger design is available: **make the session's existing SecretStorage record the source of truth for the unfinished explicit launch**.
+
+GlobalState may keep a bounded secondary index for dashboard discovery/garbage collection, but it must not be required to resume the target folder.
+
+## 3.1 Upgrade the session secret format
+
+Keep backwards compatibility with version 1 and introduce version 2:
+
+```ts
+interface StoredPendingLaunch {
+  version: 1;
+  launchId: string;
+  kind: 'start' | 'join';
+  createdAt: number;
+  descriptorDigest: string;
+}
+
+interface StoredSessionSecretV2 {
+  version: 2;
+  token: string;
+  identityPrivateKey: string;
+  pendingLaunch?: StoredPendingLaunch;
+}
+```
+
+`decodeSessionSecret()` must accept both v1 and v2.
+
+For a newly requested Start/Join, write v2 with `pendingLaunch` present.
+
+After startup commits, rewrite the **same SecretStorage key** without `pendingLaunch`:
+
+```ts
+{
+  version: 2,
+  token,
+  identityPrivateKey
+}
+```
+
+That one field is the durable distinction between:
+
+```text
+fresh explicit unfinished launch  => auto-resume after Trust
+old/established saved session     => manual reconnect only
+```
+
+## 3.2 Descriptor digest must cover immutable identity, not mutable runtime state
+
+Do not hash raw `JSON.stringify(descriptor)` as the contract. Property order and mutable fields would make it fragile.
+
+Define a canonical immutable subset:
+
+```ts
+interface LaunchDescriptorIdentity {
+  sessionId: string;
+  projectId: string;
+  role: 'host' | 'peer';
+  peerId: string;
+  peerIdentityKey: string;
+  hostPeerId: string;
+  workingFolder: string;
+  sessionEpoch: number;
+}
+```
+
+Canonicalize strings and path representation, serialize in a fixed field order, then SHA-256 it.
+
+Do **not** include fields expected to change during runtime startup, such as:
+
+- `freshStart`;
+- `knownPeers`;
+- file-state maps;
+- compute state;
+- notebook state;
+- transient runtime metadata.
+
+The digest exists to bind the pending launch to immutable local identity, not to freeze the entire descriptor forever.
+
+## 3.3 Path binding should use the real physical target
+
+The current `sameWorkspacePath()` only uses `path.resolve()` and case-folding on Windows.
+
+For the launch identity, resolve the working folder to a canonical real path after it is created and reject symlink/junction substitution where practical. The session working copy already lives below extension-owned global storage, so the expected path is known before `openFolder()`.
+
+At minimum validate:
+
+```text
+current workspace real path
+== descriptor workingFolder real path
+== pending-launch canonical path
+```
+
+A copied marker in another folder must never be enough to auto-start.
+
+## 3.4 GlobalState becomes an index, never the authority
+
+Optional structure:
+
+```ts
+interface PendingLaunchIndexEntry {
+  sessionId: string;
+  peerId: string;
+  workingFolder: string;
+  createdAt: number;
+}
+```
+
+Use it only for:
+
+- showing "Pending Sessions" in the dashboard;
+- orphan cleanup;
+- recovery if `openFolder()` never happened.
+
+If that index is lost, the exact target folder must still resume from marker + SecretStorage alone.
+
+This also removes the current single-key multi-window overwrite problem.
+
+---
+
+# 4. Write-ahead transaction before `openFolder()`
+
+`openFolder()` must be the final step. All recovery data must already be committed.
+
+## 4.1 Host Start
+
+```text
+1. require trusted source workspace
+2. prompt display name
+3. choose backing folder
+4. create sessionId/projectId/peerId/keypair/token
+5. create isolated working copy
+6. create descriptor
+7. compute canonical immutable descriptor digest
+8. store SecretStorage v2 with pendingLaunch
+9. atomically write .pair-notebook-session.json
+10. optionally update pending-launch index
+11. call vscode.openFolder(target) LAST
+```
+
+No `rememberProject()` before step 11.
+
+## 4.2 Guest Join
+
+Keep snapshot bootstrap before the Trust handoff:
+
+```text
+1. require trusted source workspace
+2. parse invite
+3. create local peerId/keypair
+4. download and verify host snapshot in trusted source context
+5. create local descriptor
+6. compute canonical immutable descriptor digest
+7. store SecretStorage v2 with pendingLaunch(kind='join')
+8. atomically write marker
+9. optionally update pending index
+10. call vscode.openFolder(target) LAST
+```
+
+If snapshot bootstrap cannot reach the host, fail before creating a committed pending target launch.
+
+## 4.3 Crash-consistency matrix
+
+The implementation must explicitly handle every crash point:
+
+| Crash point | Durable state | Correct next behavior |
+| --- | --- | --- |
+| before SecretStorage write | working copy only | no auto-resume; safe orphan cleanup |
+| after SecretStorage, before marker | secret only | no auto-resume because marker absent; cleanup later |
+| after marker, before `openFolder` | complete pending launch | source window may offer "Open pending session"; target can be opened later |
+| during successful `openFolder` | complete pending launch | old extension host may die; target activation owns continuation |
+| target opens untrusted | complete pending launch | do nothing until Trust; state remains durable indefinitely |
+| extension host dies while untrusted | complete pending launch | no effect |
+| VS Code closes/restarts while untrusted | complete pending launch | reopening exact folder and trusting it still resumes |
+| crash after Trust during startup | complete pending launch + stale startup lock | later activation retries after lock expiry |
+| startup reaches commit, crash before index cleanup | secret has no pending launch; index may be stale | treat as established/manual session; clean stale index |
+
+The important rule is that **pending intent is removed only at the startup commit point, never at claim time**.
+
+## 4.4 Do not roll back merely because `openFolder()` does not return normally
+
+A successful same-window `openFolder()` intentionally shuts down the current extension host. Therefore absence of a normal continuation after the call is not evidence of failure.
+
+If VS Code explicitly reports an error while the source host is still alive, keep the pending launch and offer:
+
+- **Retry Open Folder**;
+- **Cancel Pending Session**.
+
+Do not delete the launch automatically just because navigation failed once.
+
+---
+
+# 5. Trusted target activation: deterministic reconciliation
+
+Replace the current claim-and-delete model with reconciliation from durable state.
+
+```ts
+async function reconcileSessionWorkspaceOnActivation(context) {
+  const folder = singleLocalWorkspaceFolder();
+  if (!folder) return;
+
+  const marker = await readAndValidateMarker(folder);
+  if (!marker) return;
+
+  // If limited-mode happens to be allowed, remain inert here.
+  if (!vscode.workspace.isTrusted) {
+    renderAwaitingTrustOnly();
+    return;
+  }
+
+  const secret = await descriptorSecret(context, marker);
+  if (!secret) {
+    showMissingCredentialsRecovery();
+    return;
+  }
+
+  const pending = secret.pendingLaunch;
+  if (pending && pendingMatchesMarkerAndFolder(pending, marker, folder)) {
+    await startExactPendingLaunchSingleFlight(context, marker, secret, pending);
+    return;
+  }
+
+  if (pending) {
+    // Secret says a fresh launch exists but the marker/folder identity does not match.
+    // This is an integrity failure, not an old-session reconnect case.
+    failClosedAndOfferDiagnostics();
+    return;
+  }
+
+  // Existing marker + credentials but no pending intent = old/established session.
+  await offerManualSavedSessionReconnect(context, marker);
+}
+```
+
+### Important
+
+A valid pending launch should **not have an age-based auto-resume cutoff**. The explicit Start/Join is already the consent. Waiting one hour does not turn it into an unrelated old session.
+
+If product UX wants to warn after a long delay, show a warning **without invalidating the pending identity**.
+
+---
+
+# 6. Cross-window single-flight: filesystem startup lease
+
+A module-level `workspaceSessionRestore` promise only protects one extension host. It does not protect two VS Code windows opening the same session working folder.
+
+Use a small local lock file created atomically with exclusive create (`open(..., 'wx')`) after Trust:
+
+```text
+.pair-notebook-start.lock
+```
+
+Suggested contents:
+
+```json
+{
+  "version": 1,
+  "launchId": "...",
+  "attemptId": "...",
+  "acquiredAt": 1788912345678
+}
+```
+
+Rules:
+
+1. Acquire only after workspace is trusted and pending identity has been verified.
+2. `wx` / exclusive-create means only one process wins.
+3. If another non-stale lock exists, do not start a second runtime.
+4. If the extension host crashes, the file is allowed to become stale.
+5. A stale lock may be removed after a bounded lease (for example 120 seconds) and acquisition retried.
+6. Removing a stale lock is race-safe because the next exclusive create still has one winner.
+7. Delete the lock in `finally` on normal success/failure.
+8. The lock is **not** the durable launch intent. Losing it never loses the session.
+
+Keep the module-level promise as an additional same-process guard, but stop surfacing "existing session is still restoring" as a normal user error.
+
+---
+
+# 7. Workspace Trust manifest strategy
+
+## 7.1 Safe default: `supported: false`
+
+For a security-sensitive extension that synchronizes files and runs Python, the cleanest default is:
 
 ```json
 "capabilities": {
   "untrustedWorkspaces": {
     "supported": false,
-    "description": "Pair Notebook starts networking, project synchronization and Python execution only after this isolated session folder is trusted. A pending Start/Join is preserved while Restricted Mode is active."
+    "description": "Pair Notebook remains disabled until this isolated session folder is trusted. An explicit pending Start/Join is persisted and resumes after Trust."
   }
 }
 ```
 
-This intentionally accepts that Pair Notebook disappears in Restricted Mode. That is safe and is exactly the state the implementation must survive.
+This exactly matches the user's observed VS Code behavior: the extension disappears in Restricted Mode and returns after Trust.
 
-If product UX later prefers `"limited"`, that can be kept as an optional enhancement, but the startup state machine must behave identically if VS Code or a user override disables the extension completely.
+The startup architecture must intentionally support that behavior.
 
-Do **not** use limited-mode in-memory listeners as the only continuation mechanism.
+## 7.2 If `limited` is retained, it is only a UX optimization
 
----
+If the project keeps `supported: "limited"`, correctness still must not depend on it because users can override untrusted-workspace support.
 
-# 4. Durable pending-launch transaction
+In limited mode:
 
-Replace the current one-record, process-identity-bound `PendingSessionLaunch v2` with a durable `v3` transaction that survives extension-host death and long Trust delays.
+- do not create `SessionRuntime`;
+- do not open signalling sockets;
+- do not run CRDT sync;
+- do not run Python;
+- do not consume/clear `pendingLaunch`;
+- optionally show only an "Awaiting Workspace Trust" view;
+- `onDidGrantWorkspaceTrust` may call the same reconciliation function as a fast path.
 
-Suggested shape:
+## 7.3 Audit `activate()` ordering under limited mode
 
-```ts
-export interface PendingSessionLaunchV3 {
-  version: 3;
-  launchId: string;
-  kind: 'start' | 'join';
-  sessionId: string;
-  projectId: string;
-  peerId: string;
-  workingFolder: string;
-  descriptorDigest: string;
-  createdAt: number;
-  autoResumeUntil: number;
-  lastAttemptAt?: number;
-  lastFailure?: 'network' | 'startup';
-}
-```
+Current `activate()` calls `applyMeshNetworkConfiguration()` before the Trust-specific restore logic. If limited mode remains, move untrusted activation into a deliberately minimal branch so the extension does not perform unnecessary proxy/SecretStorage migration/network configuration work before Trust.
 
-Properties:
-
-- `launchId`: cryptographically random non-secret ID generated specifically for this Start/Join transaction.
-- `kind`: distinguishes host Start from guest Join.
-- `sessionId`, `projectId`, `peerId`, `workingFolder`: exact binding to the target marker.
-- `descriptorDigest`: SHA-256 of a canonical non-secret descriptor subset. This prevents an unrelated or modified marker from consuming a pending launch.
-- `createdAt`: diagnostics and cleanup.
-- `autoResumeUntil`: at least 24 hours after creation. This guarantees a one-hour Trust delay while bounding surprising auto-start of forgotten state.
-- no session token or private identity key in globalState. Secrets remain only in VS Code SecretStorage.
-
-Store pending launches as a **bounded map/list**, not one global singleton, so two VS Code windows cannot overwrite each other's launches.
-
-Suggested key:
-
-```text
-pairNotebook.pendingSessionLaunch.v3
-```
-
-with maximum 16 records and deterministic stale cleanup.
-
-## 4.1 Do not bind correctness to `VSCODE_PID`, IPC hook, or `vscode.env.sessionId`
-
-Those values may be retained in diagnostics, but they must not determine whether a valid delayed Trust can continue the launch.
-
-The correctness binding is:
-
-```text
-exact working folder
-+ exact sessionId
-+ exact projectId
-+ exact peerId
-+ exact descriptor digest
-+ matching SecretStorage credentials
-```
-
-That is sufficient to prove this activation belongs to the pending local Start/Join transaction.
-
-## 4.2 Persist in the correct order
-
-For host Start:
-
-```text
-1. validate trusted source workspace
-2. choose backing folder
-3. create isolated working copy
-4. create descriptor + SecretStorage credentials
-5. write .pair-notebook-session.json
-6. write durable PendingSessionLaunchV3
-7. ONLY NOW call vscode.openFolder(target)
-```
-
-For guest Join:
-
-```text
-1. validate trusted source workspace
-2. parse invite and bootstrap snapshot
-3. create descriptor + SecretStorage credentials
-4. write .pair-notebook-session.json
-5. write durable PendingSessionLaunchV3
-6. ONLY NOW call vscode.openFolder(target)
-```
-
-If step 6 fails, do not open the target folder. Roll back the fresh local session artifacts.
-
-If `vscode.openFolder()` itself throws, remove the pending launch and roll back the fresh launch or offer an explicit retry.
-
----
-
-# 5. Trusted activation algorithm
-
-Replace `offerWorkspaceSessionRestore()` / `claimPendingSessionLaunch()` semantics with activation-time reconciliation.
-
-Pseudo-code:
+Pseudo-structure:
 
 ```ts
-async function reconcileWorkspaceSessionOnActivation(context) {
-  const folder = currentWorkspaceFolder();
-  if (!folder) return;
+activate(context) {
+  register safe UI / output;
 
-  const marker = await readMarkerIfPresent(folder);
-  if (!marker) return;
-
-  // If Pair Notebook happens to be running in limited Restricted Mode,
-  // do nothing except wait. NEVER consume durable launch state here.
-  if (!vscode.workspace.isTrusted) return;
-
-  const pending = await findExactPendingLaunch(context, marker, folder);
-
-  if (pending && pending.autoResumeUntil >= Date.now()) {
-    await continuePendingLaunch(context, pending, marker);
+  if (!vscode.workspace.isTrusted) {
+    register trust-only UI;
+    onDidGrantWorkspaceTrust(() => reconcile...);
     return;
   }
 
-  if (pending) {
-    // Expired pending launches are not silently destroyed. Require one fresh
-    // confirmation, then continue the same session if credentials still match.
-    await offerExpiredPendingLaunchResume(context, pending, marker);
-    return;
-  }
-
-  // Marker with no matching pending launch is an old/recent session.
-  // It stays manual-only.
-  await offerManualSavedSessionReconnect(context, marker);
+  initialize trusted-only network/config/runtime integrations;
+  reconcileSessionWorkspaceOnActivation(context);
 }
 ```
 
-Important invariants:
+With `supported: false`, VS Code enforces this boundary for us.
 
-- never delete a valid pending launch because the workspace is untrusted;
-- never convert the pending launch to an in-memory-only claim;
-- never start networking while `workspace.isTrusted === false`;
-- never auto-resume a marker that lacks an exact pending transaction;
-- never let an unrelated old marker consume a pending transaction;
-- never create a second session ID when continuing the pending launch.
+---
 
-## 5.1 Consume pending state only after successful startup
+# 8. Activation after Trust must be a release-tested contract
 
-Current `0.5.26` deletes the durable record too early.
+Current activation events include:
 
-New rule:
-
-```text
-pending launch exists
-   -> restore exact existing descriptor
-   -> SessionRuntime.start()
-   -> bind synchronizer/controller/presence
-   -> runtime reaches usable state
-   -> remember Recent Session
-   -> remove pending launch
+```json
+[
+  "onView:pairNotebook.dashboard",
+  "workspaceContains:.pair-notebook-session.json"
+]
 ```
 
-If the extension host crashes halfway through startup, the pending launch remains recoverable.
+When the exact session working folder becomes trusted, the marker is already present. That should provide a natural activation reason. VS Code's Trust enablement test plan confirms extensions disabled by Trust become enabled after Trust.
 
-Use an idempotent startup lease only to prevent duplicate simultaneous attempts; do not use the lease as the durable intent itself.
+However, because "re-enabled" and "our exact activation sequence fired correctly" are distinct implementation details, **do not treat static reasoning as sufficient**.
 
-A lease can be short-lived, for example 120 seconds:
+Release acceptance must prove on installed VSIX:
+
+```text
+Start
+ -> target folder opens Restricted Mode
+ -> Pair Notebook disabled
+ -> wait
+ -> click Trust
+ -> Pair Notebook activates automatically
+ -> exact pending launch starts without another Start/Join click
+```
+
+This is mandatory because the current automated E2E disables Workspace Trust and cannot prove it.
+
+---
+
+# 9. Startup commit point
+
+A fresh pending launch becomes an established session only after all local bindings needed for normal operation exist.
+
+Suggested commit criteria:
+
+```text
+SessionRuntime local state prepared
++ transport state classified (ready or retryable offline state)
++ EditorSynchronizer bound
++ PresenceRenderer bound
++ NotebookController bound
++ terminal handlers installed
++ session context keys set consistently
+```
+
+Then:
+
+```text
+1. persist descriptor with freshStart=false where applicable
+2. clear pendingLaunch from SecretStorage
+3. add/update Recent Session
+4. remove pending-launch index entry
+5. release startup lock
+```
+
+Order matters: clear the authoritative pending intent only when enough state exists that a later activation can safely treat this as an established saved session.
+
+If commit step 2 succeeds but Recent indexing fails, the session is still established; repair the index later. Recent UI is not the source of truth.
+
+---
+
+# 10. Network startup must stop being terminal for transient availability
+
+## 10.1 Separate local preparation from network availability
+
+Current startup couples:
+
+```text
+local project preparation
++
+transport construction
++
+emergency relay readiness
+```
+
+into one `SessionRuntime.start()` success/failure result.
+
+Split the concepts:
+
+```text
+LOCAL_READY      = project/storage/handlers are valid locally
+NETWORK_READY    = at least one usable discovery/data route family is available
+HOST_READY       = guest has authenticated host route and current project state
+```
+
+A transient failure of NETWORK_READY must not destroy LOCAL_READY.
+
+## 10.2 Typed startup failures
+
+Introduce explicit classification instead of throwing generic errors into one terminal path:
 
 ```ts
-{
-  launchId,
-  attemptId,
-  startedAt
+type StartupFailureKind =
+  | 'local-fatal'
+  | 'network-unavailable'
+  | 'host-unavailable'
+  | 'session-ended';
+```
+
+Examples:
+
+### `local-fatal`
+
+- malformed/invalid marker;
+- missing required SecretStorage identity;
+- invalid local project path;
+- unsafe storage state;
+- unrecoverable local filesystem failure.
+
+### `network-unavailable`
+
+- no Nostr signalling endpoint ready;
+- no MQTT signalling endpoint ready;
+- emergency relay families unavailable;
+- VPN/proxy blocks sockets;
+- temporary DNS/TCP/TLS failure.
+
+### `host-unavailable`
+
+- guest target was trusted long after bootstrap and host is currently offline;
+- 45 second initial-state wait expires;
+- pinned host route is temporarily absent before first active commit.
+
+### `session-ended`
+
+- authenticated termination evidence proves the session ended.
+
+Only `local-fatal` and authenticated `session-ended` are terminal for automatic retry semantics.
+
+## 10.3 `MeshTransport.start()` should return readiness information for availability failures
+
+Do not make "no emergency relay family ready within 15 seconds" equivalent to corrupt session state.
+
+Preferred contract:
+
+```ts
+interface TransportStartResult {
+  state: 'ready' | 'degraded' | 'unavailable';
+  signallingFamilies: string[];
+  emergencyRelayReady: boolean;
+  diagnostics: ...;
 }
 ```
 
-If the process dies, the lease expires and the same durable launch may retry.
+Configuration/invariant errors can still throw. Availability errors become a result/state.
 
----
-
-# 6. Remove the `still restoring` dead-end from user flow
-
-`workspaceSessionRestore` should protect only an **actual trusted startup attempt**, not the whole Trust waiting period.
-
-Rules:
-
-1. While untrusted: no restore promise exists.
-2. After trusted activation: create one startup promise for the exact pending session.
-3. The dashboard Start/Join buttons should be disabled while that promise is active instead of allowing a click that throws:
-
-```text
-The existing Pair Notebook workspace session is still restoring...
-```
-
-4. The promise must always clear in `finally`.
-5. A failed startup must transition to a specific retryable UI state, not leave the window appearing permanently busy.
-
-The internal guard may remain, but it should be an invariant assertion, not a normal user-visible error path.
-
----
-
-# 7. Fresh launch vs Recent Session lifecycle
-
-Do not call `rememberProject()` before the first successful runtime startup.
-
-New lifecycle:
-
-```text
-fresh launch requested
-  -> pending launch store
-  -> target folder / Trust
-  -> runtime starting
-  -> SUCCESS
-      -> rememberProject(...)
-      -> remove pending launch
-
-  -> FAILURE BEFORE READY
-      -> do NOT create normal Recent Session history
-      -> keep one Pending Session transaction
-      -> offer Retry / Cancel
-```
-
-This prevents repeated failed attempts from creating many identical `project_test` cards.
-
-For an already established session that later disconnects, current Recent Session semantics may remain unchanged.
-
-## 7.1 Cancel pending launch
-
-Add an explicit cleanup path for a fresh session that never became ready:
-
-```text
-Cancel Pending Session
-```
-
-It should:
-
-- remove the durable pending launch;
-- remove its SecretStorage credentials;
-- remove the marker;
-- remove any accidental Recent Session entry for that exact fresh launch;
-- optionally delete the isolated working copy after explicit confirmation;
-- never affect another session.
-
----
-
-# 8. Network startup must be retryable, not terminal
-
-The Trust fix alone is insufficient because current startup can still terminate on transient relay/network readiness.
-
-## 8.1 Current problematic behavior
-
-Current `MeshTransport.start()`:
-
-```text
-create primary Trystero room
-  -> await startRelayFallback()
-       -> RedundantFrameRelay.waitUntilReady(15s)
-            -> both Nostr/MQTT emergency families fail
-                 -> throw
-  -> SessionRuntime marks local-route-failed terminal
-```
-
-A temporary VPN/proxy/public-relay problem therefore destroys a fresh host runtime even though the local project/session identity is valid.
-
-## 8.2 Required behavior
-
-Separate **session creation** from **external network reachability**.
+## 10.4 Fresh host behavior with no network
 
 For a host:
 
 ```text
-local session created
-project loaded
-credentials valid
-transport objects initialized
-        ↓
-network currently unavailable?
-        ↓ yes
-runtime state = network-unavailable / reconnecting
-same session remains alive
-background retry continues
-        ↓
-network becomes available
-        ↓
-ready for peers
+local project loads successfully
+ -> transport unavailable
+ -> keep same SessionRuntime / descriptor / identity
+ -> show NETWORK UNAVAILABLE
+ -> retry in background and on explicit Reconnect
+ -> network becomes ready
+ -> transition to active
 ```
 
-Do not create a new session ID for retries.
+Do not call `disposeAsync('local-route-failed')` merely because public signalling/relay infrastructure is temporarily unreachable.
 
-## 8.3 Concrete transport change
+A session invite can be generated from the same session identity, but UI should clearly indicate whether the host is currently reachable.
 
-`MeshTransport.start()` should not make emergency relay readiness a fatal requirement when the failure is transient.
+## 10.5 Guest behavior after delayed Trust
 
-Recommended split:
-
-```ts
-await initializeTransportObjects();
-startTransportTimersAndWatcher();
-void ensureSignallingAndRelayReadinessWithRetry();
-```
-
-or return structured startup status:
-
-```ts
-interface MeshStartupResult {
-  initialized: true;
-  readyFamilies: Array<'nostr' | 'mqtt' | 'relay-nostr' | 'relay-mqtt'>;
-  degraded: boolean;
-}
-```
-
-External reachability errors should be recorded in diagnostics and retried with bounded backoff, for example:
+For a guest whose snapshot bootstrap already succeeded:
 
 ```text
-1s -> 2s -> 5s -> 10s -> 30s -> 30s ...
+Trust after 1 hour
+ -> exact pending guest identity starts
+ -> host currently unavailable
+ -> keep pending Join / isolated snapshot
+ -> show WAITING FOR HOST / RETRY
+ -> same peerId and keypair retry later
 ```
 
-A terminal `local-route-failed` should be reserved for truly unrecoverable local initialization errors such as invalid cryptographic/session configuration or impossible internal state, not a temporary public relay outage.
+Do not make the 45 second initial-state timeout destroy the pending guest launch.
 
-## 8.4 Runtime/UI state
-
-Add an explicit state such as:
-
-```text
-network-unavailable
-```
-
-or reuse `reconnecting` with a precise detail string.
-
-The host dashboard should say that the session exists locally and is waiting for network reachability. `Reconnect` should retry the same runtime/session.
-
-Do not label this as "host lost" for the host's own fresh startup.
-
-## 8.5 Guest Join
-
-Guest snapshot bootstrap genuinely needs a route to the host. It may remain network-blocking, but it must be retryable without losing the invite-derived pending intent.
-
-If snapshot download fails transiently:
-
-- keep the same Join transaction and local identity;
-- offer Retry;
-- do not create a fake Recent Session;
-- do not require the user to paste a new invite unless the host explicitly ended/revoked the session.
+If authenticated termination is later observed, clear the pending intent and mark the session ended.
 
 ---
 
-# 9. Do not change normal synchronization while fixing startup
+# 11. Retry scheduler
 
-This repair should be scoped to startup/lifecycle/network-readiness code.
+Use bounded exponential backoff with jitter for transient startup networking:
 
-Unless a new failing test proves otherwise, do not modify:
+```text
+1 s
+2 s
+5 s
+10 s
+20 s
+30 s
+30 s ...
+```
 
-- protocol v7 semantics;
-- `src/core/crdt.ts`;
-- Yjs local-first text ownership;
-- notebook cell stable-ID synchronization;
+Reset backoff when:
+
+- network interface changes;
+- proxy configuration changes;
+- user presses Reconnect;
+- at least one signalling family becomes ready.
+
+Retry must be idempotent and reuse:
+
+- session ID;
+- token;
+- peer identity key;
+- host clock;
+- working folder;
+- CRDT local state.
+
+Never implement retry by recursively calling Start Session / Join Session.
+
+---
+
+# 12. Pending Session vs Recent Session UI
+
+Add a distinct lifecycle category.
+
+## Pending Session
+
+A Start/Join explicitly requested but not yet committed.
+
+Suggested states:
+
+- `Awaiting Workspace Trust`
+- `Starting`
+- `Network unavailable — retrying`
+- `Waiting for Session Host`
+- `Startup error — Retry / Cancel`
+
+## Recent Session
+
+A session that reached the established commit point at least once and was later left/disconnected.
+
+This removes the current ambiguity where failed launches appear as if the user had previously participated and left.
+
+Do not display one pending attempt as repeated `project_test` cards.
+
+---
+
+# 13. Explicit Cancel semantics
+
+Add **Cancel Pending Session** for a launch that never committed.
+
+It must target the exact `(sessionId, peerId, workingFolder)` and:
+
+1. stop any retry loop;
+2. remove pending-launch SecretStorage intent;
+3. remove session credentials if the session never committed;
+4. remove marker;
+5. remove pending index entry;
+6. remove accidental Recent entry for that exact launch if migration left one;
+7. optionally remove the isolated working copy after explicit user confirmation.
+
+Never delete a working copy of another peer/session.
+
+---
+
+# 14. Terminal session-ended while pending
+
+A long Trust delay creates a real edge case: the host may end the session before the guest ever trusts the target folder.
+
+Required behavior:
+
+```text
+pending guest launch
+ -> later Trust
+ -> attempt exact same host/session
+ -> authenticated termination evidence received
+ -> classify session-ended
+ -> clear pending intent and credentials
+ -> keep local working copy if useful
+ -> tell user session was ended by host
+```
+
+Do not silently generate a new Join or ask the user to reuse a stale invite.
+
+A simple host timeout is **not** termination evidence.
+
+---
+
+# 15. System suspend/watchdog interaction
+
+The `0.5.25`/`0.5.26` readiness guard around the suspend watchdog is conceptually correct: a startup/Trust delay must never be mistaken for a suspended active session.
+
+Keep the invariant:
+
+```text
+watchdog can leave only the same runtime
+that was already observed as an established/ready runtime
+on both sides of the timer gap
+```
+
+Do not arm it for:
+
+- awaiting Trust;
+- pending local startup;
+- fresh host network-unavailable before commit;
+- pending guest waiting for initial host state.
+
+After session commit, existing suspend/recent semantics can remain.
+
+---
+
+# 16. Security model for automatic post-Trust resume
+
+Automatic resume after Trust is safe only because it is backed by extension-owned secret state.
+
+Required validation before any network starts:
+
+```text
+workspace is trusted
+AND marker parses and normalizes safely
+AND actual workspace path equals expected working folder
+AND SecretStorage exists for marker sessionId + peerId
+AND SecretStorage contains pendingLaunch
+AND immutable descriptor digest matches
+AND local public identity matches stored private key
+AND session has no authenticated terminal marker
+AND startup lock acquired
+```
+
+If any check fails:
+
+```text
+NO automatic network activity
+NO fallback to "probably the same session"
+NO creation of a replacement identity
+```
+
+Show diagnostics/manual recovery instead.
+
+This is stronger than binding to `VSCODE_PID` because it validates the actual durable session identity rather than the editor process that happens to be running it.
+
+---
+
+# 17. Tests required before implementation is considered complete
+
+## 17.1 Pure unit tests: durable launch identity
+
+At minimum:
+
+1. v1 session secret still decodes.
+2. v2 pending Start secret decodes.
+3. v2 pending Join secret decodes.
+4. pending digest matches exact descriptor identity.
+5. sessionId mismatch rejected.
+6. projectId mismatch rejected.
+7. peerId mismatch rejected.
+8. identity public-key mismatch rejected.
+9. hostPeerId mismatch rejected.
+10. working-folder mismatch rejected.
+11. path case normalization is correct on Windows.
+12. symlink/junction substitution is rejected where supported.
+13. mutable descriptor fields do not change immutable digest.
+14. pending launch does not expire after simulated 1 hour.
+15. pending launch does not expire after simulated multi-day clock advance.
+16. clock moves backwards without invalidating identity.
+17. clearing pending intent preserves token/private key.
+18. old established secret has no auto-resume intent.
+19. malformed pending record fails closed.
+20. missing secret fails closed.
+
+## 17.2 Transaction/crash tests
+
+Simulate process death after every write step listed in the crash matrix and assert the next activation outcome.
+
+Especially:
+
+- crash after secret before marker;
+- crash after marker before `openFolder`;
+- target activation before Trust;
+- extension-host reset while awaiting Trust;
+- crash after Trust after startup-lock acquisition;
+- crash after runtime ready before pending intent clear;
+- crash after intent clear before Recent index update.
+
+## 17.3 Multi-window tests
+
+- two independent pending launches do not overwrite each other;
+- two windows opening the same pending folder produce one startup winner;
+- stale startup lock recovers;
+- live startup lock blocks duplicate runtime;
+- unrelated workspace cannot consume another pending launch.
+
+## 17.4 Network classification tests
+
+- both emergency relay families unavailable => `network-unavailable`, not terminal destruction;
+- one family available => startup proceeds degraded/ready;
+- network returns later => same runtime/session identity transitions ready;
+- proxy/VPN change wakes retry;
+- guest initial-state 45s timeout => `host-unavailable`, same pending identity preserved;
+- host returns later => same guest identity completes startup;
+- authenticated session-ended => terminal cleanup.
+
+## 17.5 Existing sync regression suite
+
+All existing text/notebook/output/execution tests must remain green without altering their expected protocol semantics.
+
+---
+
+# 18. Real Workspace Trust E2E / acceptance gate
+
+The current `--disable-workspace-trust` run stays useful as a trusted baseline, but it is not a Trust test.
+
+Add a separate Trust test lane as far as VS Code tooling permits, following the official recommendation for separate trusted/untrusted runs:
+
+https://code.visualstudio.com/api/working-with-extensions/testing-extension#testing-workspace-trust-behavior
+
+Because a normal extension test cannot grant Trust programmatically, an **installed-VSIX GUI acceptance** remains release-blocking until a reliable external UI automation harness exists.
+
+Required physical/GUI cases:
+
+### T-A — delayed Trust, host
+
+1. clean VS Code user profile;
+2. install candidate VSIX;
+3. open trusted source project;
+4. Start Session;
+5. target isolated folder opens Restricted Mode;
+6. verify Pair Notebook is disabled/limited and no session network is active;
+7. wait at least 60 seconds in the fast acceptance run; also test a synthetic pending age >1 hour;
+8. press Trust;
+9. verify extension returns automatically;
+10. verify same `sessionId/peerId` becomes active without another Start click.
+
+### T-B — close/reopen before Trust
+
+1. reach untrusted target folder;
+2. close VS Code completely;
+3. reopen the exact target folder;
+4. Trust it;
+5. same pending launch resumes.
+
+### T-C — extension-host/window reload before Trust
+
+Same expected outcome.
+
+### T-D — network unavailable after Trust
+
+1. Trust target while VPN/network route is unavailable;
+2. verify pending session is retained, not converted to Recent and not assigned a new ID;
+3. restore network;
+4. verify automatic retry reaches active state with same ID.
+
+### T-E — delayed guest Trust
+
+1. complete snapshot bootstrap;
+2. leave guest target untrusted;
+3. temporarily stop host;
+4. Trust guest target;
+5. verify WAITING FOR HOST, no new peer identity;
+6. restore host;
+7. same guest completes session.
+
+### T-F — old marker
+
+Open a previously established session folder with no pending secret intent. It must not auto-connect merely because the folder is trusted.
+
+### T-G — copied/tampered marker
+
+No automatic route.
+
+---
+
+# 19. Files expected to change
+
+Primary:
+
+- `package.json`
+- `src/extension.ts`
+- `src/core/manualSessionRestore.ts` or replacement `src/core/pendingSessionLaunch.ts`
+- session-secret encode/decode helpers (prefer extracting them from `extension.ts`)
+- `src/runtime/session.ts`
+- `src/runtime/mesh.ts`
+- `src/vscode/dashboard.ts`
+- tests and E2E harness
+
+Likely useful new modules:
+
+```text
+src/core/sessionSecret.ts
+src/core/pendingSessionLaunch.ts
+src/core/startupLease.ts
+```
+
+This reduces the amount of lifecycle state hidden inside the already large `extension.ts`.
+
+---
+
+# 20. Files/semantics that must not be changed without a separate proven defect
+
+Do not opportunistically rewrite:
+
+- `src/core/crdt.ts` local-first ownership;
+- protocol v7 wire compatibility;
+- Yjs text update rules;
+- notebook stable-cell identity;
 - output/execution synchronization;
-- text projection rules in `src/vscode/sync.ts`.
+- text projection quarantine model;
+- host authority/election semantics.
 
-Likely production files to modify:
-
-```text
-package.json
-src/extension.ts
-src/core/manualSessionRestore.ts   (or replace with pendingSessionLaunch.ts)
-src/core/recentProjects.ts         (only if needed to separate Pending vs Recent)
-src/runtime/mesh.ts
-src/runtime/session.ts
-src/vscode/dashboard.ts            (pending/network UI only)
-```
-
-Normal collaboration logic should remain untouched.
+The current failure happens before normal collaboration startup and must be repaired at the lifecycle/transport boundary.
 
 ---
 
-# 10. Tests that must exist before release
+# 21. Implementation order
 
-## 10.1 Pure pending-launch state-machine tests
+Do this as a controlled sequence, not as another patch chain.
 
-Required automated cases:
+## Phase 1 — tests first
 
-1. pending Start survives 1 minute;
-2. pending Start survives **2 hours** of simulated time;
-3. pending Join survives 2 hours;
-4. pending state survives extension module disposal/reactivation;
-5. untrusted activation does not consume/delete pending state;
-6. trusted activation with exact marker resumes automatically;
-7. wrong session ID cannot consume pending launch;
-8. wrong project ID cannot consume pending launch;
-9. wrong peer ID cannot consume pending launch;
-10. wrong working folder cannot consume pending launch;
-11. modified descriptor digest cannot consume pending launch;
-12. missing SecretStorage credentials cannot auto-start;
-13. old marker with no pending launch remains manual-only;
-14. successful startup removes pending launch exactly once;
-15. startup exception keeps the same pending launch retryable;
-16. expired auto-resume window requires confirmation instead of silently starting;
-17. no pending-launch record contains token/private key;
-18. multiple simultaneous pending launches do not overwrite each other;
-19. Cancel removes only the selected pending launch;
-20. retry reuses the same sessionId/projectId/peerId.
+Add failing tests for:
 
-Use an injectable clock. Do not make CI literally sleep for an hour.
+- durable pending intent surviving process reset;
+- no expiry after one hour;
+- marker/secret digest binding;
+- multi-window lock;
+- no early Recent Session;
+- network-unavailable retry;
+- guest host-unavailable retry.
 
-## 10.2 Fresh-launch lifecycle tests
+Do not touch sync semantics.
 
-Required:
+## Phase 2 — durable intent
 
-- `rememberProject()` is not called before runtime success;
-- failed fresh host startup produces no normal Recent Session card;
-- repeated Retry does not create duplicate Recent Sessions;
-- successful Retry creates exactly one Recent Session;
-- terminal remote `session-ended` still clears reconnect credentials correctly;
-- explicit Leave after a successfully established session keeps current semantics.
+- introduce session-secret v2;
+- put pending launch in SecretStorage;
+- stop using process identity as authorization;
+- make global pending state index-only;
+- persist before `openFolder`.
 
-## 10.3 Network startup tests
+## Phase 3 — activation reconciliation
 
-Required:
+- stop claim-and-delete before Trust;
+- reconcile only after trusted activation;
+- add startup lock;
+- consume pending intent only at commit.
 
-- both emergency relay families unavailable at first -> host session remains retryable, not terminal;
-- network becomes available later -> same session reaches ready state;
-- one relay family available -> startup works;
-- primary signalling unavailable but fallback later recovers -> same session works;
-- VPN/proxy configuration refresh does not recreate session identity;
-- unrecoverable local configuration error still produces a typed terminal failure;
-- no text/CRDT sync tests regress.
+## Phase 4 — lifecycle/UI cleanup
 
-## 10.4 Real VS Code Trust tests
+- Pending Sessions separate from Recent Sessions;
+- Retry / Cancel;
+- remove normal user exposure of `still restoring`.
 
-Keep the existing E2E suite for normal trusted editor/runtime behavior, but it cannot be the Trust test because it uses `--disable-workspace-trust`.
+## Phase 5 — transport retryability
 
-Add a separate Trust acceptance track with Workspace Trust enabled and a fresh user-data directory.
+- typed availability failures;
+- non-terminal fresh-host network outage;
+- non-terminal guest initial-host timeout;
+- retry scheduler.
 
-At minimum, release acceptance must manually exercise the installed VSIX:
+## Phase 6 — Trust release gate
 
-```text
-A. start from trusted normal project
-B. click Start Session
-C. isolated folder opens in Restricted Mode
-D. verify session/network does not start while untrusted
-E. wait (manual test can be short; automated state-machine test covers 2h)
-F. click Trust
-G. verify same sessionId is resumed automatically
-H. verify dashboard reaches active/ready or retryable-network state
-I. verify exactly one Recent Session exists after success
-J. connect a second physical computer
-K. verify two-way notebook/text/output sync
-```
+Run installed VSIX cases T-A through T-G on Windows, then physical two-computer collaboration acceptance.
 
-Also run the same path with `extensions.supportUntrustedWorkspaces` forcing Pair Notebook unsupported, because VS Code allows the user to override extension Workspace Trust support. This proves correctness does not rely on limited-mode activation.
-
-Official references:
-
-- https://code.visualstudio.com/api/extension-guides/workspace-trust
-- https://code.visualstudio.com/docs/editing/workspaces/workspace-trust
-- https://code.visualstudio.com/api/working-with-extensions/testing-extension
+Only after these pass should a new stable release be tagged.
 
 ---
 
-# 11. Required release gates
+# 22. Final acceptance definition
 
-Do not cut the next stable VSIX until all are true:
-
-- [ ] Start Session survives a delayed Trust of at least 2 simulated hours.
-- [ ] Join Session survives a delayed Trust of at least 2 simulated hours.
-- [ ] Correctness works even when the extension is completely disabled during Restricted Mode.
-- [ ] No pending launch is consumed before Trust.
-- [ ] No launch correctness depends on `VSCODE_PID`, IPC hook, or extension-host memory.
-- [ ] A successful launch produces exactly one Recent Session entry.
-- [ ] A failed fresh launch does not produce duplicate Recent Session cards.
-- [ ] A temporary network/relay outage does not terminally destroy a fresh host session.
-- [ ] Retry uses the same session identity.
-- [ ] Existing protocol-v7 sync tests pass unchanged.
-- [ ] Existing Extension Host E2E passes on Windows/Linux/macOS/minimum VS Code.
-- [ ] Separate Workspace Trust acceptance passes with Workspace Trust enabled.
-- [ ] Installed VSIX passes a physical two-computer Start -> Trust -> Join -> sync test.
-
----
-
-# 12. Suggested implementation sequence
-
-Implement in this order so failures remain attributable.
-
-## Phase A — durable Trust handoff
-
-1. Introduce `PendingSessionLaunchV3` and bounded persistent store.
-2. Remove correctness dependency on process identity.
-3. Write pending launch before `openFolder()`.
-4. Do not delete pending launch while untrusted.
-5. On trusted activation, exact-match and resume it.
-6. Remove pending only after runtime startup succeeds.
-7. Move `rememberProject()` after successful startup.
-8. Add Pending Session cancel/retry paths.
-9. Add 2-hour simulated delay tests.
-
-Do not touch sync or mesh behavior in this phase.
-
-## Phase B — transient network startup
-
-1. Make relay/signalling reachability retryable instead of fresh-session terminal.
-2. Add explicit degraded/network-unavailable runtime state.
-3. Preserve the exact same session during retries.
-4. Add failure -> network recovery tests.
-
-Do not touch CRDT/text/notebook sync behavior.
-
-## Phase C — Trust-specific acceptance
-
-1. Add a Trust-specific test/acceptance workflow that does **not** pass `--disable-workspace-trust`.
-2. Keep the existing E2E as the trusted baseline.
-3. Record installed-VSIX Trust acceptance before release.
-4. Run physical two-computer sync acceptance.
-
----
-
-# 13. Expected final user flow
-
-### Normal trusted target
+The startup repair is complete only when all of the following are true simultaneously:
 
 ```text
-Start Session
-  -> copy project
-  -> open isolated folder
-  -> trusted
-  -> same pending transaction resumes
-  -> runtime ready
+Start/Join explicit intent is durable
+AND openFolder may kill the old extension host
+AND Restricted Mode may disable Pair Notebook completely
+AND the user may wait >1 hour
+AND VS Code may restart before Trust
+AND Trust later reactivates the exact pending launch
+AND no stale marker auto-connects
+AND no duplicate local runtime can start
+AND transient network failure preserves the same identity
+AND failed fresh attempts do not pollute Recent Sessions
+AND old established sessions remain manual-only
+AND protocol-v7 sync behavior is unchanged
+AND installed-VSIX Trust acceptance passes
+AND physical two-computer sync acceptance passes
 ```
 
-### Target opens untrusted and user trusts immediately
+The key architectural change is:
 
 ```text
-Start Session
-  -> copy project
-  -> persist pending launch
-  -> open isolated folder
-  -> Pair Notebook disabled
-  -> Trust
-  -> Pair Notebook activates
-  -> exact pending launch found
-  -> same session starts
+BEFORE (0.5.26)
+explicit Start/Join
+ -> global pending record
+ -> openFolder
+ -> claim/delete durable record
+ -> RAM-only state while waiting for Trust
+ -> fragile restore
+
+AFTER
+explicit Start/Join
+ -> SecretStorage-attested pending intent + atomic marker
+ -> openFolder as hard process boundary
+ -> zero required Pair Notebook execution while untrusted
+ -> arbitrary Trust delay / restart
+ -> trusted activation verifies marker + secret intent
+ -> single-flight startup
+ -> retry transient network/host absence under same identity
+ -> commit once
+ -> clear pending intent
+ -> only then become Recent/established session
 ```
 
-### Target remains untrusted for one hour
-
-```text
-Start Session
-  -> persist pending launch
-  -> open isolated folder
-  -> Restricted Mode for 60+ minutes
-  -> no extension memory required
-  -> Trust
-  -> activation reads durable pending launch
-  -> same session starts
-```
-
-### Network is unavailable after Trust
-
-```text
-Trust
-  -> exact pending launch resumes
-  -> local session remains valid
-  -> network unavailable state
-  -> user changes VPN/proxy or waits
-  -> background/manual retry
-  -> same session becomes reachable
-```
-
-No second session ID, no stale reconnect confusion, no duplicate Recent Session cards, and no changes to normal CRDT synchronization are required.
-
----
-
-# Final design rule
-
-The Start/Join action must be represented as a **durable transaction**, not as an extension-host promise or in-memory claim.
-
-Workspace Trust may disable Pair Notebook for an arbitrary interval. That interval must be treated exactly like a process crash/restart boundary: after Trust, the extension reconstructs the launch solely from authenticated/persisted local state and continues the same session.
-
-Only after the session has actually started successfully should that transaction become normal Recent Session history.
+That state machine removes the timing dependency that caused the `0.5.24`–`0.5.26` repair chain instead of adding another timing-specific workaround.
