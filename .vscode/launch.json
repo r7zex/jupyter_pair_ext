@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pair Notebook: Extension Host E2E",
+      "type": "extensionHost",
+      "request": "launch",
+      "runtimeExecutable": "${execPath}",
+      "preLaunchTask": "npm: compile",
+      "args": [
+        "--disable-extensions",
+        "--disable-workspace-trust",
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--extensionTestsPath=${workspaceFolder}/out/test/e2e/suite/index.js",
+        "${workspaceFolder}"
+      ],
+      "env": {
+        "PAIR_NOTEBOOK_E2E": "1",
+        "PAIR_NOTEBOOK_E2E_WORKSPACE": "${workspaceFolder}"
+      },
+      "outFiles": [
+        "${workspaceFolder}/out/test/e2e/**/*.js",
+        "${workspaceFolder}/out/src/**/*.js"
+      ]
+    }
+  ]
+}
