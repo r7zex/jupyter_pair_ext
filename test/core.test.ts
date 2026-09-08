@@ -28,6 +28,7 @@ import {
   validateIdentityPublicKey,
   verifyIdentityTranscript,
 } from '../src/core/identity';
+import { isSystemSuspendGap, runConfirmedSessionRestore } from '../src/core/manualSessionRestore';
 import { StableCellIdRegistry, matchInitialCellIds, minimalNotebookSplice } from '../src/core/notebookIdentity';
 import { JupyterKernelEvent, PythonKernel, kernelLaunchSpec } from '../src/core/pythonKernel';
 import {
@@ -46,6 +47,8 @@ import {
   clearRecentReconnect,
   forgetRecentProject,
   normalizeRecentProjects,
+  presentRecentExit,
+  recentHostDisplayName,
   reconnectIdentityFromDescriptor,
   rememberRecentProject,
 } from '../src/core/recentProjects';
@@ -1963,13 +1966,13 @@ describe('compute launch and recent projects', () => {
     await writeFile(regularFile, 'not a project folder', 'utf8');
     try {
       const remembered = rememberRecentProject([
-        { name: 'old duplicate', workingFolder: available, at: 1 },
-        { name: 'missing', workingFolder: path.join(root, 'missing'), at: 2 },
-      ], { name: 'current', workingFolder: `${available}${path.sep}`, at: 3 });
+        { name: 'old duplicate', hostDisplayName: 'Old host', workingFolder: available, at: 1, leftAt: 1 },
+        { name: 'missing', hostDisplayName: 'Missing host', workingFolder: path.join(root, 'missing'), at: 2, leftAt: 2 },
+      ], { name: 'current', hostDisplayName: 'Current host', workingFolder: `${available}${path.sep}`, at: 3, leftAt: 3 });
       assert.equal(remembered.filter((item) => path.resolve(item.workingFolder) === path.resolve(available)).length, 1);
       const accessible = await accessibleRecentProjects([
         ...remembered,
-        { name: 'regular file', workingFolder: regularFile, at: 4 },
+        { name: 'regular file', hostDisplayName: 'File host', workingFolder: regularFile, at: 4, leftAt: 4 },
       ]);
       assert.deepEqual(accessible.map((item) => item.name), ['current']);
       assert.deepEqual(normalizeRecentProjects({ stale: true }), []);
@@ -1977,10 +1980,66 @@ describe('compute launch and recent projects', () => {
         { name: ' valid ', workingFolder: available, at: 4 },
         { name: '', workingFolder: available, at: 5 },
         { name: 'unsafe', workingFolder: 'bad\npath', at: 6 },
-      ]), [{ name: 'valid', workingFolder: available, at: 4 }]);
+      ]), [{
+        name: 'valid', hostDisplayName: 'Unknown host', workingFolder: available, at: 4, leftAt: 4,
+      }]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it('formats the exact Recent Session exit age and dd/mm/yy date', () => {
+    const leftAt = new Date(2026, 8, 8, 12, 0, 0).getTime();
+    assert.deepEqual(presentRecentExit(leftAt, leftAt + 60_000), {
+      relative: '1 минуту назад', date: '08/09/26',
+    });
+    assert.equal(presentRecentExit(leftAt, leftAt + 2 * 60_000).relative, '2 минуты назад');
+    assert.equal(presentRecentExit(leftAt, leftAt + 5 * 60_000).relative, '5 минут назад');
+    assert.equal(presentRecentExit(leftAt, leftAt + 3 * 3_600_000).relative, '3 часа назад');
+    assert.equal(presentRecentExit(leftAt, leftAt + 5 * 86_400_000).relative, '5 дней назад');
+  });
+
+  it('keeps restore unreachable until the user confirmation resolves true', async () => {
+    let resolveConfirmation!: (confirmed: boolean) => void;
+    let restoreCount = 0;
+    const confirmation = new Promise<boolean>((resolve) => { resolveConfirmation = resolve; });
+    const declined = runConfirmedSessionRestore(
+      () => confirmation,
+      async () => { restoreCount += 1; },
+    );
+    await Promise.resolve();
+    assert.equal(restoreCount, 0, 'activation-time inspection cannot start a restore');
+    resolveConfirmation(false);
+    assert.equal(await declined, 'declined');
+    assert.equal(restoreCount, 0);
+
+    assert.equal(await runConfirmedSessionRestore(
+      async () => true,
+      async () => { restoreCount += 1; },
+    ), 'restored');
+    assert.equal(restoreCount, 1);
+  });
+
+  it('detects an extension-host suspension only at the configured timer gap', () => {
+    assert.equal(isSystemSuspendGap(1_000, 15_999, 15_000), false);
+    assert.equal(isSystemSuspendGap(1_000, 16_000, 15_000), true);
+    assert.equal(isSystemSuspendGap(16_000, 1_000, 15_000), false);
+  });
+
+  it('offers workspace continuation on activation without starting a restore', async () => {
+    const source = await readFile(path.join(process.cwd(), 'src', 'extension.ts'), 'utf8');
+    const activateSource = source.slice(
+      source.indexOf('export async function activate'),
+      source.indexOf('export function deactivate'),
+    );
+    assert.match(activateSource, /offerWorkspaceSessionRestore\(context\)/);
+    assert.doesNotMatch(activateSource, /startWorkspaceSessionRestore\(context\)/);
+    const offerSource = source.slice(
+      source.indexOf('function offerWorkspaceSessionRestore'),
+      source.indexOf('function startWorkspaceSessionRestore'),
+    );
+    assert.match(offerSource, /runConfirmedSessionRestore/);
+    assert.match(offerSource, /showInformationMessage/);
   });
 
   it('terminates a bridge that emits an oversized protocol line', async () => {
@@ -2658,19 +2717,26 @@ describe('reconnectable Recent Sessions', () => {
 
     const normalized = normalizeRecentProjects([{
       name: 'Recent project',
+      sessionId: descriptor.sessionId,
+      hostDisplayName: 'Host',
       workingFolder: descriptor.workingFolder,
       at: 123,
+      leftAt: 456,
       reconnect,
       token: 'must-not-survive',
       identityPrivateKey: 'must-not-survive',
       transportPeerId: 'must-not-survive',
     }]);
     assert.equal(normalized.length, 1);
+    assert.equal(normalized[0]?.sessionId, 'recent-session');
+    assert.equal(normalized[0]?.hostDisplayName, 'Host');
+    assert.equal(normalized[0]?.leftAt, 456);
     assert.deepEqual(normalized[0]?.reconnect, reconnect);
     assert.equal('token' in (normalized[0] as any), false);
     assert.equal('identityPrivateKey' in (normalized[0] as any), false);
     assert.equal('transportPeerId' in (normalized[0] as any), false);
     assertRecentReconnectMatchesDescriptor(reconnect!, descriptor);
+    assert.equal(recentHostDisplayName(descriptor), 'Host');
 
     const remembered = rememberRecentProject([], normalized[0]!);
     assert.equal(remembered[0]?.reconnect?.sessionId, 'recent-session');

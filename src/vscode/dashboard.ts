@@ -1,11 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
+import { normalizeRecentProjects, presentRecentExit } from '../core/recentProjects';
 import { SessionRuntime, SessionSnapshot } from '../runtime/session';
 
 interface DashboardState {
   live: boolean;
   isHost?: boolean;
-  recent?: Array<{ name: string; folder: string; at: number }>;
+  recent?: Array<{
+    name: string;
+    folder: string;
+    hostName: string;
+    relativeExit: string;
+    exitDate: string;
+  }>;
   projectName?: string;
   mode?: string;
   durationSeconds?: number;
@@ -109,6 +116,10 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
 
   public reveal(): void {
     this.view?.show?.(true);
+  }
+
+  public refresh(): void {
+    this.push(true);
   }
 
   public dispose(): void {
@@ -293,18 +304,17 @@ function buildConnectionView(snapshot: SessionSnapshot): DashboardConnection | u
   };
 }
 
-function dashboardRecentProjects(value: unknown): Array<{ name: string; folder: string; at: number }> {
-  if (!Array.isArray(value)) return [];
-  const result: Array<{ name: string; folder: string; at: number }> = [];
-  for (const item of value.slice(0, 20)) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-    const raw = item as Record<string, unknown>;
-    if (typeof raw.name !== 'string' || !raw.name.trim() || raw.name.length > 256
-      || typeof raw.workingFolder !== 'string' || !raw.workingFolder.trim() || raw.workingFolder.length > 4096
-      || !Number.isSafeInteger(raw.at) || Number(raw.at) < 0) continue;
-    result.push({ name: raw.name, folder: raw.workingFolder, at: Number(raw.at) });
-  }
-  return result;
+function dashboardRecentProjects(value: unknown): NonNullable<DashboardState['recent']> {
+  return normalizeRecentProjects(value).map((item) => {
+    const exit = presentRecentExit(item.leftAt);
+    return {
+      name: item.name,
+      folder: item.workingFolder,
+      hostName: item.hostDisplayName,
+      relativeExit: exit.relative,
+      exitDate: exit.date,
+    };
+  });
 }
 
 function diff(previous: DashboardState, next: DashboardState): Partial<DashboardState> {
@@ -428,7 +438,7 @@ function html(): string {
     function render() {
       const root = document.getElementById('content');
       if (!state.live) {
-        const recent = (state.recent || []).map(item => '<div class="card"><strong>'+esc(item.name)+'</strong><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
+        const recent = (state.recent || []).map(item => '<div class="card"><strong>Сессия: '+esc(item.name)+'</strong><div>Хост: '+esc(item.hostName)+'</div><div class="tiny">Вы вышли '+esc(item.relativeExit)+' • '+esc(item.exitDate)+'</div><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
         root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать сессию</button><button id="join" class="secondary">Подключиться</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
         document.getElementById('start').onclick = () => command('start');
         document.getElementById('join').onclick = () => command('join');

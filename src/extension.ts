@@ -12,6 +12,7 @@ import {
   validateIdentityPrivateKey,
   validateIdentityPublicKey,
 } from './core/identity';
+import { isSystemSuspendGap, runConfirmedSessionRestore } from './core/manualSessionRestore';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
 import { copyProject } from './core/projectFiles';
 import {
@@ -20,7 +21,9 @@ import {
   clearRecentReconnect,
   forgetRecentProject,
   normalizeRecentProjects,
+  presentRecentExit,
   recentProjectForFolder,
+  recentHostDisplayName,
   reconnectIdentityFromDescriptor,
   rememberRecentProject,
 } from './core/recentProjects';
@@ -63,6 +66,8 @@ import {
 const MARKER = '.pair-notebook-session.json';
 const MAX_SESSION_MARKER_BYTES = 64 * 1024 * 1024;
 const MAX_RESTORED_PEERS = 255;
+const LIFECYCLE_WATCHDOG_INTERVAL_MS = 1_000;
+const SYSTEM_SUSPEND_GAP_MS = 15_000;
 
 let runtime: SessionRuntime | undefined;
 let synchronizer: EditorSynchronizer | undefined;
@@ -80,6 +85,8 @@ let observedSystemProxyFingerprint: string | undefined;
 let systemProxyPollInFlight = false;
 let lastLifecycleDiagnostics: LifecycleDiagnosticEvent[] = [];
 let workspaceSessionRestore: Promise<void> | undefined;
+let localSessionExit: Promise<void> | undefined;
+let lifecycleWatchdog: NodeJS.Timeout | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -201,18 +208,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.restartKernel', async () => notebookController.restartActive());
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
-  // A restored guest can legitimately wait for the host's first project state
-  // for up to 45 seconds. Do not make VS Code wait for that network operation
-  // before the dashboard and commands become available.
-  startWorkspaceSessionRestore(context);
+  startLifecycleWatchdog(context);
+  // A marker is recoverable state, not permission to reconnect. Activation may
+  // offer a continuation action, but network activity starts only after the
+  // user explicitly confirms it.
+  offerWorkspaceSessionRestore(context);
 }
 
 export function deactivate(): Thenable<void> | undefined {
   if (statusTimer) clearInterval(statusTimer);
+  if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
+  lifecycleWatchdog = undefined;
   synchronizer?.dispose();
   presence?.dispose();
   notebookController?.dispose();
-  return runtime?.leave();
+  const context = activationContext;
+  return context && runtime
+    ? leaveActiveSession(context, Date.now(), 'extension-deactivated')
+    : undefined;
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
@@ -528,7 +541,12 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
           if (reason !== 'host-unreachable') return;
           let reconnectable = true;
           try {
-            await rememberProject(context, descriptor, { pinnedHostId: event.hostId, requireReconnectable: true });
+            await rememberProject(context, descriptor, {
+              pinnedHostId: event.hostId,
+              requireReconnectable: true,
+              leftAt: event.at,
+            });
+            dashboard?.refresh();
             if (closedRuntime && correlationId) {
               closedRuntime.recordLifecycleDiagnostic('recent-session-saved', {
                 correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
@@ -587,8 +605,32 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
   }
 }
 
-function startWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
-  if (workspaceSessionRestore) return;
+function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
+  runUiBackground('Workspace session continuation offer', async () => {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+    try {
+      const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
+      if (!marker.isFile()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
+      return;
+    }
+    await runConfirmedSessionRestore(
+      async () => await vscode.window.showInformationMessage(
+        'Pair Notebook: в этой папке найдена сохранённая сессия. Подключение начнётся только по вашему выбору.',
+        'Подключиться',
+      ) === 'Подключиться',
+      async () => {
+        if (!runtime) await startWorkspaceSessionRestore(context);
+      },
+    );
+  });
+}
+
+function startWorkspaceSessionRestore(context: vscode.ExtensionContext): Promise<void> {
+  if (workspaceSessionRestore) return workspaceSessionRestore;
   workspaceSessionRestore = restoreWorkspaceSession(context)
     .catch((error) => {
       output.appendLine(`[error] Background session restore failed: ${formatError(error)}`);
@@ -597,6 +639,59 @@ function startWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
     .finally(() => {
       workspaceSessionRestore = undefined;
     });
+  return workspaceSessionRestore;
+}
+
+function startLifecycleWatchdog(context: vscode.ExtensionContext): void {
+  if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
+  let previousTickAt = Date.now();
+  lifecycleWatchdog = setInterval(() => {
+    const currentTickAt = Date.now();
+    const gap = currentTickAt - previousTickAt;
+    const leftAt = previousTickAt;
+    previousTickAt = currentTickAt;
+    if (!isSystemSuspendGap(leftAt, currentTickAt, SYSTEM_SUSPEND_GAP_MS) || !runtime || localSessionExit) return;
+    output.appendLine(`[lifecycle] Detected a ${gap}ms extension-host suspension; leaving the active session.`);
+    runUiBackground('System-suspend session leave', async () => {
+      await leaveActiveSession(context, leftAt, 'system-suspend');
+      const choice = await vscode.window.showWarningMessage(
+        'Pair Notebook: компьютер был приостановлен, поэтому активная сессия закрыта локально. Переподключитесь вручную через «Недавние проекты».',
+        'Открыть недавние',
+      );
+      if (choice === 'Открыть недавние') {
+        await vscode.commands.executeCommand('pairNotebook.openRecentProject');
+      }
+    });
+  }, LIFECYCLE_WATCHDOG_INTERVAL_MS);
+  lifecycleWatchdog.unref?.();
+  context.subscriptions.push({
+    dispose: () => {
+      if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
+      lifecycleWatchdog = undefined;
+    },
+  });
+}
+
+async function leaveActiveSession(
+  context: vscode.ExtensionContext,
+  leftAt: number,
+  reason: 'explicit-leave' | 'extension-deactivated' | 'system-suspend',
+): Promise<void> {
+  if (localSessionExit) return localSessionExit;
+  const active = runtime;
+  if (!active) return;
+  localSessionExit = (async () => {
+    try {
+      await rememberProject(context, active.descriptor, { leftAt });
+      dashboard?.refresh();
+    } catch (error) {
+      output.appendLine(`[error] Could not record session exit (${reason}): ${formatError(error)}`);
+    }
+    await active.leave();
+  })().finally(() => {
+    localSessionExit = undefined;
+  });
+  return localSessionExit;
 }
 
 async function leaveSession(): Promise<void> {
@@ -607,13 +702,17 @@ async function leaveSession(): Promise<void> {
     'Leave Session',
   );
   if (answer !== 'Leave Session') return;
-  await active.leave();
   const context = requireActivationContext();
+  await leaveActiveSession(context, Date.now(), 'explicit-leave');
   await forgetWorkspaceSession(context, active.descriptor);
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
   await context.globalState.update(
     'pairNotebook.recent',
     clearRecentReconnect(recent, active.descriptor.workingFolder),
+  );
+  dashboard?.refresh();
+  void vscode.window.showInformationMessage(
+    'Pair Notebook: вы вышли из сессии. Проект и время выхода сохранены в «Недавних проектах».',
   );
 }
 
@@ -1267,12 +1366,15 @@ async function openRecentProject(context: vscode.ExtensionContext): Promise<void
     void vscode.window.showInformationMessage('No accessible recent Pair Notebook projects were found.');
     return;
   }
-  const picked = await vscode.window.showQuickPick(recent.map((item) => ({
-    label: item.name,
-    description: new Date(item.at).toLocaleString(),
-    detail: item.workingFolder,
-    item,
-  })), { title: 'Recent Pair Notebook sessions/projects' });
+  const picked = await vscode.window.showQuickPick(recent.map((item) => {
+    const exit = presentRecentExit(item.leftAt);
+    return {
+      label: `Сессия: ${item.name}`,
+      description: `Хост: ${item.hostDisplayName} • ${exit.relative} • ${exit.date}`,
+      detail: item.workingFolder,
+      item,
+    };
+  }), { title: 'Recent Pair Notebook sessions/projects' });
   if (!picked) return;
   const currentFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const selectedPath = path.resolve(picked.item.workingFolder);
@@ -1472,6 +1574,7 @@ async function forgetWorkspaceSession(
 interface RememberProjectOptions {
   pinnedHostId?: string | undefined;
   requireReconnectable?: boolean | undefined;
+  leftAt?: number | undefined;
 }
 
 async function rememberProject(
@@ -1480,14 +1583,19 @@ async function rememberProject(
   options: RememberProjectOptions = {},
 ): Promise<void> {
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
-  const reconnect = reconnectIdentityFromDescriptor(descriptor, options.pinnedHostId ?? descriptor.hostPeerId);
+  const pinnedHostId = options.pinnedHostId ?? descriptor.hostPeerId;
+  const reconnect = reconnectIdentityFromDescriptor(descriptor, pinnedHostId);
   if (options.requireReconnectable && !reconnect) {
     throw new Error('The guest marker does not contain a valid authenticated pinned host identity.');
   }
+  const leftAt = options.leftAt ?? Date.now();
   const next = rememberRecentProject(recent, {
     name: descriptor.projectName,
+    sessionId: descriptor.sessionId,
+    hostDisplayName: recentHostDisplayName(descriptor, pinnedHostId),
     workingFolder: descriptor.workingFolder,
-    at: Date.now(),
+    at: leftAt,
+    leftAt,
     ...(reconnect ? { reconnect } : {}),
   });
   await context.globalState.update('pairNotebook.recent', next);

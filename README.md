@@ -99,7 +99,9 @@ The original host remains the host across heartbeat delays, signalling failures,
 
 - Host authority changes only when the current host selects **Transfer Host** and the selected participant completes the authenticated prepare/commit/finalize transfer.
 - If the host route disappears, guests keep the current runtime during the bounded route-recovery window. If the host is still unreachable afterwards, guests leave the active runtime without deleting their isolated working copy, credentials, or Recent Projects entry.
-- Opening that entry from **Recent Projects** retries the same pinned host identity. If its folder is already open, Pair Notebook reconnects in place without requiring a VS Code reload or another invite.
+- Extension activation, VS Code restart, and extension reinstall never reconnect by themselves. A saved workspace marker only offers a **Connect** action; the session runtime and network reconnect start after that explicit confirmation.
+- Opening an entry from **Recent Projects** explicitly retries the same pinned host identity. If its folder is already open, Pair Notebook reconnects in place; otherwise it opens the isolated folder and asks for confirmation after the VS Code reload.
+- Graceful VS Code shutdown and a detected system-suspend gap leave the active runtime locally and record the exit. Recent Sessions show the Session Host nickname, relative minutes/hours/days since exit, and the exact `dd/mm/yy` date.
 - Simply choosing **Leave Session** never transfers authority. Guests cannot replace an absent host; after a host-route loss they can only retry the same pinned host from Recent Projects.
 - Continuous atomic host persistence uses a 750 ms idle debounce by default and does not repeatedly force-save open editors.
 - During an explicit transfer, every participant sees a paused state. Persistence, invitations, and notebook execution remain disabled until the new host prepares storage.

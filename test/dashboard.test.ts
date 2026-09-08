@@ -59,7 +59,14 @@ describe('dashboard webview startup', () => {
       },
     });
     const provider = new DashboardProvider({
-      globalState: { get: () => ({ corrupt: true }) },
+      globalState: { get: () => [{
+        name: 'Shared analysis',
+        sessionId: 'dashboard-session',
+        hostDisplayName: 'Alice',
+        workingFolder: 'C:\\pair\\shared-analysis',
+        at: Date.now() - 2 * 3_600_000,
+        leftAt: Date.now() - 2 * 3_600_000,
+      }] },
     });
 
     provider.resolveWebviewView({ webview, show: () => undefined });
@@ -69,6 +76,9 @@ describe('dashboard webview startup', () => {
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
+    assert.match(assignedHtml, /Сессия:/);
+    assert.match(assignedHtml, /Хост:/);
+    assert.match(assignedHtml, /Вы вышли/);
     assert.match(assignedHtml, /Отменённый выбор папки можно открыть снова/);
     assert.match(assignedHtml, /Настроить папку нового хоста/);
     assert.match(assignedHtml, /Передать хоста','ДРУГОМУ УЧАСТНИКУ/);
@@ -84,6 +94,10 @@ describe('dashboard webview startup', () => {
     assert.deepEqual(webview.options.localResourceRoots, []);
     assert.deepEqual(webview.options.enableCommandUris, ['pairNotebook.startSession', 'pairNotebook.joinSession']);
     assert.equal(posted.length, 1, 'a complete landing state is posted after HTML assignment');
+    const landing = posted[0] as { patch?: { recent?: Array<Record<string, unknown>> } };
+    assert.equal(landing.patch?.recent?.[0]?.hostName, 'Alice');
+    assert.equal(landing.patch?.recent?.[0]?.relativeExit, '2 часа назад');
+    assert.match(String(landing.patch?.recent?.[0]?.exitDate), /^\d{2}\/\d{2}\/\d{2}$/);
 
     receive?.({ command: 'webviewReady' });
     receive?.(null);

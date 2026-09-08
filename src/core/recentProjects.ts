@@ -15,10 +15,18 @@ export interface RecentReconnectIdentity {
 
 export interface RecentProject {
   name: string;
+  sessionId?: string | undefined;
+  hostDisplayName: string;
   workingFolder: string;
   at: number;
+  leftAt: number;
   /** Present only for a guest entry that can safely reconnect to its pinned host. */
   reconnect?: RecentReconnectIdentity | undefined;
+}
+
+export interface RecentExitPresentation {
+  relative: string;
+  date: string;
 }
 
 export function normalizeRecentProjects(value: unknown, limit = 20): RecentProject[] {
@@ -32,10 +40,20 @@ export function normalizeRecentProjects(value: unknown, limit = 20): RecentProje
       || /[\0\r\n]/.test(raw.workingFolder)
       || !Number.isSafeInteger(raw.at) || Number(raw.at) < 0) continue;
     const reconnect = normalizeRecentReconnectIdentity(raw.reconnect);
+    const sessionId = typeof raw.sessionId === 'string' && PEER_ID_PATTERN.test(raw.sessionId)
+      ? raw.sessionId
+      : reconnect?.sessionId;
+    const hostDisplayName = normalizeRecentHostDisplayName(raw.hostDisplayName) ?? 'Unknown host';
+    const leftAt = Number.isSafeInteger(raw.leftAt) && Number(raw.leftAt) >= 0
+      ? Number(raw.leftAt)
+      : Number(raw.at);
     result.push({
       name: raw.name.trim(),
+      ...(sessionId ? { sessionId } : {}),
+      hostDisplayName,
       workingFolder: raw.workingFolder,
       at: Number(raw.at),
+      leftAt,
       ...(reconnect ? { reconnect } : {}),
     });
     if (result.length >= limit) break;
@@ -80,6 +98,40 @@ export function recentProjectForFolder(
 ): RecentProject | undefined {
   const wanted = canonicalPath(workingFolder);
   return recent.find((item) => canonicalPath(item.workingFolder) === wanted);
+}
+
+export function recentHostDisplayName(
+  descriptor: SessionDescriptor,
+  pinnedHostId = descriptor.hostPeerId,
+): string {
+  const host = descriptor.localPeer.peerId === pinnedHostId
+    ? descriptor.localPeer
+    : (descriptor.knownPeers ?? []).find((peer) => peer.peerId === pinnedHostId);
+  return normalizeRecentHostDisplayName(host?.displayName) ?? 'Unknown host';
+}
+
+export function presentRecentExit(leftAt: number, now = Date.now()): RecentExitPresentation {
+  const safeLeftAt = Number.isFinite(leftAt) && leftAt >= 0 ? leftAt : 0;
+  const safeNow = Number.isFinite(now) && now >= 0 ? now : safeLeftAt;
+  const elapsedMs = Math.max(0, safeNow - safeLeftAt);
+  const elapsedMinutes = Math.max(1, Math.floor(elapsedMs / 60_000));
+  let relative: string;
+  if (elapsedMinutes < 60) {
+    relative = `${elapsedMinutes} ${russianPlural(elapsedMinutes, 'минуту', 'минуты', 'минут')} назад`;
+  } else {
+    const elapsedHours = Math.floor(elapsedMs / 3_600_000);
+    if (elapsedHours < 24) {
+      relative = `${elapsedHours} ${russianPlural(elapsedHours, 'час', 'часа', 'часов')} назад`;
+    } else {
+      const elapsedDays = Math.max(1, Math.floor(elapsedMs / 86_400_000));
+      relative = `${elapsedDays} ${russianPlural(elapsedDays, 'день', 'дня', 'дней')} назад`;
+    }
+  }
+  const date = new Date(safeLeftAt);
+  return {
+    relative,
+    date: `${padTwo(date.getDate())}/${padTwo(date.getMonth() + 1)}/${String(date.getFullYear()).slice(-2)}`,
+  };
 }
 
 /**
@@ -166,6 +218,25 @@ function normalizeRecentReconnectIdentity(value: unknown): RecentReconnectIdenti
     sessionEpoch: Number(raw.sessionEpoch),
     hostEpoch: Number(raw.hostEpoch),
   };
+}
+
+function normalizeRecentHostDisplayName(value: unknown): string | undefined {
+  if (typeof value !== 'string' || /[\0\r\n]/.test(value)) return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 128 ? normalized : undefined;
+}
+
+function russianPlural(value: number, one: string, few: string, many: string): string {
+  const lastTwo = value % 100;
+  if (lastTwo >= 11 && lastTwo <= 14) return many;
+  const last = value % 10;
+  if (last === 1) return one;
+  if (last >= 2 && last <= 4) return few;
+  return many;
+}
+
+function padTwo(value: number): string {
+  return String(value).padStart(2, '0');
 }
 
 function canonicalPath(value: string): string {

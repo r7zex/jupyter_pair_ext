@@ -89,6 +89,8 @@ Terminal lifecycle reasons are deliberately non-overlapping:
 
 A terminal close clears execution context, disables Run Cell/Restart, removes Pair-owned tabs/decorations, and records typed lifecycle evidence. Explicit Leave keeps the Recent Project entry but removes reconnect credentials; an unrecoverable pinned-host loss keeps the reconnectable Recent Session identity so a later manual reconnect can target the same host.
 
+A local workspace marker is recovery data, not reconnect consent. Extension activation may inspect it and offer a connection action, but it must not start `SessionRuntime` or any session network route before an explicit user confirmation. Graceful extension shutdown and a detected system-suspend gap perform a local leave and update the Recent Session host/exit metadata while retaining marker and SecretStorage state for manual recovery. Recent Session presentation includes the host display name, relative exit age, and local `dd/mm/yy` date.
+
 ## Lifecycle diagnostics
 
 Lifecycle diagnostics are passive and bounded. Every recovery cycle gets one opaque random correlation ID that is reused for ordered route-loss/recovery/replacement/deadline/close evidence and retired when that recovery cycle ends. The next cycle gets a new ID.

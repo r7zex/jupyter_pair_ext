@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.24 - 2026-09-08 (explicit session resume lifecycle)
+
+- Stops treating extension activation, VS Code restart, or extension reinstall as permission to reconnect. A saved workspace marker now produces a confirmation offer and starts no session/network runtime until the user explicitly chooses to connect.
+- Records a local exit before graceful extension shutdown and after a detected laptop/system suspend, while retaining the isolated marker and SecretStorage identity only for later manual recovery from Recent Projects.
+- Keeps explicit Leave credential revocation and authenticated host End Session cleanup terminal, so neither path silently revives an ended connection.
+- Shows each Recent Session with its project, Session Host nickname, `n` minutes/hours/days since the local exit, and an exact `dd/mm/yy` date in both the dashboard and picker.
+- Adds regression coverage for the confirmation gate, activation wiring, suspend-gap detection, legacy Recent Project normalization, host identity, and exit-time presentation.
+
+Automated validation does not replace installed VS Code, real suspend/resume, and physical two-computer acceptance.
+
 ## 0.5.23 - 2026-09-08 (running-cell deletion recovery)
 
 - Retires the exact local or mirrored `NotebookCellExecution` before its cell is structurally removed, interrupts a deleted active execution, and ignores late state for the retired cell object.
