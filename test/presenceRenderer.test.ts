@@ -96,7 +96,7 @@ function remote(peerId: string, activeLine: number, activeLineAnchor?: string): 
 }
 
 describe('presence renderer selected-line mode', () => {
-  it('renders only a whole-line highlight with no cursor label or character range', () => {
+  it('renders a whole-line highlight from a collapsed line-start anchor', () => {
     const h = createHarness([remote('guest', 1)], {});
     h.editor('work.py', 'zero\none here\ntwo');
     const renderer = new h.PresenceRenderer(h.runtime);
@@ -104,7 +104,7 @@ describe('presence renderer selected-line mode', () => {
     assert.ok(rendered);
     assert.equal(rendered.type.options.isWholeLine, true);
     assert.deepEqual(rendered.options[0].range.start, { line: 1, character: 0 });
-    assert.deepEqual(rendered.options[0].range.end, { line: 1, character: 8 });
+    assert.deepEqual(rendered.options[0].range.end, { line: 1, character: 0 });
     assert.equal(rendered.options[0].renderOptions, undefined);
     renderer.dispose();
   });

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.22 - 2026-09-08 (selected-line presence stability)
+
+- Anchors each whole-line collaborator decoration to a collapsed line-start range, preventing VS Code from visually moving or expanding the highlight when a newline is inserted or deleted in the same cell.
+- Preserves CRDT-relative line tracking, advisory presence semantics, local-first text synchronization, and protocol v7 without changing any synchronization, session-authority, or transport behavior. Fixes #17.
+
+Automated validation does not replace installed VS Code and physical two-computer acceptance.
+
 ## 0.5.21 - 2026-09-08 (local-first text synchronization)
 
 - Applies genuine file and notebook-cell typing to the local canonical Yjs text immediately, then transports the same idempotent CRDT update without waiting for a host acknowledgement or repainting an intermediate host prefix.

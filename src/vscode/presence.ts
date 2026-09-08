@@ -63,7 +63,8 @@ export class PresenceRenderer implements vscode.Disposable {
         if (line === undefined) continue;
         const textLine = editor.document.lineAt(line);
         editor.setDecorations(this.decorationFor(state.peer.peerId), [{
-          range: new vscode.Range(textLine.range.start, textLine.range.end),
+          // Keep the whole-line decoration from tracking mutable line contents across newline edits.
+          range: new vscode.Range(textLine.range.start, textLine.range.start),
         }]);
       }
     }
