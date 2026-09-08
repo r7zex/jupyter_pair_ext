@@ -43,3 +43,12 @@ The suspend-watchdog readiness guard added in 0.5.25 is valid but cannot solve t
 - Closing/restarting VS Code before or after Trust cannot turn an abandoned marker into automatic reconnect permission.
 - Startup/trust delays cannot trigger the suspend watchdog.
 - Full TypeScript, ESLint, unit/integration, real Extension Host, Python bridge, production audit, VSIX, and complete ZIP gates must pass.
+
+## v0.5.26 implementation
+
+- `package.json` now declares `untrustedWorkspaces.supported: "limited"`. The extension can therefore remain active long enough to receive `onDidGrantWorkspaceTrust`, while every session entry point and `restoreWorkspaceSession` rejects an untrusted workspace.
+- The pending record is version 2 and stores only the session, peer, working-folder path, and a SHA-256 identity derived from VS Code's main-process `VSCODE_PID` and `VSCODE_IPC_HOOK` (or CLI fallback). It no longer uses `vscode.env.sessionId`, which belongs to an extension-host lifecycle that can change during `openFolder`.
+- Target activation validates the marker and exact process/folder/session/peer match, deletes the durable record before waiting for Trust, and keeps the resulting claim only in the current extension host. The Trust event can consume that claim once; a marker without it still uses the manual confirmation path.
+- The explicit source-side Start/Join command now refuses to run in an already-untrusted workspace and offers Workspace Trust management. This prevents creating a partial session before Trust is granted.
+
+The code and focused tests establish the state-machine invariants. The real Extension Host suite additionally asserts that the VS Code environment exposes the two process-identity values. The installed VS Code UI acceptance is kept separate because it requires an actual Trust dialog and cannot be proven by headless unit tests.

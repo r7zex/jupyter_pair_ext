@@ -14,11 +14,13 @@ import {
 } from './core/identity';
 import {
   createPendingSessionLaunch,
+  currentEditorProcessIdentity,
   normalizePendingSessionLaunch,
   pendingSessionLaunchMatches,
   runConfirmedSessionRestore,
   sameWorkspacePath,
   shouldLeaveForSystemSuspend,
+  type PendingSessionLaunch,
 } from './core/manualSessionRestore';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
 import { copyProject } from './core/projectFiles';
@@ -219,7 +221,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   startLifecycleWatchdog(context);
   // Start/Join may authorize one continuation across the folder reload in this
-  // editor session. Every other marker remains manual-only.
+  // VS Code process. Every other marker remains manual-only.
   offerWorkspaceSessionRestore(context);
 }
 
@@ -238,6 +240,7 @@ export function deactivate(): Thenable<void> | undefined {
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
+  if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
@@ -318,6 +321,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {
+  if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
@@ -420,9 +424,13 @@ async function openSessionWorkingFolder(
   context: vscode.ExtensionContext,
   descriptor: SessionDescriptor,
 ): Promise<void> {
+  const editorProcessId = currentEditorProcessIdentity();
+  if (!editorProcessId) {
+    throw new Error('VS Code did not expose a stable process identity for the trusted folder handoff.');
+  }
   await context.globalState.update(
     PENDING_SESSION_LAUNCH_KEY,
-    createPendingSessionLaunch(descriptor, vscode.env.sessionId),
+    createPendingSessionLaunch(descriptor, editorProcessId),
   );
   try {
     await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(descriptor.workingFolder), false);
@@ -433,6 +441,9 @@ async function openSessionWorkingFolder(
 }
 
 async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    throw new Error('Trust this workspace before starting or reconnecting a Pair Notebook session.');
+  }
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) return;
   const marker = path.join(folder.uri.fsPath, MARKER);
@@ -634,22 +645,21 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
 }
 
 function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
-  let continuationScheduled = false;
-  const continueWhenTrusted = () => {
-    if (!vscode.workspace.isTrusted || continuationScheduled) return;
-    continuationScheduled = true;
-    runUiBackground('Workspace session continuation offer', async () => {
-      const folder = vscode.workspace.workspaceFolders?.[0];
-      if (!folder) return;
-      try {
-        const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
-        if (!marker.isFile()) return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-        output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
-        return;
-      }
-      if (await consumePendingSessionLaunch(context, folder.uri.fsPath)) {
+  runUiBackground('Workspace session continuation offer', async () => {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+    try {
+      const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
+      if (!marker.isFile()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
+      return;
+    }
+    const claimedLaunch = await claimPendingSessionLaunch(context, folder.uri.fsPath);
+    const continueWhenTrusted = async () => {
+      if (!vscode.workspace.isTrusted) return;
+      if (claimedLaunch) {
         await startWorkspaceSessionRestore(context);
         return;
       }
@@ -662,32 +672,35 @@ function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
           if (!runtime) await startWorkspaceSessionRestore(context);
         },
       );
+    };
+    if (vscode.workspace.isTrusted) {
+      await continueWhenTrusted();
+      return;
+    }
+    output.appendLine(claimedLaunch
+      ? '[info] Explicit Start/Join handoff claimed; waiting for Workspace Trust.'
+      : '[info] Waiting for Workspace Trust before offering manual session recovery.');
+    const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      trustSubscription.dispose();
+      runUiBackground('Trusted workspace session continuation', continueWhenTrusted);
     });
-  };
-  if (vscode.workspace.isTrusted) {
-    continueWhenTrusted();
-    return;
-  }
-  output.appendLine('[info] Waiting for Workspace Trust before continuing a Pair Notebook session.');
-  const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust(() => {
-    trustSubscription.dispose();
-    continueWhenTrusted();
+    context.subscriptions.push(trustSubscription);
   });
-  context.subscriptions.push(trustSubscription);
 }
 
-async function consumePendingSessionLaunch(
+async function claimPendingSessionLaunch(
   context: vscode.ExtensionContext,
   workspaceFolder: string,
-): Promise<boolean> {
+): Promise<PendingSessionLaunch | undefined> {
   const stored = context.globalState.get<unknown>(PENDING_SESSION_LAUNCH_KEY);
-  if (stored === undefined) return false;
+  if (stored === undefined) return undefined;
   const pending = normalizePendingSessionLaunch(stored);
-  if (!pending || pending.editorSessionId !== vscode.env.sessionId) {
+  const editorProcessId = currentEditorProcessIdentity();
+  if (!pending || !editorProcessId || pending.editorProcessId !== editorProcessId) {
     await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-    return false;
+    return undefined;
   }
-  if (!sameWorkspacePath(pending.workingFolder, workspaceFolder)) return false;
+  if (!sameWorkspacePath(pending.workingFolder, workspaceFolder)) return undefined;
   let descriptor: SessionDescriptor;
   try {
     const markerBytes = await readBoundedRegularFile(path.join(workspaceFolder, MARKER), MAX_SESSION_MARKER_BYTES);
@@ -695,10 +708,10 @@ async function consumePendingSessionLaunch(
   } catch (error) {
     await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
     output.appendLine(`[error] Could not validate pending session launch: ${formatError(error)}`);
-    return false;
+    return undefined;
   }
   await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-  return pendingSessionLaunchMatches(pending, descriptor, vscode.env.sessionId);
+  return pendingSessionLaunchMatches(pending, descriptor, editorProcessId) ? pending : undefined;
 }
 
 function startWorkspaceSessionRestore(context: vscode.ExtensionContext): Promise<void> {
@@ -1694,6 +1707,18 @@ async function forgetEndedSession(
   await forgetWorkspaceSession(context, descriptor, true);
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
   await context.globalState.update('pairNotebook.recent', forgetRecentProject(recent, descriptor.workingFolder));
+}
+
+async function requireTrustedWorkspaceForSessionStart(): Promise<boolean> {
+  if (vscode.workspace.isTrusted) return true;
+  const choice = await vscode.window.showWarningMessage(
+    'Pair Notebook remains inactive in Restricted Mode. Trust this workspace before starting or joining a session.',
+    'Manage Workspace Trust',
+  );
+  if (choice === 'Manage Workspace Trust') {
+    await vscode.commands.executeCommand('workbench.trust.manage');
+  }
+  return false;
 }
 
 function displayName(): string {

@@ -40,6 +40,11 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     this.timeout(15_000);
     assert.equal(process.env.PAIR_NOTEBOOK_E2E, '1', 'the suite must run through the isolated E2E launcher');
     assert.equal(vscode.workspace.isTrusted, true, 'the E2E workspace must be trusted so Pair Notebook can activate');
+    assert.match(process.env.VSCODE_PID ?? '', /^[1-9]\d*$/, 'VS Code must expose its stable main-process PID');
+    assert.ok(
+      (process.env.VSCODE_IPC_HOOK ?? process.env.VSCODE_IPC_HOOK_CLI)?.trim(),
+      'VS Code must expose its stable main-process IPC endpoint',
+    );
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `${EXTENSION_ID} must be loaded as the development extension`);
     await extension.activate();

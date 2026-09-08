@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.26 - 2026-09-09 (Workspace Trust handoff)
+
+- Keeps Pair Notebook enabled in Restricted Mode with limited capability support so the explicit Start/Join action can survive the isolated-folder Trust prompt.
+- Blocks session runtime, signalling, synchronization, and execution until the target folder is trusted; an untrusted Start/Join command opens Workspace Trust management instead of starting a partial session.
+- Replaces the extension-session handoff key with a versioned record bound to the exact session, participant, folder, and hashed VS Code main-process PID/IPC identity. The target activation consumes the durable claim before waiting for Trust, then continues it once in memory; stale, restarted, reinstalled, or unrelated markers remain manual-only.
+- Adds unit and real Extension Host coverage for the limited capability and stable process identity, plus a root-cause report in `WORKSPACE_TRUST_SESSION_START_ROOT_CAUSE.md`.
+
+Automated validation does not replace the installed-VSIX Trust prompt and physical two-computer acceptance; the release gate records those boundaries explicitly.
+
 ## 0.5.25 - 2026-09-09 (trusted Start/Join continuation)
 
 - Preserves the explicit Start/Join intent across the isolated-folder reload and continues it once after Workspace Trust is granted in the same VS Code editor session.

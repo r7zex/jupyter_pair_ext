@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, direct WebRTC, and redundant Nostr/MQTT relay fallback.",
-  "version": "0.5.25",
+  "version": "0.5.26",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -39,8 +39,8 @@
   "main": "./out/extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
-      "supported": false,
-      "description": "Pair Notebook exchanges project files and launches Python kernels on the session host, so the workspace must be trusted first."
+      "supported": "limited",
+      "description": "Pair Notebook stays loaded only to preserve an explicit Start/Join handoff while VS Code asks for Workspace Trust. Session networking, synchronization, and execution remain blocked until the folder is trusted."
     },
     "virtualWorkspaces": {
       "supported": false

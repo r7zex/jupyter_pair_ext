@@ -1,11 +1,12 @@
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { SessionDescriptor } from './types';
 
 export type ManualSessionRestoreResult = 'declined' | 'restored';
 
 export interface PendingSessionLaunch {
-  version: 1;
-  editorSessionId: string;
+  version: 2;
+  editorProcessId: string;
   sessionId: string;
   peerId: string;
   workingFolder: string;
@@ -13,11 +14,11 @@ export interface PendingSessionLaunch {
 
 export function createPendingSessionLaunch(
   descriptor: Pick<SessionDescriptor, 'sessionId' | 'localPeer' | 'workingFolder'>,
-  editorSessionId: string,
+  editorProcessId: string,
 ): PendingSessionLaunch {
   return {
-    version: 1,
-    editorSessionId,
+    version: 2,
+    editorProcessId,
     sessionId: descriptor.sessionId,
     peerId: descriptor.localPeer.peerId,
     workingFolder: path.resolve(descriptor.workingFolder),
@@ -27,14 +28,14 @@ export function createPendingSessionLaunch(
 export function normalizePendingSessionLaunch(value: unknown): PendingSessionLaunch | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const pending = value as Partial<PendingSessionLaunch>;
-  if (pending.version !== 1
-    || typeof pending.editorSessionId !== 'string' || !pending.editorSessionId
+  if (pending.version !== 2
+    || typeof pending.editorProcessId !== 'string' || !pending.editorProcessId
     || typeof pending.sessionId !== 'string' || !pending.sessionId
     || typeof pending.peerId !== 'string' || !pending.peerId
     || typeof pending.workingFolder !== 'string' || !pending.workingFolder) return undefined;
   return {
-    version: 1,
-    editorSessionId: pending.editorSessionId,
+    version: 2,
+    editorProcessId: pending.editorProcessId,
     sessionId: pending.sessionId,
     peerId: pending.peerId,
     workingFolder: path.resolve(pending.workingFolder),
@@ -52,12 +53,21 @@ export function sameWorkspacePath(left: string, right: string): boolean {
 export function pendingSessionLaunchMatches(
   pending: PendingSessionLaunch,
   descriptor: Pick<SessionDescriptor, 'sessionId' | 'localPeer' | 'workingFolder'>,
-  editorSessionId: string,
+  editorProcessId: string,
 ): boolean {
-  return pending.editorSessionId === editorSessionId
+  return pending.editorProcessId === editorProcessId
     && pending.sessionId === descriptor.sessionId
     && pending.peerId === descriptor.localPeer.peerId
     && sameWorkspacePath(pending.workingFolder, descriptor.workingFolder);
+}
+
+export function currentEditorProcessIdentity(
+  environment: Partial<Pick<NodeJS.ProcessEnv, 'VSCODE_PID' | 'VSCODE_IPC_HOOK' | 'VSCODE_IPC_HOOK_CLI'>> = process.env,
+): string | undefined {
+  const vscodePid = environment.VSCODE_PID?.trim();
+  const ipcHook = (environment.VSCODE_IPC_HOOK ?? environment.VSCODE_IPC_HOOK_CLI)?.trim();
+  if (!vscodePid || !/^[1-9]\d*$/.test(vscodePid) || !ipcHook) return undefined;
+  return createHash('sha256').update(`${vscodePid}\0${ipcHook}`, 'utf8').digest('hex');
 }
 
 export function isSystemSuspendGap(previousTickAt: number, currentTickAt: number, thresholdMs: number): boolean {

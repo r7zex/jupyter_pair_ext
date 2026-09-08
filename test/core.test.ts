@@ -30,6 +30,7 @@ import {
 } from '../src/core/identity';
 import {
   createPendingSessionLaunch,
+  currentEditorProcessIdentity,
   isSystemSuspendGap,
   normalizePendingSessionLaunch,
   pendingSessionLaunchMatches,
@@ -2038,19 +2039,41 @@ describe('compute launch and recent projects', () => {
     assert.equal(shouldLeaveForSystemSuspend(readyRuntime, readyRuntime, 1_000, 16_000, 15_000), true);
   });
 
-  it('binds an explicit folder handoff to one editor session without storing secrets', () => {
+  it('binds an explicit folder handoff to one VS Code process without storing secrets', () => {
     const descriptor = {
       sessionId: 'session-a',
       workingFolder: path.join(os.tmpdir(), 'pair-pending-session'),
       localPeer: { peerId: 'host-a', displayName: 'Host', joinOrder: 0, identityKey: 'identity-a' },
     };
-    const created = createPendingSessionLaunch(descriptor, 'editor-session-a');
+    const created = createPendingSessionLaunch(descriptor, 'editor-process-a');
     assert.deepEqual(normalizePendingSessionLaunch(created), created);
     assert.equal(Object.hasOwn(created, 'token'), false);
-    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-session-a'), true);
-    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-session-b'), false);
-    assert.equal(pendingSessionLaunchMatches(created, { ...descriptor, sessionId: 'session-b' }, 'editor-session-a'), false);
-    assert.equal(normalizePendingSessionLaunch({ ...created, editorSessionId: '' }), undefined);
+    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-process-a'), true);
+    assert.equal(pendingSessionLaunchMatches(created, descriptor, 'editor-process-b'), false);
+    assert.equal(pendingSessionLaunchMatches(created, { ...descriptor, sessionId: 'session-b' }, 'editor-process-a'), false);
+    assert.equal(normalizePendingSessionLaunch({ ...created, editorProcessId: '' }), undefined);
+    assert.equal(normalizePendingSessionLaunch({ ...created, version: 1 }), undefined);
+  });
+
+  it('derives the folder-handoff identity only from a valid VS Code main process', () => {
+    const first = currentEditorProcessIdentity({
+      VSCODE_PID: '1234',
+      VSCODE_IPC_HOOK: '\\\\.\\pipe\\vscode-main-a',
+    });
+    assert.match(first ?? '', /^[0-9a-f]{64}$/);
+    assert.equal(currentEditorProcessIdentity({
+      VSCODE_PID: '1234',
+      VSCODE_IPC_HOOK: '\\\\.\\pipe\\vscode-main-a',
+    }), first);
+    assert.notEqual(currentEditorProcessIdentity({
+      VSCODE_PID: '1235',
+      VSCODE_IPC_HOOK: '\\\\.\\pipe\\vscode-main-a',
+    }), first);
+    assert.equal(currentEditorProcessIdentity({ VSCODE_PID: '1234' }), undefined);
+    assert.equal(currentEditorProcessIdentity({
+      VSCODE_PID: 'not-a-pid',
+      VSCODE_IPC_HOOK: '\\\\.\\pipe\\vscode-main-a',
+    }), undefined);
   });
 
   it('waits for Workspace Trust and keeps stale activation manual-only', async () => {
@@ -2067,14 +2090,21 @@ describe('compute launch and recent projects', () => {
     );
     assert.match(offerSource, /vscode\.workspace\.isTrusted/);
     assert.match(offerSource, /onDidGrantWorkspaceTrust/);
-    assert.match(offerSource, /consumePendingSessionLaunch/);
+    assert.match(offerSource, /claimPendingSessionLaunch/);
+    assert.match(offerSource, /claimedLaunch/);
     assert.match(offerSource, /runConfirmedSessionRestore/);
     assert.match(offerSource, /showInformationMessage/);
     const handoffSource = source.slice(
       source.indexOf('async function openSessionWorkingFolder'),
       source.indexOf('async function restoreWorkspaceSession'),
     );
-    assert.match(handoffSource, /createPendingSessionLaunch\(descriptor, vscode\.env\.sessionId\)/);
+    assert.match(handoffSource, /currentEditorProcessIdentity\(\)/);
+    assert.match(handoffSource, /createPendingSessionLaunch\(descriptor, editorProcessId\)/);
+    const restoreSource = source.slice(
+      source.indexOf('async function restoreWorkspaceSession'),
+      source.indexOf('async function startRuntime'),
+    );
+    assert.match(restoreSource, /if \(!vscode\.workspace\.isTrusted\)/);
   });
 
   it('terminates a bridge that emits an oversized protocol line', async () => {
@@ -2145,7 +2175,7 @@ describe('protocol and notebook compatibility', () => {
 
   it('declares safe workspace defaults and no remote-compute deny switches', async () => {
     const manifest = JSON.parse(await readFile(path.resolve(__dirname, '../../package.json'), 'utf8')) as any;
-    assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
+    assert.equal(manifest.capabilities.untrustedWorkspaces.supported, 'limited');
     assert.equal(manifest.capabilities.virtualWorkspaces.supported, false);
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);
