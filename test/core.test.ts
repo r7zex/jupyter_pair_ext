@@ -2076,11 +2076,17 @@ describe('compute launch and recent projects', () => {
     }), undefined);
   });
 
-  it('waits for Workspace Trust and keeps stale activation manual-only', async () => {
+  it('keeps untrusted activation inert and resumes only authenticated pending launches', async () => {
     const source = await readFile(path.join(process.cwd(), 'src', 'extension.ts'), 'utf8');
     const activateSource = source.slice(
       source.indexOf('export async function activate'),
       source.indexOf('export function deactivate'),
+    );
+    assert.match(activateSource, /if \(!vscode\.workspace\.isTrusted\)/);
+    assert.ok(
+      activateSource.indexOf('if (!vscode.workspace.isTrusted)')
+        < activateSource.indexOf('applyMeshNetworkConfiguration'),
+      'Trust gate must run before network initialization',
     );
     assert.match(activateSource, /offerWorkspaceSessionRestore\(context\)/);
     assert.doesNotMatch(activateSource, /startWorkspaceSessionRestore\(context\)/);
@@ -2089,17 +2095,17 @@ describe('compute launch and recent projects', () => {
       source.indexOf('function startWorkspaceSessionRestore'),
     );
     assert.match(offerSource, /vscode\.workspace\.isTrusted/);
-    assert.match(offerSource, /onDidGrantWorkspaceTrust/);
-    assert.match(offerSource, /claimPendingSessionLaunch/);
-    assert.match(offerSource, /claimedLaunch/);
+    assert.match(offerSource, /findAutomaticPendingLaunch/);
+    assert.match(offerSource, /pendingLaunch/);
     assert.match(offerSource, /runConfirmedSessionRestore/);
     assert.match(offerSource, /showInformationMessage/);
     const handoffSource = source.slice(
       source.indexOf('async function openSessionWorkingFolder'),
       source.indexOf('async function restoreWorkspaceSession'),
     );
-    assert.match(handoffSource, /currentEditorProcessIdentity\(\)/);
-    assert.match(handoffSource, /createPendingSessionLaunch\(descriptor, editorProcessId\)/);
+    assert.doesNotMatch(handoffSource, /currentEditorProcessIdentity/);
+    assert.doesNotMatch(handoffSource, /PENDING_SESSION_LAUNCH_KEY/);
+    assert.match(handoffSource, /persistPendingLaunchArtifacts/);
     const restoreSource = source.slice(
       source.indexOf('async function restoreWorkspaceSession'),
       source.indexOf('async function startRuntime'),
@@ -2175,7 +2181,7 @@ describe('protocol and notebook compatibility', () => {
 
   it('declares safe workspace defaults and no remote-compute deny switches', async () => {
     const manifest = JSON.parse(await readFile(path.resolve(__dirname, '../../package.json'), 'utf8')) as any;
-    assert.equal(manifest.capabilities.untrustedWorkspaces.supported, 'limited');
+    assert.equal(manifest.capabilities.untrustedWorkspaces.supported, false);
     assert.equal(manifest.capabilities.virtualWorkspaces.supported, false);
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);

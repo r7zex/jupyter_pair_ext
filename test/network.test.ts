@@ -1311,7 +1311,7 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
-  it('refuses to advertise a session when the guaranteed relay readiness barrier fails', async () => {
+  it('keeps independent transport engines alive when relay readiness is delayed', async () => {
     const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
     const deadRoom = {
       makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
@@ -1340,10 +1340,91 @@ describe('mesh relay fallback integration', function () {
       roomFactory: () => deadRoom as never,
     });
     try {
-      await assert.rejects(
-        transport.start(),
-        /Guaranteed emergency relay readiness failed: no common WSS path/,
-      );
+      await transport.start();
+      await Promise.resolve();
+      const diagnostics = transport.networkDiagnostics() as {
+        relayFallback: { readinessError?: string };
+      };
+      assert.equal(diagnostics.relayFallback.readinessError, 'no common WSS path');
+    } finally {
+      await transport.stop();
+      configureMeshNetwork({});
+    }
+  });
+
+  it('uses one startup attempt and preserves secondary signalling when primary construction fails', async () => {
+    const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
+    const deadRoom = {
+      makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+      onPeerJoin: () => undefined,
+      onPeerLeave: () => undefined,
+      ping: async () => -1,
+      leave: async () => undefined,
+      getPeers: () => ({}),
+    };
+    let primaryStarts = 0;
+    let secondaryStarts = 0;
+    configureMeshNetwork({ disableRelayFallback: true });
+    const transport = new MeshTransport({
+      sessionId: 'secondary-survival', token: 'secondary-survival-token-that-is-long-enough',
+      localPeer: { peerId: 'secondary-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'secondary-host' }),
+      isHost: () => true,
+      roomFactory: () => {
+        primaryStarts += 1;
+        throw new Error('primary unavailable');
+      },
+      secondaryRoomFactory: () => {
+        secondaryStarts += 1;
+        return deadRoom as never;
+      },
+    });
+    try {
+      const first = transport.start();
+      const second = transport.start();
+      assert.equal(first, second);
+      await first;
+      assert.equal(primaryStarts, 1);
+      assert.equal(secondaryStarts, 1);
+      assert.ok((transport as unknown as { mqttRoom?: unknown }).mqttRoom);
+    } finally {
+      await transport.stop();
+      configureMeshNetwork({});
+    }
+  });
+
+  it('holds the commit barrier through an outage and releases it after relay recovery', async () => {
+    const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
+    let connectedRelayCount = 0;
+    configureMeshNetwork({
+      relayFactory: () => ({
+        get connectedRelayCount() { return connectedRelayCount; },
+        onFrame: () => undefined,
+        onPeerAnnounce: () => undefined,
+        start: () => undefined,
+        stop: () => undefined,
+        waitUntilReady: async () => { throw new Error('temporarily offline'); },
+        sendAnnounce: () => undefined,
+        send: () => undefined,
+      }),
+    });
+    const transport = new MeshTransport({
+      sessionId: 'relay-recovery-barrier', token: 'relay-recovery-token-that-is-long-enough',
+      localPeer: { peerId: 'recovery-host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'recovery-host' }),
+      isHost: () => true,
+      roomFactory: () => { throw new Error('primary offline'); },
+      disableSecondarySignalling: true,
+    });
+    try {
+      await transport.start();
+      let released = false;
+      const barrier = transport.waitForInfrastructureReady().then(() => { released = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(released, false);
+      connectedRelayCount = 1;
+      await barrier;
+      assert.equal(released, true);
     } finally {
       await transport.stop();
       configureMeshNetwork({});

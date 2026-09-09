@@ -5,7 +5,7 @@ import path from 'node:path';
 describe('terminal lifecycle product wiring', () => {
   it('uses the typed terminal event as the extension UI cleanup source', () => {
     const source = readFileSync(path.join(process.cwd(), 'src/extension.ts'), 'utf8');
-    assert.match(source, /runtime\.on\('terminal', \(event: SessionTerminalLifecycle\)/);
+    assert.match(source, /activeRuntime\.on\('terminal', \(event: SessionTerminalLifecycle\)/);
     assert.doesNotMatch(source, /runtime\.on\('closed',/);
     assert.doesNotMatch(source, /sessionEnded[^\n]+host-lost/);
   });

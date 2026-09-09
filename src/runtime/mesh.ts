@@ -464,11 +464,14 @@ export class MeshTransport extends EventEmitter {
   private lastSentRate = 0;
   private lastReceivedRate = 0;
   private hasStarted = false;
+  private startState: 'idle' | 'starting' | 'started' | 'stopping' | 'stopped' = 'idle';
+  private startPromise: Promise<number> | undefined;
   private pingInFlight = false;
   private turnEndpoints: TurnEndpoint[] | undefined;
   private turnProbes: TurnProbeResult[] | undefined;
   private turnStatus: 'not-configured' | 'invalid' | 'configured' = 'not-configured';
   private relay: FrameRelay | undefined;
+  private relayReadinessError: string | undefined;
   private readonly relayNegotiations = new Map<string, RelayNegotiation>();
   private readonly relayAttempts = new Map<string, number>();
   /** Valid signed relay envelopes retained briefly to reject captured replays. */
@@ -530,13 +533,35 @@ export class MeshTransport extends EventEmitter {
     this.directory.set(options.localPeer.peerId, options.localPeer);
   }
 
-  /** Starts discovery. The numeric return value is retained for API compatibility and is always zero. */
-  public async start(): Promise<number> {
-    if (this.room) return 0;
+  /** Starts discovery. Concurrent callers share one structural startup attempt. */
+  public start(): Promise<number> {
+    if (this.startPromise) return this.startPromise;
+    if (this.startState === 'started') return Promise.resolve(0);
+    if (this.startState === 'stopping') {
+      return Promise.reject(new Error('Mesh transport is stopping.'));
+    }
+    const start = this.startInternal();
+    this.startPromise = start;
+    const clear = (): void => {
+      if (this.startPromise === start) this.startPromise = undefined;
+    };
+    void start.then(clear, clear);
+    return start;
+  }
+
+  private async startInternal(): Promise<number> {
     const restarting = this.hasStarted;
+    this.startState = 'starting';
     this.stopped = false;
     this.signallingEvidence.nostr = { startedAt: Date.now() };
-    ensureWebSocketRuntime();
+    this.relayReadinessError = undefined;
+    let primaryError: unknown;
+    try {
+      ensureWebSocketRuntime();
+    } catch (error) {
+      primaryError = error;
+      this.noteSignallingError('nostr', error, 'startup', 'startup');
+    }
     const callbacks: JoinRoomCallbacks = {
       handshakeTimeoutMs: 15_000,
       onPeerHandshake: async (transportPeerId, send, receive, isInitiator) => {
@@ -568,37 +593,37 @@ export class MeshTransport extends EventEmitter {
         this.onJoinError(details);
       },
     };
-    const turnConfig = this.buildTurnConfig();
-    const config: NostrRoomConfig = {
-      appId: TRYSTERO_APP_ID,
-      password: this.options.token,
-      rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
-      relayConfig: {
-        urls: TRYSTERO_RELAY_URLS,
-        redundancy: RELAY_REDUNDANCY,
-        warnOnRelayFailure: false,
-      },
-      ...(turnConfig !== undefined ? { turnConfig } : {}),
-    };
-    const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
-    this.primaryUsesProductionSockets = factory === joinRoom;
-    try {
-      this.room = factory(config, this.options.sessionId, callbacks);
-      this.action = this.room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
-      this.action.onMessage = (data, { peerId }) => this.handleAction(data, peerId);
-      this.room.onPeerJoin = (peerId) => {
-        this.onPeerJoin(peerId);
-        if (this.connections.has(peerId)) this.noteSignallingPeerStage('nostr', 'route-established', peerId);
+    if (!primaryError) {
+      const turnConfig = this.buildTurnConfig();
+      const config: NostrRoomConfig = {
+        appId: TRYSTERO_APP_ID,
+        password: this.options.token,
+        rtcPolyfill: WeriftPeerConnection as unknown as NostrRoomConfig['rtcPolyfill'],
+        relayConfig: {
+          urls: TRYSTERO_RELAY_URLS,
+          redundancy: RELAY_REDUNDANCY,
+          warnOnRelayFailure: false,
+        },
+        ...(turnConfig !== undefined ? { turnConfig } : {}),
       };
-      this.room.onPeerLeave = (peerId) => this.onPeerLeave(peerId);
-    } catch (error) {
-      this.room = undefined;
-      this.action = undefined;
-      this.noteSignallingError('nostr', error, 'startup', 'startup');
-      throw new Error(`Could not start Trystero: ${formatError(error)}`, { cause: error });
+      const factory = this.options.roomFactory ?? MeshTransport.testingRoomFactory ?? joinRoom;
+      this.primaryUsesProductionSockets = factory === joinRoom;
+      try {
+        this.room = factory(config, this.options.sessionId, callbacks);
+        this.action = this.room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
+        this.action.onMessage = (data, { peerId }) => this.handleAction(data, peerId);
+        this.room.onPeerJoin = (peerId) => {
+          this.onPeerJoin(peerId);
+          if (this.connections.has(peerId)) this.noteSignallingPeerStage('nostr', 'route-established', peerId);
+        };
+        this.room.onPeerLeave = (peerId) => this.onPeerLeave(peerId);
+      } catch (error) {
+        this.room = undefined;
+        this.action = undefined;
+        primaryError = error;
+        this.noteSignallingError('nostr', error, 'startup', 'startup');
+      }
     }
-    this.hasStarted = true;
-    await this.startRelayFallback();
     this.timers = [
       setInterval(() => this.heartbeatTick(), 500),
       setInterval(() => void this.pingTick(), 1000),
@@ -609,9 +634,22 @@ export class MeshTransport extends EventEmitter {
     // Secondary signalling family and passive network-change watching are
     // strictly additive: neither can affect an already-working session.
     try { this.startSecondarySignalling(); } catch { /* primary stays up */ }
+    this.startRelayFallback();
     if (!this.options.roomFactory && !MeshTransport.testingRoomFactory) {
       this.networkWatcher.start();
     }
+    if (!this.room && !this.mqttRoom && !this.relay) {
+      for (const timer of this.timers) clearInterval(timer);
+      this.timers = [];
+      this.networkWatcher.stop();
+      this.stopped = true;
+      this.startState = 'idle';
+      throw new Error(`Could not start any transport route: ${formatError(primaryError ?? 'no route engine available')}`, {
+        cause: primaryError,
+      });
+    }
+    this.hasStarted = true;
+    this.startState = 'started';
     if (restarting) this.emit('restarted');
     return 0;
   }
@@ -763,6 +801,26 @@ export class MeshTransport extends EventEmitter {
     return this.signallingDiagnostics()
       .filter((family) => family.active)
       .map((family) => family.family);
+  }
+
+  /**
+   * Waits for positive route-infrastructure evidence without imposing an
+   * absolute startup deadline. Every engine keeps its own reconnect loop, so
+   * a VPN/proxy/network transition can satisfy this barrier later without a
+   * new Start/Join identity.
+   */
+  public async waitForInfrastructureReady(): Promise<void> {
+    while (!this.stopped && this.startState === 'started') {
+      const injectedPrimaryReady = Boolean(this.room && !this.primaryUsesProductionSockets);
+      const injectedSecondaryReady = Boolean(this.mqttRoom && !this.secondaryUsesProductionSockets);
+      if (injectedPrimaryReady
+        || injectedSecondaryReady
+        || (this.relay?.connectedRelayCount ?? 0) > 0
+        || this.activeSignallingFamilies().length > 0
+        || this.connections.size > 0) return;
+      await delay(250);
+    }
+    throw new Error('Mesh transport stopped before network infrastructure became ready.');
   }
 
   /** Sanitized signalling lifecycle evidence safe for diagnostics and UI. */
@@ -1061,6 +1119,7 @@ export class MeshTransport extends EventEmitter {
       relayFallback: {
         enabled: !meshNetworkConfig.disableRelayFallback,
         connectedRelays: this.relay?.connectedRelayCount ?? 0,
+        ...(this.relayReadinessError ? { readinessError: this.relayReadinessError } : {}),
         peers: [...this.connections.keys()]
           .filter((transportPeerId) => transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX))
           .map((transportPeerId) => {
@@ -1348,7 +1407,7 @@ export class MeshTransport extends EventEmitter {
   }
 
   /** Starts independent Nostr and MQTT emergency data relays unless disabled. */
-  private async startRelayFallback(): Promise<void> {
+  private startRelayFallback(): void {
     if (this.relay || meshNetworkConfig.disableRelayFallback || this.stopped) return;
     // Tests inject a custom room factory (options or the testing hook) to run
     // in-memory transports; a relay there would dial real public Nostr relays
@@ -1368,20 +1427,26 @@ export class MeshTransport extends EventEmitter {
       });
     } catch (error) {
       this.relay = undefined;
-      throw new Error(`Guaranteed emergency relay construction failed: ${formatError(error)}`, { cause: error });
+      this.relayReadinessError = `construction failed: ${formatError(error)}`;
+      return;
     }
     this.relay.onPeerAnnounce = (peerId) => {
       if (!this.identityToTransport.has(peerId)) this.considerRelayFallback(peerId);
     };
     this.relay.onFrame = (fromPeerId, bytes) => this.handleRelayData(fromPeerId, bytes);
     this.relay.start();
-    try {
-      await this.relay.waitUntilReady?.(15_000);
-    } catch (error) {
-      this.relay.stop();
-      this.relay = undefined;
-      throw new Error(`Guaranteed emergency relay readiness failed: ${formatError(error)}`, { cause: error });
-    }
+    const relay = this.relay;
+    void relay.waitUntilReady?.(15_000).then(
+      () => {
+        if (this.relay === relay) this.relayReadinessError = undefined;
+      },
+      (error) => {
+        // A readiness timeout is a health observation, not a terminal startup
+        // verdict. RedundantFrameRelay owns reconnect and may recover after a
+        // proxy/VPN/network transition without recreating the session.
+        if (this.relay === relay) this.relayReadinessError = formatError(error);
+      },
+    );
     // Announce presence a few times so peers joining via WebRTC-less paths
     // find each other even if some early publishes race the socket open.
     for (const delayMs of [500, 4_000, 12_000]) {
@@ -2317,6 +2382,7 @@ public improvablePeerIds(): string[] {
 
   public async stop(): Promise<void> {
     if (this.stopped) return;
+    this.startState = 'stopping';
     // Relay routes have no Trystero onPeerLeave callback. Publish an explicit
     // authenticated departure before clearing the local route maps so remote
     // participants can retire relay-only peers immediately.
@@ -2367,6 +2433,7 @@ public improvablePeerIds(): string[] {
     this.networkWatcher.stop();
     if (upgradeRoom) await upgradeRoom.leave().catch(() => undefined);
     if (mqttRoom) await mqttRoom.leave().catch(() => undefined);
+    this.startState = 'stopped';
   }
 
   private localHandshake(): HandshakeMessage {
@@ -2752,7 +2819,19 @@ public improvablePeerIds(): string[] {
   }
 
   private enqueue(transportPeerId: string, frame: Buffer, priority: FramePriority): void {
-    if (this.stopped || !this.action) throw new Error('Trystero transport is not active.');
+    if (this.stopped) throw new Error('Mesh transport is not active.');
+    if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX) && !this.relay) {
+      throw new Error('Relay fallback transport is not active.');
+    }
+    if (transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX) && !this.mqttAction) {
+      throw new Error('Secondary signalling transport is not active.');
+    }
+    if (!transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)
+      && !transportPeerId.startsWith(MQTT_TRANSPORT_PREFIX)
+      && !transportPeerId.startsWith(UPGRADE_TRANSPORT_PREFIX)
+      && !this.action) {
+      throw new Error('Primary signalling transport is not active.');
+    }
     if (!this.connections.has(transportPeerId)) throw new Error('The target peer is no longer connected.');
     const queue = this.outboundQueues.get(transportPeerId) ?? {
       realtimeFrames: [],
@@ -2805,8 +2884,6 @@ public improvablePeerIds(): string[] {
         queue.inFlightBytes += item.bytes.byteLength;
         queue.inFlightFrames += 1;
         try {
-          const action = this.action;
-          if (!action) throw new Error('Trystero transport stopped during send.');
           if (transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
             const relayChannel = this.relay;
             if (!relayChannel) throw new Error('Relay fallback transport stopped during send.');
@@ -2829,6 +2906,8 @@ public improvablePeerIds(): string[] {
               target: transportPeerId.slice(MQTT_TRANSPORT_PREFIX.length),
             });
           } else {
+            const action = this.action;
+            if (!action) throw new Error('Primary signalling transport stopped during send.');
             await action.send(exactArrayBuffer(item.bytes), { target: transportPeerId });
           }
           this.sentWindow += item.bytes.byteLength;

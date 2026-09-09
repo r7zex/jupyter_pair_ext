@@ -526,6 +526,14 @@ export type RuntimeState = 'connecting' | 'connected' | 'syncing' | 'ready' | 'e
 export type BackingFolderMode = 'replace' | 'reuse-existing';
 export type BackingFolderInspection = MaterializedFolderInspection;
 
+export type RuntimeLaunchPhase = 'constructed' | 'local-preparing' | 'local-prepared'
+  | 'transport-starting' | 'network-ready' | 'outer-bindings-ready' | 'established' | 'closed';
+
+export interface SessionRuntimeLaunchOptions {
+  pendingLaunch?: boolean | undefined;
+  onHostLocalPrepared?: (() => void | Promise<void>) | undefined;
+}
+
 export class BackingFolderMismatchError extends Error {
   public constructor(public readonly inspection: BackingFolderInspection) {
     super('The selected existing folder no longer matches the authoritative session state.');
@@ -672,8 +680,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private fullPresenceSince = 0;
   private stateReadyResolve!: () => void;
   private readonly stateReady = new Promise<void>((resolve) => { this.stateReadyResolve = resolve; });
-  private initialized = false;
+  private launchPhase: RuntimeLaunchPhase = 'constructed';
+  private startPromise: Promise<void> | undefined;
+  private descriptorPersistenceEnabled: boolean;
   private initialStateReceived = false;
+  private initialStateProgressAt = Date.now();
   private recoveringHost: boolean;
   private editorLineAnchorResolver: ((document: vscode.TextDocument, offset: number) => number | undefined) | undefined;
   private waitingForHostFolder = false;
@@ -710,6 +721,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
     identityPrivateKey?: string,
+    private readonly launchOptions: SessionRuntimeLaunchOptions = {},
   ) {
     super();
     this.lifecycleDiagnosticsRing = new LifecycleDiagnosticRing(descriptor.sessionId, descriptor.localPeer.peerId);
@@ -720,7 +732,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (descriptor.backingFolder && pathsOverlap(descriptor.backingFolder, descriptor.workingFolder)) {
       descriptor.backingFolder = '';
     }
-    this.recoveringHost = descriptor.role === 'host' && descriptor.freshStart === false;
+    this.descriptorPersistenceEnabled = !launchOptions.pendingLaunch;
+    this.recoveringHost = descriptor.role === 'host' && descriptor.freshStart === false && !launchOptions.pendingLaunch;
     this.waitingForHostFolder = descriptor.role === 'host' && !descriptor.backingFolder;
     const restoredFileStates = isPlainRecord(descriptor.fileStates) ? Object.entries(descriptor.fileStates) : [];
     if (restoredFileStates.length > MAX_TRACKED_PROJECT_ENTRIES) {
@@ -809,12 +822,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transport.updateDirectory(descriptor.knownPeers ?? []);
   }
 
-  public async start(): Promise<void> {
-    if (this.initialized) return;
+  public start(): Promise<void> {
+    if (this.launchPhase === 'established' || this.launchPhase === 'outer-bindings-ready') return Promise.resolve();
+    if (this.startPromise) return this.startPromise;
+    if (this.closed) return Promise.reject(new Error('Session runtime is already closed.'));
+    const start = this.startInternal();
+    this.startPromise = start;
+    void start.catch(() => undefined).finally(() => {
+      if (this.startPromise === start) this.startPromise = undefined;
+    });
+    return start;
+  }
+
+  private async startInternal(): Promise<void> {
+    this.launchPhase = 'local-preparing';
     await this.normalizeRestoredBackingFolder();
     const existingTermination = await readSessionTermination(this.descriptor, this.token);
     if (existingTermination) throw new SessionTerminatedError(existingTermination);
-    this.initialized = true;
     this.transition('connecting', 'Opening peer transport.');
     const hasRecoveryPeers = this.recoveringHost && Boolean(this.descriptor.knownPeers?.length);
     if (this.descriptor.role === 'host' && !hasRecoveryPeers) {
@@ -826,7 +850,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.installProjectHandlers();
     this.installTransportHandlers();
     this.installAwarenessHandlers();
+    if (this.descriptor.role === 'host') {
+      this.installFileWatcher();
+      await this.launchOptions.onHostLocalPrepared?.();
+    }
+    this.launchPhase = 'local-prepared';
     try {
+      this.launchPhase = 'transport-starting';
       await this.transport.start();
     } catch (error) {
       // This is the exact local-route-failed boundary: our own MeshTransport
@@ -839,6 +869,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       throw error;
     }
+    if (this.launchOptions.pendingLaunch) await this.transport.waitForInfrastructureReady();
+    this.launchPhase = 'network-ready';
     this.transition('connected', 'Joined the encrypted Trystero room; discovering peers.');
     this.coordinator.upsertPeer(this.asRuntime(this.descriptor.localPeer, true));
     if (this.recoveringHost) {
@@ -860,9 +892,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const host = resolveHostIdentity(this.descriptor, this.descriptor.hostPeerId);
       this.coordinator.upsertPeer(this.asRuntime(host, true));
       this.transport.connect(host);
-      await withTimeout(this.stateReady, 45_000, 'Host did not provide project state within 45 seconds.');
+      await this.waitForInitialState();
     }
-    this.installFileWatcher();
+    if (!this.watcher) this.installFileWatcher();
     this.installPresenceTracking();
     this.timers.push(
       setInterval(() => this.runBackground('Coordination tick', () => this.coordinationTick()), 250),
@@ -878,8 +910,45 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     );
 
     await this.refreshHardware();
+    if (this.launchOptions.pendingLaunch) {
+      this.launchPhase = 'outer-bindings-ready';
+      return;
+    }
+    this.prepareLaunchCommit();
+    await this.completeLaunchCommit();
+  }
+
+  public currentLaunchPhase(): RuntimeLaunchPhase {
+    return this.launchPhase;
+  }
+
+  public prepareLaunchCommit(): void {
+    if (this.launchPhase === 'network-ready' && !this.launchOptions.pendingLaunch) {
+      this.launchPhase = 'outer-bindings-ready';
+    }
+    if (this.launchPhase !== 'outer-bindings-ready') {
+      throw new Error(`Session runtime cannot prepare commit from phase ${this.launchPhase}.`);
+    }
     this.descriptor.freshStart = false;
-    await this.persistDescriptor();
+    this.descriptor.fileStates = Object.fromEntries(this.fileStates);
+    this.descriptor.fileRevisionCounter = this.fileRevisionCounter;
+    this.descriptor.binaryVersions = Object.fromEntries(this.binaryVersions);
+  }
+
+  public async completeLaunchCommit(backingRoot?: string): Promise<void> {
+    if (this.launchPhase === 'established') return;
+    if (this.launchPhase !== 'outer-bindings-ready') {
+      throw new Error(`Session runtime cannot commit from phase ${this.launchPhase}.`);
+    }
+    if (backingRoot && this.coordinator.isCurrentHost()) {
+      this.storage?.setBackingRoot(backingRoot);
+      for (const key of this.project.keys()) this.storage?.schedule(key);
+      await this.storage?.flush();
+    }
+    if (!this.launchOptions.pendingLaunch) {
+      this.descriptorPersistenceEnabled = true;
+      await this.persistDescriptor();
+    }
     await this.refreshAutosaveManager();
     this.updatePresence();
     await vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', true);
@@ -895,6 +964,39 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       'Session termination check',
       () => this.checkTerminationMarker(),
     ), 2_000));
+    this.launchPhase = 'established';
+  }
+
+  /**
+   * Opens ordinary marker persistence only after the outer authenticated
+   * launch control has reached `established`. Pending launches deliberately
+   * keep this fence closed while H1 is being published and UI/backing-folder
+   * bindings are completed.
+   */
+  public enableDescriptorPersistence(): void {
+    if (!this.launchOptions.pendingLaunch || this.descriptorPersistenceEnabled) return;
+    if (this.launchPhase !== 'established') {
+      throw new Error(`Session marker persistence cannot start from phase ${this.launchPhase}.`);
+    }
+    this.descriptorPersistenceEnabled = true;
+  }
+
+  private async waitForInitialState(): Promise<void> {
+    const idleTimeoutMs = 45_000;
+    this.initialStateProgressAt = Date.now();
+    while (!this.initialStateReceived) {
+      const idleRemaining = this.initialStateProgressAt + idleTimeoutMs - Date.now();
+      if (idleRemaining <= 0) {
+        throw new Error('Host project-state transfer stalled without progress for 45 seconds.');
+      }
+      await Promise.race([
+        this.stateReady,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, Math.min(1_000, idleRemaining));
+          timer.unref?.();
+        }),
+      ]);
+    }
   }
 
   public terminalLifecycle(): SessionTerminalLifecycle | undefined {
@@ -2138,6 +2240,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       connectionState: 'closing', routeKind: 'none', reason: diagnosticReason,
     });
     this.closed = true;
+    this.launchPhase = 'closed';
     this.closeReason = reason;
     const terminal: SessionTerminalLifecycle = {
       reason,
@@ -2596,6 +2699,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       });
     });
     this.transport.on('peerConnected', (peer: PeerIdentity) => {
+      if (!this.initialStateReceived && peer.peerId === this.coordinator.clock.hostId) {
+        this.initialStateProgressAt = Date.now();
+      }
       if (this.coordinator.isCurrentHost()) peer = this.assignPeerJoinOrder(peer);
       this.coordinator.upsertPeer(this.asRuntime(peer, true));
       const known = new Map((this.descriptor.knownPeers ?? []).map((item) => [item.peerId, item]));
@@ -2712,6 +2818,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     });
     this.transport.on('metrics', (metrics: MeshMetrics) => { this.meshMetrics = metrics; });
     this.transport.on('message', (frame: WireFrame, sourceId: string) => {
+      if (!this.initialStateReceived && sourceId === this.coordinator.clock.hostId) {
+        this.initialStateProgressAt = Date.now();
+      }
       this.enqueueIncomingMessage(frame, sourceId);
     });
     this.transport.on('protocolError', (error) => this.log.appendLine(`[error] Protocol: ${formatError(error)}`));
@@ -3653,7 +3762,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private async createStorage(): Promise<void> {
     this.storage = new StorageAdapter({
       workingRoot: this.descriptor.workingFolder,
-      backingRoot: this.coordinator.isCurrentHost() && this.descriptor.backingFolder
+      backingRoot: !this.launchOptions.pendingLaunch
+        && this.coordinator.isCurrentHost() && this.descriptor.backingFolder
         ? this.descriptor.backingFolder
         : undefined,
       debounceMs: vscode.workspace.getConfiguration('pairNotebook').get<number>('persistenceDebounceMs', 750),
@@ -6613,6 +6723,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.descriptor.fileStates = Object.fromEntries(this.fileStates);
     this.descriptor.fileRevisionCounter = this.fileRevisionCounter;
     this.descriptor.binaryVersions = Object.fromEntries(this.binaryVersions);
+    if (!this.descriptorPersistenceEnabled) return this.descriptorWriteQueue;
     const marker = path.join(this.descriptor.workingFolder, '.pair-notebook-session.json');
     const contents = `${JSON.stringify(this.descriptor, null, 2)}\n`;
     const previous = this.descriptorWriteQueue;
@@ -6732,18 +6843,6 @@ function resolveHostIdentity(descriptor: SessionDescriptor, hostPeerId: string):
     displayName: 'Session Host',
     joinOrder: 0,
   };
-}
-
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  try {
-    return await Promise.race([promise, expired]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 function lineFromSelection(position: unknown): number | undefined {

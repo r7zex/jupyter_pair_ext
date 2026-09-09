@@ -4,6 +4,7 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicFile';
 import { validateIdentityPrivateKey } from './identity';
 import { LaunchBaselineV1 } from './projectBaseline';
+import { portablePathComparisonKey, portableRelativePath } from './projectPath';
 import { PEER_ID_PATTERN, SessionDescriptor } from './types';
 
 const CONTROL_DOMAIN = 'pair-notebook-local-launch-control-v1';
@@ -43,6 +44,14 @@ export interface SessionControlPaths {
   marker: string;
 }
 
+export interface VerifiedLaunchArtifacts {
+  paths: SessionControlPaths;
+  control: SessionLaunchControlV1;
+  baseline: LaunchBaselineV1;
+  markerBytes: Buffer;
+  recovery: LaunchRecoveryAction;
+}
+
 export function sessionControlPaths(globalStorageRoot: string, sessionId: string, peerId: string): SessionControlPaths {
   assertId(sessionId, 'session');
   assertId(peerId, 'peer');
@@ -78,6 +87,59 @@ export function createSessionLaunchControl(
   validateUnsignedControl(control);
   control.mac = signControl(control, identityPrivateKey);
   return control;
+}
+
+export async function persistPendingLaunchArtifacts(
+  globalStorageRoot: string,
+  descriptor: SessionDescriptor,
+  baseline: LaunchBaselineV1,
+  launchId: string,
+  kind: 'start' | 'join',
+  identityPrivateKey: string,
+): Promise<VerifiedLaunchArtifacts> {
+  const paths = sessionControlPaths(globalStorageRoot, descriptor.sessionId, descriptor.localPeer.peerId);
+  const workingFolderRealPath = await realpath(descriptor.workingFolder);
+  const backingFolderRealPath = descriptor.backingFolder
+    ? await realpath(descriptor.backingFolder)
+    : undefined;
+  await assertExactSessionWorkspace(descriptor.workingFolder, paths.workspace, workingFolderRealPath);
+  const markerBytes = Buffer.from(serializeSessionDescriptor(descriptor), 'utf8');
+  const baselineSha256 = await writeLaunchBaseline(paths.baseline, baseline);
+  const control = createSessionLaunchControl({
+    generation: 1,
+    launchId,
+    kind,
+    state: 'pending',
+    sessionId: descriptor.sessionId,
+    projectId: descriptor.projectId,
+    peerId: descriptor.localPeer.peerId,
+    role: descriptor.role,
+    workingFolderRealPath,
+    ...(backingFolderRealPath ? { backingFolderRealPath } : {}),
+    markerSha256: sha256(markerBytes),
+    baselineSha256,
+    createdAt: Date.now(),
+  }, identityPrivateKey);
+  await writeSessionLaunchControl(paths.control, control);
+  await atomicWriteFile(paths.marker, markerBytes);
+  return { paths, control, baseline, markerBytes, recovery: 'resume-pending' };
+}
+
+export async function readVerifiedLaunchArtifacts(
+  globalStorageRoot: string,
+  currentWorkspace: string,
+  descriptor: SessionDescriptor,
+  identityPrivateKey: string,
+): Promise<VerifiedLaunchArtifacts> {
+  const paths = sessionControlPaths(globalStorageRoot, descriptor.sessionId, descriptor.localPeer.peerId);
+  const markerBytes = await readBoundedRegularFile(paths.marker, MAX_BASELINE_BYTES);
+  const control = await readSessionLaunchControl(paths.control, identityPrivateKey);
+  await assertExactSessionWorkspace(currentWorkspace, paths.workspace, control.workingFolderRealPath);
+  assertControlMatchesDescriptor(control, descriptor);
+  const baseline = await readLaunchBaseline(paths.baseline, control.baselineSha256);
+  const recovery = classifyLaunchRecovery(control, sha256(markerBytes));
+  if (recovery === 'integrity-error') throw new Error('Session launch marker does not match authenticated control state.');
+  return { paths, control, baseline, markerBytes, recovery };
 }
 
 export function verifySessionLaunchControl(value: unknown, identityPrivateKey: string): SessionLaunchControlV1 {
@@ -134,10 +196,10 @@ export async function readLaunchBaseline(target: string, expectedSha256: string)
   const bytes = await readBoundedRegularFile(target, MAX_BASELINE_BYTES);
   if (sha256(bytes) !== expectedSha256) throw new Error('Session launch baseline integrity check failed.');
   const parsed = JSON.parse(bytes.toString('utf8')) as Partial<LaunchBaselineV1>;
-  if (parsed.version !== 1 || !parsed.working || typeof parsed.working !== 'object') {
+  if (!isLaunchBaseline(parsed)) {
     throw new Error('Session launch baseline has an unsupported schema.');
   }
-  return parsed as LaunchBaselineV1;
+  return parsed;
 }
 
 export async function assertExactSessionWorkspace(
@@ -241,6 +303,62 @@ function validateUnsignedControl(control: SessionLaunchControlV1): void {
   if (!Number.isSafeInteger(control.createdAt) || control.createdAt < 0) {
     throw new Error('Session launch creation time is invalid.');
   }
+}
+
+function assertControlMatchesDescriptor(control: SessionLaunchControlV1, descriptor: SessionDescriptor): void {
+  if (control.sessionId !== descriptor.sessionId
+    || control.projectId !== descriptor.projectId
+    || control.peerId !== descriptor.localPeer.peerId
+    || control.role !== descriptor.role
+    || control.kind !== (descriptor.role === 'host' ? 'start' : 'join')) {
+    throw new Error('Session marker identity does not match authenticated launch control.');
+  }
+}
+
+function isLaunchBaseline(value: Partial<LaunchBaselineV1>): value is LaunchBaselineV1 {
+  return value.version === 1
+    && isProjectManifest(value.working)
+    && (value.source === undefined || isProjectManifest(value.source))
+    && optionalString(value.sourceRealPath, 4_096)
+    && optionalString(value.sourceDevice, 128)
+    && optionalString(value.sourceInode, 128);
+}
+
+function isProjectManifest(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const manifest = value as Record<string, unknown>;
+  if (manifest.version !== 1 || !Array.isArray(manifest.files) || !Array.isArray(manifest.directories)
+    || manifest.files.length + manifest.directories.length > 50_000) return false;
+  let previousFile = '';
+  const portableFiles = new Set<string>();
+  for (const file of manifest.files) {
+    if (!file || typeof file !== 'object' || Array.isArray(file)) return false;
+    const entry = file as Record<string, unknown>;
+    if (typeof entry.relativePath !== 'string' || portableRelativePath(entry.relativePath) !== entry.relativePath
+      || !['text', 'notebook', 'binary'].includes(String(entry.kind))
+      || !Number.isSafeInteger(entry.size) || Number(entry.size) < 0
+      || typeof entry.hash !== 'string' || !SHA256_PATTERN.test(entry.hash)
+      || entry.relativePath.localeCompare(previousFile) < 0) return false;
+    const key = portablePathComparisonKey(entry.relativePath);
+    if (portableFiles.has(key)) return false;
+    portableFiles.add(key);
+    previousFile = entry.relativePath;
+  }
+  let previousDirectory = '';
+  const portableDirectories = new Set<string>();
+  for (const directory of manifest.directories) {
+    if (typeof directory !== 'string' || portableRelativePath(directory) !== directory
+      || directory.localeCompare(previousDirectory) < 0) return false;
+    const key = portablePathComparisonKey(directory);
+    if (portableDirectories.has(key) || portableFiles.has(key)) return false;
+    portableDirectories.add(key);
+    previousDirectory = directory;
+  }
+  return true;
+}
+
+function optionalString(value: unknown, maxLength: number): boolean {
+  return value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= maxLength);
 }
 
 function assertId(value: string, label: string): void {

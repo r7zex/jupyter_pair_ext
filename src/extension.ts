@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, rm, stat } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,17 +13,18 @@ import {
   validateIdentityPublicKey,
 } from './core/identity';
 import {
-  createPendingSessionLaunch,
-  currentEditorProcessIdentity,
-  normalizePendingSessionLaunch,
-  pendingSessionLaunchMatches,
   runConfirmedSessionRestore,
-  sameWorkspacePath,
   shouldLeaveForSystemSuspend,
-  type PendingSessionLaunch,
 } from './core/manualSessionRestore';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
-import { copyProject } from './core/projectFiles';
+import {
+  captureProjectManifest,
+  classifyProjectDrift,
+  projectManifestsEqual,
+  refreshWorkingCopyFromStableSource,
+  stableCopyProject,
+  type LaunchBaselineV1,
+} from './core/projectBaseline';
 import {
   accessibleRecentProjects,
   assertRecentReconnectMatchesDescriptor,
@@ -37,6 +38,24 @@ import {
   rememberRecentProject,
 } from './core/recentProjects';
 import { SessionTerminatedError } from './core/sessionTermination';
+import { acquireRuntimeOwner, type RuntimeOwnerLease } from './core/runtimeOwner';
+import {
+  createSessionLaunchControl,
+  persistPendingLaunchArtifacts,
+  readVerifiedLaunchArtifacts,
+  serializeSessionDescriptor,
+  sessionControlPaths,
+  sha256,
+  writeSessionLaunchControl,
+  type SessionLaunchControlV1,
+  type VerifiedLaunchArtifacts,
+} from './core/sessionControl';
+import {
+  credentialsMatchPublicIdentity,
+  decodeExactSessionCredentials,
+  encodeSessionCredentials,
+  type StoredSessionCredentialsV2,
+} from './core/sessionCredentials';
 import {
   InviteData,
   PeerIdentity,
@@ -77,8 +96,6 @@ const MAX_SESSION_MARKER_BYTES = 64 * 1024 * 1024;
 const MAX_RESTORED_PEERS = 255;
 const LIFECYCLE_WATCHDOG_INTERVAL_MS = 1_000;
 const SYSTEM_SUSPEND_GAP_MS = 15_000;
-const PENDING_SESSION_LAUNCH_KEY = 'pairNotebook.pendingSessionLaunch';
-
 let runtime: SessionRuntime | undefined;
 let synchronizer: EditorSynchronizer | undefined;
 let presence: PresenceRenderer | undefined;
@@ -98,10 +115,45 @@ let workspaceSessionRestore: Promise<void> | undefined;
 let localSessionExit: Promise<void> | undefined;
 let lifecycleWatchdog: NodeJS.Timeout | undefined;
 let lifecycleReadyRuntime: SessionRuntime | undefined;
+let launchPreparation: Promise<void> | undefined;
+let runtimeOwnerLease: RuntimeOwnerLease | undefined;
+let localSessionLifecycle: 'none' | 'preparing' | 'pending' | 'starting' | 'established' = 'none';
+
+interface AutomaticPendingLaunch {
+  descriptor: SessionDescriptor;
+  credentials: StoredSessionCredentialsV2;
+  artifacts: VerifiedLaunchArtifacts;
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
   output = vscode.window.createOutputChannel('Pair Notebook');
+  context.subscriptions.push(output);
+  if (!vscode.workspace.isTrusted) {
+    output.appendLine('[info] Restricted Mode: Pair Notebook trusted services remain disabled.');
+    const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      trustSubscription.dispose();
+      runUiBackground('Trusted Pair Notebook initialization', () => initializeTrustedServices(context));
+    });
+    context.subscriptions.push(trustSubscription);
+    return;
+  }
+  await initializeTrustedServices(context);
+}
+
+let trustedServicesInitialization: Promise<void> | undefined;
+
+function initializeTrustedServices(context: vscode.ExtensionContext): Promise<void> {
+  if (!vscode.workspace.isTrusted) return Promise.resolve();
+  if (trustedServicesInitialization) return trustedServicesInitialization;
+  trustedServicesInitialization = initializeTrustedServicesImpl(context).catch((error) => {
+    trustedServicesInitialization = undefined;
+    throw error;
+  });
+  return trustedServicesInitialization;
+}
+
+async function initializeTrustedServicesImpl(context: vscode.ExtensionContext): Promise<void> {
   const proxyMigrationPending = shouldMigrateLegacyProxyPassword(
     context.globalState.get<unknown>(PROXY_CREDENTIAL_MIGRATION_KEY),
   );
@@ -114,7 +166,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'pairNotebook.openPanel';
   context.subscriptions.push(
-    output,
     dashboard,
     notebookController,
     status,
@@ -234,12 +285,17 @@ export function deactivate(): Thenable<void> | undefined {
   presence?.dispose();
   notebookController?.dispose();
   const context = activationContext;
-  return context && runtime
+  if (!context || !runtime) return runtimeOwnerLease?.release();
+  return localSessionLifecycle === 'established'
     ? leaveActiveSession(context, Date.now(), 'extension-deactivated')
-    : undefined;
+    : stopPrecommitRuntime();
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
+  return runLaunchPreparation(() => prepareStartSession(context));
+}
+
+async function prepareStartSession(context: vscode.ExtensionContext): Promise<void> {
   if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
@@ -273,14 +329,19 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
   const peerId = newId();
   const identity = generateIdentityCredentials();
   const workingFolder = sessionWorkingFolder(sessionId, peerId, context);
+  let baseline: LaunchBaselineV1;
   try {
-    await vscode.window.withProgress({
+    const copied = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: 'Pair Notebook: creating isolated working copy',
       cancellable: false,
-    }, async () => copyProject(backingFolder, workingFolder));
+    }, async () => stableCopyProject(backingFolder, workingFolder));
+    baseline = copied.baseline;
   } catch (error) {
-    await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
+    await rm(sessionControlPaths(context.globalStorageUri.fsPath, sessionId, peerId).root, {
+      recursive: true,
+      force: true,
+    }).catch(() => undefined);
     throw error;
   }
   const localPeer: PeerIdentity = {
@@ -297,7 +358,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     role: 'host',
     localPeer,
     hostPeerId: peerId,
-    backingFolder,
+    backingFolder: baseline.sourceRealPath ?? backingFolder,
     workingFolder,
     createdAt: Date.now(),
     sessionEpoch: Date.now(),
@@ -308,19 +369,26 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     knownPeers: [],
   };
   const token = newToken();
+  const launchId = newId();
   try {
-    await saveDescriptor(context, descriptor, token, identity.privateKey);
+    await savePendingLaunch(context, descriptor, token, identity.privateKey, baseline, launchId, 'start');
   } catch (error) {
-    await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
+    await rm(sessionControlPaths(context.globalStorageUri.fsPath, sessionId, peerId).root, {
+      recursive: true,
+      force: true,
+    }).catch(() => undefined);
+    await Promise.resolve(context.secrets.delete(secretKey(sessionId, peerId))).catch(() => undefined);
     throw error;
   }
-  await rememberProject(context, descriptor).catch((error) => {
-    output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
-  });
+  localSessionLifecycle = 'pending';
   await openSessionWorkingFolder(context, descriptor);
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {
+  return runLaunchPreparation(() => prepareJoinSession(context));
+}
+
+async function prepareJoinSession(context: vscode.ExtensionContext): Promise<void> {
   if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
@@ -400,7 +468,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     hostEpoch: invite.hostEpoch ?? 0,
     computeExecutorId: invite.hostPeerId,
     pythonPath: vscode.workspace.getConfiguration('pairNotebook').get<string>('pythonPath', 'python'),
-    freshStart: false,
+    freshStart: true,
     knownPeers: [{
       peerId: invite.hostPeerId,
       displayName: invite.hostDisplayName,
@@ -408,47 +476,83 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
       identityKey: invite.hostIdentityKey,
     }],
   };
+  const baseline: LaunchBaselineV1 = {
+    version: 1,
+    working: await captureProjectManifest(workingFolder),
+  };
+  const launchId = newId();
   try {
-    await saveDescriptor(context, descriptor, invite.token, identity.privateKey);
+    await savePendingLaunch(context, descriptor, invite.token, identity.privateKey, baseline, launchId, 'join');
   } catch (error) {
-    await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
+    await rm(sessionControlPaths(context.globalStorageUri.fsPath, invite.sessionId, peerId).root, {
+      recursive: true,
+      force: true,
+    }).catch(() => undefined);
+    await Promise.resolve(context.secrets.delete(secretKey(invite.sessionId, peerId))).catch(() => undefined);
     throw error;
   }
-  await rememberProject(context, descriptor).catch((error) => {
-    output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
-  });
+  localSessionLifecycle = 'pending';
   await openSessionWorkingFolder(context, descriptor);
 }
 
 async function openSessionWorkingFolder(
-  context: vscode.ExtensionContext,
+  _context: vscode.ExtensionContext,
   descriptor: SessionDescriptor,
 ): Promise<void> {
-  const editorProcessId = currentEditorProcessIdentity();
-  if (!editorProcessId) {
-    throw new Error('VS Code did not expose a stable process identity for the trusted folder handoff.');
-  }
-  await context.globalState.update(
-    PENDING_SESSION_LAUNCH_KEY,
-    createPendingSessionLaunch(descriptor, editorProcessId),
-  );
-  try {
-    await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(descriptor.workingFolder), false);
-  } catch (error) {
-    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-    throw error;
-  }
+  await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(descriptor.workingFolder), false);
 }
 
-async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promise<void> {
+function runLaunchPreparation(
+  action: () => Promise<void>,
+): Promise<void> {
+  if (launchPreparation) return launchPreparation;
+  localSessionLifecycle = 'preparing';
+  void vscode.commands.executeCommand('setContext', 'pairNotebook.launchPreparing', true);
+  launchPreparation = action().finally(() => {
+    launchPreparation = undefined;
+    if (localSessionLifecycle === 'preparing') localSessionLifecycle = 'none';
+    void vscode.commands.executeCommand('setContext', 'pairNotebook.launchPreparing', false);
+    dashboard?.refresh();
+  });
+  dashboard?.refresh();
+  return launchPreparation;
+}
+
+async function savePendingLaunch(
+  context: vscode.ExtensionContext,
+  descriptor: SessionDescriptor,
+  token: string,
+  identityPrivateKey: string,
+  baseline: LaunchBaselineV1,
+  launchId: string,
+  kind: 'start' | 'join',
+): Promise<void> {
+  await context.secrets.store(
+    secretKey(descriptor.sessionId, descriptor.localPeer.peerId),
+    encodeSessionCredentials(token, identityPrivateKey),
+  );
+  await persistPendingLaunchArtifacts(
+    context.globalStorageUri.fsPath,
+    descriptor,
+    baseline,
+    launchId,
+    kind,
+    identityPrivateKey,
+  );
+}
+
+async function restoreWorkspaceSession(
+  context: vscode.ExtensionContext,
+  pendingLaunch?: AutomaticPendingLaunch,
+): Promise<void> {
   if (!vscode.workspace.isTrusted) {
     throw new Error('Trust this workspace before starting or reconnecting a Pair Notebook session.');
   }
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) return;
   const marker = path.join(folder.uri.fsPath, MARKER);
-  let descriptor: SessionDescriptor;
-  try {
+  let descriptor: SessionDescriptor = pendingLaunch?.descriptor as SessionDescriptor;
+  if (!descriptor) try {
     const markerBytes = await readBoundedRegularFile(marker, MAX_SESSION_MARKER_BYTES);
     descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), folder.uri.fsPath);
     if (descriptor.role === 'peer') {
@@ -468,7 +572,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     return;
   }
   let storedSecret: StoredSessionSecret | undefined;
-  try {
+  if (!pendingLaunch) try {
     storedSecret = await descriptorSecret(context, descriptor);
   } catch (error) {
     output.appendLine(`[error] Could not read session credentials: ${formatError(error)}`);
@@ -477,142 +581,56 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     );
     return;
   }
-  if (!storedSecret) {
+  if (!pendingLaunch && !storedSecret) {
     void vscode.window.showErrorMessage('Pair Notebook session token is unavailable. Rejoin using a fresh invite.');
     return;
   }
   try {
-    const identityPrivateKey = await ensureDescriptorIdentity(context, descriptor, storedSecret);
+    const identityPrivateKey = pendingLaunch
+      ? pendingLaunch.credentials.identityPrivateKey
+      : await ensureDescriptorIdentity(context, descriptor, storedSecret!);
+    const token = pendingLaunch?.credentials.token ?? storedSecret!.token;
+    if (pendingLaunch) await reconcilePendingWorkspace(pendingLaunch);
+    const ownerPath = sessionControlPaths(
+      context.globalStorageUri.fsPath,
+      descriptor.sessionId,
+      descriptor.localPeer.peerId,
+    ).owner;
+    runtimeOwnerLease = await acquireRuntimeOwner(
+      ownerPath,
+      pendingLaunch?.artifacts.control.launchId ?? newId(),
+    );
+    localSessionLifecycle = 'starting';
     output.appendLine(`[info] Starting session ${descriptor.sessionId} in ${descriptor.mode} mode.`);
-    runtime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
+    const runtimeHolder: { current?: SessionRuntime } = {};
+    const activeRuntime = new SessionRuntime(descriptor, token, context, output, identityPrivateKey, {
+      pendingLaunch: pendingLaunch !== undefined,
+      onHostLocalPrepared: pendingLaunch ? () => {
+        if (!runtimeHolder.current) throw new Error('Session runtime editor capture was not initialized.');
+        bindEditorCapture(runtimeHolder.current, descriptor);
+      } : undefined,
+    });
+    runtimeHolder.current = activeRuntime;
+    runtime = activeRuntime;
+    bindRuntimeLifecycle(context, descriptor, activeRuntime);
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: 'Pair Notebook: connecting to session',
       cancellable: false,
-    }, async () => runtime!.start());
-    synchronizer = new EditorSynchronizer(
-      runtime.project,
-      descriptor.workingFolder,
-      output,
-      runtime.notebookCellIds,
-      notebookController,
-    );
-    runtime.setEditorLineAnchorResolver(
-      (document, offset) => synchronizer?.canonicalOffsetForDocument(document, offset),
-    );
-    runtime.setWorkingCopyWriter(
-      (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),
-      () => synchronizer?.prepareWorkingCopy() ?? Promise.resolve(),
-    );
-    presence = new PresenceRenderer(runtime);
+    }, async () => activeRuntime.start());
+    bindEditorCapture(activeRuntime, descriptor);
+    presence = new PresenceRenderer(activeRuntime);
     notebookController.setSynchronizer(synchronizer);
-    notebookController.setRuntime(runtime);
-    dashboard.setRuntime(runtime);
-    runtime.on('computeChanged', () => {
-      runUiBackground('Compute-change notification', async () => {
-        const choice = await vscode.window.showInformationMessage(
-          'Compute changed. A fresh Jupyter kernel will be used; previous in-memory variables are unavailable.',
-          'Run All',
-        );
-        if (choice === 'Run All') await vscode.commands.executeCommand('notebook.execute');
-      });
-    });
-    runtime.on('sessionEnding', () => {
-      void vscode.window.showInformationMessage('Pair Notebook: хост завершает сессию и сохраняет последние изменения.');
-    });
-    runtime.on('hostPaused', () => {
-      if (runtime?.coordinator.isCurrentHost()) return;
-      void vscode.window.showWarningMessage(
-        'Pair Notebook: сессия на паузе. Новый хост должен выбрать папку на своём компьютере; изменения в общей папке пока не записываются.',
-      );
-    });
-    runtime.on('hostFolderRequired', () => {
-      if (runtime) runUiBackground('New-host folder prompt', () => promptForNewHostFolder(runtime!));
-    });
-    runtime.on('hostResumed', () => {
-      void vscode.window.showInformationMessage('Pair Notebook: новый хост подготовил папку. Совместная сессия продолжена.');
-    });
-    runtime.on('sessionEnded', (peer: PeerIdentity) => {
-      void forgetEndedSession(context, descriptor).then(() => {
-        void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
-      }).catch((error) => {
-        output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
-      });
-    });
-    runtime.on('networkChanged', () => {
-      queueAutomaticNetworkRecovery(context, 'Network interface route changed');
-    });
-    runtime.on('terminal', (event: SessionTerminalLifecycle) => {
-      const closedRuntime = runtime;
-      const reason = event.reason;
-      if (lifecycleReadyRuntime === closedRuntime) lifecycleReadyRuntime = undefined;
-      if (statusTimer) clearInterval(statusTimer);
-      statusTimer = undefined;
-      synchronizer?.dispose();
-      synchronizer = undefined;
-      presence?.dispose();
-      presence = undefined;
-      notebookController.setSynchronizer(undefined);
-      notebookController.setRuntime(undefined);
-      runtime = undefined;
-      lastLifecycleDiagnostics = closedRuntime?.lifecycleDiagnostics() ?? lastLifecycleDiagnostics;
-      dashboard.setRuntime(undefined);
-      status.hide();
-      if (reason === 'host-unreachable' || reason === 'session-ended') {
-        runUiBackground('Close ended Pair Notebook editors', async () => {
-          const correlationId = event.correlationId ?? closedRuntime?.newLifecycleCorrelationId();
-          if (closedRuntime && correlationId) {
-            closedRuntime.recordLifecycleDiagnostic('pair-tabs-close-started', {
-              correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
-              reason: 'tab-cleanup',
-            });
-          }
-          const tabs = await closeSessionTabs(descriptor.workingFolder);
-          if (closedRuntime && correlationId) {
-            closedRuntime.recordLifecycleDiagnostic('pair-tabs-close-completed', {
-              correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
-              reason: 'tab-cleanup', metadata: { tabMatched: tabs.matched, tabClosed: tabs.closed, tabFailed: tabs.failed },
-            });
-            lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
-          }
-          if (reason !== 'host-unreachable') return;
-          let reconnectable = true;
-          try {
-            await rememberProject(context, descriptor, {
-              pinnedHostId: event.hostId,
-              requireReconnectable: true,
-              leftAt: event.at,
-            });
-            dashboard?.refresh();
-            if (closedRuntime && correlationId) {
-              closedRuntime.recordLifecycleDiagnostic('recent-session-saved', {
-                correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
-                reason: 'recent-session-saved',
-              });
-              lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
-            }
-          } catch (error) {
-            reconnectable = false;
-            output.appendLine(`[error] Could not retain reconnectable Recent Session: ${formatError(error)}`);
-          }
-          const tabDetail = tabs.failed
-            ? `Pair tabs: закрыто ${tabs.closed} из ${tabs.matched}; остальные вкладки не затронуты.`
-            : 'Pair tabs закрыты; остальные вкладки VS Code не затронуты.';
-          const message = reconnectable
-            ? `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Сессия сохранена в Recent Sessions и доступна для reconnect к исходному host.`
-            : `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Безопасные reconnect-данные сохранить не удалось; см. Pair Notebook output.`;
-          const choice = reconnectable
-            ? await vscode.window.showWarningMessage(message, 'Open Recent Sessions')
-            : await vscode.window.showWarningMessage(message);
-          if (choice === 'Open Recent Sessions') void vscode.commands.executeCommand('pairNotebook.openRecentProject');
-        });
-      } else if (reason === 'local-route-failed') {
-        void showLocalRouteFailedMessage();
-      }
-    });
-    lifecycleReadyRuntime = runtime;
+    notebookController.setRuntime(activeRuntime);
+    dashboard.setRuntime(activeRuntime);
+    if (pendingLaunch) {
+      activeRuntime.prepareLaunchCommit();
+      await commitPendingLaunch(pendingLaunch, descriptor, identityPrivateKey, activeRuntime);
+    }
+    localSessionLifecycle = 'established';
+    lifecycleReadyRuntime = activeRuntime;
     startStatusUpdates();
-    const restored = runtime.snapshot();
+    const restored = activeRuntime.snapshot();
     if (restored.waitingForHostFolder) {
       if (restored.isHost) runUiBackground('Restored new-host folder prompt', () => promptForNewHostFolder(runtime!));
       else void vscode.window.showWarningMessage(
@@ -624,6 +642,10 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     const startupTerminal = runtime?.terminalLifecycle();
     lifecycleReadyRuntime = undefined;
     await runtime?.leave().catch(() => undefined);
+    const lease = runtimeOwnerLease;
+    runtimeOwnerLease = undefined;
+    await lease?.release().catch(() => undefined);
+    localSessionLifecycle = pendingLaunch ? 'pending' : 'none';
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
         output.appendLine(`[error] Could not forget terminated session: ${formatError(cleanupError)}`);
@@ -632,6 +654,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
         `Pair Notebook: сессия уже завершена (${error.termination.endedByDisplayName}). Рабочая копия сохранена.`,
       );
       runtime = undefined;
+      localSessionLifecycle = 'none';
       return;
     }
     if (startupTerminal?.reason === 'local-route-failed') {
@@ -642,6 +665,262 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     void vscode.window.showErrorMessage(`Pair Notebook could not start: ${formatError(error)}`);
     runtime = undefined;
   }
+}
+
+async function reconcilePendingWorkspace(pendingLaunch: AutomaticPendingLaunch): Promise<void> {
+  const { descriptor, artifacts } = pendingLaunch;
+  const working = await captureProjectManifest(descriptor.workingFolder);
+  if (descriptor.role === 'peer') {
+    if (!projectManifestsEqual(working, artifacts.baseline.working)) {
+      throw new Error(
+        'The pending guest workspace changed before initial host synchronization. Local files were preserved; resolve them before retrying.',
+      );
+    }
+    return;
+  }
+  const sourceBaseline = artifacts.baseline.source;
+  const sourcePath = artifacts.control.backingFolderRealPath;
+  if (!sourceBaseline || !sourcePath || !artifacts.baseline.sourceRealPath) {
+    throw new Error('Pending host launch is missing its authenticated source baseline.');
+  }
+  const sourceRealPath = await realpath(sourcePath);
+  if (!sameFilesystemPath(sourceRealPath, artifacts.baseline.sourceRealPath)) {
+    throw new Error('The original project path now resolves to a different physical folder.');
+  }
+  const sourceInfo = await stat(sourceRealPath);
+  if (!sourceInfo.isDirectory()) throw new Error('The original project source is no longer a directory.');
+  if ((artifacts.baseline.sourceDevice !== undefined
+      && artifacts.baseline.sourceDevice !== String(sourceInfo.dev))
+    || (artifacts.baseline.sourceInode !== undefined
+      && artifacts.baseline.sourceInode !== String(sourceInfo.ino))) {
+    throw new Error('The original project folder was replaced after Start Session.');
+  }
+  const source = await captureProjectManifest(sourceRealPath);
+  const drift = classifyProjectDrift(sourceBaseline, working, source);
+  if (drift === 'source-only') {
+    await refreshWorkingCopyFromStableSource(
+      sourceRealPath,
+      descriptor.workingFolder,
+      working,
+      path.join(artifacts.paths.root, 'recovery'),
+    );
+    return;
+  }
+  if (drift === 'conflict') {
+    throw new Error(
+      'Both the original project and isolated pending workspace changed after Start Session. Neither side was overwritten.',
+    );
+  }
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalizedLeft = path.resolve(left);
+  const normalizedRight = path.resolve(right);
+  return process.platform === 'win32'
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function bindEditorCapture(activeRuntime: SessionRuntime, descriptor: SessionDescriptor): void {
+  if (synchronizer) return;
+  synchronizer = new EditorSynchronizer(
+    activeRuntime.project,
+    descriptor.workingFolder,
+    output,
+    activeRuntime.notebookCellIds,
+    notebookController,
+  );
+  activeRuntime.setEditorLineAnchorResolver(
+    (document, offset) => synchronizer?.canonicalOffsetForDocument(document, offset),
+  );
+  activeRuntime.setWorkingCopyWriter(
+    (relativePath, bytes) => synchronizer?.persistWorkingCopy(relativePath, bytes) ?? Promise.resolve(false),
+    () => synchronizer?.prepareWorkingCopy() ?? Promise.resolve(),
+  );
+  notebookController.setSynchronizer(synchronizer);
+}
+
+function bindRuntimeLifecycle(
+  context: vscode.ExtensionContext,
+  descriptor: SessionDescriptor,
+  activeRuntime: SessionRuntime,
+): void {
+  activeRuntime.on('computeChanged', () => {
+    runUiBackground('Compute-change notification', async () => {
+      const choice = await vscode.window.showInformationMessage(
+        'Compute changed. A fresh Jupyter kernel will be used; previous in-memory variables are unavailable.',
+        'Run All',
+      );
+      if (choice === 'Run All') await vscode.commands.executeCommand('notebook.execute');
+    });
+  });
+  activeRuntime.on('sessionEnding', () => {
+    void vscode.window.showInformationMessage('Pair Notebook: хост завершает сессию и сохраняет последние изменения.');
+  });
+  activeRuntime.on('hostPaused', () => {
+    if (activeRuntime.coordinator.isCurrentHost()) return;
+    void vscode.window.showWarningMessage(
+      'Pair Notebook: сессия на паузе. Новый хост должен выбрать папку на своём компьютере; изменения в общей папке пока не записываются.',
+    );
+  });
+  activeRuntime.on('hostFolderRequired', () => {
+    if (runtime === activeRuntime) runUiBackground('New-host folder prompt', () => promptForNewHostFolder(activeRuntime));
+  });
+  activeRuntime.on('hostResumed', () => {
+    void vscode.window.showInformationMessage('Pair Notebook: новый хост подготовил папку. Совместная сессия продолжена.');
+  });
+  activeRuntime.on('sessionEnded', (peer: PeerIdentity) => {
+    void forgetEndedSession(context, descriptor).then(() => {
+      void vscode.window.showInformationMessage(`Pair Notebook: ${peer.displayName} завершил сессию для всех.`);
+    }).catch((error) => {
+      output.appendLine(`[error] Could not forget ended session: ${formatError(error)}`);
+    });
+  });
+  activeRuntime.on('networkChanged', () => {
+    if (runtime === activeRuntime) queueAutomaticNetworkRecovery(context, 'Network interface route changed');
+  });
+  activeRuntime.on('terminal', (event: SessionTerminalLifecycle) => {
+    const wasEstablished = localSessionLifecycle === 'established'
+      && lifecycleReadyRuntime === activeRuntime;
+    if (lifecycleReadyRuntime === activeRuntime) lifecycleReadyRuntime = undefined;
+    if (runtime === activeRuntime) runtime = undefined;
+    if (statusTimer) clearInterval(statusTimer);
+    statusTimer = undefined;
+    synchronizer?.dispose();
+    synchronizer = undefined;
+    presence?.dispose();
+    presence = undefined;
+    notebookController?.setSynchronizer(undefined);
+    notebookController?.setRuntime(undefined);
+    lastLifecycleDiagnostics = activeRuntime.lifecycleDiagnostics();
+    dashboard?.setRuntime(undefined);
+    status?.hide();
+    const lease = runtimeOwnerLease;
+    runtimeOwnerLease = undefined;
+    void lease?.release().catch((error) => {
+      output.appendLine(`[error] Could not release runtime ownership: ${formatError(error)}`);
+    });
+    if (!wasEstablished) {
+      localSessionLifecycle = event.reason === 'session-ended' ? 'none' : 'pending';
+      if (event.reason === 'local-route-failed') {
+        void vscode.window.showWarningMessage(
+          'Pair Notebook: сеть сейчас недоступна. Pending Session и исходная identity сохранены; повторите запуск из этой рабочей папки после восстановления сети.',
+        );
+      }
+      return;
+    }
+    localSessionLifecycle = 'none';
+    const reason = event.reason;
+    if (reason === 'host-unreachable' || reason === 'session-ended') {
+      runUiBackground('Close ended Pair Notebook editors', async () => {
+        const correlationId = event.correlationId ?? activeRuntime.newLifecycleCorrelationId();
+        activeRuntime.recordLifecycleDiagnostic('pair-tabs-close-started', {
+          correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+          reason: 'tab-cleanup',
+        });
+        const tabs = await closeSessionTabs(descriptor.workingFolder);
+        activeRuntime.recordLifecycleDiagnostic('pair-tabs-close-completed', {
+          correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+          reason: 'tab-cleanup', metadata: { tabMatched: tabs.matched, tabClosed: tabs.closed, tabFailed: tabs.failed },
+        });
+        lastLifecycleDiagnostics = activeRuntime.lifecycleDiagnostics();
+        if (reason !== 'host-unreachable') return;
+        let reconnectable = true;
+        try {
+          await rememberProject(context, descriptor, {
+            pinnedHostId: event.hostId,
+            requireReconnectable: true,
+            leftAt: event.at,
+          });
+          dashboard?.refresh();
+          activeRuntime.recordLifecycleDiagnostic('recent-session-saved', {
+            correlationId, remotePeerId: event.hostId, connectionState: 'closed', routeKind: 'none',
+            reason: 'recent-session-saved',
+          });
+          lastLifecycleDiagnostics = activeRuntime.lifecycleDiagnostics();
+        } catch (error) {
+          reconnectable = false;
+          output.appendLine(`[error] Could not retain reconnectable Recent Session: ${formatError(error)}`);
+        }
+        const tabDetail = tabs.failed
+          ? `Pair tabs: закрыто ${tabs.closed} из ${tabs.matched}; остальные вкладки не затронуты.`
+          : 'Pair tabs закрыты; остальные вкладки VS Code не затронуты.';
+        const message = reconnectable
+          ? `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Сессия сохранена в Recent Sessions и доступна для reconnect к исходному host.`
+          : `Pair Notebook: связь с закреплённым хостом не восстановилась за 30 секунд. ${tabDetail} Безопасные reconnect-данные сохранить не удалось; см. Pair Notebook output.`;
+        const choice = reconnectable
+          ? await vscode.window.showWarningMessage(message, 'Open Recent Sessions')
+          : await vscode.window.showWarningMessage(message);
+        if (choice === 'Open Recent Sessions') void vscode.commands.executeCommand('pairNotebook.openRecentProject');
+      });
+    } else if (reason === 'local-route-failed') {
+      void showLocalRouteFailedMessage();
+    }
+  });
+}
+
+async function commitPendingLaunch(
+  pendingLaunch: AutomaticPendingLaunch,
+  descriptor: SessionDescriptor,
+  identityPrivateKey: string,
+  activeRuntime: SessionRuntime,
+): Promise<void> {
+  const markerBytes = Buffer.from(serializeSessionDescriptor(descriptor), 'utf8');
+  const markerDigest = sha256(markerBytes);
+  const current = pendingLaunch.artifacts.control;
+  const observedMarkerDigest = sha256(pendingLaunch.artifacts.markerBytes);
+  const committing = transitionLaunchControl(current, identityPrivateKey, {
+    state: 'committing',
+    // Recovery may enter here with either the old H0 marker or a previously
+    // published H1 marker. Authenticate the marker that is physically present
+    // as this generation's rollback side before advertising the next H1.
+    markerSha256: observedMarkerDigest,
+    nextMarkerSha256: markerDigest,
+  });
+  await writeSessionLaunchControl(pendingLaunch.artifacts.paths.control, committing);
+  await atomicWriteFile(pendingLaunch.artifacts.paths.marker, markerBytes);
+  await activeRuntime.completeLaunchCommit(committing.backingFolderRealPath);
+  const established = transitionLaunchControl(committing, identityPrivateKey, {
+    state: 'established',
+    markerSha256: markerDigest,
+  });
+  await writeSessionLaunchControl(pendingLaunch.artifacts.paths.control, established);
+  activeRuntime.enableDescriptorPersistence();
+}
+
+function transitionLaunchControl(
+  current: SessionLaunchControlV1,
+  identityPrivateKey: string,
+  transition: Pick<SessionLaunchControlV1, 'state' | 'markerSha256'>
+    & Partial<Pick<SessionLaunchControlV1, 'nextMarkerSha256'>>,
+): SessionLaunchControlV1 {
+  return createSessionLaunchControl({
+    generation: current.generation + 1,
+    launchId: current.launchId,
+    kind: current.kind,
+    state: transition.state,
+    sessionId: current.sessionId,
+    projectId: current.projectId,
+    peerId: current.peerId,
+    role: current.role,
+    workingFolderRealPath: current.workingFolderRealPath,
+    ...(current.backingFolderRealPath ? { backingFolderRealPath: current.backingFolderRealPath } : {}),
+    markerSha256: transition.markerSha256,
+    ...(transition.nextMarkerSha256 ? { nextMarkerSha256: transition.nextMarkerSha256 } : {}),
+    baselineSha256: current.baselineSha256,
+    createdAt: current.createdAt,
+  }, identityPrivateKey);
+}
+
+async function stopPrecommitRuntime(): Promise<void> {
+  const activeRuntime = runtime;
+  runtime = undefined;
+  lifecycleReadyRuntime = undefined;
+  localSessionLifecycle = 'pending';
+  await activeRuntime?.leave().catch(() => undefined);
+  const lease = runtimeOwnerLease;
+  runtimeOwnerLease = undefined;
+  await lease?.release().catch(() => undefined);
 }
 
 function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
@@ -656,67 +935,59 @@ function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
       output.appendLine(`[error] Could not inspect the workspace session marker: ${formatError(error)}`);
       return;
     }
-    const claimedLaunch = await claimPendingSessionLaunch(context, folder.uri.fsPath);
-    const continueWhenTrusted = async () => {
-      if (!vscode.workspace.isTrusted) return;
-      if (claimedLaunch) {
-        await startWorkspaceSessionRestore(context);
-        return;
-      }
-      await runConfirmedSessionRestore(
-        async () => await vscode.window.showInformationMessage(
-          'Pair Notebook: в этой папке найдена сохранённая сессия. Подключение начнётся только по вашему выбору.',
-          'Подключиться',
-        ) === 'Подключиться',
-        async () => {
-          if (!runtime) await startWorkspaceSessionRestore(context);
-        },
-      );
-    };
-    if (vscode.workspace.isTrusted) {
-      await continueWhenTrusted();
+    if (!vscode.workspace.isTrusted) return;
+    const pendingLaunch = await findAutomaticPendingLaunch(context, folder.uri.fsPath);
+    if (pendingLaunch) {
+      await startWorkspaceSessionRestore(context, pendingLaunch);
       return;
     }
-    output.appendLine(claimedLaunch
-      ? '[info] Explicit Start/Join handoff claimed; waiting for Workspace Trust.'
-      : '[info] Waiting for Workspace Trust before offering manual session recovery.');
-    const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust(() => {
-      trustSubscription.dispose();
-      runUiBackground('Trusted workspace session continuation', continueWhenTrusted);
-    });
-    context.subscriptions.push(trustSubscription);
+    await runConfirmedSessionRestore(
+      async () => await vscode.window.showInformationMessage(
+        'Pair Notebook: в этой папке найдена сохранённая сессия. Подключение начнётся только по вашему выбору.',
+        'Подключиться',
+      ) === 'Подключиться',
+      async () => {
+        if (!runtime) await startWorkspaceSessionRestore(context);
+      },
+    );
   });
 }
 
-async function claimPendingSessionLaunch(
+async function findAutomaticPendingLaunch(
   context: vscode.ExtensionContext,
   workspaceFolder: string,
-): Promise<PendingSessionLaunch | undefined> {
-  const stored = context.globalState.get<unknown>(PENDING_SESSION_LAUNCH_KEY);
-  if (stored === undefined) return undefined;
-  const pending = normalizePendingSessionLaunch(stored);
-  const editorProcessId = currentEditorProcessIdentity();
-  if (!pending || !editorProcessId || pending.editorProcessId !== editorProcessId) {
-    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-    return undefined;
-  }
-  if (!sameWorkspacePath(pending.workingFolder, workspaceFolder)) return undefined;
-  let descriptor: SessionDescriptor;
+): Promise<AutomaticPendingLaunch | undefined> {
   try {
     const markerBytes = await readBoundedRegularFile(path.join(workspaceFolder, MARKER), MAX_SESSION_MARKER_BYTES);
-    descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), workspaceFolder);
+    const descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), workspaceFolder);
+    const stored = await context.secrets.get(secretKey(descriptor.sessionId, descriptor.localPeer.peerId));
+    if (!stored) return undefined;
+    const credentials = decodeExactSessionCredentials(stored);
+    if (!credentials || !descriptor.localPeer.identityKey
+      || !credentialsMatchPublicIdentity(credentials, descriptor.localPeer.identityKey)) {
+      output.appendLine('[error] Pending session credentials do not match the marker identity; automatic restore blocked.');
+      return undefined;
+    }
+    const artifacts = await readVerifiedLaunchArtifacts(
+      context.globalStorageUri.fsPath,
+      workspaceFolder,
+      descriptor,
+      credentials.identityPrivateKey,
+    );
+    if (artifacts.recovery === 'established') return undefined;
+    return { descriptor, credentials, artifacts };
   } catch (error) {
-    await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-    output.appendLine(`[error] Could not validate pending session launch: ${formatError(error)}`);
+    output.appendLine(`[error] Automatic pending session validation failed closed: ${formatError(error)}`);
     return undefined;
   }
-  await context.globalState.update(PENDING_SESSION_LAUNCH_KEY, undefined);
-  return pendingSessionLaunchMatches(pending, descriptor, editorProcessId) ? pending : undefined;
 }
 
-function startWorkspaceSessionRestore(context: vscode.ExtensionContext): Promise<void> {
+function startWorkspaceSessionRestore(
+  context: vscode.ExtensionContext,
+  pendingLaunch?: AutomaticPendingLaunch,
+): Promise<void> {
   if (workspaceSessionRestore) return workspaceSessionRestore;
-  workspaceSessionRestore = restoreWorkspaceSession(context)
+  workspaceSessionRestore = restoreWorkspaceSession(context, pendingLaunch)
     .catch((error) => {
       output.appendLine(`[error] Background session restore failed: ${formatError(error)}`);
       void vscode.window.showErrorMessage(`Pair Notebook could not restore the previous session: ${formatError(error)}`);
@@ -778,6 +1049,7 @@ async function leaveActiveSession(
   if (localSessionExit) return localSessionExit;
   const active = runtime;
   if (!active) return;
+  if (localSessionLifecycle !== 'established') return stopPrecommitRuntime();
   if (lifecycleReadyRuntime === active) lifecycleReadyRuntime = undefined;
   localSessionExit = (async () => {
     try {
@@ -788,6 +1060,12 @@ async function leaveActiveSession(
     }
     await active.leave();
   })().finally(() => {
+    localSessionLifecycle = 'none';
+    const lease = runtimeOwnerLease;
+    runtimeOwnerLease = undefined;
+    void lease?.release().catch((error) => {
+      output.appendLine(`[error] Could not release runtime ownership: ${formatError(error)}`);
+    });
     localSessionExit = undefined;
   });
   return localSessionExit;
@@ -1554,7 +1832,7 @@ function runUiBackground(label: string, action: () => unknown | Promise<unknown>
 }
 
 interface StoredSessionSecret {
-  version: 1;
+  version: 1 | 2;
   token: string;
   identityPrivateKey?: string;
 }
@@ -1571,7 +1849,7 @@ async function saveDescriptor(
   await mkdir(descriptor.workingFolder, { recursive: true });
   const key = secretKey(descriptor.sessionId, descriptor.localPeer.peerId);
   const previousSecret = await context.secrets.get(key);
-  const secret = encodeSessionSecret(token, identityPrivateKey);
+  const secret = encodeSessionCredentials(token, identityPrivateKey);
   await context.secrets.store(key, secret);
   try {
     await atomicWriteFile(path.join(descriptor.workingFolder, MARKER), `${JSON.stringify(descriptor, null, 2)}\n`);
@@ -1634,24 +1912,17 @@ async function ensureDescriptorIdentity(
   );
 }
 
-function encodeSessionSecret(token: string, identityPrivateKey: string): string {
-  if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) throw new Error('Session token has an unsupported format.');
-  const privateKeyError = validateIdentityPrivateKey(identityPrivateKey);
-  if (privateKeyError) throw new Error(`Session identity is invalid: ${privateKeyError}.`);
-  return JSON.stringify({ version: 1, token, identityPrivateKey } satisfies StoredSessionSecret);
-}
-
 function decodeSessionSecret(value: string): StoredSessionSecret | undefined {
   if (/^[A-Za-z0-9_-]{32,128}$/.test(value)) return { version: 1, token: value };
   try {
     const parsed = JSON.parse(value) as Partial<StoredSessionSecret>;
-    if (parsed.version !== 1 || typeof parsed.token !== 'string'
+    if ((parsed.version !== 1 && parsed.version !== 2) || typeof parsed.token !== 'string'
       || !/^[A-Za-z0-9_-]{32,128}$/.test(parsed.token)
       || (parsed.identityPrivateKey !== undefined && validateIdentityPrivateKey(parsed.identityPrivateKey))) {
       return undefined;
     }
     return {
-      version: 1,
+      version: parsed.version,
       token: parsed.token,
       ...(parsed.identityPrivateKey ? { identityPrivateKey: parsed.identityPrivateKey } : {}),
     };

@@ -4315,6 +4315,66 @@ describe('pinned host reconnect', () => {
   });
 });
 
+describe('runtime launch phases', () => {
+  it('makes concurrent start callers await one shared startup and defers pending commit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-runtime-single-flight-'));
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'runtime-single-flight', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath, backingFolder: '',
+    }), 'runtime-single-flight-token-value', context(path.join(root, 'extension')), logger(), undefined, {
+      pendingLaunch: true,
+    });
+    let starts = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    (runtime as any).transport.start = async () => {
+      starts += 1;
+      await gate;
+      return 0;
+    };
+    (runtime as any).transport.waitForInfrastructureReady = async () => undefined;
+    try {
+      const first = runtime.start();
+      const second = runtime.start();
+      assert.equal(first, second);
+      await waitFor(() => starts === 1, 2_000, 'single transport startup');
+      assert.equal(starts, 1);
+      assert.equal(runtime.currentLaunchPhase(), 'transport-starting');
+      release();
+      await Promise.all([first, second]);
+      assert.equal(runtime.currentLaunchPhase(), 'outer-bindings-ready');
+      runtime.prepareLaunchCommit();
+      await runtime.completeLaunchCommit();
+      assert.equal(runtime.currentLaunchPhase(), 'established');
+      runtime.enableDescriptorPersistence();
+    } finally {
+      release();
+      await runtime.leave().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report success after a failed startup', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-runtime-start-failure-'));
+    const runtime = new SessionRuntime(descriptor({
+      sessionId: 'runtime-start-failure', role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: root, pythonPath: process.execPath, backingFolder: '',
+    }), 'runtime-start-failure-token-value', context(path.join(root, 'extension')), logger());
+    (runtime as any).transport.start = async () => { throw new Error('synthetic startup failure'); };
+    try {
+      const first = runtime.start();
+      const second = runtime.start();
+      assert.equal(first, second);
+      await assert.rejects(first, /synthetic startup failure/);
+      await assert.rejects(second, /synthetic startup failure/);
+      await assert.rejects(runtime.start(), /already closed/i);
+      assert.equal(runtime.currentLaunchPhase(), 'closed');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 function descriptor(options: {
   sessionId: string;
   role: 'host' | 'peer';

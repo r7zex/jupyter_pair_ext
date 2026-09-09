@@ -39,8 +39,8 @@
   "main": "./out/extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
-      "supported": "limited",
-      "description": "Pair Notebook stays loaded only to preserve an explicit Start/Join handoff while VS Code asks for Workspace Trust. Session networking, synchronization, and execution remain blocked until the folder is trusted."
+      "supported": false,
+      "description": "Pair Notebook remains disabled until the workspace is trusted. Pending Start/Join state is restored from authenticated extension-owned storage after activation."
     },
     "virtualWorkspaces": {
       "supported": false

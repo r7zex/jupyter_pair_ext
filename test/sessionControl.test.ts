@@ -5,7 +5,9 @@ import path from 'node:path';
 import { generateIdentityCredentials } from '../src/core/identity';
 import {
   ProjectManifestV1,
+  captureProjectManifest,
   classifyProjectDrift,
+  refreshWorkingCopyFromStableSource,
   stableCopyProject,
 } from '../src/core/projectBaseline';
 import { copyProject } from '../src/core/projectFiles';
@@ -17,7 +19,11 @@ import {
   assertExactSessionWorkspace,
   classifyLaunchRecovery,
   createSessionLaunchControl,
+  persistPendingLaunchArtifacts,
+  readLaunchBaseline,
+  readVerifiedLaunchArtifacts,
   sessionControlPaths,
+  sha256,
   verifySessionLaunchControl,
 } from '../src/core/sessionControl';
 import {
@@ -130,6 +136,55 @@ describe('durable session launch control', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('persists all recovery artifacts before accepting an exact pending workspace', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-control-artifacts-'));
+    const identity = generateIdentityCredentials();
+    const paths = sessionControlPaths(root, 'session-1', 'peer-1');
+    try {
+      await mkdir(paths.workspace, { recursive: true });
+      await writeFile(path.join(paths.workspace, 'value.txt'), 'value');
+      const baseline = { version: 1 as const, working: await captureProjectManifest(paths.workspace) };
+      const descriptor = {
+        sessionId: 'session-1', projectId: 'project-1', projectName: 'Project', mode: 'resilient' as const,
+        role: 'peer' as const,
+        localPeer: { peerId: 'peer-1', displayName: 'Peer', joinOrder: 1, identityKey: identity.publicKey },
+        hostPeerId: 'host-1', backingFolder: '', workingFolder: paths.workspace,
+        createdAt: 1, sessionEpoch: 1, hostEpoch: 0, computeExecutorId: 'host-1', pythonPath: 'python',
+        freshStart: true,
+        knownPeers: [{ peerId: 'host-1', displayName: 'Host', joinOrder: 0, identityKey: identity.publicKey }],
+      };
+      const created = await persistPendingLaunchArtifacts(
+        root, descriptor, baseline, 'launch-1', 'join', identity.privateKey,
+      );
+      assert.equal(created.recovery, 'resume-pending');
+      const verified = await readVerifiedLaunchArtifacts(root, paths.workspace, descriptor, identity.privateKey);
+      assert.equal(verified.control.sessionId, descriptor.sessionId);
+      assert.equal(verified.recovery, 'resume-pending');
+      assert.deepEqual(verified.baseline, baseline);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects authenticated baseline manifests containing non-portable paths', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-control-baseline-'));
+    const target = path.join(root, 'baseline.json');
+    try {
+      const bytes = `${JSON.stringify({
+        version: 1,
+        working: {
+          version: 1,
+          files: [{ relativePath: '../escape.txt', kind: 'text', size: 1, hash: DIGEST_A }],
+          directories: [],
+        },
+      })}\n`;
+      await writeFile(target, bytes);
+      await assert.rejects(readLaunchBaseline(target, sha256(bytes)), /unsupported schema/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('runtime participant ownership', () => {
@@ -229,5 +284,29 @@ describe('stable project snapshot and delayed-source classification', () => {
     assert.equal(classifyProjectDrift(baseline, changed, baseline), 'working-only');
     assert.equal(classifyProjectDrift(baseline, changed, changed), 'identical-change');
     assert.equal(classifyProjectDrift(baseline, changed, divergent), 'conflict');
+  });
+
+  it('refreshes a source-only change through a verified staging copy', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-source-refresh-'));
+    const source = path.join(root, 'source');
+    const destination = path.join(root, 'session', 'workspace');
+    try {
+      await mkdir(source, { recursive: true });
+      await writeFile(path.join(source, 'value.txt'), 'before');
+      const initial = await stableCopyProject(source, destination);
+      await writeFile(path.join(source, 'value.txt'), 'after');
+      await writeFile(path.join(source, 'added.txt'), 'new');
+      const refreshed = await refreshWorkingCopyFromStableSource(
+        source,
+        destination,
+        initial.baseline.working,
+        path.join(root, 'recovery'),
+      );
+      assert.equal(await readFile(path.join(destination, 'value.txt'), 'utf8'), 'after');
+      assert.equal(await readFile(path.join(destination, 'added.txt'), 'utf8'), 'new');
+      assert.deepEqual(refreshed.manifest, await captureProjectManifest(source));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
