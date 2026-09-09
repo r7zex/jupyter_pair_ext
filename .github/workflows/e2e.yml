@@ -67,6 +67,15 @@ jobs:
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
         run: xvfb-run -a npm run test:e2e
 
+      - name: Run real Workspace Trust transition E2E on Linux
+        if: runner.os == 'Linux'
+        env:
+          PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
+          PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
+          PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+        run: xvfb-run -a npm run test:e2e:trust
+
       - name: Run real VS Code Extension Host E2E
         if: runner.os != 'Linux'
         env:
@@ -75,3 +84,12 @@ jobs:
           PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
         run: npm run test:e2e
+
+      - name: Run real Workspace Trust transition E2E
+        if: runner.os != 'Linux'
+        env:
+          PAIR_NOTEBOOK_E2E_DRIVER: test-electron
+          PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
+          PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
+          PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+        run: npm run test:e2e:trust

@@ -66,6 +66,7 @@ describe('audit regressions', () => {
       assert.match(workflow, /^permissions:\s*\n\s+contents:\s+read$/m);
       assert.match(verifyJob, /permissions:\s*\n\s+contents:\s+read/);
       assert.doesNotMatch(verifyJob, /contents:\s+write/);
+      assert.match(verifyJob, /xvfb-run -a npm run test:e2e:trust/);
       assert.match(publishJob, /needs:\s+verify/);
       assert.match(publishJob, /permissions:[^]*?contents:\s+write/);
       assert.equal((workflow.match(/contents:\s+write/g) ?? []).length, 1);

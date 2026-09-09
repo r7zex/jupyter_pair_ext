@@ -274,6 +274,7 @@ async function initializeTrustedServicesImpl(context: vscode.ExtensionContext): 
   // Start/Join may authorize one continuation across the folder reload in this
   // VS Code process. Every other marker remains manual-only.
   offerWorkspaceSessionRestore(context);
+  startTrustE2EHandoff(context);
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -320,7 +321,15 @@ async function prepareStartSession(context: vscode.ExtensionContext): Promise<vo
     openLabel: 'Use as backing folder',
   });
   if (!chosen?.[0]) return;
-  const backingFolder = chosen[0].fsPath;
+  const descriptor = await createPendingHostLaunch(context, localDisplayName, chosen[0].fsPath);
+  await openSessionWorkingFolder(context, descriptor);
+}
+
+async function createPendingHostLaunch(
+  context: vscode.ExtensionContext,
+  localDisplayName: string,
+  backingFolder: string,
+): Promise<SessionDescriptor> {
   const projectName = path.basename(backingFolder);
   const projectNameError = validateProjectName(projectName);
   if (projectNameError) throw new Error(`The selected folder name cannot be used as a project name: ${projectNameError}`);
@@ -381,7 +390,40 @@ async function prepareStartSession(context: vscode.ExtensionContext): Promise<vo
     throw error;
   }
   localSessionLifecycle = 'pending';
-  await openSessionWorkingFolder(context, descriptor);
+  return descriptor;
+}
+
+function startTrustE2EHandoff(context: vscode.ExtensionContext): void {
+  if (process.env.PAIR_NOTEBOOK_E2E !== '1'
+    || process.env.PAIR_NOTEBOOK_E2E_TRUST !== '1'
+    || process.env.PAIR_NOTEBOOK_E2E_TRUST_STAGE !== 'external-handoff') return;
+  const handoffPath = process.env.PAIR_NOTEBOOK_E2E_TRUST_HANDOFF?.trim();
+  if (!handoffPath || !path.isAbsolute(handoffPath)) {
+    throw new Error('Workspace Trust E2E requires an absolute handoff path.');
+  }
+  runUiBackground('Workspace Trust E2E handoff', async () => {
+    try {
+      await lstat(handoffPath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const sourceWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!sourceWorkspace) throw new Error('Workspace Trust E2E requires one source workspace.');
+    const descriptor = await createPendingHostLaunch(context, 'Pair Trust E2E Host', sourceWorkspace);
+    const paths = sessionControlPaths(
+      context.globalStorageUri.fsPath,
+      descriptor.sessionId,
+      descriptor.localPeer.peerId,
+    );
+    await atomicWriteFile(handoffPath, `${JSON.stringify({
+      descriptor,
+      controlRoot: paths.root,
+      controlPath: paths.control,
+      ownerPath: paths.owner,
+    })}\n`);
+    await openSessionWorkingFolder(context, descriptor);
+  });
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {

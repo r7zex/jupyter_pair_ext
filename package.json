@@ -252,6 +252,7 @@
     "lint": "eslint .",
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:e2e": "npm run compile && node scripts/run-vscode-e2e.mjs",
+    "test:e2e:trust": "npm run compile && node scripts/run-vscode-e2e.mjs --trust",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
     "test:live:relay": "npm run compile && node scripts/emergency-relay-live-smoke.mjs",
     "package": "npm run clean && npm run lint && npm test && node scripts/make-artifacts.mjs --preflight-only && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
