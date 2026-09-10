@@ -4,6 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from './core/atomicFile';
+import {
+  awaitSessionStartup,
+  awaitSessionStartupCleanup,
+  SessionStartupTimeoutError,
+} from './core/sessionStartup';
 import { buildNetworkDiagnostics, type SignallingFamilyDiagnostic } from './runtime/diagnostics';
 import { formatLifecycleDiagnostics, type LifecycleDiagnosticEvent } from './runtime/lifecycleDiagnostics';
 import {
@@ -484,12 +489,39 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
   try {
     const identityPrivateKey = await ensureDescriptorIdentity(context, descriptor, storedSecret);
     output.appendLine(`[info] Starting session ${descriptor.sessionId} in ${descriptor.mode} mode.`);
-    runtime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
+    const startupRuntime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
+    runtime = startupRuntime;
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: 'Pair Notebook: connecting to session',
       cancellable: false,
-    }, async () => runtime!.start());
+    }, async (progress) => {
+      const reportState = (_state: unknown, detail: unknown): void => {
+        if (typeof detail === 'string') progress.report({ message: detail });
+      };
+      let startupExpired = false;
+      startupRuntime.on('state', reportState);
+      try {
+        const runtimeStart = startupRuntime.start();
+        void runtimeStart.then(() => {
+          if (!startupExpired) return;
+          void awaitSessionStartupCleanup(startupRuntime.leave()).catch((cleanupError) => {
+            output.appendLine(`[error] Late session startup cleanup did not settle: ${formatError(cleanupError)}`);
+          });
+        }, () => undefined);
+        try {
+          await awaitSessionStartup(runtimeStart);
+        } catch (error) {
+          startupExpired = error instanceof SessionStartupTimeoutError;
+          throw error;
+        }
+      } finally {
+        startupRuntime.off('state', reportState);
+      }
+    });
+    if (runtime !== startupRuntime) {
+      throw new Error('Session startup was superseded before it became ready.');
+    }
     synchronizer = new EditorSynchronizer(
       runtime.project,
       descriptor.workingFolder,
@@ -621,9 +653,15 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     }
   } catch (error) {
     output.appendLine(`[error] Session startup failed: ${formatError(error)}`);
-    const startupTerminal = runtime?.terminalLifecycle();
+    const failedRuntime = runtime;
+    const startupTerminal = failedRuntime?.terminalLifecycle();
     lifecycleReadyRuntime = undefined;
-    await runtime?.leave().catch(() => undefined);
+    runtime = undefined;
+    if (failedRuntime) {
+      await awaitSessionStartupCleanup(failedRuntime.leave()).catch((cleanupError) => {
+        output.appendLine(`[error] Session startup cleanup did not settle: ${formatError(cleanupError)}`);
+      });
+    }
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
         output.appendLine(`[error] Could not forget terminated session: ${formatError(cleanupError)}`);
@@ -631,16 +669,29 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       void vscode.window.showInformationMessage(
         `Pair Notebook: сессия уже завершена (${error.termination.endedByDisplayName}). Рабочая копия сохранена.`,
       );
-      runtime = undefined;
       return;
     }
     if (startupTerminal?.reason === 'local-route-failed') {
       await showLocalRouteFailedMessage();
-      runtime = undefined;
+      return;
+    }
+    if (error instanceof SessionStartupTimeoutError) {
+      const choice = await vscode.window.showErrorMessage(
+        `Pair Notebook stopped session startup after ${Math.ceil(error.timeoutMs / 1_000)} seconds. `
+          + 'The configured proxy or network route did not become ready. The working copy and session identity were preserved.',
+        'Retry',
+        'Open Proxy Settings',
+      );
+      if (choice === 'Retry') {
+        setTimeout(() => {
+          if (!runtime) void startWorkspaceSessionRestore(context);
+        }, 0);
+      } else if (choice === 'Open Proxy Settings') {
+        await vscode.commands.executeCommand('workbench.action.openSettings', 'http.proxy');
+      }
       return;
     }
     void vscode.window.showErrorMessage(`Pair Notebook could not start: ${formatError(error)}`);
-    runtime = undefined;
   }
 }
 
