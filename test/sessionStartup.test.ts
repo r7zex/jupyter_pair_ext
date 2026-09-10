@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import {
   awaitSessionStartup,
   awaitSessionStartupCleanup,
@@ -98,5 +100,12 @@ describe('session startup lifecycle deadlines', () => {
     await assert.rejects(awaitSessionStartup(Promise.resolve(), 0, scheduler), /positive integer/);
     assert.equal(scheduler.scheduledFor, undefined);
     assert.equal(scheduler.cancelled, 0);
+  });
+
+  it('does not retain the restore guard while a failure notification is unanswered', () => {
+    const source = readFileSync(path.join(process.cwd(), 'src/extension.ts'), 'utf8');
+    assert.match(source, /if \(startupTerminal\?\.reason === 'local-route-failed'\) \{[\s\S]*?void showLocalRouteFailedMessage\(\);[\s\S]*?return;/);
+    assert.doesNotMatch(source, /if \(startupTerminal\?\.reason === 'local-route-failed'\) \{[\s\S]*?await showLocalRouteFailedMessage\(\);/);
+    assert.match(source, /runUiBackground\('Session startup timeout recovery'/);
   });
 });

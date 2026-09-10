@@ -79,6 +79,8 @@ Consequently, one non-settling network-start Promise leaves all of these states 
 
 The internal emergency-relay checks normally intend to reject after 15 seconds, but the outer launch lifecycle assumes every nested network implementation will always honour its own deadline. The current live incident proves that assumption is false under the unavailable forced-proxy/recovery sequence. A user-visible startup operation therefore has no authoritative liveness boundary.
 
+There is a second independent latch after the normal 15-second relay failure. The startup catch path awaits `showLocalRouteFailedMessage()`, which in turn awaits `vscode.window.showWarningMessage()`. VS Code message promises remain pending until the notification is dismissed or an action is selected. Because `workspaceSessionRestore` is cleared only by the outer `.finally()`, an unanswered failure notification keeps the restore guard set even though transport cleanup has already completed. The incident logs demonstrate this sequence: a relay-readiness failure is followed by later Start commands being rejected as “still restoring.” User acknowledgement must never own lifecycle cleanup.
+
 ## Why synchronization is not the cause
 
 `EditorSynchronizer` is constructed only after `runtime.start()` returns. In the failing incident it never returns, so editor/notebook CRDT synchronization has not started.
@@ -100,7 +102,8 @@ The extension-level launch lifecycle must supervise the opaque runtime start ope
 4. Never turn the failed fresh launch into an active or established session.
 5. Make a later explicit retry possible without restarting VS Code.
 6. Guard cleanup against late settlement so a timed-out attempt cannot become ready afterward.
-7. Add deterministic tests for resolution, rejection, timeout, late resolution, and timer disposal.
+7. Present failure/retry UI out of band so an ignored notification cannot retain `workspaceSessionRestore`.
+8. Add deterministic tests for resolution, rejection, timeout, late resolution, and timer disposal.
 
 This repair guarantees the bounded property that Pair Notebook will leave the **connecting** state and return control to the user even if a nested network Promise never settles. It cannot guarantee internet or proxy availability; an unreachable configured proxy must still produce a clear recoverable failure rather than a false successful session.
 
@@ -108,6 +111,7 @@ This repair guarantees the bounded property that Pair Notebook will leave the **
 
 - A never-settling runtime start cannot keep the UI in `connecting` beyond the extension-owned deadline.
 - Timeout cleanup runs exactly once and a subsequent explicit restore/retry is allowed.
+- An unanswered startup-failure notification does not keep the restore guard set.
 - A runtime that resolves after the timeout cannot be attached to the dashboard, notebook controller, presence renderer, or synchronizer.
 - A normal successful start remains unchanged.
 - A normal immediate startup error remains unchanged except for clearer lifecycle cleanup.

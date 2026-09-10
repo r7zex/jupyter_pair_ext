@@ -672,23 +672,26 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       return;
     }
     if (startupTerminal?.reason === 'local-route-failed') {
-      await showLocalRouteFailedMessage();
+      // User acknowledgement must not keep workspaceSessionRestore latched.
+      void showLocalRouteFailedMessage();
       return;
     }
     if (error instanceof SessionStartupTimeoutError) {
-      const choice = await vscode.window.showErrorMessage(
-        `Pair Notebook stopped session startup after ${Math.ceil(error.timeoutMs / 1_000)} seconds. `
-          + 'The configured proxy or network route did not become ready. The working copy and session identity were preserved.',
-        'Retry',
-        'Open Proxy Settings',
-      );
-      if (choice === 'Retry') {
-        setTimeout(() => {
-          if (!runtime) void startWorkspaceSessionRestore(context);
-        }, 0);
-      } else if (choice === 'Open Proxy Settings') {
-        await vscode.commands.executeCommand('workbench.action.openSettings', 'http.proxy');
-      }
+      runUiBackground('Session startup timeout recovery', async () => {
+        const choice = await vscode.window.showErrorMessage(
+          `Pair Notebook stopped session startup after ${Math.ceil(error.timeoutMs / 1_000)} seconds. `
+            + 'The configured proxy or network route did not become ready. The working copy and session identity were preserved.',
+          'Retry',
+          'Open Proxy Settings',
+        );
+        if (choice === 'Retry') {
+          setTimeout(() => {
+            if (!runtime) void startWorkspaceSessionRestore(context);
+          }, 0);
+        } else if (choice === 'Open Proxy Settings') {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'http.proxy');
+        }
+      });
       return;
     }
     void vscode.window.showErrorMessage(`Pair Notebook could not start: ${formatError(error)}`);
