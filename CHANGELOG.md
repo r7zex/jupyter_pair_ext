@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.27 - 2026-09-10 (bounded session startup recovery)
+
+- Bounds workspace session startup with an extension-owned 90-second deadline and a 5-second cleanup deadline so stalled transport startup cannot leave an endless connecting state.
+- Releases the restore guard before showing failure notifications, keeps the pending session identity for retry, and offers Retry or Open Proxy Settings after a startup timeout.
+- Adds regression coverage for startup timeout, bounded cleanup, late settlement, deadline disposal, and notification-latch behavior without changing synchronization, CRDT, transport, or protocol code.
+
+Automated validation does not replace installed-VSIX and physical two-computer acceptance; the release gate records those boundaries explicitly.
+
 ## 0.5.26 - 2026-09-09 (Workspace Trust handoff)
 
 - Keeps Pair Notebook enabled in Restricted Mode with limited capability support so the explicit Start/Join action can survive the isolated-folder Trust prompt.
