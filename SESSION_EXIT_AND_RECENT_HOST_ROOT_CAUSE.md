@@ -4,6 +4,8 @@ Date: 2026-09-12
 
 Baseline: `d9376d4911ea743747cb12576b19115c6715d42b` (`main`, package version `0.5.26`)
 
+Affected published release: `v0.5.27` at `5a274f6754ed69631a2b65120289c858503bf383` (released from a side branch and not merged into `main`)
+
 Status: localized before production changes
 
 ## Reported behavior
@@ -16,6 +18,14 @@ Status: localized before production changes
 ## Scope proof
 
 `git diff v0.5.23..v0.5.26 -- src/runtime src/core/election.ts src/core/types.ts` is empty. The runtime, mesh, election, and protocol implementation that existed in `0.5.23` did not change in the affected release range. The new behavior is in the VS Code lifecycle integration added after `0.5.23`, primarily `src/extension.ts`, `src/core/manualSessionRestore.ts`, and `src/core/recentProjects.ts`.
+
+## RC-0: published 0.5.27 adds a terminal timeout before establishment
+
+The `v0.5.27` release was created from `codex/session-start-lifecycle-20260909`, while GitHub `main` remained on package version `0.5.26`. Its `ddf1313` implementation adds `src/core/sessionStartup.ts` and wraps `SessionRuntime.start()` in an absolute 90-second `awaitSessionStartup()` deadline.
+
+When that deadline expires, `restoreWorkspaceSession()` classifies the in-progress connection as failed, clears the module-level runtime, and invokes `leave()` through a separate 5-second cleanup deadline. This is a timeout-driven session exit before `lifecycleReadyRuntime` can be assigned. It therefore contradicts the required boundary directly: the timeout acts during connection rather than after a fully established session later becomes unreachable.
+
+The `0.5.28` repair must not carry the `0.5.27` startup deadline or `src/core/sessionStartup.ts` forward. Startup remains governed by the pre-`0.5.27` connection behavior; only the established-session deactivation/suspend/host-loss policies may produce an automatic exit.
 
 ## RC-1: pre-establishment runtime is treated as an active session during deactivation
 
@@ -70,4 +80,3 @@ Pending Start/Join, established Active Session, and Recent Session are distinct 
 - A guest exit uses the live host nickname when available.
 - A missing guest host cache preserves an existing valid Recent nickname instead of replacing it with `Unknown host`.
 - Host nickname behavior remains unchanged.
-
