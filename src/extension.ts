@@ -15,6 +15,7 @@ import {
 import {
   createPendingSessionLaunch,
   currentEditorProcessIdentity,
+  establishedSessionRuntime,
   normalizePendingSessionLaunch,
   pendingSessionLaunchMatches,
   runConfirmedSessionRestore,
@@ -226,17 +227,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export function deactivate(): Thenable<void> | undefined {
+  const establishedRuntime = establishedSessionRuntime(runtime, lifecycleReadyRuntime);
   if (statusTimer) clearInterval(statusTimer);
   if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
   lifecycleWatchdog = undefined;
-  lifecycleReadyRuntime = undefined;
   synchronizer?.dispose();
   presence?.dispose();
   notebookController?.dispose();
   const context = activationContext;
-  return context && runtime
-    ? leaveActiveSession(context, Date.now(), 'extension-deactivated')
+  const exit = context && establishedRuntime
+    ? leaveActiveSession(context, Date.now(), 'extension-deactivated', establishedRuntime)
     : undefined;
+  lifecycleReadyRuntime = undefined;
+  return exit;
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
@@ -314,9 +317,6 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
-  await rememberProject(context, descriptor).catch((error) => {
-    output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
-  });
   await openSessionWorkingFolder(context, descriptor);
 }
 
@@ -414,9 +414,6 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
-  await rememberProject(context, descriptor).catch((error) => {
-    output.appendLine(`[error] Could not update recent projects: ${formatError(error)}`);
-  });
   await openSessionWorkingFolder(context, descriptor);
 }
 
@@ -582,6 +579,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
               pinnedHostId: event.hostId,
               requireReconnectable: true,
               leftAt: event.at,
+              hostDisplayName: runtimeHostDisplayName(closedRuntime, event.hostId),
             });
             dashboard?.refresh();
             if (closedRuntime && correlationId) {
@@ -735,8 +733,8 @@ function startLifecycleWatchdog(context: vscode.ExtensionContext): void {
     const currentTickAt = Date.now();
     const gap = currentTickAt - previousTickAt;
     const leftAt = previousTickAt;
-    const currentReadyRuntime = vscode.workspace.isTrusted && runtime === lifecycleReadyRuntime
-      ? runtime
+    const currentReadyRuntime = vscode.workspace.isTrusted
+      ? establishedSessionRuntime(runtime, lifecycleReadyRuntime)
       : undefined;
     const suspendedRuntime = shouldLeaveForSystemSuspend(
       previousReadyRuntime,
@@ -751,7 +749,7 @@ function startLifecycleWatchdog(context: vscode.ExtensionContext): void {
     output.appendLine(`[lifecycle] Detected a ${gap}ms extension-host suspension; leaving the active session.`);
     runUiBackground('System-suspend session leave', async () => {
       if (runtime !== suspendedRuntime || localSessionExit) return;
-      await leaveActiveSession(context, leftAt, 'system-suspend');
+      await leaveActiveSession(context, leftAt, 'system-suspend', suspendedRuntime);
       const choice = await vscode.window.showWarningMessage(
         'Pair Notebook: компьютер был приостановлен, поэтому активная сессия закрыта локально. Переподключитесь вручную через «Недавние проекты».',
         'Открыть недавние',
@@ -774,17 +772,24 @@ async function leaveActiveSession(
   context: vscode.ExtensionContext,
   leftAt: number,
   reason: 'explicit-leave' | 'extension-deactivated' | 'system-suspend',
+  expectedRuntime = runtime,
 ): Promise<void> {
   if (localSessionExit) return localSessionExit;
-  const active = runtime;
-  if (!active) return;
-  if (lifecycleReadyRuntime === active) lifecycleReadyRuntime = undefined;
+  const active = expectedRuntime;
+  if (!active || runtime !== active) return;
+  const wasEstablished = establishedSessionRuntime(active, lifecycleReadyRuntime) === active;
+  if (wasEstablished) lifecycleReadyRuntime = undefined;
   localSessionExit = (async () => {
-    try {
-      await rememberProject(context, active.descriptor, { leftAt });
-      dashboard?.refresh();
-    } catch (error) {
-      output.appendLine(`[error] Could not record session exit (${reason}): ${formatError(error)}`);
+    if (wasEstablished) {
+      try {
+        await rememberProject(context, active.descriptor, {
+          leftAt,
+          hostDisplayName: runtimeHostDisplayName(active),
+        });
+        dashboard?.refresh();
+      } catch (error) {
+        output.appendLine(`[error] Could not record session exit (${reason}): ${formatError(error)}`);
+      }
     }
     await active.leave();
   })().finally(() => {
@@ -802,7 +807,7 @@ async function leaveSession(): Promise<void> {
   );
   if (answer !== 'Leave Session') return;
   const context = requireActivationContext();
-  await leaveActiveSession(context, Date.now(), 'explicit-leave');
+  await leaveActiveSession(context, Date.now(), 'explicit-leave', active);
   await forgetWorkspaceSession(context, active.descriptor);
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
   await context.globalState.update(
@@ -1674,6 +1679,7 @@ interface RememberProjectOptions {
   pinnedHostId?: string | undefined;
   requireReconnectable?: boolean | undefined;
   leftAt?: number | undefined;
+  hostDisplayName?: string | undefined;
 }
 
 async function rememberProject(
@@ -1682,6 +1688,7 @@ async function rememberProject(
   options: RememberProjectOptions = {},
 ): Promise<void> {
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+  const previous = recentProjectForFolder(recent, descriptor.workingFolder);
   const pinnedHostId = options.pinnedHostId ?? descriptor.hostPeerId;
   const reconnect = reconnectIdentityFromDescriptor(descriptor, pinnedHostId);
   if (options.requireReconnectable && !reconnect) {
@@ -1691,13 +1698,34 @@ async function rememberProject(
   const next = rememberRecentProject(recent, {
     name: descriptor.projectName,
     sessionId: descriptor.sessionId,
-    hostDisplayName: recentHostDisplayName(descriptor, pinnedHostId),
+    hostDisplayName: recentHostDisplayName(
+      descriptor,
+      pinnedHostId,
+      options.hostDisplayName,
+      previous?.hostDisplayName,
+    ),
     workingFolder: descriptor.workingFolder,
     at: leftAt,
     leftAt,
     ...(reconnect ? { reconnect } : {}),
   });
   await context.globalState.update('pairNotebook.recent', next);
+}
+
+function runtimeHostDisplayName(
+  active: SessionRuntime | undefined,
+  pinnedHostId = active?.descriptor.hostPeerId,
+): string | undefined {
+  if (!active || !pinnedHostId) return undefined;
+  if (active.descriptor.localPeer.peerId === pinnedHostId) return active.descriptor.localPeer.displayName;
+  try {
+    const snapshot = active.snapshot();
+    return snapshot.peers.find((peer) => peer.peerId === pinnedHostId)?.displayName
+      ?? snapshot.awareness.find((state) => state.peer.peerId === pinnedHostId)?.peer.displayName;
+  } catch (error) {
+    output.appendLine(`[debug] Could not read the live host nickname for Recent Sessions: ${formatError(error)}`);
+    return undefined;
+  }
 }
 
 async function forgetEndedSession(

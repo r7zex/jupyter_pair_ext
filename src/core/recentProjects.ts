@@ -103,11 +103,19 @@ export function recentProjectForFolder(
 export function recentHostDisplayName(
   descriptor: SessionDescriptor,
   pinnedHostId = descriptor.hostPeerId,
+  liveHostDisplayName?: string,
+  rememberedHostDisplayName?: string,
 ): string {
   const host = descriptor.localPeer.peerId === pinnedHostId
     ? descriptor.localPeer
     : (descriptor.knownPeers ?? []).find((peer) => peer.peerId === pinnedHostId);
-  return normalizeRecentHostDisplayName(host?.displayName) ?? 'Unknown host';
+  if (host === descriptor.localPeer) {
+    return normalizeRecentHostDisplayName(host.displayName) ?? 'Unknown host';
+  }
+  return normalizeRecentHostDisplayName(liveHostDisplayName)
+    ?? normalizeRecentHostDisplayName(host?.displayName)
+    ?? normalizeRecentHostDisplayName(rememberedHostDisplayName)
+    ?? 'Unknown host';
 }
 
 export function presentRecentExit(leftAt: number, now = Date.now()): RecentExitPresentation {
