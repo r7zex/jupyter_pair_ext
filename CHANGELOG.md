@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.5.27 - 2026-09-12 (established-session exit boundary)
+## 0.5.28 - 2026-09-12 (established-session exit boundary)
 
+- Supersedes the side-branch `0.5.27` release without carrying forward its absolute 90-second pre-establishment startup deadline or forced startup cleanup; connecting is no longer converted into a timeout-driven session exit.
 - Applies graceful deactivation and suspend-gap leave handling only after the exact runtime completed startup and all VS Code editor, notebook, presence, dashboard, and terminal bindings were installed.
 - Keeps pending Start/Join attempts out of Recent Sessions and prevents an Extension Host reload during connection from turning an unfinished launch into a recorded session exit.
 - Resolves a guest's Recent Session host nickname from the live authenticated runtime when available and preserves an already remembered valid nickname when the optional peer cache is incomplete; host-side naming remains unchanged.
