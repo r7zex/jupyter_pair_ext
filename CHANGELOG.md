@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.27 - 2026-09-12 (established-session exit boundary)
+
+- Applies graceful deactivation and suspend-gap leave handling only after the exact runtime completed startup and all VS Code editor, notebook, presence, dashboard, and terminal bindings were installed.
+- Keeps pending Start/Join attempts out of Recent Sessions and prevents an Extension Host reload during connection from turning an unfinished launch into a recorded session exit.
+- Resolves a guest's Recent Session host nickname from the live authenticated runtime when available and preserves an already remembered valid nickname when the optional peer cache is incomplete; host-side naming remains unchanged.
+- Leaves synchronization, CRDT, transport, host election, and protocol code unchanged. Fixes #21.
+
+Automated validation does not replace installed-VSIX startup, real Windows suspend/resume, extension uninstall, power-loss, and physical two-computer acceptance.
+
 ## 0.5.26 - 2026-09-09 (Workspace Trust handoff)
 
 - Keeps Pair Notebook enabled in Restricted Mode with limited capability support so the explicit Start/Join action can survive the isolated-folder Trust prompt.
