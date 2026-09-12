@@ -78,6 +78,13 @@ export function isSystemSuspendGap(previousTickAt: number, currentTickAt: number
     && currentTickAt - previousTickAt >= thresholdMs;
 }
 
+export function establishedSessionRuntime<T extends object>(
+  runtime: T | undefined,
+  readyRuntime: T | undefined,
+): T | undefined {
+  return runtime !== undefined && runtime === readyRuntime ? runtime : undefined;
+}
+
 export function shouldLeaveForSystemSuspend<T extends object>(
   previousReadyRuntime: T | undefined,
   currentReadyRuntime: T | undefined,

@@ -31,6 +31,7 @@ import {
 import {
   createPendingSessionLaunch,
   currentEditorProcessIdentity,
+  establishedSessionRuntime,
   isSystemSuspendGap,
   normalizePendingSessionLaunch,
   pendingSessionLaunchMatches,
@@ -2033,6 +2034,10 @@ describe('compute launch and recent projects', () => {
     assert.equal(isSystemSuspendGap(1_000, 16_000, 15_000), true);
     assert.equal(isSystemSuspendGap(16_000, 1_000, 15_000), false);
     const readyRuntime = {};
+    assert.equal(establishedSessionRuntime(undefined, readyRuntime), undefined);
+    assert.equal(establishedSessionRuntime(readyRuntime, undefined), undefined);
+    assert.equal(establishedSessionRuntime({}, readyRuntime), undefined);
+    assert.equal(establishedSessionRuntime(readyRuntime, readyRuntime), readyRuntime);
     assert.equal(shouldLeaveForSystemSuspend(undefined, readyRuntime, 1_000, 20_000, 15_000), false);
     assert.equal(shouldLeaveForSystemSuspend({}, readyRuntime, 1_000, 20_000, 15_000), false);
     assert.equal(shouldLeaveForSystemSuspend(readyRuntime, readyRuntime, 1_000, 15_999, 15_000), false);
@@ -2084,6 +2089,28 @@ describe('compute launch and recent projects', () => {
     );
     assert.match(activateSource, /offerWorkspaceSessionRestore\(context\)/);
     assert.doesNotMatch(activateSource, /startWorkspaceSessionRestore\(context\)/);
+    const deactivateSource = source.slice(
+      source.indexOf('export function deactivate'),
+      source.indexOf('async function startSession'),
+    );
+    assert.match(deactivateSource, /establishedSessionRuntime\(runtime, lifecycleReadyRuntime\)/);
+    assert.doesNotMatch(deactivateSource, /context && runtime/);
+    const startSource = source.slice(
+      source.indexOf('async function startSession'),
+      source.indexOf('async function joinSession'),
+    );
+    const joinSource = source.slice(
+      source.indexOf('async function joinSession'),
+      source.indexOf('async function openSessionWorkingFolder'),
+    );
+    assert.doesNotMatch(startSource, /rememberProject\(/);
+    assert.doesNotMatch(joinSource, /rememberProject\(/);
+    const leaveSource = source.slice(
+      source.indexOf('async function leaveActiveSession'),
+      source.indexOf('async function leaveSession'),
+    );
+    assert.match(leaveSource, /const wasEstablished = establishedSessionRuntime\(active, lifecycleReadyRuntime\) === active/);
+    assert.match(leaveSource, /if \(wasEstablished\) \{[\s\S]+rememberProject\(/);
     const offerSource = source.slice(
       source.indexOf('function offerWorkspaceSessionRestore'),
       source.indexOf('function startWorkspaceSessionRestore'),
@@ -2802,6 +2829,23 @@ describe('reconnectable Recent Sessions', () => {
     assert.equal('transportPeerId' in (normalized[0] as any), false);
     assertRecentReconnectMatchesDescriptor(reconnect!, descriptor);
     assert.equal(recentHostDisplayName(descriptor), 'Host');
+    assert.equal(recentHostDisplayName(
+      { ...descriptor, knownPeers: [] },
+      'original-host',
+      undefined,
+      'Remembered Host',
+    ), 'Remembered Host');
+    assert.equal(recentHostDisplayName(
+      { ...descriptor, knownPeers: [] },
+      'original-host',
+      'Live Host',
+      'Remembered Host',
+    ), 'Live Host');
+    assert.equal(recentHostDisplayName({
+      ...descriptor,
+      role: 'host',
+      hostPeerId: 'guest',
+    }, 'guest', 'Stale Remote Name', 'Stale Recent Name'), 'Guest');
 
     const remembered = rememberRecentProject([], normalized[0]!);
     assert.equal(remembered[0]?.reconnect?.sessionId, 'recent-session');
