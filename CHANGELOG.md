@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.30 - 2026-09-13 (preserve input after remote edits)
+
+- Removes the 100 ms post-projection input suppression that discarded genuine same-line typing, Backspace, paste and multi-cursor changes. Fixes #19.
+- Preserves input arriving after the projected target while the VS Code edit promise is still pending, and keeps duplicate editor notifications and network replay idempotent.
+- Applies canonical line endings with the remote edit so native Windows CRLF normalization does not become a new local update.
+- Enables the previously skipped real VS Code regression and adds repeated native typing, multi-cursor, notebook-cell and LF/CRLF coverage. The repair passed Extension Host checks on Windows, Linux, macOS and VS Code 1.95.0 minimum.
+
+Update every participant to receive the editor fix. The wire protocol is unchanged; physical two-computer acceptance remains separate from automated verification.
+
 ## 0.5.29 - 2026-09-13 (independent connection paths and retry recovery)
 
 - Releases failed Start/Join ownership independently of notification lifetime and bounds failed cleanup; adds explicit cancellation during connection and snapshot reception.
