@@ -156,9 +156,12 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
-  test('does not duplicate a remote newline when VS Code reshapes the projection event', async () => {
+  for (const eol of [vscode.EndOfLine.LF, vscode.EndOfLine.CRLF]) test(`does not duplicate a remote newline with native EOL=${eol}`, async () => {
     const harness = await createTextHarness('print(a');
     try {
+      const eolEdit = new vscode.WorkspaceEdit();
+      eolEdit.set(harness.document.uri, [vscode.TextEdit.setEndOfLine(eol)]);
+      assert.equal(await vscode.workspace.applyEdit(eolEdit), true);
       let nonRemoteUpdates = 0;
       const onUpdate = (event: ProjectUpdate): void => {
         if (event.key === harness.key && event.origin !== REMOTE_ORIGIN) nonRemoteUpdates += 1;
@@ -178,11 +181,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
-  test.skip('KNOWN #19: keeps genuine local typing during the 100 ms post-projection quarantine', async () => {
-    // Real VS Code E2E on Windows, Linux, macOS, and minimum VS Code 1.95.0
-    // confirmed that suppressProjectionTail currently treats this genuine edit
-    // as a delayed projection tail. Keep the exact regression visible until
-    // https://github.com/r7zex/jupyter_pair_ext/issues/19 is fixed in src/**.
+  test('keeps genuine local typing immediately after a remote projection', async () => {
     const harness = await createTextHarness('alpha');
     try {
       harness.project.replaceText(harness.key, '#alpha', REMOTE_ORIGIN);
@@ -196,26 +195,22 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
-  test('keeps immediate local typing on a different line during projection quarantine', async () => {
+  test('keeps immediate local typing on a different line after a remote projection', async () => {
   const harness = await createTextHarness('remote = 0\nlocal = 0');
   try {
     harness.project.applyTextChanges(harness.key, [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
-    await waitFor(
-      () => (harness.synchronizer as any).projectionQuarantines.has(harness.document.uri.toString()),
-      3_000,
-      'post-projection guard to arm before different-line file edit',
-    );
+    await harness.synchronizer.prepareWorkingCopy();
     assert.equal(normalizeEol(harness.document.getText()), 'remote = 1\nlocal = 0');
     const edit = new vscode.WorkspaceEdit();
     edit.insert(harness.document.uri, harness.document.lineAt(1).range.end, ' + 1');
     assert.equal(await vscode.workspace.applyEdit(edit), true);
     await waitFor(() => harness.project.text(harness.key).toString() === 'remote = 1\nlocal = 0 + 1', 3_000,
-      'different-line local edit during quarantine');
+      'different-line local edit after projection');
     assert.equal(harness.document.getText(), 'remote = 1\nlocal = 0 + 1');
   } finally { await harness.dispose(); }
 });
 
-  test('authors genuine local typing after the projection-tail quarantine has expired', async () => {
+  test('authors genuine local typing after an idle remote projection', async () => {
     const harness = await createTextHarness('alpha');
     try {
       harness.project.replaceText(harness.key, '#alpha', REMOTE_ORIGIN);
@@ -275,6 +270,38 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     } finally {
       await harness.dispose();
     }
+  });
+});
+
+suite('Pair Notebook — native input following remote text', () => {
+  test('preserves native repeated typing immediately after a remote same-line edit', async () => {
+    const harness = await createTextHarness('alpha');
+    try {
+      const editor = await vscode.window.showTextDocument(harness.document, { preview: false });
+      editor.selection = new vscode.Selection(0, 5, 0, 5);
+      harness.project.replaceText(harness.key, '#alpha', REMOTE_ORIGIN);
+      await waitFor(() => harness.document.getText() === '#alpha', 3_000, 'remote same-line projection');
+      for (let i = 0; i < 20; i++) {
+        await vscode.commands.executeCommand('default:type', { text: '!' });
+      }
+      const expected = '#alpha' + '!'.repeat(20);
+      await waitFor(() => harness.project.text(harness.key).toString() === expected, 3_000, 'all native keys to be published');
+      assert.equal(harness.document.getText(), expected);
+    } finally { await harness.dispose(); }
+  });
+
+  test('preserves native multi-cursor input spanning a remotely edited line', async () => {
+    const harness = await createTextHarness('remote = 0\nlocal = 0');
+    try {
+      const editor = await vscode.window.showTextDocument(harness.document, { preview: false });
+      editor.selections = [new vscode.Selection(0, 10, 0, 10), new vscode.Selection(1, 9, 1, 9)];
+      harness.project.applyTextChanges(harness.key, [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
+      await waitFor(() => normalizeEol(harness.document.getText()) === 'remote = 1\nlocal = 0', 3_000, 'remote first-line projection');
+      await vscode.commands.executeCommand('default:type', { text: '!' });
+      const expected = 'remote = 1!\nlocal = 0!';
+      await waitFor(() => normalizeEol(harness.project.text(harness.key).toString()) === expected, 3_000, 'both native cursors to publish');
+      assert.equal(normalizeEol(harness.document.getText()), expected);
+    } finally { await harness.dispose(); }
   });
 });
 
