@@ -58,6 +58,8 @@ import { configureMeshNetwork } from './runtime/mesh';
 import { EXPLICIT_PROXY_PASSWORD_ERROR, inspectExplicitProxyPassword } from './runtime/proxy';
 import { BackingFolderMismatchError, SessionRuntime, SessionTerminalLifecycle } from './runtime/session';
 import { readWindowsSystemProxy } from './runtime/systemProxy';
+import { assertProxyReachable } from './runtime/proxyReadiness';
+import { awaitFailedStartupCleanup, awaitStartupOperation, SessionStartCancelledError } from './core/startupRecovery';
 import { DashboardProvider } from './vscode/dashboard';
 import { PresenceRenderer } from './vscode/presence';
 import { statusBarTextForRuntimeState } from './vscode/connectionProgress';
@@ -248,7 +250,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
   if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
-  await applyMeshNetworkConfiguration(context);
+  await applyMeshNetworkConfiguration(context, { checkProxy: true });
   const localDisplayName = await promptDisplayName(
     displayName(),
     'Введите имя, которое увидят остальные участники.',
@@ -326,7 +328,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
   if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
-  await applyMeshNetworkConfiguration(context);
+  await applyMeshNetworkConfiguration(context, { checkProxy: true });
   const raw = await vscode.window.showInputBox({
     title: 'Join Pair Notebook Session',
     prompt: 'Paste the complete pair-notebook:// invite',
@@ -354,19 +356,27 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
       await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
         title: 'Pair Notebook: receiving project snapshot',
-        cancellable: false,
-      }, async (progress) => downloadProjectSnapshot(invite, localPeer, workingFolder, (state) => {
-        const completedDelta = Math.max(0, state.completedFiles - lastCompletedFiles);
-        lastCompletedFiles = state.completedFiles;
-        progress.report({
-          ...(state.currentFile !== undefined ? { message: state.currentFile } : {}),
-          ...(state.totalFiles ? { increment: completedDelta * 100 / state.totalFiles } : {}),
-        });
-      }, undefined, identity.privateKey));
+        cancellable: true,
+      }, async (progress, cancellation) => {
+        const controller = new AbortController();
+        const subscription = cancellation.onCancellationRequested(() => controller.abort());
+        if (cancellation.isCancellationRequested) controller.abort();
+        try {
+          await downloadProjectSnapshot(invite, localPeer, workingFolder, (state) => {
+            const completedDelta = Math.max(0, state.completedFiles - lastCompletedFiles);
+            lastCompletedFiles = state.completedFiles;
+            progress.report({
+              ...(state.currentFile !== undefined ? { message: state.currentFile } : {}),
+              ...(state.totalFiles ? { increment: completedDelta * 100 / state.totalFiles } : {}),
+            });
+          }, undefined, identity.privateKey, controller.signal);
+        } finally { subscription.dispose(); }
+      });
       break;
     } catch (error) {
       if (!(error instanceof SnapshotBootstrapError) || error.kind !== 'display-name-conflict') {
         await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
+        if (error instanceof SessionStartCancelledError) return;
         throw error;
       }
       const replacement = await promptDisplayName(nickname, 'Этот никнейм уже занят подключённым участником.');
@@ -478,15 +488,39 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     void vscode.window.showErrorMessage('Pair Notebook session token is unavailable. Rejoin using a fresh invite.');
     return;
   }
+  let startupRuntime: SessionRuntime | undefined;
   try {
+    await applyMeshNetworkConfiguration(context, { checkProxy: true });
     const identityPrivateKey = await ensureDescriptorIdentity(context, descriptor, storedSecret);
     output.appendLine(`[info] Starting session ${descriptor.sessionId} in ${descriptor.mode} mode.`);
-    runtime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
+    startupRuntime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
+    runtime = startupRuntime;
+    const attemptRuntime = startupRuntime;
+    attemptRuntime.setContextOwner(() => !runtime || runtime === attemptRuntime);
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: 'Pair Notebook: connecting to session',
-      cancellable: false,
-    }, async () => runtime!.start());
+      cancellable: true,
+    }, async (_progress, cancellation) => {
+      const controller = new AbortController();
+      const subscription = cancellation.onCancellationRequested(() => controller.abort());
+      if (cancellation.isCancellationRequested) controller.abort();
+      const start = attemptRuntime.start(controller.signal);
+      try {
+        await awaitStartupOperation(start, controller.signal);
+      } finally {
+        subscription.dispose();
+        if (controller.signal.aborted) {
+          // The abandoned attempt owns its eventual completion and cleanup.
+          void start.finally(() => attemptRuntime.leave()).catch((error) => {
+            if (!(error instanceof SessionStartCancelledError)) {
+              output.appendLine(`[debug] Cancelled startup settled: ${formatError(error)}`);
+            }
+          });
+        }
+      }
+    });
+    if (runtime !== startupRuntime) throw new SessionStartCancelledError();
     synchronizer = new EditorSynchronizer(
       runtime.project,
       descriptor.workingFolder,
@@ -619,9 +653,20 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     }
   } catch (error) {
     output.appendLine(`[error] Session startup failed: ${formatError(error)}`);
-    const startupTerminal = runtime?.terminalLifecycle();
-    lifecycleReadyRuntime = undefined;
-    await runtime?.leave().catch(() => undefined);
+    const failedRuntime = startupRuntime;
+    if (failedRuntime) output.appendLine(`[network] Startup diagnostics: ${JSON.stringify(failedRuntime.networkDiagnostics())}`);
+    const startupTerminal = failedRuntime?.terminalLifecycle();
+    if (lifecycleReadyRuntime === failedRuntime) lifecycleReadyRuntime = undefined;
+    if (runtime === failedRuntime) runtime = undefined;
+    if (failedRuntime) {
+      const cleanup = failedRuntime.leave();
+      await awaitFailedStartupCleanup(cleanup).then((completed) => {
+        if (!completed) output.appendLine('[warn] Failed startup cleanup is continuing in the background; retry is available.');
+      }).catch((cleanupError) => {
+        output.appendLine(`[error] Failed startup cleanup: ${formatError(cleanupError)}`);
+      });
+    }
+    if (error instanceof SessionStartCancelledError) return;
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
         output.appendLine(`[error] Could not forget terminated session: ${formatError(cleanupError)}`);
@@ -629,16 +674,13 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       void vscode.window.showInformationMessage(
         `Pair Notebook: сессия уже завершена (${error.termination.endedByDisplayName}). Рабочая копия сохранена.`,
       );
-      runtime = undefined;
       return;
     }
     if (startupTerminal?.reason === 'local-route-failed') {
-      await showLocalRouteFailedMessage();
-      runtime = undefined;
+      void showLocalRouteFailedMessage();
       return;
     }
     void vscode.window.showErrorMessage(`Pair Notebook could not start: ${formatError(error)}`);
-    runtime = undefined;
   }
 }
 
@@ -1130,6 +1172,7 @@ async function changeCompute(): Promise<void> {
  */
 interface MeshNetworkRefreshOptions {
   allowLegacyProxyMigration?: boolean;
+  checkProxy?: boolean;
 }
 
 function effectiveProxyConfigurationTarget(
@@ -1188,19 +1231,22 @@ async function applyMeshNetworkConfiguration(
   ]);
   if (generation !== meshNetworkConfigurationGeneration) return;
   observedSystemProxyFingerprint = systemProxyFingerprint(systemProxy);
+  const proxy = {
+    explicitProxy: explicitProxy || undefined,
+    explicitProxyPassword: proxyPassword,
+    vscodeProxy: httpConfiguration.get<string>('proxy') || undefined,
+    vscodeProxySupport: httpConfiguration.get<string>('proxySupport'),
+    vscodeNoProxy: httpConfiguration.get<string[]>('noProxy', []),
+    systemProxy: systemProxy?.proxyUrl,
+    systemNoProxy: systemProxy?.noProxy,
+  };
+  if (options.checkProxy) await assertProxyReachable(proxy);
+  if (generation !== meshNetworkConfigurationGeneration) return;
   configureMeshNetwork({
     turnUrls: configuration.get<string[]>('turnUrls', []),
     turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
     turnPassword: turnPassword || undefined,
-    proxy: {
-      explicitProxy: explicitProxy || undefined,
-      explicitProxyPassword: proxyPassword,
-      vscodeProxy: httpConfiguration.get<string>('proxy') || undefined,
-      vscodeProxySupport: httpConfiguration.get<string>('proxySupport'),
-      vscodeNoProxy: httpConfiguration.get<string[]>('noProxy', []),
-      systemProxy: systemProxy?.proxyUrl,
-      systemNoProxy: systemProxy?.noProxy,
-    },
+    proxy,
   });
 }
 

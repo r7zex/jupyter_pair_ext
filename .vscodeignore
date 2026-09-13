@@ -18,6 +18,8 @@ venv/**
 out/src/**
 # The bundle itself is gitignored via out/, but must ship in the VSIX.
 !out/extension.js
+!media/native/*.node
+!media/native/manifest.json
 *.log
 *.zip
 *.vsix

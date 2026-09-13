@@ -1311,7 +1311,7 @@ describe('mesh relay fallback integration', function () {
     }
   });
 
-  it('refuses to advertise a session when the guaranteed relay readiness barrier fails', async () => {
+  it('keeps local discovery active and reports unavailable emergency paths', async () => {
     const { MeshTransport, configureMeshNetwork } = await import('../src/runtime/mesh.js');
     const deadRoom = {
       makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
@@ -1339,11 +1339,12 @@ describe('mesh relay fallback integration', function () {
       isHost: () => true,
       roomFactory: () => deadRoom as never,
     });
+    const warnings: Error[] = [];
+    transport.on('networkWarning', (error) => warnings.push(error));
     try {
-      await assert.rejects(
-        transport.start(),
-        /Guaranteed emergency relay readiness failed: no common WSS path/,
-      );
+      await transport.start();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.match(warnings[0]!.message, /No emergency path is ready yet.*no common WSS path/);
     } finally {
       await transport.stop();
       configureMeshNetwork({});

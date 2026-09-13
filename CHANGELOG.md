@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.29 - 2026-09-13 (independent connection paths and retry recovery)
+
+- Releases failed Start/Join ownership independently of notification lifetime and bounds failed cleanup; adds explicit cancellation during connection and snapshot reception.
+- Starts Nostr, MQTT and emergency paths concurrently. An unavailable emergency service no longer vetoes local host creation or prevents independent discovery.
+- Contains relay-send errors raised from discovery timers and renews the retry budget for known participants after transient outages.
+- Adds bundled Iroh 1.1.0 QUIC with encrypted relay fallback, existing identity authentication and HTTPS Pkarr address lookup with signature verification when native DNS TXT lookup is unavailable. No separate installation is required.
+- Identifies an unavailable selected proxy before session launch and preserves that routing choice. Iroh is disabled while an application proxy is selected because its binding has no explicit proxy API.
+- Preserves the wire protocol and document synchronization. Older versions use their shared legacy transports; Iroh requires 0.5.29 on both ends.
+- Verifies all seven packaged native binaries against pinned package integrity and binary hashes, and publishes the complete ZIP alongside the VSIX.
+
+Connection-success rates on physical Russian/German networks remain a separate acceptance measurement; this release does not claim a verified 99% rate.
+
 ## 0.5.28 - 2026-09-12 (established-session exit boundary)
 
 - Supersedes the side-branch `0.5.27` release without carrying forward its absolute 90-second pre-establishment startup deadline or forced startup cleanup; connecting is no longer converted into a timeout-driven session exit.

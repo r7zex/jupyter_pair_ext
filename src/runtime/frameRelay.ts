@@ -18,4 +18,7 @@ export interface FrameRelay {
   waitUntilReady?(timeoutMs?: number): Promise<void>;
   sendAnnounce(): void;
   send(bytes: Buffer, toPeerId?: string): void;
+  updateDirectory?(peers: readonly PeerIdentity[]): void;
+  diagnostics?(): Record<string, unknown>;
 }
+import type { PeerIdentity } from '../core/types';

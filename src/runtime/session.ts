@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from '../core/atomicFile';
+import { awaitFailedStartupCleanup, SessionStartCancelledError } from '../core/startupRecovery';
 import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import * as Y from 'yjs';
 import {
@@ -570,6 +571,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   /** Sanitized networking + bounded lifecycle diagnostics for the diagnostics command. */
+  private contextOwner: (() => boolean) | undefined;
+
+  public setContextOwner(owner: () => boolean): void {
+    this.contextOwner = owner;
+  }
+
   public networkDiagnostics(): Record<string, unknown> {
     return { ...this.transport.networkDiagnostics(), lifecycleEvents: this.getLifecycleDiagnosticsRing().snapshot() };
   }
@@ -809,46 +816,62 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.transport.updateDirectory(descriptor.knownPeers ?? []);
   }
 
-  public async start(): Promise<void> {
+  public async start(signal?: AbortSignal): Promise<void> {
+    const checkStartup = () => {
+      if (signal?.aborted || this.closed) throw new SessionStartCancelledError();
+    };
+    checkStartup();
     if (this.initialized) return;
     await this.normalizeRestoredBackingFolder();
+    checkStartup();
     const existingTermination = await readSessionTermination(this.descriptor, this.token);
+    checkStartup();
     if (existingTermination) throw new SessionTerminatedError(existingTermination);
     this.initialized = true;
     this.transition('connecting', 'Opening peer transport.');
     const hasRecoveryPeers = this.recoveringHost && Boolean(this.descriptor.knownPeers?.length);
     if (this.descriptor.role === 'host' && !hasRecoveryPeers) {
       await loadCrdtProject(this.descriptor.workingFolder, this.project);
+      checkStartup();
     }
     await this.indexBinaryFiles();
+    checkStartup();
     await this.createStorage();
+    checkStartup();
     await this.sweepTransferDirectory();
+    checkStartup();
     this.installProjectHandlers();
     this.installTransportHandlers();
     this.installAwarenessHandlers();
     try {
       await this.transport.start();
+      checkStartup();
     } catch (error) {
       // This is the exact local-route-failed boundary: our own MeshTransport
       // never reached readiness. A later loss of an established pinned host is
       // a different condition and remains host-unreachable.
       try {
-        await this.disposeAsync('local-route-failed');
+        await awaitFailedStartupCleanup(this.disposeAsync(
+          error instanceof SessionStartCancelledError ? 'explicit-leave' : 'local-route-failed',
+        ));
       } catch (cleanupError) {
         this.log.appendLine(`[error] Local-route startup cleanup failed: ${formatError(cleanupError)}`);
       }
       throw error;
     }
-    this.transition('connected', 'Joined the encrypted Trystero room; discovering peers.');
+    this.transition('connecting', 'Discovery started; waiting for authenticated peers.');
     this.coordinator.upsertPeer(this.asRuntime(this.descriptor.localPeer, true));
     if (this.recoveringHost) {
       for (const peer of this.descriptor.knownPeers ?? []) this.transport.connect(peer);
       await new Promise((resolve) => setTimeout(resolve, 2000));
+      checkStartup();
       const terminationAfterRecoveryWait = await readSessionTermination(this.descriptor, this.token);
+      checkStartup();
       if (terminationAfterRecoveryWait) throw new SessionTerminatedError(terminationAfterRecoveryWait);
       if (!this.project.keys().length) {
         this.log.appendLine('[state:syncing] No live peer state arrived; recovering project state from the local working copy.');
         await loadCrdtProject(this.descriptor.workingFolder, this.project);
+        checkStartup();
       }
       this.recoveringHost = false;
     }
@@ -861,6 +884,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.coordinator.upsertPeer(this.asRuntime(host, true));
       this.transport.connect(host);
       await withTimeout(this.stateReady, 45_000, 'Host did not provide project state within 45 seconds.');
+      checkStartup();
     }
     this.installFileWatcher();
     this.installPresenceTracking();
@@ -878,17 +902,24 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     );
 
     await this.refreshHardware();
+    checkStartup();
     this.descriptor.freshStart = false;
     await this.persistDescriptor();
+    checkStartup();
     await this.refreshAutosaveManager();
+    checkStartup();
     this.updatePresence();
     await vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', true);
+    checkStartup();
     await vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', true);
+    checkStartup();
     this.emit('ready');
     if (this.waitingForHostFolder) {
       this.transition('waiting-for-host-folder', 'You are the new host. The session is paused until you choose a folder on this computer.');
     } else {
-      this.transition('ready', 'Notebook and project state are synchronized.');
+      this.transition('ready', this.coordinator.isCurrentHost() && this.transport.peerRuntime().every((peer) => !peer.online)
+        ? 'Local host workspace is ready; waiting for a peer connection.'
+        : 'Notebook and project state are synchronized.');
     }
     this.armWorkingCopyFallback();
     this.timers.push(setInterval(() => this.runBackground(
@@ -2245,16 +2276,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     for (const transferId of [...this.binaryTransfers.keys()]) {
       await step(() => this.abortBinaryTransfer(transferId));
     }
+    // Stop network callbacks before potentially slow persistence cleanup.
+    await step(() => this.transport.stop());
     await step(() => this.descriptorWriteQueue);
     await step(() => this.autosave?.stop());
     this.autosave = undefined;
     await step(() => this.storage?.stop(true));
-    await step(() => this.transport.stop());
     await step(() => this.project.destroy());
     await step(() => this.awareness.destroy());
     await step(() => this.removeTransferDirectory());
-    await step(() => vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', false));
-    await step(() => vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', false));
+    await step(() => this.contextOwner?.() === false ? undefined
+      : vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', false));
+    await step(() => this.contextOwner?.() === false ? undefined
+      : vscode.commands.executeCommand('setContext', 'pairNotebook.inSession', false));
     await step(() => {
       if (this.terminalEventEmitted) return;
       this.terminalEventEmitted = true;
@@ -2584,6 +2618,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private installTransportHandlers(): void {
+    this.transport.on('networkWarning', (error: Error) => {
+      this.log.appendLine(`[warn] Connection path: ${formatError(error)}`);
+      this.log.appendLine(`[network] ${JSON.stringify(this.transport.networkDiagnostics())}`);
+    });
     this.transport.on('lifecycleDiagnostic', (event: TransportLifecycleDiagnostic) => {
       this.getLatestLifecycleCorrelationByPeer().set(event.remotePeerId, event.correlationId);
       this.getLifecycleDiagnosticsRing().record(event.eventType, {
@@ -3872,6 +3910,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     try {
       autosaveFolder = await this.assertAutosaveFolder(autosaveFolder);
+      if (this.closed) return;
       this.autosaveState.folder = autosaveFolder;
       const manager = new LocalAutosaveManager({
         root: autosaveFolder,
@@ -3888,6 +3927,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.emit('autosave', state);
       });
       await manager.start();
+      if (this.closed) { await manager.stop(); return; }
       this.autosave = manager;
       this.autosaveState = manager.status();
     } catch (error) {

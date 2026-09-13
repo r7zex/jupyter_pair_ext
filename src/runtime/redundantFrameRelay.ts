@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
 import { MqttFrameRelay } from './mqttFrameRelay';
 import { NostrFrameRelay } from './nostrRelay';
+import { IrohFrameRelay } from './irohFrameRelay';
+import type { PeerIdentity } from '../core/types';
 
 const DEDUPE_TTL_MS = 120_000;
 const MAX_DEDUPE_ENTRIES = 65_536;
@@ -10,16 +12,19 @@ const MAX_ANNOUNCED_PEERS = 1_024;
 
 export interface RedundantFrameRelayOptions extends FrameRelayOptions {
   channels?: readonly FrameRelay[];
+  identityPrivateKey?: string;
+  peers?: readonly PeerIdentity[];
+  disableIroh?: boolean;
 }
 
 /**
- * Fans emergency frames across independent Nostr and MQTT infrastructures.
- * Session startup requires at least one complete family; identical frames
+ * Fans frames across independent Nostr, MQTT and Iroh transports. Identical frames
  * returned through several brokers/relays are collapsed before the identity
  * protocol sees them.
  */
 export class RedundantFrameRelay implements FrameRelay {
   private readonly relays: readonly FrameRelay[];
+  private readonly failedStarts = new Map<FrameRelay, Error>();
   private readonly seenFrames = new Map<string, number>();
   private readonly announcedPeers = new Map<string, number>();
   private housekeepingTimer: NodeJS.Timeout | undefined;
@@ -31,6 +36,8 @@ export class RedundantFrameRelay implements FrameRelay {
     this.relays = options.channels ?? [
       new NostrFrameRelay(options),
       new MqttFrameRelay(options),
+      ...(options.identityPrivateKey && !options.disableIroh
+        ? [new IrohFrameRelay({ ...options, identityPrivateKey: options.identityPrivateKey })] : []),
     ];
     for (const relay of this.relays) {
       relay.onFrame = (fromPeerId, bytes) => this.acceptFrame(fromPeerId, bytes);
@@ -42,8 +49,22 @@ export class RedundantFrameRelay implements FrameRelay {
     return this.relays.reduce((total, relay) => total + relay.connectedRelayCount, 0);
   }
 
+  updateDirectory(peers: readonly PeerIdentity[]): void {
+    for (const relay of this.relays) relay.updateDirectory?.(peers);
+  }
+
+  diagnostics(): Record<string, unknown> {
+    return { paths: this.relays.map((relay) => ({
+      ...(relay.diagnostics?.() ?? { transport: relay.constructor.name, ready: relay.connectedRelayCount > 0 }),
+      ...(this.failedStarts.has(relay) ? { startupError: this.failedStarts.get(relay)!.message } : {}),
+    })) };
+  }
+
   start(): void {
-    for (const relay of this.relays) relay.start();
+    for (const relay of this.relays) {
+      try { relay.start(); this.failedStarts.delete(relay); }
+      catch (error) { this.failedStarts.set(relay, asError(error)); }
+    }
     this.housekeepingTimer ??= setInterval(() => this.housekeeping(), 10_000);
     this.housekeepingTimer.unref?.();
   }
@@ -58,8 +79,9 @@ export class RedundantFrameRelay implements FrameRelay {
 
   async waitUntilReady(timeoutMs = 15_000): Promise<void> {
     const readinessChecks = this.relays
-      .filter((relay) => relay.waitUntilReady !== undefined)
+      .filter((relay) => !this.failedStarts.has(relay) && relay.waitUntilReady !== undefined)
       .map((relay) => relay.waitUntilReady!(timeoutMs));
+    if (this.failedStarts.size === this.relays.length) throw new Error('No relay transport could start.');
     if (readinessChecks.length === 0) return;
     try {
       // Either family is a complete data path. Requiring both would turn a

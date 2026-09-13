@@ -4,13 +4,13 @@
 [![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
 [![Download VSIX](https://img.shields.io/badge/download-VSIX-2ea44f)](https://github.com/r7zex/jupyter_pair_ext/releases/latest)
 
-Pair Notebook is a self-contained VS Code extension for collaborative editing and remote execution across project files and Jupyter notebooks. Yjs keeps document state conflict-free; authenticated peers use direct WebRTC when possible and automatically retain a redundant encrypted Nostr/MQTT full-data route when direct connectivity is unavailable.
+Pair Notebook is a self-contained VS Code extension for collaborative editing and remote execution across project files and Jupyter notebooks. Yjs keeps document state conflict-free; authenticated peers use WebRTC and redundant encrypted Nostr, MQTT and Iroh data paths.
 
 ## What it provides
 
 - Live text, notebook structure, outputs, files, directories, renames, deletions, and selected-line collaboration locks.
 - Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
-- Direct WebRTC for the normal low-latency path, optional user-configured TURN, and two independent encrypted emergency relay families.
+- Direct WebRTC, optional user-configured TURN, Nostr/MQTT relay fallback and bundled Iroh QUIC with independent discovery and relay support.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
 - A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
 
@@ -23,6 +23,30 @@ code --install-extension ".\path\to\pair-notebook-<version>.vsix" --force
 ```
 
 That is the complete collaboration setup. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
+
+Starting with 0.5.29, the VSIX also contains Iroh native binaries for Windows x64/ARM64,
+Linux x64/ARM64 (glibc and musl), and macOS ARM64. Other platforms retain the
+WebRTC/Nostr/MQTT paths. Iroh uses the existing authenticated invite identity;
+both participants need 0.5.29 to use it. Older participants continue to use the
+shared legacy paths. HTTPS address lookup verifies the participant's signature
+and complements native DNS TXT discovery.
+
+If an application proxy is selected, Iroh is disabled because its current native
+binding cannot apply that proxy. The other paths keep using the configured proxy.
+VPN TUN routing works at the operating-system level. An unavailable selected
+proxy produces an explicit endpoint error; the extension never changes or bypasses
+your proxy settings automatically.
+
+Session creation prepares the local host workspace while independent network
+paths start concurrently. This does not mean a remote participant is already
+connected. Connecting and receiving a snapshot can be cancelled; a failed attempt
+does not stay locked behind its warning notification. A fixed connection duration
+does not force an established-session exit.
+
+Public services do not establish a 99% connection-success guarantee. That target
+requires measurements across the intended Russian/German providers and VPN modes,
+plus suitable relay capacity. Network diagnostics show the available paths and
+authenticated participants separately.
 
 VS Code 1.95 or newer and internet access are required. Python, `jupyter_client`, and `ipykernel` are required only on the session host, because every participant's notebook cells execute there. Text and notebook collaboration on guest computers does not require Python.
 

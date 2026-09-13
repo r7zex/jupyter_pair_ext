@@ -175,7 +175,7 @@ jobs:
             RELEASE_FLAGS=(--prerelease)
           fi
 
-          ASSETS=("${VERSIONED_VSIX}")
+          ASSETS=("${VERSIONED_VSIX}" "pair-notebook-complete-${RELEASE_VERSION}.zip")
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             EXISTING_NAMES="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
             MISSING_ASSETS=()

@@ -109,6 +109,17 @@ describe('emergency MQTT data relay', () => {
       }).waitUntilReady(),
       /No emergency relay family became ready/,
     );
+    const failedStarter = channel('failed');
+    failedStarter.start = () => { throw new Error('first transport startup failed'); };
+    let secondStarted = false;
+    const readyStarter = channel('ready');
+    readyStarter.start = () => { secondStarted = true; };
+    const independent = new RedundantFrameRelay({ ...options, channels: [failedStarter, readyStarter] });
+    try {
+      independent.start();
+      await independent.waitUntilReady();
+      assert.equal(secondStarted, true);
+    } finally { independent.stop(); }
   });
 
   it('does not report an MQTT broker ready when SUBACK rejects or downgrades QoS 1', async () => {

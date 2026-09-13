@@ -10,6 +10,7 @@ import { WebSocketServer } from 'ws';
 import { CollaborativeProject } from '../src/core/crdt';
 import { formatInvite, parseInvite, REMOTE_ORIGIN } from '../src/core/types';
 import { generateIdentityCredentials } from '../src/core/identity';
+import { SessionStartCancelledError } from '../src/core/startupRecovery';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
 import { NostrFrameRelay } from '../src/runtime/nostrRelay';
@@ -63,6 +64,44 @@ afterEach(() => {
 });
 
 describe('production SessionRuntime integration', () => {
+  it('cancels snapshot discovery and permits another attempt with the same destination', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bootstrap-cancel-'));
+    const invite = { sessionId: 'cancel-bootstrap', projectId: 'project', projectName: 'Project',
+      mode: 'resilient' as const, token: 'cancel-bootstrap-token-that-is-long-enough', sessionEpoch: 1,
+      hostPeerId: 'host', hostDisplayName: 'Host' };
+    const peer = { peerId: 'guest', displayName: 'Guest', joinOrder: 1 };
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const controller = new AbortController();
+        const pending = downloadProjectSnapshot(invite, peer, root, undefined, runtimeRoomFactory, undefined, controller.signal);
+        const cancellation = setTimeout(() => controller.abort(), 50);
+        try { await assert.rejects(pending, SessionStartCancelledError); }
+        finally { clearTimeout(cancellation); }
+        assert.deepEqual(await readdir(root), []);
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('prevents cancelled startup from opening transport after a delayed filesystem step', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-runtime-cancel-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'cancel-start', role: 'host',
+      peerId: 'host', hostPeerId: 'host', workingFolder: root, pythonPath: process.execPath,
+    }), 'cancel-start-token-that-is-long-enough', context(path.join(root, 'extension')), logger());
+    let finish!: () => void;
+    let transportStarts = 0;
+    runtime.normalizeRestoredBackingFolder = () => new Promise<void>((resolve) => { finish = resolve; });
+    runtime.transport.start = async () => { transportStarts += 1; };
+    const controller = new AbortController();
+    const start = runtime.start(controller.signal);
+    controller.abort();
+    try {
+      await runtime.leave();
+      finish();
+      await assert.rejects(start, SessionStartCancelledError);
+      assert.equal(transportStarts, 0);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it('decodes only complete canonical Base64 notebook outputs', () => {
     const encoded = Buffer.from('complete image').toString('base64');
     assert.equal(decodeJupyterBase64([encoded.slice(0, 4), encoded.slice(4)])?.toString('utf8'), 'complete image');

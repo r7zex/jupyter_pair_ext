@@ -482,6 +482,7 @@ export class MeshTransport extends EventEmitter {
   private mqttRoom: Room | undefined;
   private mqttAction: MessageAction<ArrayBuffer> | undefined;
   private mqttJoining = false;
+  private running = false;
   private primaryUsesProductionSockets = false;
   private secondaryUsesProductionSockets = false;
   private readonly signallingEvidence: Record<'nostr' | 'mqtt', SignallingEvidence> = {
@@ -532,7 +533,7 @@ export class MeshTransport extends EventEmitter {
 
   /** Starts discovery. The numeric return value is retained for API compatibility and is always zero. */
   public async start(): Promise<number> {
-    if (this.room) return 0;
+    if (this.running) return 0;
     const restarting = this.hasStarted;
     this.stopped = false;
     this.signallingEvidence.nostr = { startedAt: Date.now() };
@@ -569,6 +570,7 @@ export class MeshTransport extends EventEmitter {
       },
     };
     const turnConfig = this.buildTurnConfig();
+    this.running = true;
     const config: NostrRoomConfig = {
       appId: TRYSTERO_APP_ID,
       password: this.options.token,
@@ -592,13 +594,25 @@ export class MeshTransport extends EventEmitter {
       };
       this.room.onPeerLeave = (peerId) => this.onPeerLeave(peerId);
     } catch (error) {
+      const failedRoom = this.room;
+      if (failedRoom) void Promise.resolve().then(() => failedRoom.leave()).catch(() => undefined);
       this.room = undefined;
       this.action = undefined;
       this.noteSignallingError('nostr', error, 'startup', 'startup');
-      throw new Error(`Could not start Trystero: ${formatError(error)}`, { cause: error });
+      this.emit('networkWarning', new Error(`Primary discovery could not start: ${formatError(error)}`));
     }
     this.hasStarted = true;
-    await this.startRelayFallback();
+    try { this.startSecondarySignalling(); } catch (error) {
+      this.emit('networkWarning', new Error(`Secondary discovery could not start: ${formatError(error)}`));
+    }
+    // Relay readiness must not veto independent discovery or a local host workspace.
+    void this.startRelayFallback().catch((error) => {
+      if (!this.stopped) this.emit('networkWarning', error);
+    });
+    if (!this.room && !this.mqttRoom && !this.relay) {
+      this.running = false;
+      throw new Error('No peer transport could start. Check Pair Notebook network diagnostics.');
+    }
     this.timers = [
       setInterval(() => this.heartbeatTick(), 500),
       setInterval(() => void this.pingTick(), 1000),
@@ -608,7 +622,6 @@ export class MeshTransport extends EventEmitter {
     ];
     // Secondary signalling family and passive network-change watching are
     // strictly additive: neither can affect an already-working session.
-    try { this.startSecondarySignalling(); } catch { /* primary stays up */ }
     if (!this.options.roomFactory && !MeshTransport.testingRoomFactory) {
       this.networkWatcher.start();
     }
@@ -1061,6 +1074,7 @@ export class MeshTransport extends EventEmitter {
       relayFallback: {
         enabled: !meshNetworkConfig.disableRelayFallback,
         connectedRelays: this.relay?.connectedRelayCount ?? 0,
+        paths: this.relay?.diagnostics?.(),
         peers: [...this.connections.keys()]
           .filter((transportPeerId) => transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX))
           .map((transportPeerId) => {
@@ -1365,28 +1379,35 @@ export class MeshTransport extends EventEmitter {
         token: this.options.token,
         sessionId: this.options.sessionId,
         localPeerId: this.options.localPeer.peerId,
+        identityPrivateKey: this.identityPrivateKey,
+        peers: [...this.directory.values()],
+        // The native binding has no explicit proxy API. Never silently bypass one.
+        disableIroh: Boolean(resolveSignallingProxy('https://iroh-relay.pair-notebook.invalid')),
       });
     } catch (error) {
       this.relay = undefined;
       throw new Error(`Guaranteed emergency relay construction failed: ${formatError(error)}`, { cause: error });
     }
-    this.relay.onPeerAnnounce = (peerId) => {
+    const relay = this.relay;
+    relay.onPeerAnnounce = (peerId) => {
       if (!this.identityToTransport.has(peerId)) this.considerRelayFallback(peerId);
     };
-    this.relay.onFrame = (fromPeerId, bytes) => this.handleRelayData(fromPeerId, bytes);
-    this.relay.start();
+    relay.onFrame = (fromPeerId, bytes) => this.handleRelayData(fromPeerId, bytes);
+    relay.start();
     try {
-      await this.relay.waitUntilReady?.(15_000);
+      await relay.waitUntilReady?.(15_000);
     } catch (error) {
-      this.relay.stop();
-      this.relay = undefined;
-      throw new Error(`Guaranteed emergency relay readiness failed: ${formatError(error)}`, { cause: error });
+      if (!this.stopped && this.relay === relay) this.emit('networkWarning', new Error(
+        `No emergency path is ready yet; discovery and relay retries continue. ${formatError(error)}`,
+        { cause: error },
+      ));
     }
+    if (this.stopped || this.relay !== relay) return;
     // Announce presence a few times so peers joining via WebRTC-less paths
     // find each other even if some early publishes race the socket open.
     for (const delayMs of [500, 4_000, 12_000]) {
       const timer = setTimeout(() => {
-        if (!this.stopped) this.relay?.sendAnnounce();
+        if (!this.stopped && this.relay === relay) relay.sendAnnounce();
       }, delayMs);
       timer.unref?.();
     }
@@ -1936,6 +1957,9 @@ public improvablePeerIds(): string[] {
     for (const peerId of this.directory.keys()) {
       if (peerId === this.options.localPeer.peerId) continue;
       if (this.identityToTransport.has(peerId)) continue;
+      // A transient outage must not permanently exhaust a known peer's retries.
+      // Unknown public announcements retain their bounded candidate budget.
+      if ((this.relayAttempts.get(peerId) ?? 0) >= 6) this.relayAttempts.delete(peerId);
       this.considerRelayFallback(peerId);
     }
   }
@@ -1959,8 +1983,17 @@ public improvablePeerIds(): string[] {
     const existing = this.relayNegotiations.get(peerId);
     const negotiation = existing ?? this.createRelayNegotiation(peerId);
     if (!negotiation.sentLocalHs) {
-      negotiation.sentLocalHs = true;
-      this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+      try {
+        negotiation.sentLocalHs = true;
+        this.sendRelayEnvelope(peerId, { k: 'hs', hs: negotiation.localHs });
+      } catch (error) {
+        clearTimeout(negotiation.timeout);
+        this.relayNegotiations.delete(peerId);
+        // Discovery timers and announce callbacks must survive a route that
+        // is not writable yet. The next announcement/sweep retries it.
+        const peer = this.directory.get(peerId);
+        if (peer) this.emit('connectionError', peer, error);
+      }
     }
   }
 
@@ -2327,6 +2360,7 @@ public improvablePeerIds(): string[] {
       // Route teardown below remains authoritative when a peer is already gone.
     }
     this.stopped = true;
+    this.running = false;
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
     const room = this.room;
@@ -2346,7 +2380,6 @@ public improvablePeerIds(): string[] {
     this.seenIds.clear();
     this.seenRelayEnvelopes.clear();
     this.inboundWindows.clear();
-    if (room) await room.leave();
     this.relay?.stop();
     this.relay = undefined;
     for (const negotiation of this.relayNegotiations.values()) clearTimeout(negotiation.timeout);
@@ -2365,8 +2398,15 @@ public improvablePeerIds(): string[] {
     this.mqttAction = undefined;
     this.remoteRouteStatuses.clear();
     this.networkWatcher.stop();
-    if (upgradeRoom) await upgradeRoom.leave().catch(() => undefined);
-    if (mqttRoom) await mqttRoom.leave().catch(() => undefined);
+    // Release every local resource before awaiting third-party room cleanup.
+    let cleanupTimer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([room, upgradeRoom, mqttRoom].filter((item): item is Room => !!item)
+          .map((item) => Promise.resolve().then(() => item.leave()))),
+        new Promise<void>((resolve) => { cleanupTimer = setTimeout(resolve, 3000); }),
+      ]);
+    } finally { if (cleanupTimer) clearTimeout(cleanupTimer); }
   }
 
   private localHandshake(): HandshakeMessage {
@@ -3015,6 +3055,7 @@ public improvablePeerIds(): string[] {
     if (conflict) throw new Error(`Display name is already in use: ${conflict.displayName}.`);
     connection.identity = identity;
     this.directory.set(identity.peerId, identity);
+    this.relay?.updateDirectory?.([...this.directory.values()]);
     if (this.options.isHost()) this.broadcastDirectory();
   }
 
@@ -3059,6 +3100,7 @@ public improvablePeerIds(): string[] {
       throw new Error(`Pair Notebook identity directory reached its ${MAX_DIRECTORY_PEERS}-peer limit.`);
     }
     this.directory.set(identity.peerId, identity);
+    this.relay?.updateDirectory?.([...this.directory.values()]);
   }
 
   private rejectProtocolPeer(transportPeerId: string, value: unknown): void {

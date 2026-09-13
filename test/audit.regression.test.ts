@@ -97,7 +97,7 @@ describe('audit regressions', () => {
       assert.match(publishJob, /GH_REPO:\s+\$\{\{ github\.repository \}\}/);
       assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
       assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
-      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}"\)/);
+      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}" "pair-notebook-complete-\$\{RELEASE_VERSION\}\.zip"\)/);
       assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
       assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
       assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix|pair-notebook-complete|SHA256SUMS/);

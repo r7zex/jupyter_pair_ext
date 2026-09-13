@@ -65,3 +65,39 @@ Sources: [JavaScript bindings](https://docs.iroh.computer/languages/javascript),
 Public default relays are development infrastructure, not a service-level
 guarantee. A production 99% objective still requires representative network
 measurements and sustainable relay capacity.
+
+## Additional defects found during implementation
+
+- A relay write can throw before a connection becomes writable. The periodic
+  sweep called the handshake sender without containing that exception. A public
+  Iroh-only mesh probe reproduced a process-ending JavaScript exception.
+  The sender now clears that failed negotiation and lets later discovery retry.
+- The six-attempt relay budget could permanently exclude a known participant
+  after an outage. The periodic sweep renews the budget for known participants;
+  unknown public announcements retain their bounded candidate limit.
+- The Iroh 1.1.0 synchronous `watchHomeRelay` API panicked outside Tokio's runtime.
+  The integration uses the asynchronous `online()` API and does not call native
+  watchers. Native endpoint, authentication, reconnect and stream tests cover
+  the APIs used by the integration.
+- On the validation network, Iroh connected to a home relay but native DNS TXT
+  discovery repeatedly returned no addressing information. HTTPS lookup through
+  the same official Pkarr service, with Ed25519 signature and record-size/freshness
+  checks, enabled an independent public connection. This is validation evidence,
+  not proof of the second computer's exact external failure.
+
+## Release implementation
+
+Failed cleanup is bounded separately from startup. Explicit cancellation owns
+its abandoned runtime, and late cleanup checks runtime ownership before changing
+VS Code session context. Snapshot cancellation drains outstanding disk writes
+before deleting scratch files. There is no new overall startup deadline.
+
+Iroh carries the existing signed mesh envelopes. The invite's Ed25519 identity
+pins the endpoint, and a session-specific ALPN plus token proof precedes the
+existing application handshake. The wire version and CRDT/editor code are
+unchanged. Native assets ship in the VSIX with lockfile SHA-512 verification,
+packaged SHA-256 checks and upstream license texts.
+
+Default services remain an availability dependency. A separately managed relay
+deployment and representative connection-rate measurements are follow-up work
+for the 99% objective, not a result established by this release.

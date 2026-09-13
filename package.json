@@ -1,8 +1,8 @@
 {
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
-  "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, direct WebRTC, and redundant Nostr/MQTT relay fallback.",
-  "version": "0.5.28",
+  "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, WebRTC, Iroh QUIC and redundant relay fallback.",
+  "version": "0.5.29",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -248,21 +248,24 @@
   },
   "scripts": {
     "clean": "rimraf out",
-    "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap",
+    "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap && node scripts/bundle-iroh-native.mjs",
     "lint": "eslint .",
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:e2e": "npm run compile && node scripts/run-vscode-e2e.mjs",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
     "test:live:relay": "npm run compile && node scripts/emergency-relay-live-smoke.mjs",
+    "test:live:iroh": "npm run compile && node scripts/iroh-live-smoke.mjs",
     "package": "npm run clean && npm run lint && npm test && node scripts/make-artifacts.mjs --preflight-only && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
     "artifacts": "npm run package && node scripts/make-artifacts.mjs",
     "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs"
   },
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",
+    "@number0/iroh": "1.1.0",
     "@trystero-p2p/core": "^0.25.3",
     "debug": "^4.4.3",
     "diff": "8.0.3",
+    "dns-packet": "5.6.1",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "mqtt": "^5.15.2",
@@ -274,6 +277,7 @@
     "yjs": "^13.6.27"
   },
   "devDependencies": {
+    "@types/dns-packet": "5.6.5",
     "@types/mocha": "^10.0.10",
     "@types/node": "^20.19.43",
     "@types/vscode": "1.95.0",

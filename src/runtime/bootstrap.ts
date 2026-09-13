@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { FileHandle, lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { publishTemporaryFile } from '../core/atomicFile';
+import { SessionStartCancelledError } from '../core/startupRecovery';
 import { safeProjectTarget, safeRelativePath } from '../core/persistence';
 import { hashFileContents, shouldTrackProjectPath } from '../core/projectFiles';
 import { portablePathComparisonKey } from '../core/projectPath';
@@ -81,7 +82,9 @@ export async function downloadProjectSnapshot(
   onProgress?: (progress: SnapshotProgress) => void,
   roomFactory?: TrysteroRoomFactory,
   identityPrivateKey?: string,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) throw new SessionStartCancelledError();
   await mkdir(destination, { recursive: true });
   const destinationInfo = await lstat(destination);
   if (destinationInfo.isSymbolicLink() || !destinationInfo.isDirectory()) {
@@ -140,6 +143,7 @@ export async function downloadProjectSnapshot(
     localPeer.joinOrder = identity.joinOrder;
   });
 
+  let cancel: (() => void) | undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timeout;
@@ -147,8 +151,11 @@ export async function downloadProjectSnapshot(
         if (finished) return;
         finished = true;
         clearTimeout(timer);
-        reject(normalizeBootstrapError(error, endpoint));
+        reject(error instanceof SessionStartCancelledError ? error : normalizeBootstrapError(error, endpoint));
       };
+      cancel = () => fail(new SessionStartCancelledError());
+      signal?.addEventListener('abort', cancel, { once: true });
+      if (signal?.aborted) { cancel(); return; }
       const arm = (timeoutMs = IDLE_TIMEOUT_MS, message = 'Project snapshot stalled without progress.') => {
         clearTimeout(timer);
         timer = setTimeout(() => fail(lastConnectionError ?? new Error(message)), timeoutMs);
@@ -535,6 +542,7 @@ export async function downloadProjectSnapshot(
       });
     });
   } finally {
+    if (cancel) signal?.removeEventListener('abort', cancel);
     await transport.stop().catch(() => undefined);
     // A timeout or queue-limit failure can race with an in-progress disk write.
     // Drain that bounded queue before closing handles and deleting its scratch

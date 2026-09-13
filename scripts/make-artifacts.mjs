@@ -89,6 +89,48 @@ function externalRequires(bundle) {
   return [...new Set(imports.filter((moduleName) => !allowed.has(moduleName)))].sort();
 }
 
+async function verifyNativeAssets(vsixPath, entries) {
+  const targets = ['win32-x64-msvc', 'win32-arm64-msvc', 'linux-x64-gnu', 'linux-arm64-gnu',
+    'linux-x64-musl', 'linux-arm64-musl', 'darwin-arm64'];
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'media/native/manifest.json'), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+  const hashes = new Map();
+  for (const target of targets) {
+    const name = `iroh.${target}.node`;
+    const record = manifest[name];
+    const dependency = lock.packages[`node_modules/@number0/iroh-${target}`];
+    if (!record || record.integrity !== dependency?.integrity || record.version !== dependency.version) {
+      throw new Error(`Native manifest does not match the dependency lock: ${name}`);
+    }
+    const entry = `extension/media/native/${name}`;
+    if (!entries.includes(entry)) throw new Error(`VSIX is missing native transport: ${name}`);
+    hashes.set(entry, record.sha256);
+  }
+  await new Promise((resolve, reject) => {
+    yauzl.open(vsixPath, { lazyEntries: true }, (error, zip) => {
+      if (error) return reject(error);
+      zip.on('error', reject);
+      zip.on('end', resolve);
+      zip.on('entry', (entry) => {
+        if (!hashes.has(entry.fileName)) return zip.readEntry();
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError) return reject(streamError);
+          const hash = createHash('sha256');
+          stream.on('error', reject);
+          stream.on('data', (bytes) => hash.update(bytes));
+          stream.on('end', () => {
+            if (hash.digest('hex') !== hashes.get(entry.fileName)) {
+              zip.close(); reject(new Error(`Packaged native binary hash mismatch: ${entry.fileName}`));
+            } else zip.readEntry();
+          });
+        });
+      });
+      zip.readEntry();
+    });
+  });
+  console.log(`Packaged Iroh binaries verified: ${targets.length} SHA-256 hashes.`);
+}
+
 async function main() {
   const files = collectFiles(root);
   if (process.argv.includes('--preflight-only')) {
@@ -102,10 +144,14 @@ async function main() {
     'extension/out/extension.js',
     'extension/media/jupyter_kernel_bridge.py',
     'extension/media/pair-notebook.svg',
+    'extension/media/native/manifest.json',
+    'extension/media/iroh-LICENSE-MIT.txt',
+    'extension/media/iroh-LICENSE-APACHE.txt',
     'extension.vsixmanifest',
   ];
   const missing = required.filter((entry) => !vsixEntries.includes(entry));
   if (missing.length) throw new Error(`VSIX is missing required entries: ${missing.join(', ')}`);
+  await verifyNativeAssets(vsixPath, vsixEntries);
   const unsafePaths = vsixEntries.filter((entry) => entry.startsWith('/') || entry.includes('\\')
     || entry.split('/').includes('..'));
   if (unsafePaths.length) throw new Error(`VSIX contains an unsafe archive path: ${unsafePaths.join(', ')}`);

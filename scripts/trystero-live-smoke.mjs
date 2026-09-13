@@ -59,7 +59,10 @@ if (process.argv.includes('--worker')) {
     PAIR_NOTEBOOK_SMOKE_SESSION: sessionId,
     PAIR_NOTEBOOK_SMOKE_TOKEN: token,
   };
-  const start = (role) => spawn(process.execPath, [currentFile, '--worker'], {
+  const start = (role) => spawn(process.execPath, [
+    role === process.env.PAIR_NOTEBOOK_SMOKE_LEGACY_ROLE && process.env.PAIR_NOTEBOOK_SMOKE_LEGACY_WORKER
+      ? process.env.PAIR_NOTEBOOK_SMOKE_LEGACY_WORKER : currentFile, '--worker',
+  ], {
     env: { ...baseEnvironment, PAIR_NOTEBOOK_SMOKE_ROLE: role },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
