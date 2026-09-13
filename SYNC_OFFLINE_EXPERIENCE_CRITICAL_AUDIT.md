@@ -133,3 +133,9 @@ New regressions cover identical-character input, newline, Backspace, multiline p
 Production changes are confined to `src/vscode/sync.ts`. CRDT, transport, protocol, persistence and execution implementations are unchanged.
 
 The first cross-platform run exposed Windows EOL normalization: VS Code converted a projected LF to CRLF, which was then published as new text. The repair now sets the document EOL to the projected source's EOL in the same workspace edit. Focused LF/CRLF regressions and explicit real-VS-Code LF/CRLF cases verify that this conversion remains part of the remote projection and generates no local update.
+
+### Verified repair checkpoint
+
+The final production repair is commit `5d507d4ea2751704353aa6e0bc9356b28e29358d`, merged through [PR #22](https://github.com/r7zex/jupyter_pair_ext/pull/22). TypeScript compilation, targeted ESLint and all **151** focused editor/replay/replica/initial-binding tests passed. [Actions run 34759762297](https://github.com/r7zex/jupyter_pair_ext/actions/runs/34759762297) passed real Extension Host checks on Windows stable, Linux stable, macOS stable and Linux VS Code 1.95.0. This supersedes the initial audit's unavailable fresh native verification for the repaired source; it does not claim a successful local installed-VSIX or physical two-computer test.
+
+The release containing this repair is version **0.5.30**. Every participant should update to obtain the corrected local editor behavior.
