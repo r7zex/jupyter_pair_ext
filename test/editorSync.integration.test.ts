@@ -1586,6 +1586,32 @@ describe('EditorSynchronizer VS Code-compatible production path', () => {
 });
 
 describe('local input after remote projection', () => {
+  for (const notebookCell of [false, true]) for (const eol of [1, 2]) {
+    it(`projects a newline without publishing native EOL normalization cell=${notebookCell} eol=${eol}`, async () => {
+      const root = path.resolve('/tmp/pair-editor-projection-eol');
+      const notebook = fakeNotebook(root, [fakeCell('ab', 'a')]);
+      const document = notebookCell ? notebook.cells[0].document : fakeTextDocument(path.join(root, 'notes.txt'), 'ab');
+      document.eol = eol === 1 ? 2 : 1;
+      if (notebookCell) vscodeBoundary.__reset(notebook); else vscodeBoundary.__resetText(document);
+      const project = new CollaborativeProject();
+      const synchronizer = new EditorSynchronizer(project, root, logger());
+      let localUpdates = 0;
+      try {
+        if (notebookCell) await synchronizer.whenNotebookReady(notebook);
+        const key = notebookCell ? 'work.ipynb' : 'notes.txt';
+        const newline = eol === 1 ? '\n' : '\r\n';
+        project.on('update', event => { if (event.origin === LOCAL_EDITOR_ORIGIN) localUpdates++; });
+        const change = [{ offset: 1, deleteCount: 0, insertText: newline }];
+        if (notebookCell) project.applyCellTextChanges(key, 'a', change, REMOTE_ORIGIN); else project.applyTextChanges(key, change, REMOTE_ORIGIN);
+        await synchronizer.prepareWorkingCopy();
+        assert.equal(document.eol, eol);
+        assert.equal(document.text, `a${newline}b`);
+        assert.equal((notebookCell ? project.cellSource(key, 'a') : project.text(key)).toString(), document.text);
+        assert.equal(localUpdates, 0, 'native EOL normalization is part of the remote projection');
+      } finally { synchronizer.dispose(); project.destroy(); }
+    });
+  }
+
   for (const notebookCell of [false, true]) for (const pending of [false, true]) for (const edit of [
     { name: 'identical character', changes: [{ rangeOffset: 10, rangeLength: 0, text: '1' }], expected: 'remote = 11\nlocal = 0' },
     { name: 'newline', changes: [{ rangeOffset: 10, rangeLength: 0, text: '\n' }], expected: 'remote = 1\n\nlocal = 0' },
@@ -1767,7 +1793,13 @@ function createNotebookVscodeBoundary(): any {
   class WorkspaceEdit {
     public operations: any[] = [];
     public replace(uri: Uri, range: Range, text: string): void { this.operations.push({ type: 'text', uri, range, text }); }
-    public set(uri: Uri, edits: any[]): void { this.operations.push({ type: 'notebook', uri, edits }); }
+    public set(uri: Uri, edits: any[]): void {
+      for (const edit of edits.filter((item) => item.newEol !== undefined)) {
+        this.operations.push({ type: 'eol', uri, eol: edit.newEol });
+      }
+      const notebookEdits = edits.filter((item) => item.newEol === undefined);
+      if (notebookEdits.length) this.operations.push({ type: 'notebook', uri, edits: notebookEdits });
+    }
   }
   const boundary: any = {
     Uri,
@@ -1777,6 +1809,8 @@ function createNotebookVscodeBoundary(): any {
     NotebookCellOutput,
     NotebookCellOutputItem,
     WorkspaceEdit,
+    EndOfLine: { LF: 1, CRLF: 2 },
+    TextEdit: { setEndOfLine: (newEol: number) => ({ newEol }) },
     NotebookEdit: {
       replaceCells: (range: NotebookRange, cells: any[]) => ({ type: 'replaceCells', range, cells }),
       updateCellMetadata: (index: number, metadata: Record<string, unknown>) => ({ type: 'cellMetadata', index, metadata }),
@@ -1800,6 +1834,11 @@ function createNotebookVscodeBoundary(): any {
           && documents.some((document: any) => document.uri.toString() === operation.uri.toString()
             && document.version !== versions.get(document)))) return false;
         for (const operation of edit.operations) {
+          if (operation.type === 'eol') {
+            const document = documents.find((item: any) => item.uri.toString() === operation.uri.toString());
+            if (document) document.eol = operation.eol;
+            continue;
+          }
           if (operation.type === 'text') {
             boundary.__textEdits.push(operation);
             const cell = boundary.workspace.notebookDocuments.flatMap((item: any) => item.cells)
@@ -1808,6 +1847,9 @@ function createNotebookVscodeBoundary(): any {
               .find((item: any) => item.uri.toString() === operation.uri.toString());
             if (document) {
               document.text = `${document.text.slice(0, operation.range.start)}${operation.text}${document.text.slice(operation.range.end)}`;
+              if (document.eol !== undefined) {
+                document.text = document.text.replace(/\r?\n/g, document.eol === 2 ? '\r\n' : '\n');
+              }
               boundary.__fireTextChange(document, [{ rangeOffset: operation.range.start,
                 rangeLength: operation.range.end - operation.range.start, text: operation.text }]);
             }

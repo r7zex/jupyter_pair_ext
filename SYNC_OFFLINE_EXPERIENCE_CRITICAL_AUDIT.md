@@ -131,3 +131,5 @@ The former delayed-tail mock changed the actual document after the completed pro
 New regressions cover identical-character input, newline, Backspace, multiline paste and multi-cursor input in files and notebook cells, both after completion and after observing the projected target while the apply promise is still pending. Repeated-key cases verify that every local edit immediately advances canonical state. The skipped issue #19 Extension Host test is enabled, with additional native typing, native multi-cursor and notebook-cell cases.
 
 Production changes are confined to `src/vscode/sync.ts`. CRDT, transport, protocol, persistence and execution implementations are unchanged.
+
+The first cross-platform run exposed Windows EOL normalization: VS Code converted a projected LF to CRLF, which was then published as new text. The repair now sets the document EOL to the projected source's EOL in the same workspace edit. Focused LF/CRLF regressions and explicit real-VS-Code LF/CRLF cases verify that this conversion remains part of the remote projection and generates no local update.

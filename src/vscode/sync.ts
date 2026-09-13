@@ -904,6 +904,14 @@ export class EditorSynchronizer implements vscode.Disposable {
       }
       const edit = minimalEdit(current, target);
       const workspaceEdit = new vscode.WorkspaceEdit();
+      if (document.eol !== undefined && target.includes('\n')) {
+        const eol = target.includes('\r\n') ? vscode.EndOfLine.CRLF : vscode.EndOfLine.LF;
+        if (document.eol !== eol) {
+          // VS Code normalizes inserted newlines to the document EOL. Keep that
+          // normalization inside the projection instead of authoring it as input.
+          workspaceEdit.set(document.uri, [vscode.TextEdit.setEndOfLine(eol)]);
+        }
+      }
       workspaceEdit.replace(
         document.uri,
         new vscode.Range(document.positionAt(edit.offset), document.positionAt(edit.offset + edit.deleteCount)),

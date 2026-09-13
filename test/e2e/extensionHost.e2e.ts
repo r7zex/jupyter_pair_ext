@@ -156,9 +156,12 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
-  test('does not duplicate a remote newline when VS Code reshapes the projection event', async () => {
+  for (const eol of [vscode.EndOfLine.LF, vscode.EndOfLine.CRLF]) test(`does not duplicate a remote newline with native EOL=${eol}`, async () => {
     const harness = await createTextHarness('print(a');
     try {
+      const eolEdit = new vscode.WorkspaceEdit();
+      eolEdit.set(harness.document.uri, [vscode.TextEdit.setEndOfLine(eol)]);
+      assert.equal(await vscode.workspace.applyEdit(eolEdit), true);
       let nonRemoteUpdates = 0;
       const onUpdate = (event: ProjectUpdate): void => {
         if (event.key === harness.key && event.origin !== REMOTE_ORIGIN) nonRemoteUpdates += 1;
@@ -207,7 +210,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
   } finally { await harness.dispose(); }
 });
 
-  test('authors genuine local typing after the projection-tail quarantine has expired', async () => {
+  test('authors genuine local typing after an idle remote projection', async () => {
     const harness = await createTextHarness('alpha');
     try {
       harness.project.replaceText(harness.key, '#alpha', REMOTE_ORIGIN);
