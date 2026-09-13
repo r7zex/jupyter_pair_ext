@@ -119,3 +119,15 @@ Error: Code is currently being updated. Please wait for the update to complete b
 The log is `audit/real-editor-console.log`. Therefore this audit claims fresh deterministic production-path reproduction, not a successful new installed-VS-Code or physical two-computer run. The native typing and Undo probes did not run; no Undo finding is asserted.
 
 Issue #19 separately records earlier real Extension Host reproduction on Windows, Linux, macOS and minimum VS Code 1.95.0. That is prior repository evidence read during this audit, not fresh cross-platform testing performed here. Its historical description predates the current different-line exception; the same-line defect remains reproduced on the audited revision.
+
+## Repair implementation
+
+The repair removes time- and line-based post-projection suppression. A document change after a successful remote projection is published immediately. A repeated notification that does not change the observed document text is ignored.
+
+For input received before `workspace.applyEdit()` resolves, the synchronizer consumes buffered events through the actual projected target and publishes the subsequent edits against the replica of that target. The existing buffered-edit fallback handles a hidden target event by reconciling the final observed text against the projected replica. The failed-apply/version-conflict path retains its existing rebase behavior.
+
+The former delayed-tail mock changed the actual document after the completed projection. That event is indistinguishable from a genuine local newline, deletion, formatting edit or auto-closing bracket. Its expectation has been corrected to preserve the new document edit. Tests for split/minimized remote echoes still assert zero local publications when the final document equals the projected target; network replay and duplicate notifications also remain idempotent.
+
+New regressions cover identical-character input, newline, Backspace, multiline paste and multi-cursor input in files and notebook cells, both after completion and after observing the projected target while the apply promise is still pending. Repeated-key cases verify that every local edit immediately advances canonical state. The skipped issue #19 Extension Host test is enabled, with additional native typing, native multi-cursor and notebook-cell cases.
+
+Production changes are confined to `src/vscode/sync.ts`. CRDT, transport, protocol, persistence and execution implementations are unchanged.

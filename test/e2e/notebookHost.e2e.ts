@@ -70,7 +70,7 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
     }
   });
 
-  test('keeps immediate local typing on another line of the same cell during projection quarantine', async () => {
+  test('keeps immediate local typing on another line of the same cell after a remote projection', async () => {
   const harness = await createNotebookHarness('remote = 0\nlocal = 0');
   try {
     const cell = harness.notebook.cellAt(0);
@@ -79,16 +79,12 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
     harness.project.applyCellTextChanges(harness.key, stableId,
       [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
     await waitFor(() => cell.document.getText() === 'remote = 1\nlocal = 0', 3_000, 'remote first-line cell projection');
-    await waitFor(
-      () => (harness.synchronizer as any).projectionQuarantines.has(cell.document.uri.toString()),
-      1_000,
-      'post-projection guard to arm before different-line cell edit',
-    );
+    await harness.synchronizer.prepareWorkingCopy();
     const edit = new vscode.WorkspaceEdit();
     edit.insert(cell.document.uri, cell.document.lineAt(1).range.end, ' + 1');
     assert.equal(await vscode.workspace.applyEdit(edit), true);
     await waitFor(() => harness.project.cellSource(harness.key, stableId).toString() === 'remote = 1\nlocal = 0 + 1', 3_000,
-      'different-line cell edit during quarantine');
+      'different-line cell edit after projection');
     assert.equal(cell.document.getText(), 'remote = 1\nlocal = 0 + 1');
   } finally { await harness.dispose(); }
 });
@@ -180,6 +176,26 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
     } finally {
       await harness.dispose();
     }
+  });
+});
+
+suite('Pair Notebook — cell input following remote source', () => {
+  for (const multiRange of [false, true]) test(`preserves immediate same-cell input with multiple ranges=${multiRange}`, async () => {
+    const harness = await createNotebookHarness('remote = 0\nlocal = 0');
+    try {
+      const cell = harness.notebook.cellAt(0);
+      const id = harness.project.notebookSnapshot(harness.key).cells[0]!.id;
+      harness.project.applyCellTextChanges(harness.key, id, [{ offset: 9, deleteCount: 1, insertText: '1' }], REMOTE_ORIGIN);
+      await waitFor(() => normalizeEol(cell.document.getText()) === 'remote = 1\nlocal = 0', 3_000, 'remote same-cell projection');
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(cell.document.uri, cell.document.lineAt(0).range.end, '!');
+      if (multiRange) edit.insert(cell.document.uri, cell.document.lineAt(1).range.end, '!');
+      assert.equal(await vscode.workspace.applyEdit(edit), true);
+      const expected = `remote = 1!\nlocal = 0${multiRange ? '!' : ''}`;
+      await waitFor(() => normalizeEol(harness.project.cellSource(harness.key, id).toString()) === expected, 3_000, 'local cell edit to publish');
+      assert.equal(normalizeEol(cell.document.getText()), expected);
+      assert.equal(harness.notebook.cellAt(0), cell);
+    } finally { await harness.dispose(); }
   });
 });
 

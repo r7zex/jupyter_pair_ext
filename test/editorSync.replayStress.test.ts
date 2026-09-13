@@ -38,7 +38,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`suppresses an ambiguous post-target event in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`preserves a local post-target event in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'print(a',
@@ -88,7 +88,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`suppresses an ambiguous append when the remote target event is hidden in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`preserves a local append when the remote target event is hidden in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'abc',
@@ -102,7 +102,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`suppresses an ambiguous hidden-target newline insertion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`preserves a local hidden-target newline insertion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: 'onetwo',
@@ -116,7 +116,7 @@ describe('EditorSynchronizer multi-event echo stress', () => {
       });
     });
 
-    it(`suppresses an ambiguous hidden-target newline deletion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
+    it(`preserves a local hidden-target newline deletion in a ${notebookCell ? 'cell' : 'file'}`, async () => {
       await runScenario({
         notebookCell,
         initial: '#x\nnext',
@@ -238,15 +238,15 @@ async function runScenario(options: Scenario): Promise<void> {
     );
     await synchronizer.prepareWorkingCopy();
 
-    const expected = options.target;
-    const expectedLocalUpdates = 0;
+    const expected = options.projectionResult ?? `${options.target}${options.localAfter ?? ''}`;
+    const expectedLocalUpdates = expected === options.target ? 0 : 1;
     const source = options.notebookCell ? project.cellSource(key, 'a').toString() : project.text(key).toString();
     const displayed = (synchronizer as any).textReplicas.get(document.uri.toString())?.source();
-    assert.equal(document.getText(), expected, 'editor must discard every ambiguous render-transaction tail');
+    assert.equal(document.getText(), expected, 'editor must preserve edits following the projected target');
     assert.equal(source, expected, 'canonical CRDT must equal the editor');
     assert.equal(displayed, expected, 'displayed Yjs replica must share the same baseline');
     assert.equal(localUpdates.length, expectedLocalUpdates,
-      'remote editor echo must never become a fresh local CRDT update');
+      'only the post-projection edit may become a fresh local CRDT update');
     assert.equal(vscodeBoundary.__warnings.length, 0, 'valid editing must not trigger rejected-update recovery');
     assert.equal(vscodeBoundary.__warnings.some((warning: string) => warning.includes('Text change is outside')), false);
 
@@ -267,8 +267,6 @@ async function runScenario(options: Scenario): Promise<void> {
     assert.equal((synchronizer as any).textReplicas.get(document.uri.toString())?.source(), expected,
       'wire replay must not desynchronize the displayed replica');
 
-    await waitFor(() => !(synchronizer as any).projectionQuarantines.has(document.uri.toString()),
-      1000, 'projection quarantine expiry');
     document.text = `${expected}Z`;
     originalFire(document, [{ rangeOffset: expected.length, rangeLength: 0, text: 'Z' }]);
     const followup = options.notebookCell ? project.cellSource(key, 'a').toString() : project.text(key).toString();
@@ -284,14 +282,6 @@ async function runScenario(options: Scenario): Promise<void> {
     synchronizer.dispose();
     project.destroy();
     peer.destroy();
-  }
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}.`);
-    await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
 }
 
