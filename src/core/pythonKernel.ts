@@ -81,6 +81,7 @@ export function kernelLaunchSpec(
     ...baseEnvironment,
     PYTHONUNBUFFERED: '1',
     PAIR_NOTEBOOK_CWD: workingDirectory,
+    PAIR_NOTEBOOK_WORKSPACE: workingDirectory,
   };
   if (cudaDevice !== undefined) env.CUDA_VISIBLE_DEVICES = String(cudaDevice);
   else delete env.CUDA_VISIBLE_DEVICES;

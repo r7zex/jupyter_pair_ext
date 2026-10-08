@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import Module from 'node:module';
@@ -14,7 +15,10 @@ import { SessionStartCancelledError } from '../src/core/startupRecovery';
 import { downloadProjectSnapshot } from '../src/runtime/bootstrap';
 import { configureMeshNetwork, MeshTransport } from '../src/runtime/mesh';
 import { NostrFrameRelay } from '../src/runtime/nostrRelay';
+import { VpsFrameRelay } from '../src/runtime/vpsFrameRelay';
+import { VpsServer } from '../src/vps/server';
 import { decodeFrame, encodeFrame } from '../src/core/wire';
+import { trainingProgram, trainingHelper, trainingData } from './support/modelTraining';
 import {
   createInMemoryTrysteroFactory,
   healInMemoryTrystero,
@@ -64,6 +68,70 @@ afterEach(() => {
 });
 
 describe('production SessionRuntime integration', () => {
+  for (const vpsOnly of [false, true]) it(`trains a real model from host repository files and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
+    this.timeout(45_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-training-'));
+    const hostFolder = path.join(root, 'working');
+    const backing = path.join(root, 'host-repository');
+    const peerFolder = path.join(root, 'guest');
+    await Promise.all([mkdir(hostFolder), mkdir(backing), mkdir(peerFolder)]);
+    await mkdir(path.join(backing, '.git'));
+    await writeFile(path.join(backing, '.git', 'dataset.csv'), trainingData);
+    await writeFile(path.join(hostFolder, 'config.json'), JSON.stringify({ dataset: '.git/dataset.csv', delay: vpsOnly ? 0.8 : 0 }));
+    await writeFile(path.join(hostFolder, 'training_helpers.py'), trainingHelper);
+    await writeFile(path.join(hostFolder, 'train.ipynb'), JSON.stringify({ cells: [
+      { cell_type: 'code', id: 'train', metadata: {}, source: [trainingProgram], outputs: [], execution_count: null },
+    ], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
+    const token = 'host-training-session-token-that-is-long-enough';
+    const sessionId = `host-training-${Date.now()}`;
+    let broker: VpsServer | undefined;
+    let port = 0;
+    const brokerOptions = { dataDirectory: path.join(root, 'broker'), clientToken: 'a'.repeat(64), agentTokens: { pc: 'b'.repeat(64) } };
+    if (vpsOnly) {
+      broker = new VpsServer(brokerOptions); port = await broker.start();
+      const vps = { url: `http://127.0.0.1:${port}`, token: brokerOptions.clientToken };
+      configureMeshNetwork({ disableRelayFallback: false, disableTurnProbe: true,
+        relayFactory: (options) => new VpsFrameRelay({ ...options, vps }) });
+      MeshTransport.setRoomFactoryForTesting(() => ({
+        makeAction: () => ({ onMessage: () => undefined, send: async () => undefined }),
+        onPeerJoin: () => undefined, onPeerLeave: () => undefined, ping: async () => -1, leave: async () => undefined,
+      }) as never);
+    }
+    const host = new SessionRuntime(descriptor({ sessionId, role: 'host', peerId: 'host', hostPeerId: 'host',
+      workingFolder: hostFolder, backingFolder: backing, pythonPath: 'python3' }), token, context(path.resolve('.')), logger());
+    let guest: any;
+    try {
+      await host.start();
+      guest = new SessionRuntime(descriptor({ sessionId, role: 'peer', peerId: 'guest', hostPeerId: 'host',
+        workingFolder: peerFolder, pythonPath: 'python3', knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(path.resolve('.')), logger());
+      await guest.start();
+      await waitFor(() => guest.project.has('train.ipynb'), 5000, 'host notebook snapshot');
+      const events: any[] = [];
+      const execution = guest.executeCell('train.ipynb', 'train', trainingProgram, (event: any) => events.push(event));
+      if (broker) {
+        await waitFor(() => events.some((event) => String(event.content?.text).includes('TRAINING_STARTED')), 5000, 'VPS-only execution accepted');
+        assert.equal(guest.snapshot().peers.find((peer: any) => peer.peerId === 'host').route, 'Relay');
+        await broker.stop();
+        await waitFor(() => fileExists(path.join(backing, 'checkpoints', 'model.json')), 5000, 'training finishes while VPS is down');
+        broker = new VpsServer(brokerOptions); await broker.start(port);
+      }
+      const result = await execution;
+      assert.equal(result.success, true, JSON.stringify(events));
+      const model = JSON.parse(await readFile(path.join(backing, 'checkpoints', 'model.json'), 'utf8'));
+      assert.equal(model.epochs, 400);
+      assert.ok(Math.abs(model.weights[0] * 3 + model.weights[1] - 7) < 1e-4);
+      await assert.rejects(readFile(path.join(peerFolder, '.git', 'dataset.csv')), { code: 'ENOENT' });
+      assert.ok(events.some((event) => String(event.content?.text).includes('"mse"')));
+      const shared = guest.sharedTerminal(); shared.requestSnapshot();
+      await assert.rejects(shared.execute('echo forbidden'), /Only the active session host/);
+      guest.transport.sendTo('host', 'shellInput', { clock: guest.coordinator.clock }, Buffer.from('echo forbidden > forbidden-shell.txt'));
+      await host.sharedTerminal().execute(process.platform === 'win32' ? 'echo host-command' : 'printf "host-command\\n"');
+      await waitFor(() => shared.view().text.includes('host-command\n') || shared.view().text.includes('host-command\r\n'), 5000, 'shared host shell output');
+      await assert.rejects(readFile(path.join(backing, 'forbidden-shell.txt')), { code: 'ENOENT' });
+    } finally { await guest?.leave(); await host.leave(); await broker?.stop(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it('cancels snapshot discovery and permits another attempt with the same destination', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-bootstrap-cancel-'));
     const invite = { sessionId: 'cancel-bootstrap', projectId: 'project', projectName: 'Project',

@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import * as vscode from 'vscode';
 import type { SessionRuntime } from '../runtime/session';
 import type { VpsRelayConnection } from '../runtime/vpsFrameRelay';
+import { classifyFile, decodeUtf8ProjectFile, MAX_TRACKED_PROJECT_ENTRIES, shouldTrackProjectPath } from '../core/projectFiles';
 import { VpsClient, VpsHttpError } from '../vps/client';
 import { PendingSubmissionStore } from '../vps/pendingSubmission';
 import { type JobSubmission, type VpsAgent, type VpsDevice,
@@ -196,7 +198,12 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     const editor = vscode.window.activeTextEditor;
     const uri = notebook?.notebook.uri ?? editor?.document.uri;
     if (!uri) throw new Error('Open a Python file or notebook to submit a background job.');
-    let entrypoint = active ? path.relative(active.descriptor.workingFolder, uri.fsPath).split(path.sep).join('/') : path.basename(uri.fsPath);
+    const folder = vscode.workspace.workspaceFolders?.find((item) => {
+      const key = path.relative(item.uri.fsPath, uri.fsPath).split(path.sep).join('/');
+      return safeJobPath(key);
+    })?.uri.fsPath;
+    const projectRoot = active?.descriptor.workingFolder ?? folder;
+    let entrypoint = projectRoot ? path.relative(projectRoot, uri.fsPath).split(path.sep).join('/') : path.basename(uri.fsPath);
     if (!safeJobPath(entrypoint)) throw new Error('The active file must be inside the current collaborative project.');
     let scope: 'all' | 'cell' | undefined;
     if (notebook) {
@@ -208,25 +215,47 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       scope = selectedScope.value as 'all' | 'cell';
     }
     if (this.disposed || active !== this.currentRuntime()) throw new Error('The collaborative session changed during source selection. Try again.');
-    // Capture the project and open dirty editors synchronously after every dialog.
-    // This includes unsaved imported modules, not just the active document.
+    // Read standalone project resources before capturing dirty editors. Collaborative
+    // state is captured synchronously so canonical dependencies form one snapshot.
     let sourceBytes = 0;
     const putSource = (key: string, value: string): void => {
       sourceBytes += Buffer.byteLength(value) - (files[key] === undefined ? 0 : Buffer.byteLength(files[key]));
       if (sourceBytes > MAX_JOB_BYTES) throw new Error('Python source snapshot is too large for a background job.');
       files[key] = value;
     };
+    if (!active && projectRoot) {
+      let visited = 0;
+      const visit = async (directory: string): Promise<void> => {
+        for (const entry of await readdir(path.join(projectRoot, directory), { withFileTypes: true })) {
+          const key = directory ? `${directory}/${entry.name}` : entry.name;
+          if (!shouldTrackProjectPath(key)) continue;
+          if (++visited > MAX_TRACKED_PROJECT_ENTRIES) throw new Error('Project has too many entries to snapshot.');
+          if (entry.isDirectory()) { await visit(key); continue; }
+          if (!entry.isFile() || !safeJobPath(key)) continue;
+          const absolute = path.join(projectRoot, key);
+          const size = (await stat(absolute)).size;
+          // Binary datasets stay on the compute PC; never hash or load them here.
+          if (classifyFile(key, size) !== 'text') continue;
+          if (size > MAX_JOB_BYTES || Object.keys(files).length >= MAX_JOB_FILES) throw new Error('Project snapshot is too large. Keep large datasets on the compute machine in PAIR_NOTEBOOK_WORKSPACE.');
+          const bytes = await readFile(absolute);
+          const text = decodeUtf8ProjectFile(bytes);
+          if (text !== undefined) putSource(key, text);
+        }
+      };
+      await visit('');
+    }
+    if (this.disposed || active !== this.currentRuntime()) throw new Error('The collaborative session changed during source capture. Try again.');
     if (active) for (const key of active.project.keys()) {
-      if (key.endsWith('.py') && safeJobPath(key) && active.project.kindOf(key) === 'text') {
+      if (safeJobPath(key) && shouldTrackProjectPath(key) && active.project.kindOf(key) === 'text') {
         const text = active.project.text(key);
         if (text.length > MAX_JOB_BYTES || Object.keys(files).length >= MAX_JOB_FILES) throw new Error('Python source snapshot is too large for a background job.');
         putSource(key, text.toString());
       }
     }
-    if (active) for (const document of vscode.workspace.textDocuments) {
+    if (projectRoot) for (const document of vscode.workspace.textDocuments) {
       if (!document.isDirty || document.uri.scheme !== 'file') continue;
-      const key = path.relative(active.descriptor.workingFolder, document.uri.fsPath).split(path.sep).join('/');
-      if (key.endsWith('.py') && safeJobPath(key)) putSource(key, document.getText());
+      const key = path.relative(projectRoot, document.uri.fsPath).split(path.sep).join('/');
+      if (!key.endsWith('.ipynb') && safeJobPath(key) && shouldTrackProjectPath(key)) putSource(key, document.getText());
     }
     if (notebook) {
       const cells = scope === 'all' ? notebook.notebook.getCells() : [notebook.notebook.cellAt(notebook.selection.start)];

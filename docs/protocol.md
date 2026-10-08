@@ -64,6 +64,14 @@ The authoritative host CRDT receives the final output/execution state once, and 
 
 Kernel control frames enter a separate serialized runtime queue, so an unfinished inbound project snapshot cannot block Interrupt or Restart. Per-peer command rates and global inbound admission budgets still apply. Native Stop invalidates remaining and already queued batches for that notebook; fresh runs use a new cancellation generation. Notebook rename preserves the kernel, execution owners, and controller queue identity.
 
+## Shared host command terminal
+
+`shellSnapshotRequest`, `shellSnapshot` and `shellOutput` travel through the authenticated mesh, including the VPS relay. They carry the exact current host clock. Only the current host may publish terminal output; guests reject messages from another peer, stale clocks and malformed sequence/generation metadata. `shellInput` is rejected: no remote frame can write to the host shell.
+
+The host starts a local persistent command shell in its backing repository after the file barrier. Output is UTF-8 decoded per pipe, coalesced into at most 16 Ki UTF-16-unit chunks, sequenced and retained within 128 Ki UTF-16 units without splitting surrogate pairs. A sequence gap requests the bounded authoritative snapshot; unacknowledged requests retry and route replacement sends the latest snapshot. Host transfer, backing-folder changes and runtime shutdown stop the old process tree. The VS Code Pseudoterminal accepts line input only from the current local host. Ctrl+C also invalidates pending commands before starting a fresh shell.
+
+This restriction applies to the terminal channel. Notebook execution remains available to trusted participants and can itself call operating-system APIs.
+
 ## Presence and resources
 
 New peers publish semantic presence only: participant identity, active file, stable notebook cell ID, active **line**, and a CRDT-relative line-start anchor. Displayed editor offsets are mapped through the local text replica before the canonical anchor is created, so the anchor follows the same logical line when text is inserted above it. Exact cursors, columns, selections, names, and colors are not rendered; selected-line highlighting is advisory and never rejects or rolls back text. Legacy exact cursor data remains receive-only compatibility and is not rendered.

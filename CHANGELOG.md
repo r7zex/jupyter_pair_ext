@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased — own VPS and persistent background compute
+## 0.5.31 - 2026-10-08 (VPS compute, host repository execution and shared terminal)
+
+- Adds a shared host command terminal in the sidebar and Command Palette. Every authenticated participant can view it; only the current host can type or interrupt commands. Output is bounded and recovered after route replacement, and old host shells stop on transfer or session shutdown.
+- Executes live notebook cells from the host backing repository after the canonical file barrier, so host-only datasets and local resources are accessible. `PAIR_NOTEBOOK_WORKSPACE` identifies that repository.
+- Includes tracked text resources, configuration and small CSV datasets in immutable VPS job snapshots, captures standalone workspace dependencies and dirty modules, and fixes root-module imports for nested script/notebook entrypoints.
+- Verifies real CPU model fitting, repository data loading, checkpoint reload/evaluation, shared-terminal authority, and VPS outage recovery through the production runtime/controller and real Python processes.
 
 - Adds an optional private VPS relay alongside existing encrypted P2P routes, with authenticated HTTPS/WebSockets and endpoint-bound SecretStorage credentials.
 - Adds VPS Compute commands and sidebar view for selecting any registered CPU/GPU machine, submitting Python files or notebook scopes, following shared output and cancelling jobs without requiring the compute PC to be the session host.

@@ -134,6 +134,9 @@ def run_job(directory):
         env = clean_environment()
         env["PAIR_NOTEBOOK_WORKSPACE"] = manifest["workspace"]
         env["PAIR_NOTEBOOK_JOB_ID"] = job["id"]
+        # Python otherwise adds only the entrypoint's directory to sys.path.
+        # A notebook/script in a subdirectory must still import root modules.
+        env["PYTHONPATH"] = str(work) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         cuda_device = manifest.get("cudaDevice", "" if job["device"] == "cpu" else None)
         if cuda_device is None:
             raise ValueError("Selected GPU is no longer available; restart the agent to refresh its inventory")

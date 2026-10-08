@@ -12,10 +12,13 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 - Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
 - Direct WebRTC, optional user-configured TURN, Nostr/MQTT relay fallback and bundled Iroh QUIC with independent discovery and relay support.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
+- A shared host command terminal: everyone can view its output; the current host enters commands and interrupts the shell. Open **Host terminal** in the session sidebar or **Pair Notebook: Open Shared Host Terminal** from the Command Palette.
 - Optional [own VPS relay and persistent compute agents](docs/VPS_COMPUTE.md): encrypted collaboration through your server and CPU/GPU Python jobs on any registered PC, continuing while the submitting laptop is off.
 - A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
 
 ## Install
+
+Version **0.5.31** is available from the `codex/vps-persistent-compute` branch. Build its VSIX with `npm ci` and `npm run package`, then install `pair-notebook-0.5.31.vsix` on every participant's computer. Branch pushes do not publish a GitHub Release automatically; the latest published release can have an earlier version.
 
 Open the [latest GitHub Release](https://github.com/r7zex/jupyter_pair_ext/releases/latest), download its single `pair-notebook-<version>.vsix` file, and install it on **both computers** from **Extensions: Install from VSIX...**, or run:
 
@@ -140,7 +143,11 @@ Editing state remains in the CRDT during the short folder-selection pause, so an
 
 ## Saving behavior
 
-Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. Activating a shared notebook selects the Pair Jupyter controller without restarting its kernel; Pair Run also selects the controller explicitly. Stop cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
+Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. The Jupyter kernel runs from the host backing repository, so relative paths and `PAIR_NOTEBOOK_WORKSPACE` can read the host's own datasets, including files omitted from guest snapshots. Activating a shared notebook selects the Pair Jupyter controller without restarting its kernel; Pair Run also selects the controller explicitly. Stop cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
+
+The shared terminal uses the host's operating-system account and starts in that same repository. It keeps shell variables and `cd` changes between commands. Guest terminals are view only, and incoming remote shell-input frames are rejected. This command terminal supports line commands and streamed output; full-screen TTY tools and interactive password prompts require the host's ordinary local terminal. Closing its tab preserves the shell until the session ends; Ctrl+C stops the shell and its child commands, and the next command starts a fresh shell. All participants must install 0.5.31 to use the shared terminal.
+
+The terminal input restriction is specific to the terminal. Trusted collaborators can still execute notebook Python on the host, including operating-system calls, as described below.
 
 Live text and notebook updates are sent immediately; disk persistence is separate and debounced. The canonical host copy and join snapshots are serialized directly from current CRDT state, so an unsaved open editor cannot make a new participant receive stale disk contents.
 

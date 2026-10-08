@@ -66,6 +66,7 @@ import { statusBarTextForRuntimeState } from './vscode/connectionProgress';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
 import { VpsComputeController, readVpsConnection } from './vscode/vpsCompute';
+import { SharedTerminalController } from './vscode/sharedTerminal';
 import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
 import {
   PROXY_CREDENTIAL_MIGRATION_KEY,
@@ -116,6 +117,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
   const vpsCompute = new VpsComputeController(context, () => runtime);
+  const sharedTerminal = new SharedTerminalController(() => runtime);
+  context.subscriptions.push(sharedTerminal);
+  register(context, 'pairNotebook.openSharedTerminal', () => sharedTerminal.open());
   context.subscriptions.push(vpsCompute);
   register(context, 'pairNotebook.connectVps', async () => { await vpsCompute.connect(); await applyMeshNetworkConfiguration(context); });
   register(context, 'pairNotebook.runVpsJob', (id?: string) => vpsCompute.submit(id));

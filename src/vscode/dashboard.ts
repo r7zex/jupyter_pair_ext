@@ -170,6 +170,7 @@ const commandMap: Record<string, string> = {
   autosaveNow: 'pairNotebook.createAutosave',
   backingFolder: 'pairNotebook.selectBackingFolder',
   compute: 'pairNotebook.changeCompute',
+  shell: 'pairNotebook.openSharedTerminal',
   hardware: 'pairNotebook.refreshHardware',
   recent: 'pairNotebook.openRecentProject',
 };
@@ -486,7 +487,7 @@ function html(): string {
       const networkCard = '<div class="card"><div class="row"><span>Прямые P2P-подключения</span><span>'+esc(state.network?.direct)+'</span></div><div class="row"><span>↓ '+bytes(state.network?.down||0)+'</span><span>↑ '+bytes(state.network?.up||0)+'</span></div><div class="tiny">'+esc(state.network?.address)+'</div></div>';
       const autosaveFolder = state.autosave?.folder || 'Папка не выбрана';
       const paused = Boolean(state.waitingForHostFolder);
-      const quickActions = '<div class="actions">'+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.isHost?state.compute?.device:'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
+      const quickActions = '<div class="actions">'+action('shell','Терминал хоста',state.isHost?'ВВОД КОМАНД':'ПРОСМОТР')+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.isHost?state.compute?.device:'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
       const transferAction = state.isHost && paused ? '' : action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost});
       const endAction = state.isHost && !paused ? action('end','Завершить сессию','ДЛЯ ВСЕХ',{danger:true,title:'Завершить сессию для всех участников'}) : '';
       const pauseAction = paused && state.isHost ? '<div class="actions">'+action('backingFolder','Настроить папку нового хоста','ПРОДОЛЖИТЬ',{secondary:false,wide:true})+action('transfer','Передать хоста','ДРУГОМУ УЧАСТНИКУ',{secondary:true,wide:true})+action('end','Завершить сессию','БЕЗ НОВОЙ ПАПКИ',{danger:true,wide:true,title:'Завершить сессию и сохранить состояние в локальных рабочих копиях'})+'</div>' : '';
@@ -500,7 +501,7 @@ function html(): string {
         section('network','СЕТЬ',networkCard)+
         section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
         '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+transferAction+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
-      for (const name of ['backingFolder','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
+      for (const name of ['backingFolder','shell','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
       }

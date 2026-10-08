@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import Module from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +11,7 @@ import type { SessionRuntime } from '../src/runtime/session';
 import { VpsServer } from '../src/vps/server';
 import { VpsClient, VpsHttpError } from '../src/vps/client';
 import { type JobSubmission, MAX_JOB_BYTES, safeJobPath, validateSubmission, vpsSecretKey } from '../src/vps/protocol';
+import { trainingProgram, trainingHelper, trainingData } from './support/modelTraining';
 
 let root: string;
 let endpoint = '';
@@ -18,6 +20,7 @@ let runtime: any;
 let editor: any;
 let notebook: any;
 let documents: any[] = [];
+let workspaceFolders: any[] | undefined;
 let pick: (items: any[], options: any) => Promise<any>;
 let output = '';
 let secretRead: ((key: string) => Promise<string | undefined>) | undefined;
@@ -33,6 +36,7 @@ const boundary = {
   EventEmitter: class { public event = () => disposable(); public fire(): void {} public dispose(): void {} },
   workspace: {
     get isTrusted() { return trusted; }, get textDocuments() { return documents; },
+    get workspaceFolders() { return workspaceFolders; },
     getConfiguration: () => ({ get: () => endpoint, update: async (_key: string, value: string) => { endpoint = value; } }),
     onDidChangeConfiguration: (callback: (event: any) => void) => { configurationListeners.add(callback); return { dispose: () => configurationListeners.delete(callback) }; },
   },
@@ -65,12 +69,39 @@ function makeController(): InstanceType<typeof VpsComputeController> {
 async function setup(): Promise<void> {
   root = await mkdtemp(path.join(os.tmpdir(), 'pair-vps-ui-'));
   endpoint = ''; trusted = true; runtime = undefined; notebook = undefined; documents = [];
+  workspaceFolders = undefined;
   secrets.clear(); state.clear(); output = ''; secretRead = undefined;
   editor = { document: { uri: { scheme: 'file', fsPath: path.join(root, 'train.py') }, getText: () => 'print("original")' } };
   pick = async (items) => items[0];
   controller = makeController();
 }
 async function teardown(): Promise<void> { controller.dispose(); await rm(root, { recursive: true, force: true }); }
+
+describe('VPS project input resources', () => {
+  beforeEach(setup); afterEach(teardown);
+  it('includes canonical project config and data while excluding credential files', async () => {
+    const project = new Map([['helper.py', 'VALUE=1'], ['config.json', '{"epochs":40}'], ['data.csv', 'x,y\n1,3'], ['.env', 'PRIVATE=secret']]);
+    runtime = { descriptor: { workingFolder: root }, project: { keys: () => project.keys(), kindOf: () => 'text', text: (key: string) => project.get(key) } };
+    const snapshot = await (controller as any).sourceSnapshot();
+    assert.equal(snapshot.files['config.json'], '{"epochs":40}');
+    assert.equal(snapshot.files['data.csv'], 'x,y\n1,3');
+    assert.equal(snapshot.files['.env'], undefined);
+  });
+  it('snapshots standalone repository dependencies and overlays unsaved modules after disk reads', async () => {
+    await mkdir(path.join(root, 'experiments'));
+    await writeFile(path.join(root, 'helper.py'), 'VALUE=1');
+    await writeFile(path.join(root, 'config.json'), '{"epochs":40}');
+    await writeFile(path.join(root, '.env'), 'PRIVATE=secret');
+    editor = { document: { uri: { scheme: 'file', fsPath: path.join(root, 'experiments', 'train.py') }, getText: () => 'from helper import VALUE' } };
+    workspaceFolders = [{ uri: { fsPath: root } }];
+    documents = [{ uri: { scheme: 'file', fsPath: path.join(root, 'helper.py') }, isDirty: true, getText: () => 'VALUE=2' }];
+    const snapshot = await (controller as any).sourceSnapshot();
+    assert.equal(snapshot.entrypoint, 'experiments/train.py');
+    assert.equal(snapshot.files['helper.py'], 'VALUE=2');
+    assert.equal(snapshot.files['config.json'], '{"epochs":40}');
+    assert.equal(snapshot.files['.env'], undefined);
+  });
+});
 
 describe('Stage 64 — source snapshot, dialog cancellation and concurrent edit combinations', () => {
   beforeEach(setup); afterEach(teardown);
@@ -165,6 +196,49 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       body: JSON.stringify({ instanceId: 'pc-installation', name: 'Compute PC', resources: { cpuCount: 4, python: 'python3', gpus: [] } }) });
     assert.equal(response.status, 200); await response.arrayBuffer();
   }
+  it('trains from a real repository snapshot, reloads a model and recovers after the editor and VPS stop', async function () {
+    this.timeout(20_000);
+    const repository = path.join(root, 'repository');
+    await mkdir(path.join(repository, 'experiments'), { recursive: true });
+    await writeFile(path.join(repository, 'config.json'), JSON.stringify({ dataset: 'data.csv', delay: 0.8 }));
+    await writeFile(path.join(repository, 'data.csv'), trainingData);
+    await writeFile(path.join(repository, 'training_helpers.py'), 'raise RuntimeError("stale disk module")');
+    workspaceFolders = [{ uri: { fsPath: repository } }];
+    editor = { document: { uri: { scheme: 'file', fsPath: path.join(repository, 'experiments', 'train.py') }, getText: () => trainingProgram } };
+    documents = [{ uri: { scheme: 'file', fsPath: path.join(repository, 'training_helpers.py') }, isDirty: true, getText: () => trainingHelper }];
+    let daemon: ChildProcess | undefined;
+    const until = async (check: () => Promise<boolean>): Promise<void> => {
+      const end = Date.now() + 8000;
+      while (!await check()) { if (Date.now() > end) assert.fail('Model pipeline did not complete'); await new Promise((resolve) => setTimeout(resolve, 25)); }
+    };
+    try {
+      daemon = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'pc',
+        '--state', path.join(root, 'agent'), '--workspace', repository, '--poll-seconds', '0.1'],
+      { env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore' });
+      await until(async () => (await client.agents()).length === 1);
+      await controller.submit();
+      const submitted = (await client.jobs())[0]!;
+      const work = path.join(root, 'agent', 'jobs', submitted.id, 'work');
+      await until(async () => Buffer.from((await client.job(submitted.id)).log, 'base64').toString().includes('TRAINING_STARTED'));
+      controller.dispose();
+      await broker.stop();
+      await until(async () => { try { await readFile(path.join(work, 'checkpoints', 'model.json')); return true; } catch { return false; } });
+      const model = JSON.parse(await readFile(path.join(work, 'checkpoints', 'model.json'), 'utf8'));
+      assert.equal(model.epochs, 400);
+      assert.ok(Math.abs(model.weights[0] * 3 + model.weights[1] - 7) < 1e-4);
+      const port = Number(new URL(endpoint).port);
+      broker = new VpsServer({ dataDirectory: path.join(root, 'broker'), clientToken: token, agentTokens: { pc: agentToken } });
+      await broker.start(port);
+      await until(async () => (await client.job(submitted.id)).status === 'succeeded');
+      const completed = await client.job(submitted.id);
+      assert.match(Buffer.from(completed.log, 'base64').toString(), /"mse"/);
+      assert.equal((await client.jobs()).length, 1);
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
+        const exit = new Promise<void>((resolve) => daemon!.once('exit', () => resolve())); daemon.kill('SIGTERM'); await exit;
+      }
+    }
+  });
   it('truncates a long job title without splitting a Unicode code point', async () => {
     await register();
     editor.document.uri.fsPath = path.join(root, 'a'.repeat(199) + '🧠.py');

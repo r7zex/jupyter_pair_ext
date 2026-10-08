@@ -12,6 +12,7 @@ Guest execution synchronizes project dependencies before request retries, then m
 | `DashboardProvider` | Non-empty startup fallback, command bridge, state rendering, Recent Session exit metadata, and host-pause controls |
 | `MeshTransport` | Nostr/MQTT discovery, authenticated handshakes, WebRTC actions, redundant emergency relays, queues, RTT, and metrics |
 | `SessionRuntime` | CRDT/filesystem synchronization, pinned host authority, execution barriers, persistence ownership, and pause/resume |
+| `SharedTerminal` / `SharedTerminalController` | Host-local shell input, read-only guest terminal replicas, sequenced output and bounded snapshot recovery |
 | `downloadProjectSnapshot` | Folderless join bootstrap with streamed files, hashes, atomic publish, and final reconciliation |
 | `CollaborativeProject` | Bounded Yjs text/notebook state and stable notebook-cell identity |
 | `StorageAdapter` | Debounced atomic working/backing writes, retries, redirects, deletes, and full materialization |

@@ -49,6 +49,7 @@ import {
 import { SessionCoordinator } from '../core/election';
 import { CpuSnapshot, discoverHardware, HardwareInfo, ResourceSample, sampleResources } from '../core/hardware';
 import { JupyterExecutionResult, JupyterKernel, JupyterKernelEvent } from '../core/pythonKernel';
+import { SharedTerminal } from '../core/sharedTerminal';
 import { validateIdentityPublicKey } from '../core/identity';
 import { discoverPythonEnvironments, PythonEnvironment } from '../core/pythonEnvironments';
 import {
@@ -695,6 +696,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private runtimeDetail = 'Session runtime is starting.';
   private workingCopyWriter: ((relativePath: string, bytes: Uint8Array) => Promise<boolean>) | undefined;
   private prepareWorkingCopy: (() => Promise<void>) | undefined;
+  private hostTerminal: SharedTerminal | undefined;
   private deferWorkingCopyWrites = true;
   private workingCopyFallbackTimer: NodeJS.Timeout | undefined;
   private descriptorWriteQueue: Promise<void> = Promise.resolve();
@@ -1254,6 +1256,41 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       reason,
       metadata: { requestId, ...metadata },
     });
+  }
+
+  public sharedTerminal(): SharedTerminal {
+    if (!this.hostTerminal) this.hostTerminal = new SharedTerminal({
+      isHost: () => this.coordinator.isCurrentHost(),
+      hostId: () => this.coordinator.clock.hostId,
+      available: () => !this.closed && !this.waitingForHostFolder && !this.endingSession,
+      directory: () => this.descriptor.backingFolder || this.descriptor.workingFolder,
+      prepare: async () => { await this.prepareWorkingCopy?.(); await this.flush(); await this.prepareHostRepositoryBinaries(); },
+      send: (peer, type, meta, payload) => {
+        if (this.closed) return;
+        const framed = { ...meta, clock: this.coordinator.clock };
+        if (peer) this.transport.sendTo(peer, type, framed, payload);
+        else this.transport.broadcast(type, framed, payload);
+      },
+    });
+    return this.hostTerminal;
+  }
+
+  private async prepareHostRepositoryBinaries(): Promise<void> {
+    const root = this.descriptor.backingFolder;
+    if (!this.coordinator.isCurrentHost() || !root || !this.storage) return;
+    for (const [key, version] of this.binaryVersions) {
+      if (this.effectiveFileState(key)?.deleted) continue;
+      try {
+        const target = await safeProjectTarget(root, key, true);
+        const info = await stat(target);
+        if (!info.isFile()) throw new Error(`Host binary dependency is not a file: ${key}`);
+      }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        // Stream missing canonical assets without removing host-only resources.
+        await this.storage.mirrorBinaryToBacking(key, version.hash);
+      }
+    }
   }
 
   public async executeCell(
@@ -2169,6 +2206,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       connectionState: 'closing', routeKind: 'none', reason: diagnosticReason,
     });
     this.closed = true;
+    this.hostTerminal?.dispose();
     this.closeReason = reason;
     const terminal: SessionTerminalLifecycle = {
       reason,
@@ -2657,6 +2695,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         }
         this.sendRuntimePresence(peer.peerId);
         this.replayRemoteExecutionsForPeer(peer.peerId);
+        this.hostTerminal?.peerConnected(peer.peerId);
         if (peer.peerId === this.coordinator.clock.hostId) this.flushPendingTextIntents();
       } catch (error) {
         this.log.appendLine(`[error] Failed to initialize peer ${peer.displayName}: ${formatError(error)}`);
@@ -2970,6 +3009,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const clock = normalizeHostClock(rawClock, this.coordinator.clock.sessionEpoch);
       if (rawClock !== undefined && !clock) throw new Error(`Peer ${sourceId} sent a malformed host clock.`);
       if (clock && compareClock(clock, this.coordinator.clock) < 0 && !isClockAgnosticFrame(frame.type)) return;
+      if (frame.type.startsWith('shell')) {
+        if (!clock || !sameClock(clock, this.coordinator.clock)) return;
+        this.sharedTerminal().handle(frame, sourceId);
+        return;
+      }
       switch (frame.type) {
         case 'helloAck': {
           const peer = this.transport.peerRuntime().find((candidate) => candidate.peerId === sourceId);
@@ -3722,6 +3766,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const wasHost = this.descriptor.role === 'host';
     const hostChanged = this.descriptor.hostPeerId !== this.coordinator.clock.hostId;
     const becameHost = isHost && !wasHost;
+    if (hostChanged || becameHost) this.hostTerminal?.reset();
     this.storage?.setBackingRoot(undefined);
     if (!isHost || (hostChanged && becameHost)) {
       // A backing path is local to one computer and must never follow the role
@@ -6441,14 +6486,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
     this.project.on('documentRenamed', onRename);
     try {
-    // Python reads the physical working copy, including files whose current
-    // canonical content is still owned by an unsaved VS Code editor.
+    // Flush canonical edits first, then execute in the host repository so
+    // private/unshared datasets and local project resources stay available.
     if (materializeWorkspace) {
       await this.prepareWorkingCopy?.();
       await this.flush();
     }
     let kernel = this.kernels.get(notebookKey);
     if (!kernel) {
+      await this.prepareHostRepositoryBinaries();
       if (this.kernels.size >= MAX_LIVE_KERNELS) {
         const idleCandidate = [...this.kernels.keys()]
           .filter((key) => (this.notebookActiveExecutions.get(key) ?? 0) === 0)
@@ -6468,7 +6514,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       kernel = new JupyterKernel(
         pythonPath,
         vscode.Uri.joinPath(this.context.extensionUri, 'media', 'jupyter_kernel_bridge.py').fsPath,
-        this.descriptor.workingFolder,
+        this.descriptor.backingFolder || this.descriptor.workingFolder,
         gpuMatch ? Number(gpuMatch[1]) : undefined,
       );
       kernel.on('stderr', (message) => this.log.appendLine(`[jupyter] ${String(message).trimEnd()}`));
@@ -6593,6 +6639,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const resolved = await this.validateBackingFolder(folder);
     if (!this.storage) throw new Error('Session storage is not ready.');
     const previous = this.descriptor.backingFolder;
+    if (previous !== resolved && this.activeExecutions > 0) throw new Error('Finish or stop notebook execution before changing the host repository.');
     if (mode === 'reuse-existing') {
       const snapshot = await this.collectMaterialization();
       const inspection = await this.storage.bindExistingBacking(
@@ -6609,6 +6656,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     try {
       if (mode === 'replace') await this.materializeBackingFolder();
       await this.persistDescriptor();
+      if (previous !== resolved) {
+        for (const [key, kernel] of this.kernels) { kernel.stop(); this.setKernelStatus(key, 'Offline'); }
+        this.kernels.clear();
+        this.kernelLastUsed.clear();
+        this.hostTerminal?.reset();
+      }
       await this.onHostStorageReady(this.descriptor.localPeer.peerId);
       this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
     } catch (error) {
