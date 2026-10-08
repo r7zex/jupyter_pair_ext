@@ -4144,12 +4144,13 @@ describe('terminal session lifecycle', () => {
     };
     const routeWait = (runtime as any).waitForTransportRoute('host', 60_000);
     try {
+      const executionRejected = assert.rejects(pendingExecution, (error: any) =>
+        error instanceof SessionClosedError && error.reason === 'host-unreachable');
+      const routeRejected = assert.rejects(routeWait, (error: any) =>
+        error instanceof SessionClosedError && error.reason === 'host-unreachable');
       await new Promise((resolve) => setImmediate(resolve));
       await (runtime as any).disposeAsync('host-unreachable');
-      await assert.rejects(pendingExecution, (error: any) =>
-        error instanceof SessionClosedError && error.reason === 'host-unreachable');
-      await assert.rejects(routeWait, (error: any) =>
-        error instanceof SessionClosedError && error.reason === 'host-unreachable');
+      await Promise.all([executionRejected, routeRejected]);
       assert.equal((runtime as any).pendingExecutions.size, 0);
     } finally {
       clearTimeout(pendingTimer);

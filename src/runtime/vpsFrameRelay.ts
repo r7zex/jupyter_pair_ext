@@ -22,7 +22,8 @@ export class VpsFrameRelay implements FrameRelay {
   private readonly key: Buffer;
   private readonly url: string;
 
-  public constructor(private readonly options: FrameRelayOptions & { vps: VpsRelayConnection }) {
+  public constructor(private readonly options: FrameRelayOptions & { vps: VpsRelayConnection;
+    socketFactory?: typeof createProxiedNodeWebSocket }) {
     this.key = deriveRelayFrameKey(options.token, options.sessionId);
     const url = new URL(normalizeVpsUrl(options.vps.url) + '/v1/relay');
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -35,28 +36,37 @@ export class VpsFrameRelay implements FrameRelay {
   public diagnostics(): Record<string, unknown> { return { transport: 'VPS', ready: this.ready }; }
   public start(): void {
     if (this.stopped || this.socket) return;
-    const socket = createProxiedNodeWebSocket(this.url, undefined, {
+    const socket = (this.options.socketFactory ?? createProxiedNodeWebSocket)(this.url, undefined, {
       headers: { authorization: `Bearer ${this.options.vps.token}` },
       handshakeTimeout: 10_000, maxPayload: 96 * 1024 * 1024, followRedirects: false,
-    });
+    }, true);
     this.socket = socket;
+    this.nonce = '';
     socket.on('open', () => {
+      if (this.stopped || this.socket !== socket) return;
       this.nonce = randomBytes(24).toString('hex');
       socket.send(JSON.stringify({ t: 'probe', d: encryptRelayReadinessProbe(this.key, this.nonce) }));
       this.probeTimer = setTimeout(() => socket.terminate(), 10_000);
       this.probeTimer.unref();
     });
-    socket.on('message', (raw) => this.receive(raw.toString()));
+    socket.on('message', (raw) => { if (!this.stopped && this.socket === socket) this.receive(raw.toString()); });
     socket.on('close', () => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.ready = false;
       if (this.probeTimer) clearTimeout(this.probeTimer);
       if (!this.stopped) {
-        this.reconnect = setTimeout(() => { this.reconnect = undefined; this.start(); }, 2000);
-        this.reconnect.unref();
+        this.scheduleReconnect();
       }
     });
+  }
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnect) return;
+    this.reconnect = setTimeout(() => {
+      this.reconnect = undefined;
+      try { this.start(); } catch { this.scheduleReconnect(); }
+    }, 2000);
+    this.reconnect.unref();
   }
   public stop(): void {
     this.stopped = true;
@@ -95,7 +105,7 @@ export class VpsFrameRelay implements FrameRelay {
         }
         return;
       }
-      if (!message.f || !VPS_ID.test(message.f) || message.f === this.options.localPeerId) return;
+      if (!this.ready || !message.f || !VPS_ID.test(message.f) || message.f === this.options.localPeerId) return;
       if (message.t === 'announce') {
         if (verifyRelayAnnounceProof(this.key, this.options.sessionId, message.f, message.proof)) this.onPeerAnnounce(message.f);
         return;

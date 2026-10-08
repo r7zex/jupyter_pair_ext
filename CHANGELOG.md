@@ -6,6 +6,7 @@
 - Adds VPS Compute commands and sidebar view for selecting any registered CPU/GPU machine, submitting Python files or notebook scopes, following shared output and cancelling jobs without requiring the compute PC to be the session host.
 - Adds a durable VPS job broker and outbound-only Python agent. Detached training continues through editor shutdown, laptop shutdown, polling-agent restarts and VPS outages; durable receipts prevent automatic duplicate execution.
 - Includes deployment/service examples and CPU integration tests covering outage recovery, actual process cancellation, job persistence, role credentials, source paths and private relay reconnection.
+- Adds a staged 2047-scenario audit and fixes durable submission retries, live VPS changes, portable snapshots, UUID-pinned GPU selection, broker ownership/memory bounds and agent output/recovery errors. The full regression audit also fixes an early Jupyter interrupt race.
 
 ## 0.5.30 - 2026-09-13 (preserve input after remote edits)
 

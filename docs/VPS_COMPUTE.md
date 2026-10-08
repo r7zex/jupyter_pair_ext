@@ -74,7 +74,7 @@ python3 /opt/pair-notebook-agent.py \
   --state /var/lib/pair-notebook-agent
 ```
 
-`--python` is selected by the PC's owner. A submitted job cannot replace it. NVIDIA GPUs are discovered through `nvidia-smi`; selecting a GPU sets `CUDA_VISIBLE_DEVICES` for the training process, while selecting CPU hides CUDA devices. Your selected environment must contain the CUDA-capable framework and drivers needed by your code.
+`--python` is selected by the PC's owner. A submitted job cannot replace it. Relative interpreter paths are made absolute without resolving a virtual environment's symlink. NVIDIA GPUs are discovered through `nvidia-smi`; a selected GPU is pinned by UUID across queueing and CUDA enumeration changes. The runner sets `CUDA_VISIBLE_DEVICES` to that UUID; CPU hides CUDA devices. Your selected environment must contain the CUDA-capable framework and drivers needed by your code.
 
 `--workspace` points at existing datasets or other files on the compute PC. Source snapshots execute in a separate directory for each job. Refer to existing datasets without uploading them from your laptop:
 
@@ -136,7 +136,7 @@ Use the **VPS Compute** view in the Pair Notebook sidebar, or these commands:
 
 Click a machine to select its compute device; click a job to follow its output. You can submit from a guest or without an active P2P session. Registered offline agents can receive queued jobs, which start when they reconnect. The VPS processes one job at a time per agent, in queue order.
 
-For collaborative projects, the extension snapshots the current `.py` files from shared document state, including the active editor's unsaved code. A notebook can submit its active cell or all Python code cells as a fresh Python program. IPython magics, interactive input and existing Jupyter kernel variables are unavailable in background jobs. Regular live notebook execution retains its existing Session Host kernel behavior; background execution is selected explicitly with **Run Python on VPS Compute**.
+For collaborative projects, the extension snapshots the current `.py` files from shared document state, including unsaved open Python modules, after all selection dialogs finish. A notebook can submit its active cell or all Python code cells as a fresh Python program. IPython magics, interactive input and existing Jupyter kernel variables are unavailable in background jobs. Regular live notebook execution retains its existing Session Host kernel behavior; background execution is selected explicitly with **Run Python on VPS Compute**.
 
 The submitted source is immutable for that job: later collaborative edits do not alter running training. At most 256 source files and 4 MiB of JSON input can be sent. Outside a collaborative project, only the active Python file/notebook is sent. Install dependencies on the agent in advance; scripts are launched without a shell or automatic package installation. Large datasets stay on the PC.
 
@@ -144,12 +144,16 @@ The submitted source is immutable for that job: later collaborative edits do not
 
 - A disconnected laptop or stopped polling daemon does not stop the detached training process. The agent buffers output on disk and reports it after reconnecting.
 - VPS restarts preserve queued jobs, running claims, cancellation requests, completion results and output. Retried submissions with the same ID do not create a second job.
+- If a submission response is lost, the editor retains its immutable input in private extension storage. The next Run command retries that input and ID before accepting a new job, including after an editor restart. It never assumes that an absent job listing means a timed-out request cannot still commit. After confirmation, Run can create a fresh job.
+- Changing VPS configuration replaces the private P2P channel during an active session and stops the old endpoint's output watcher. Other available transports continue working.
 - An agent restart with its original state directory reconnects to the same runner and reports its result. An ambiguous launch or a PC reboot is reported as interrupted when no runner holds its OS lock. Such jobs are never automatically rerun. Resume from a checkpoint in a new job if needed.
 - A different agent installation cannot take over an already running claim. Restore the original state directory to reconcile it; do not delete agent state as a recovery shortcut.
 - Cancellation of an offline agent is delivered when it reconnects. Cancellation is a request until that agent confirms it; it cannot power off a remote process while the network is unavailable.
 - Each job retains its source, files and checkpoints in `<agent-state>/jobs/<job-id>/work/`. Retrieve artifacts through your existing SSH/file access to that PC, or save them into `PAIR_NOTEBOOK_WORKSPACE` for future jobs. The VPS UI displays status and logs; it does not stream model weights or datasets.
 - The broker retains the last 1 MiB of each job's output. The PC stores up to 32 MiB of output and continues draining further output so verbose training cannot block on a full pipe. Job files remain until the owner archives them.
 - The broker supports up to 1000 stored jobs. Archive completed job JSON files while the broker is stopped, and retain any active claims. Use one broker process per store.
+- The broker keeps job metadata in memory and reads one payload from disk at a time, so archived source/output do not all occupy VPS memory.
+- The broker enforces a directory ownership lock. A dead process on the same hostname can be recovered automatically. Incomplete locks, a different hostname, containers sharing storage, and PID reuse require operator inspection: stop all brokers and remove `<data-directory>/.broker-lock` only after confirming there is no writer. A second live broker cannot open the store.
 
 The P2P editor session retains its existing host availability rules. A persistent compute agent does not become the editor Session Host. Background jobs and their VPS view remain available independently of that editor session.
 
@@ -157,4 +161,6 @@ The P2P editor session retains its existing host availability rules. A persisten
 
 Automated loopback checks cover credential separation, path validation, idempotent submissions, durable claims after a VPS restart, bounded/idempotent log replay, queued/running cancellation, encrypted P2P delivery and reconnection. A real Python agent test kills the polling daemon and stops the VPS while the detached program continues, then reconnects with the original state and verifies exactly one execution and recovered output. A second real-process test verifies cancellation.
 
-These checks use local CPU processes. Deployment certificates, public-network routing, Windows service wrappers and physical GPU training must be tested on the VPS and compute PCs you configure.
+The [extended audit](VPS_AUDIT.md) documents 2047 staged adversarial scenarios plus recovery, UI and transport regressions. Run `npm run compile`, `npm run test:vps:audit`, and `npm run test:vps:agent` to repeat them.
+
+These checks use local CPU processes and a substituted VS Code API boundary for UI tests. Deployment certificates, public-network routing, a real VS Code extension host, Windows service wrappers and physical GPU training must be tested in their respective environments.

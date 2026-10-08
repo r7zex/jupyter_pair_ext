@@ -2,11 +2,14 @@
 """Persistent outbound-only Pair Notebook compute agent. Python 3.10+, stdlib only."""
 import argparse
 import base64
+import csv
 import json
+import math
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 import uuid
 
 MAX_LOG = 32 * 1024 * 1024
@@ -65,10 +69,13 @@ def lock_file(target):
 
 
 def safe_path(value):
-    return isinstance(value, str) and 0 < len(value) <= 512 and not re.search(r'[\\:*?"<>|\x00-\x1f\x7f]', value) and all(
-        part and part not in (".", "..") and not part.endswith((".", " "))
-        and not re.match(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)", part, re.I)
-        for part in value.split("/"))
+    try:
+        return isinstance(value, str) and 0 < len(value) <= 512 and not re.search(r'[\\:*?"<>|\x00-\x1f\x7f]', value) and all(
+            part and len(part.encode("utf-8")) <= 255 and part not in (".", "..") and not part.endswith((".", " "))
+            and not re.match(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)", unicodedata.normalize("NFKC", part), re.I)
+            for part in value.split("/"))
+    except UnicodeEncodeError:
+        return False
 
 
 def clean_environment():
@@ -121,7 +128,10 @@ def run_job(directory):
         env = clean_environment()
         env["PAIR_NOTEBOOK_WORKSPACE"] = manifest["workspace"]
         env["PAIR_NOTEBOOK_JOB_ID"] = job["id"]
-        env["CUDA_VISIBLE_DEVICES"] = "" if job["device"] == "cpu" else job["device"].split(":", 1)[1]
+        cuda_device = manifest.get("cudaDevice", "" if job["device"] == "cpu" else None)
+        if cuda_device is None:
+            raise ValueError("Selected GPU is no longer available; restart the agent to refresh its inventory")
+        env["CUDA_VISIBLE_DEVICES"] = cuda_device
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         with (directory / "output.log").open("wb") as log:
@@ -132,7 +142,9 @@ def run_job(directory):
                                        cwd=work, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, **options)
 
-            def drain():
+            drain_errors = []
+
+            def drain_output():
                 written = 0
                 truncated = False
                 while True:
@@ -149,10 +161,19 @@ def run_job(directory):
                         log.flush()
                         truncated = True
 
+            def drain():
+                try:
+                    drain_output()
+                except Exception as error:
+                    drain_errors.append(error)
+
             reader = threading.Thread(target=drain, daemon=True)
             reader.start()
             cancelled = False
             while process.poll() is None:
+                if drain_errors:
+                    stop_process(process)
+                    break
                 if (directory / "cancel").exists():
                     cancelled = True
                     stop_process(process)
@@ -168,6 +189,8 @@ def run_job(directory):
             reader.join(timeout=5)
             if reader.is_alive():
                 raise RuntimeError("Output stream did not close")
+            if drain_errors:
+                raise RuntimeError("Output could not be captured") from drain_errors[0]
             log.flush()
             os.fsync(log.fileno())
         atomic_json(directory / "result.json", {"status": "cancelled" if cancelled else ("succeeded" if exit_code == 0 else "failed"),
@@ -179,6 +202,8 @@ def run_job(directory):
             log.write(b"\nPair Notebook runner failed. Check the configured Python environment and local agent storage.\n")
         atomic_json(directory / "result.json", {"status": "failed", "exitCode": -1})
     finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
         held_lock.close()
 
 
@@ -191,17 +216,23 @@ class Agent:
     def __init__(self, args):
         self.args = args
         url = urllib.parse.urlsplit(args.url)
-        if url.scheme not in ("http", "https") or url.username or url.password or url.query or url.fragment or not url.hostname:
+        if url.scheme not in ("http", "https") or url.username or url.password or "?" in args.url or "#" in args.url or not url.hostname:
             raise ValueError("Invalid VPS URL")
         if url.scheme == "http" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("Use HTTPS outside localhost")
         if not ID.fullmatch(args.id):
             raise ValueError("Invalid agent ID")
         self.endpoint = args.url.rstrip("/")
-        self.token = Path(args.token_file).read_text().strip() if args.token_file else os.environ.get("PAIR_AGENT_TOKEN", "")
+        self.token = Path(args.token_file).expanduser().read_text().strip() if args.token_file else os.environ.get("PAIR_AGENT_TOKEN", "")
         if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", self.token):
             raise ValueError("Missing agent credential")
-        self.state = Path(args.state).resolve()
+        interpreter = shutil.which(str(Path(args.python).expanduser()))
+        if not interpreter:
+            raise ValueError("The owner-selected Python interpreter does not exist")
+        # Preserve a venv's interpreter symlink; resolving it loses the environment.
+        self.args.python = os.path.abspath(interpreter)
+        self.args.workspace = str(Path(args.workspace).expanduser().resolve())
+        self.state = Path(args.state).expanduser().resolve()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = lock_file(self.state / "agent.lock")
         if self.lock is None:
@@ -217,15 +248,18 @@ class Agent:
         self.opener = urllib.request.build_opener(NoRedirect())
         self.active_id = None
         self.children = []
+        self.recovery_started = {}
 
     def inventory(self):
         gpus = []
         try:
-            result = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
+            result = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total", "--format=csv,noheader,nounits"],
                                     capture_output=True, text=True, timeout=5, check=True)
-            for line in result.stdout.splitlines():
-                index, name, memory = [value.strip() for value in line.split(",", 2)]
-                gpus.append({"index": int(index), "name": name, "memoryMb": float(memory)})
+            for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
+                index, gpu_uuid, name, memory = [value.strip() for value in row]
+                if not re.fullmatch(r"GPU-[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", gpu_uuid):
+                    raise ValueError("Invalid GPU identity")
+                gpus.append({"index": int(index), "uuid": gpu_uuid, "name": name, "memoryMb": float(memory)})
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
         return {"cpuCount": os.cpu_count() or 1, "python": self.args.python, "gpus": gpus}
@@ -249,9 +283,18 @@ class Agent:
         sync_directory(directory.parent)
         sync_directory(self.state)
         manifest = directory / "manifest.json"
+        if manifest.exists():
+            retained = read_json(manifest)["job"]
+            for field in ("id", "agentId", "entrypoint", "device", "gpuUuid", "files", "args"):
+                if field in job and job[field] != retained.get(field):
+                    raise ValueError("The broker input disagrees with the retained execution receipt")
+        self.recovery_started.setdefault(job["id"], time.monotonic())
         if not manifest.exists():
+            gpu = None if job["device"] == "cpu" else next((gpu for gpu in self.inventory()["gpus"] if
+                        (gpu["uuid"] == job["gpuUuid"] if job.get("gpuUuid") else "gpu:" + str(gpu["index"]) == job["device"])), None)
             atomic_json(manifest, {"job": job, "python": self.args.python,
-                                   "workspace": str(Path(self.args.workspace).resolve()), "launchedAt": time.time()})
+                                   "workspace": self.args.workspace, "launchedAt": time.time(),
+                                   "cudaDevice": "" if job["device"] == "cpu" else (gpu["uuid"] if gpu else None)})
             # Persist intent before spawning. On ambiguous crash recovery we never rerun Python.
             try:
                 options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -260,7 +303,7 @@ class Agent:
                                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options))
             except OSError:
                 atomic_json(directory / "result.json", {"status": "failed", "exitCode": -1})
-        elif not (directory / "result.json").exists() and time.time() - read_json(manifest)["launchedAt"] > 10:
+        elif not (directory / "result.json").exists() and time.monotonic() - self.recovery_started[job["id"]] > 10:
             runner_lock = lock_file(directory / "run.lock")
             if runner_lock is not None:
                 with (directory / "output.log").open("ab") as stream:
@@ -318,7 +361,7 @@ def main():
     if args.run_job:
         run_job(Path(args.run_job).resolve())
         return
-    if not args.url or not args.id or args.poll_seconds < 0.1:
+    if not args.url or not args.id or not math.isfinite(args.poll_seconds) or args.poll_seconds < 0.1:
         parser.error("--url, --id and a positive polling interval are required")
     try:
         agent = Agent(args)

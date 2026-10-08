@@ -219,11 +219,12 @@ interface SignedRelayEnvelope {
 const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> & MeshNetworkConfig = {
   disableTurnProbe: false,
 };
+const activeVpsRelays = new Set<RedundantFrameRelay>();
 
 /**
  * Applies extension-level networking configuration (settings + secrets).
- * Safe to call again before any transport start; running transports keep
- * their captured configuration.
+ * Running transports retain their TURN configuration; private VPS relays
+ * and replacement proxy sockets pick up changes without ending the session.
  */
 export function configureMeshNetwork(config: MeshNetworkConfig): void {
   meshNetworkConfig.vps = config.vps;
@@ -238,6 +239,7 @@ export function configureMeshNetwork(config: MeshNetworkConfig): void {
   // recovery. Refresh the global constructor now so those reconnects see a
   // newly enabled VPN or proxy without restarting the extension host.
   installProxyAwareWebSocket(config.proxy ?? {});
+  for (const relay of activeVpsRelays) relay.updateVps(config.vps);
 }
 
 const RELAY_REDUNDANCY = 8;
@@ -1394,6 +1396,7 @@ export class MeshTransport extends EventEmitter {
       throw new Error(`Guaranteed emergency relay construction failed: ${formatError(error)}`, { cause: error });
     }
     const relay = this.relay;
+    if (relay instanceof RedundantFrameRelay) activeVpsRelays.add(relay);
     relay.onPeerAnnounce = (peerId) => {
       if (!this.identityToTransport.has(peerId)) this.considerRelayFallback(peerId);
     };
@@ -2385,6 +2388,7 @@ public improvablePeerIds(): string[] {
     this.seenIds.clear();
     this.seenRelayEnvelopes.clear();
     this.inboundWindows.clear();
+    if (this.relay instanceof RedundantFrameRelay) activeVpsRelays.delete(this.relay);
     this.relay?.stop();
     this.relay = undefined;
     for (const negotiation of this.relayNegotiations.values()) clearTimeout(negotiation.timeout);

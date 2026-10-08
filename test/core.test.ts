@@ -2640,11 +2640,27 @@ describe('real transport and compute', () => {
       assert.ok(events.some((event) => event.requestId === 'stdin' && event.messageType === 'stream'
         && String(event.content?.text).includes('PAIR_INPUT')));
 
-      const accepted = onceKernelEvent(kernel, (event) => event.type === 'accepted' && event.requestId === 'interrupt');
-      const sleeping = kernel.execute('interrupt', 'import time\ntime.sleep(30)');
-      await accepted;
-      await kernel.interrupt();
-      assert.equal((await sleeping).success, false);
+      // Repeat cancellation immediately after acceptance: a signal delivered
+      // on the initial busy event can race ipykernel's execution handler setup.
+      for (let round = 0; round < 5; round++) {
+        const id = `interrupt-${round}`;
+        const accepted = onceKernelEvent(kernel, (event) => event.type === 'accepted' && event.requestId === id);
+        const sleeping = kernel.execute(id, 'import time\ntime.sleep(30)');
+        await accepted;
+        await kernel.interrupt();
+        assert.equal((await sleeping).success, false);
+      }
+      // A deferred interrupt for an already finished cell must never hit the
+      // next cell or a restarted kernel.
+      for (let round = 0; round < 5; round++) {
+        const id = `fast-interrupt-${round}`;
+        const accepted = onceKernelEvent(kernel, (event) => event.type === 'accepted' && event.requestId === id);
+        const fast = kernel.execute(id, 'pass');
+        await accepted;
+        await kernel.interrupt();
+        await fast;
+        assert.equal((await kernel.execute(`after-fast-${round}`, 'import time\ntime.sleep(0.15)')).success, true);
+      }
 
       assert.equal((await kernel.execute('set-state', 'x = 123')).success, true);
       await kernel.restart();

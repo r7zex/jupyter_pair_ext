@@ -231,6 +231,33 @@ def maybe_complete(jupyter_id: str) -> None:
     })
 
 
+def schedule_interrupt(manager: Any, jupyter_id: str) -> None:
+    # A busy notification precedes ipykernel's execution/SIGINT handler setup.
+    # An immediate signal can be consumed in that gap and let the cell run.
+    # Deliver once after a short grace, bound to this exact pending execution.
+    with STATE_LOCK:
+        pending = PENDING.get(jupyter_id)
+        if not pending or pending.get("interruptScheduled") or pending.get("interruptDelivered"):
+            return
+        pending["interruptScheduled"] = True
+
+    def deliver() -> None:
+        with STATE_LOCK:
+            current = PENDING.get(jupyter_id)
+            if current is not pending or not current.get("busy") or STOP.is_set() or PAUSE_CHANNELS.is_set():
+                return
+            try:
+                manager.interrupt_kernel()
+                current["interruptDelivered"] = True
+            except Exception:
+                current["interruptScheduled"] = False
+                emit({"type": "channelError", "channel": "control", "message": "Kernel interrupt could not be delivered."})
+
+    timer = threading.Timer(0.05, deliver)
+    timer.daemon = True
+    timer.start()
+
+
 def iopub_loop(client: Any, manager: Any) -> None:
     while not STOP.is_set():
         if PAUSE_CHANNELS.is_set():
@@ -265,13 +292,12 @@ def iopub_loop(client: Any, manager: Any) -> None:
                 if pending and execution_state == "busy":
                     pending["busy"] = True
                     if pending.get("interruptRequested") and not pending.get("interruptDelivered"):
-                        pending["interruptDelivered"] = True
                         deliver_interrupt = True
                 elif pending and execution_state == "idle":
                     pending["busy"] = False
                     pending["idle"] = True
             if deliver_interrupt:
-                manager.interrupt_kernel()
+                schedule_interrupt(manager, jupyter_id)
             if execution_state == "idle":
                 maybe_complete(jupyter_id)
 
@@ -448,15 +474,14 @@ def main() -> int:
                         raise ValueError("Kernel input exceeds the Pair Notebook safety limit.")
                     client.input(value)
                 elif kind == "interrupt":
-                    deliver_interrupt = False
+                    interrupt_ids = []
                     with STATE_LOCK:
-                        for pending in PENDING.values():
+                        for jupyter_id, pending in PENDING.items():
                             pending["interruptRequested"] = True
                             if pending.get("busy") and not pending.get("interruptDelivered"):
-                                pending["interruptDelivered"] = True
-                                deliver_interrupt = True
-                    if deliver_interrupt:
-                        manager.interrupt_kernel()
+                                interrupt_ids.append(jupyter_id)
+                    for jupyter_id in interrupt_ids:
+                        schedule_interrupt(manager, jupyter_id)
                     emit({"type": "commandResult", "command": "interrupt", "requestId": request_id})
                 elif kind == "restart":
                     fail_pending("Kernel restarted")

@@ -1,0 +1,117 @@
+{
+  "date": "2026-10-08T13:56:01.679Z",
+  "baseRevision": "db55c8fed71b86b75757531cda55f8c59c4d3da3",
+  "branch": "codex/vps-persistent-compute",
+  "platform": "linux",
+  "node": "v24.19.0",
+  "interpretation": "2047 adversarial scenarios, not 2047 distinct defects or a frequency ranking",
+  "stages": [
+    {
+      "cases": 1024,
+      "tests": 1024,
+      "passes": 1024,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 512,
+      "tests": 512,
+      "passes": 512,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 256,
+      "tests": 256,
+      "passes": 256,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 128,
+      "tests": 128,
+      "passes": 128,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 64,
+      "tests": 64,
+      "passes": 64,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 32,
+      "tests": 32,
+      "passes": 32,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 16,
+      "tests": 16,
+      "passes": 16,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 8,
+      "tests": 8,
+      "passes": 8,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 4,
+      "tests": 4,
+      "passes": 4,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 2,
+      "tests": 2,
+      "passes": 2,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 1,
+      "tests": 1,
+      "passes": 1,
+      "failures": 0,
+      "pending": 0
+    }
+  ],
+  "typescriptSuite": {
+    "suites": 105,
+    "tests": 2614,
+    "passes": 2614,
+    "pending": 0,
+    "failures": 0,
+    "start": "2026-10-08T13:55:53.751Z",
+    "end": "2026-10-08T13:57:22.438Z",
+    "duration": 88687
+  },
+  "pythonAgentSuite": {
+    "tests": 39,
+    "passes": 39,
+    "failures": 0,
+    "pending": 0
+  },
+  "checks": {
+    "compile": "passed",
+    "eslint": "passed",
+    "pythonCompilation": "passed",
+    "sourcePreflight": "passed",
+    "boundedBrokerHeap": "passed: 128 MiB source store with 96 MiB heap",
+    "jupyterInterrupt": "passed: 5 immediate cancellations and 5 following-cell isolation checks",
+    "nativeExtensionHost": "blocked: VS Code executable not installed"
+  },
+  "limits": [
+    "Loopback Linux CPU processes; GPU UUID inventory simulated.",
+    "VS Code API substituted for UI/controller tests.",
+    "Public VPS TLS/routing, actual GPU training and Windows service behavior are unverified."
+  ]
+}

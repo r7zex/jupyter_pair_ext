@@ -4,7 +4,8 @@ import { StringDecoder } from 'node:string_decoder';
 import * as vscode from 'vscode';
 import type { SessionRuntime } from '../runtime/session';
 import type { VpsRelayConnection } from '../runtime/vpsFrameRelay';
-import { VpsClient } from '../vps/client';
+import { VpsClient, VpsHttpError } from '../vps/client';
+import { PendingSubmissionStore } from '../vps/pendingSubmission';
 import { type JobSubmission, type VpsAgent, type VpsDevice,
   MAX_JOB_BYTES, MAX_JOB_FILES, normalizeVpsUrl, safeJobPath, terminalJob, validateSubmission, vpsSecretKey } from '../vps/protocol';
 
@@ -34,9 +35,18 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private logTimer: NodeJS.Timeout | undefined;
   private logGeneration = 0;
   private disposed = false;
+  private submitting = false;
+  private readonly settingsSubscription: vscode.Disposable;
+  private readonly pending: PendingSubmissionStore;
 
   public constructor(private readonly context: vscode.ExtensionContext, private readonly currentRuntime: () => SessionRuntime | undefined) {
     this.view = vscode.window.createTreeView('pairNotebook.vpsCompute', { treeDataProvider: this });
+    this.pending = new PendingSubmissionStore(path.join(context.globalStorageUri.fsPath, 'pending-vps-jobs'));
+    this.settingsSubscription = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('pairNotebook.vpsUrl')) return;
+      this.stopWatching();
+      this.refresh();
+    });
     this.refreshTimer = setInterval(() => { if (this.view.visible) this.refresh(); }, 10_000);
     this.refreshTimer.unref();
   }
@@ -46,6 +56,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     clearInterval(this.refreshTimer);
     if (this.logTimer) clearTimeout(this.logTimer);
     this.changed.dispose();
+    this.settingsSubscription.dispose();
     this.view.dispose();
     this.output.dispose();
   }
@@ -61,15 +72,21 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       }
       if (!item) return [new ComputeItem('Compute machines', 'agents'), new ComputeItem('Background jobs', 'jobs')];
       const client = new VpsClient(connection.url, connection.token);
-      if (item.group === 'agents') return (await client.agents()).map((agent) => {
+      if (item.group === 'agents') {
+        const agents = await client.agents();
+        if (!agents.length) return [new ComputeItem('Start the compute agent on your PC to register it')];
+        return agents.map((agent) => {
         const result = new ComputeItem(agent.name);
         result.description = `${agent.online ? 'online' : 'offline'} • ${agent.resources.cpuCount} CPUs • ${agent.resources.gpus.length} GPUs`;
         result.tooltip = `${agent.id}\nPython: ${agent.resources.python}\n${agent.resources.gpus.map((gpu) => `${gpu.name} (${gpu.memoryMb} MB)`).join('\n')}`;
         result.iconPath = new vscode.ThemeIcon(agent.online ? 'vm-active' : 'vm-outline');
         result.command = { command: 'pairNotebook.runVpsJob', title: 'Run on this machine', arguments: [agent.id] };
         return result;
-      });
-      return (await client.jobs()).slice(0, 100).map((job) => {
+        });
+      }
+      const jobs = await client.jobs();
+      if (!jobs.length) return [new ComputeItem('No background jobs yet')];
+      return jobs.slice(0, 100).map((job) => {
         const result = new ComputeItem(job.title);
         result.id = job.id;
         result.description = `${job.status}${job.cancelRequested && !terminalJob(job.status) ? ' • cancellation requested' : ''} • ${job.agentId} • ${job.device}`;
@@ -78,9 +95,10 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
         result.command = { command: 'pairNotebook.showVpsJob', title: 'Show job output', arguments: [job.id] };
         return result;
       });
-    } catch {
-      const retry = new ComputeItem('VPS unavailable — click to retry');
-      retry.command = { command: 'pairNotebook.refreshVpsJobs', title: 'Retry VPS connection' };
+    } catch (error) {
+      const auth = error instanceof VpsHttpError && [401, 403].includes(error.status);
+      const retry = new ComputeItem(auth ? 'VPS access denied — click to reconnect' : 'VPS unavailable — click to retry');
+      retry.command = { command: auth ? 'pairNotebook.connectVps' : 'pairNotebook.refreshVpsJobs', title: 'Retry VPS connection' };
       return [retry];
     }
   }
@@ -106,21 +124,35 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     const client = new VpsClient(url, token);
     await client.agents();
     await this.context.secrets.store(vpsSecretKey(url), token);
+    this.stopWatching();
     await configuration.update('vpsUrl', url, vscode.ConfigurationTarget.Global);
     this.refresh();
-    void vscode.window.showInformationMessage('VPS connected. Start or rejoin a P2P session to use its relay. Background jobs are available immediately.');
+    void vscode.window.showInformationMessage('VPS connected. Its relay is available to the current session; background jobs are ready.');
   }
 
   public async submit(preferredAgent?: string): Promise<void> {
+    if (this.submitting) throw new Error('A background submission is already in progress. Finish its selection or retry first.');
+    this.submitting = true;
+    try { await this.submitOnce(preferredAgent); }
+    finally { this.submitting = false; }
+  }
+
+  private async submitOnce(preferredAgent?: string): Promise<void> {
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before submitting Python for remote execution.');
-    const client = await this.client();
-    const pending = this.context.globalState.get<{ endpoint: string; id: string }>('pairNotebook.pendingVpsJob');
-    if (pending?.endpoint === client.endpoint) {
-      // Resolve an earlier ambiguous submission before allowing a fresh training run.
-      const existing = (await client.jobs()).find((job) => job.id === pending.id);
+    const initial = await readVpsConnection(this.context);
+    if (!initial) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS first.');
+    const client = new VpsClient(initial.url, initial.token);
+    const legacy = this.context.globalState.get<{ endpoint: string; id: string }>('pairNotebook.pendingVpsJob');
+    if (legacy?.endpoint === client.endpoint) {
+      // Older extension versions did not retain the input. An absent listing is
+      // not proof that an earlier request cannot still commit.
+      const existing = (await client.jobs()).find((job) => job.id === legacy.id);
+      if (!existing) throw new Error(`An earlier submission (${legacy.id}) remains unconfirmed. Check VPS Jobs before clearing its legacy receipt.`);
       await this.context.globalState.update('pairNotebook.pendingVpsJob', undefined);
-      if (existing) { await this.showJob(existing.id); return; }
+      await this.showJob(existing.id); return;
     }
+    const pending = await this.pending.load(client.endpoint);
+    if (pending) { await this.deliver(client, pending); return; }
     const agents = await client.agents();
     const targets = agents.filter((agent) => typeof preferredAgent !== 'string' || agent.id === preferredAgent).flatMap((agent) => [
       this.target(agent, 'cpu'), ...agent.resources.gpus.map((gpu) => this.target(agent, `gpu:${gpu.index}`, `${gpu.name} • ${gpu.memoryMb} MB`)),
@@ -131,12 +163,22 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     if (!selected) return;
     const input = await this.sourceSnapshot();
     if (!input) return;
+    const current = await readVpsConnection(this.context);
+    if (this.disposed || !current || current.url !== client.endpoint || current.token !== initial.token) {
+      throw new Error('The VPS configuration changed during selection. Start the submission again.');
+    }
+    const gpuUuid = selected.agent.resources.gpus.find((gpu) => `gpu:${gpu.index}` === selected.device)?.uuid;
     const job = validateSubmission({ id: randomUUID(), agentId: selected.agent.id, device: selected.device,
+      ...(gpuUuid ? { gpuUuid } : {}),
       title: path.basename(input.entrypoint).slice(0, 200), ...input, args: [] });
-    await this.context.globalState.update('pairNotebook.pendingVpsJob', { endpoint: client.endpoint, id: job.id });
+    await this.pending.save(client.endpoint, job);
+    await this.deliver(client, job);
+  }
+
+  private async deliver(client: VpsClient, job: JobSubmission): Promise<void> {
     try { await client.submit(job); }
     catch { throw new Error(`Could not confirm job ${job.id}. Open VPS Jobs to check it; the next submission will reconcile this request first.`); }
-    await this.context.globalState.update('pairNotebook.pendingVpsJob', undefined);
+    await this.pending.clear(job.id);
     this.refresh();
     void vscode.window.showInformationMessage('Background job submitted. It will keep running when you close VS Code or switch off this computer.');
     await this.showJob(job.id);
@@ -150,40 +192,54 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private async sourceSnapshot(): Promise<Pick<JobSubmission, 'entrypoint' | 'files'> | undefined> {
     const active = this.currentRuntime();
     const files: Record<string, string> = Object.create(null) as Record<string, string>;
-    let sourceBytes = 0;
-    // Only Python sources are sent; existing PC datasets and credentials are never uploaded automatically.
-    if (active) for (const key of active.project.keys()) {
-      if (key.endsWith('.py') && safeJobPath(key) && active.project.kindOf(key) === 'text') {
-        const text = active.project.text(key);
-        if (text.length > MAX_JOB_BYTES || Object.keys(files).length >= MAX_JOB_FILES) throw new Error('Python source snapshot is too large for a background job.');
-        const value = text.toString();
-        sourceBytes += Buffer.byteLength(value);
-        if (sourceBytes > MAX_JOB_BYTES) throw new Error('Python source snapshot is too large for a background job.');
-        files[key] = value;
-      }
-    }
     const notebook = vscode.window.activeNotebookEditor;
     const editor = vscode.window.activeTextEditor;
     const uri = notebook?.notebook.uri ?? editor?.document.uri;
     if (!uri) throw new Error('Open a Python file or notebook to submit a background job.');
     let entrypoint = active ? path.relative(active.descriptor.workingFolder, uri.fsPath).split(path.sep).join('/') : path.basename(uri.fsPath);
     if (!safeJobPath(entrypoint)) throw new Error('The active file must be inside the current collaborative project.');
+    let scope: 'all' | 'cell' | undefined;
     if (notebook) {
-      const scope = await vscode.window.showQuickPick([
+      const selectedScope = await vscode.window.showQuickPick([
         { label: 'Whole notebook', description: 'Python cells in a fresh process', value: 'all' },
         { label: 'Active cell', description: 'Fresh process; existing kernel variables are unavailable', value: 'cell' },
       ], { title: 'Run notebook in background' });
-      if (!scope) return undefined;
-      const cells = scope.value === 'all' ? notebook.notebook.getCells() : [notebook.notebook.cellAt(notebook.selection.start)];
+      if (!selectedScope) return undefined;
+      scope = selectedScope.value as 'all' | 'cell';
+    }
+    if (this.disposed || active !== this.currentRuntime()) throw new Error('The collaborative session changed during source selection. Try again.');
+    // Capture the project and open dirty editors synchronously after every dialog.
+    // This includes unsaved imported modules, not just the active document.
+    let sourceBytes = 0;
+    const putSource = (key: string, value: string): void => {
+      sourceBytes += Buffer.byteLength(value) - (files[key] === undefined ? 0 : Buffer.byteLength(files[key]));
+      if (sourceBytes > MAX_JOB_BYTES) throw new Error('Python source snapshot is too large for a background job.');
+      files[key] = value;
+    };
+    if (active) for (const key of active.project.keys()) {
+      if (key.endsWith('.py') && safeJobPath(key) && active.project.kindOf(key) === 'text') {
+        const text = active.project.text(key);
+        if (text.length > MAX_JOB_BYTES || Object.keys(files).length >= MAX_JOB_FILES) throw new Error('Python source snapshot is too large for a background job.');
+        putSource(key, text.toString());
+      }
+    }
+    if (active) for (const document of vscode.workspace.textDocuments) {
+      if (!document.isDirty || document.uri.scheme !== 'file') continue;
+      const key = path.relative(active.descriptor.workingFolder, document.uri.fsPath).split(path.sep).join('/');
+      if (key.endsWith('.py') && safeJobPath(key)) putSource(key, document.getText());
+    }
+    if (notebook) {
+      const cells = scope === 'all' ? notebook.notebook.getCells() : [notebook.notebook.cellAt(notebook.selection.start)];
       const python = cells.filter((cell) => cell.kind === vscode.NotebookCellKind.Code && cell.document.languageId === 'python');
       if (!python.length) throw new Error('No Python code cells selected.');
       const code = python.map((cell) => cell.document.getText()).join('\n\n');
-      entrypoint = entrypoint.replace(/\.ipynb$/i, '') + '.pair-job.py';
-      files[entrypoint] = code;
+      entrypoint = entrypoint.replace(/\.ipynb$/i, '') + `.pair-job-${randomUUID()}.py`;
+      putSource(entrypoint, code);
     } else {
       if (!editor || !entrypoint.endsWith('.py')) throw new Error('Open a .py file or a Python notebook.');
-      files[entrypoint] = editor.document.getText();
+      putSource(entrypoint, editor.document.getText());
     }
+    if (Object.keys(files).length > MAX_JOB_FILES || Buffer.byteLength(JSON.stringify(files)) > MAX_JOB_BYTES) throw new Error('Python source snapshot is too large for a background job.');
     return { entrypoint, files };
   }
 
@@ -216,14 +272,17 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     let offset = 0;
     let headerShown = false;
     let unavailable = false;
-    const decoder = new StringDecoder('utf8');
+    let decoder = new StringDecoder('utf8');
     const poll = async (): Promise<void> => {
       try {
         const job = await client.job(id, offset);
         if (this.disposed || generation !== this.logGeneration) return;
         if (!headerShown) { this.output.appendLine(`${job.title} • ${job.agentId} • ${job.device}\nJob: ${job.id}`); headerShown = true; }
         unavailable = false;
-        if (offset < job.logStart) { this.output.appendLine('[Earlier output is retained only on the compute machine.]'); offset = job.logStart; }
+        if (offset < job.logStart) {
+          this.output.append(decoder.end()); decoder = new StringDecoder('utf8');
+          this.output.appendLine('[Earlier output is retained only on the compute machine.]'); offset = job.logStart;
+        }
         const bytes = Buffer.from(job.log, 'base64').subarray(Math.max(0, offset - job.logStart));
         this.output.append(decoder.write(bytes));
         offset = job.logEnd;
@@ -243,5 +302,11 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       }
     };
     await poll();
+  }
+
+  private stopWatching(): void {
+    this.logGeneration++;
+    if (this.logTimer) clearTimeout(this.logTimer);
+    this.logTimer = undefined;
   }
 }

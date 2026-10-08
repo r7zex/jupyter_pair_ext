@@ -152,11 +152,13 @@ export function createProxiedNodeWebSocket(
   url: string,
   protocols?: string | string[],
   socketOptions?: NodeWebSocket.ClientOptions,
+  requireProxy = false,
 ): NodeWebSocket {
   let agent: Agent | undefined;
   try {
     agent = createProxyAgent(url, activeProxyRuntimeOptions)?.agent;
-  } catch {
+  } catch (error) {
+    if (requireProxy) throw error;
     agent = undefined;
   }
   const options = { ...socketOptions, ...(agent ? { agent } : {}) };

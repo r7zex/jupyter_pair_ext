@@ -25,7 +25,11 @@ export interface RedundantFrameRelayOptions extends FrameRelayOptions {
  * protocol sees them.
  */
 export class RedundantFrameRelay implements FrameRelay {
-  private readonly relays: readonly FrameRelay[];
+  private readonly relays: FrameRelay[];
+  private vpsRelay: FrameRelay | undefined;
+  private vpsConnection: VpsRelayConnection | undefined;
+  private started = false;
+  private stopped = false;
   private readonly failedStarts = new Map<FrameRelay, Error>();
   private readonly seenFrames = new Map<string, number>();
   private readonly announcedPeers = new Map<string, number>();
@@ -34,21 +38,56 @@ export class RedundantFrameRelay implements FrameRelay {
   onFrame: (fromPeerId: string, bytes: Buffer) => void = () => undefined;
   onPeerAnnounce: (peerId: string) => void = () => undefined;
 
-  constructor(options: RedundantFrameRelayOptions) {
-    this.relays = options.channels ?? [
-      ...(options.vps ? [new VpsFrameRelay({ ...options, vps: options.vps })] : []),
-      new NostrFrameRelay(options),
-      new MqttFrameRelay(options),
-      ...(options.identityPrivateKey && !options.disableIroh
-        ? [new IrohFrameRelay({ ...options, identityPrivateKey: options.identityPrivateKey })] : []),
+  constructor(private readonly options: RedundantFrameRelayOptions) {
+    this.vpsConnection = options.vps;
+    this.vpsRelay = options.vps ? new VpsFrameRelay({ ...options, vps: options.vps }) : undefined;
+    this.relays = [
+      ...(this.vpsRelay ? [this.vpsRelay] : []),
+      ...(options.channels ?? [
+        new NostrFrameRelay(options),
+        new MqttFrameRelay(options),
+        ...(options.identityPrivateKey && !options.disableIroh
+          ? [new IrohFrameRelay({ ...options, identityPrivateKey: options.identityPrivateKey })] : []),
+      ]),
     ];
     for (const relay of this.relays) {
-      relay.onFrame = (fromPeerId, bytes) => this.acceptFrame(fromPeerId, bytes);
-      relay.onPeerAnnounce = (peerId) => this.acceptAnnounce(peerId);
+      this.bind(relay);
+    }
+  }
+
+  private bind(relay: FrameRelay): void {
+    relay.onFrame = (fromPeerId, bytes) => { if (!this.stopped && this.relays.includes(relay)) this.acceptFrame(fromPeerId, bytes); };
+    relay.onPeerAnnounce = (peerId) => { if (!this.stopped && this.relays.includes(relay)) this.acceptAnnounce(peerId); };
+  }
+
+  public updateVps(connection?: VpsRelayConnection): void {
+    if (this.stopped) return;
+    if (connection?.url === this.vpsConnection?.url && connection?.token === this.vpsConnection?.token) {
+      if (this.vpsRelay && this.failedStarts.has(this.vpsRelay)) {
+        try { this.vpsRelay.start(); this.failedStarts.delete(this.vpsRelay); }
+        catch (error) { this.failedStarts.set(this.vpsRelay, asError(error)); }
+      }
+      return;
+    }
+    if (this.vpsRelay) {
+      this.vpsRelay.stop();
+      this.failedStarts.delete(this.vpsRelay);
+      this.relays.splice(this.relays.indexOf(this.vpsRelay), 1);
+      this.vpsRelay = undefined;
+    }
+    this.vpsConnection = connection;
+    if (!connection) return;
+    const relay = new VpsFrameRelay({ ...this.options, vps: connection });
+    this.vpsRelay = relay;
+    this.relays.unshift(relay);
+    this.bind(relay);
+    if (this.started) {
+      try { relay.start(); } catch (error) { this.failedStarts.set(relay, asError(error)); }
     }
   }
 
   get connectedRelayCount(): number {
+    if (this.stopped) return 0;
     return this.relays.reduce((total, relay) => total + relay.connectedRelayCount, 0);
   }
 
@@ -64,6 +103,8 @@ export class RedundantFrameRelay implements FrameRelay {
   }
 
   start(): void {
+    if (this.stopped || this.started) return;
+    this.started = true;
     for (const relay of this.relays) {
       try { relay.start(); this.failedStarts.delete(relay); }
       catch (error) { this.failedStarts.set(relay, asError(error)); }
@@ -73,6 +114,7 @@ export class RedundantFrameRelay implements FrameRelay {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.housekeepingTimer) clearInterval(this.housekeepingTimer);
     this.housekeepingTimer = undefined;
     for (const relay of this.relays) relay.stop();
@@ -100,6 +142,7 @@ export class RedundantFrameRelay implements FrameRelay {
   }
 
   sendAnnounce(): void {
+    if (this.stopped) return;
     const errors: Error[] = [];
     for (const relay of this.relays) {
       try { relay.sendAnnounce(); } catch (error) { errors.push(asError(error)); }
@@ -108,6 +151,7 @@ export class RedundantFrameRelay implements FrameRelay {
   }
 
   send(bytes: Buffer, toPeerId?: string): void {
+    if (this.stopped) throw new Error('Relay transport is stopped.');
     const errors: Error[] = [];
     for (const relay of this.relays) {
       try { relay.send(bytes, toPeerId); } catch (error) { errors.push(asError(error)); }
