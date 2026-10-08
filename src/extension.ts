@@ -65,6 +65,7 @@ import { PresenceRenderer } from './vscode/presence';
 import { statusBarTextForRuntimeState } from './vscode/connectionProgress';
 import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
+import { VpsComputeController, readVpsConnection } from './vscode/vpsCompute';
 import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
 import {
   PROXY_CREDENTIAL_MIGRATION_KEY,
@@ -114,6 +115,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
+  const vpsCompute = new VpsComputeController(context, () => runtime);
+  context.subscriptions.push(vpsCompute);
+  register(context, 'pairNotebook.connectVps', async () => { await vpsCompute.connect(); await applyMeshNetworkConfiguration(context); });
+  register(context, 'pairNotebook.runVpsJob', (id?: string) => vpsCompute.submit(id));
+  register(context, 'pairNotebook.showVpsJobs', () => vpsCompute.showJobs());
+  register(context, 'pairNotebook.showVpsJob', (id: string) => vpsCompute.showJob(id));
+  register(context, 'pairNotebook.cancelVpsJob', () => vpsCompute.cancel());
+  register(context, 'pairNotebook.refreshVpsJobs', async () => vpsCompute.refresh());
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'pairNotebook.openPanel';
   context.subscriptions.push(
@@ -129,6 +138,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'pairNotebook.proxyUrl',
         'pairNotebook.turnUrls',
         'pairNotebook.turnUsername',
+        'pairNotebook.vpsUrl',
         'http.proxy',
         'http.proxySupport',
         'http.noProxy',
@@ -1218,7 +1228,7 @@ async function applyMeshNetworkConfiguration(
       void vscode.window.showErrorMessage('Pair Notebook: ' + EXPLICIT_PROXY_PASSWORD_ERROR);
     }
   }
-  const [turnPassword, proxyPassword, systemProxy] = await Promise.all([
+  const [turnPassword, proxyPassword, systemProxy, vps] = await Promise.all([
     Promise.resolve(context.secrets.get('pairNotebook.turnPassword')).catch((error: unknown) => {
       output.appendLine(`[error] Could not read TURN credentials: ${formatError(error)}`);
       return undefined;
@@ -1228,6 +1238,10 @@ async function applyMeshNetworkConfiguration(
       return undefined;
     }),
     readWindowsSystemProxy(),
+    readVpsConnection(context).catch(() => {
+      output.appendLine('[error] Invalid VPS configuration. Use Pair Notebook: Connect to VPS to repair it.');
+      return undefined;
+    }),
   ]);
   if (generation !== meshNetworkConfigurationGeneration) return;
   observedSystemProxyFingerprint = systemProxyFingerprint(systemProxy);
@@ -1243,6 +1257,7 @@ async function applyMeshNetworkConfiguration(
   if (options.checkProxy) await assertProxyReachable(proxy);
   if (generation !== meshNetworkConfigurationGeneration) return;
   configureMeshNetwork({
+    vps,
     turnUrls: configuration.get<string[]>('turnUrls', []),
     turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
     turnPassword: turnPassword || undefined,
@@ -1581,10 +1596,10 @@ function startStatusUpdates(): void {
   statusTimer = setInterval(update, 1000);
 }
 
-function register(context: vscode.ExtensionContext, command: string, callback: () => unknown | Promise<unknown>): void {
-  context.subscriptions.push(vscode.commands.registerCommand(command, async () => {
+function register<Args extends unknown[]>(context: vscode.ExtensionContext, command: string, callback: (...args: Args) => unknown | Promise<unknown>): void {
+  context.subscriptions.push(vscode.commands.registerCommand(command, async (...args: Args) => {
     try {
-      await callback();
+      await callback(...args);
     } catch (error) {
       output.appendLine(`[error] ${command}: ${formatError(error)}`);
       void vscode.window.showErrorMessage(`Pair Notebook: ${formatError(error)}`);

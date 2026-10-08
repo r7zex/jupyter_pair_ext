@@ -59,6 +59,7 @@ import {
   type ProxyWebSocketRuntimeOptions,
 } from './proxyWebSocket';
 import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
+import type { VpsRelayConnection } from './vpsFrameRelay';
 import { RedundantFrameRelay } from './redundantFrameRelay';
 import { assessUdpAvailability, type SignallingFamilyDiagnostic } from './diagnostics';
 import { shouldMigrateRoute } from './routeScoring';
@@ -104,6 +105,8 @@ export const TRYSTERO_TURN_SERVERS: ReadonlyArray<{
 }> = [];
 
 export interface MeshNetworkConfig {
+  /** Optional private VPS data relay; session encryption remains end to end. */
+  vps?: VpsRelayConnection | undefined;
   /** Overrides the default TURN endpoint URL list. */
   turnUrls?: readonly string[] | undefined;
   turnUsername?: string | undefined;
@@ -223,6 +226,7 @@ const meshNetworkConfig: Required<Pick<MeshNetworkConfig, 'disableTurnProbe'>> &
  * their captured configuration.
  */
 export function configureMeshNetwork(config: MeshNetworkConfig): void {
+  meshNetworkConfig.vps = config.vps;
   meshNetworkConfig.turnUrls = config.turnUrls;
   meshNetworkConfig.turnUsername = config.turnUsername;
   meshNetworkConfig.turnPassword = config.turnPassword;
@@ -1376,6 +1380,7 @@ export class MeshTransport extends EventEmitter {
         sessionId: this.options.sessionId,
         localPeerId: this.options.localPeer.peerId,
       }) ?? new RedundantFrameRelay({
+        vps: meshNetworkConfig.vps,
         token: this.options.token,
         sessionId: this.options.sessionId,
         localPeerId: this.options.localPeer.peerId,

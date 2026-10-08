@@ -12,6 +12,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 - Host-owned durable storage with folderless joins, host authority pinned until an explicit transfer, and safe folder selection after transfer.
 - Direct WebRTC, optional user-configured TURN, Nostr/MQTT relay fallback and bundled Iroh QUIC with independent discovery and relay support.
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
+- Optional [own VPS relay and persistent compute agents](docs/VPS_COMPUTE.md): encrypted collaboration through your server and CPU/GPU Python jobs on any registered PC, continuing while the submitting laptop is off.
 - A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
 
 ## Install

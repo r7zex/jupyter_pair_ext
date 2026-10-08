@@ -145,6 +145,31 @@
       {
         "command": "pairNotebook.showAdvancedDiagnostics",
         "title": "Pair Notebook: Run Advanced Network Diagnostics"
+      },
+      {
+        "command": "pairNotebook.connectVps",
+        "title": "Pair Notebook: Connect to VPS",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "pairNotebook.runVpsJob",
+        "title": "Pair Notebook: Run Python on VPS Compute",
+        "icon": "$(play)"
+      },
+      {
+        "command": "pairNotebook.showVpsJobs",
+        "title": "Pair Notebook: Show VPS Jobs",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "pairNotebook.cancelVpsJob",
+        "title": "Pair Notebook: Cancel VPS Job",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "pairNotebook.refreshVpsJobs",
+        "title": "Pair Notebook: Refresh VPS Compute",
+        "icon": "$(refresh)"
       }
     ],
     "viewsContainers": {
@@ -162,6 +187,10 @@
           "id": "pairNotebook.dashboard",
           "name": "Pair Notebook",
           "type": "webview"
+        },
+        {
+          "id": "pairNotebook.vpsCompute",
+          "name": "VPS Compute"
         }
       ]
     },
@@ -171,6 +200,33 @@
           "command": "pairNotebook.runActiveCell",
           "group": "navigation@20",
           "when": "pairNotebook.inSession && pairNotebook.executionAvailable"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "pairNotebook.connectVps",
+          "when": "view == pairNotebook.vpsCompute",
+          "group": "navigation@0"
+        },
+        {
+          "command": "pairNotebook.runVpsJob",
+          "when": "view == pairNotebook.vpsCompute",
+          "group": "navigation@1"
+        },
+        {
+          "command": "pairNotebook.showVpsJobs",
+          "when": "view == pairNotebook.vpsCompute",
+          "group": "navigation@2"
+        },
+        {
+          "command": "pairNotebook.cancelVpsJob",
+          "when": "view == pairNotebook.vpsCompute",
+          "group": "navigation@3"
+        },
+        {
+          "command": "pairNotebook.refreshVpsJobs",
+          "when": "view == pairNotebook.vpsCompute",
+          "group": "navigation@4"
         }
       ]
     },
@@ -242,6 +298,13 @@
           "pattern": "^(?:|(?:[Hh][Tt][Tt][Pp][Ss]?|[Ss][Oo][Cc][Kk][Ss](?:4[Aa]?|5[Hh]?))://(?:[^\\s:/@]+@)?(?:\\[[^\\]\\s]+\\]|[^\\s/:@?#]+)(?::[0-9]{1,5})?/?)$",
           "patternErrorMessage": "Do not put a proxy password in settings. Keep only the endpoint and optional username here, then run 'Pair Notebook: Set Proxy Password'.",
           "description": "Optional HTTP(S), SOCKS4 or SOCKS5 proxy endpoint plus optional username for signalling and encrypted relay fallback (for example http://user@127.0.0.1:10809). Store its password with 'Pair Notebook: Set Proxy Password'. Pair Notebook otherwise uses VS Code, environment and Windows system proxy settings automatically."
+        },
+        "pairNotebook.vpsUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "restricted": true,
+          "description": "HTTPS endpoint of your own Pair Notebook VPS relay and durable compute service. Run Connect to VPS to store its team token securely. All participants can submit background jobs to any registered compute agent, independently of the session host."
         }
       }
     }
@@ -257,7 +320,9 @@
     "test:live:iroh": "npm run compile && node scripts/iroh-live-smoke.mjs",
     "package": "npm run clean && npm run lint && npm test && node scripts/make-artifacts.mjs --preflight-only && vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository",
     "artifacts": "npm run package && node scripts/make-artifacts.mjs",
-    "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs"
+    "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs",
+    "vps:server": "node out/src/vps/cli.js",
+    "vps:agent": "python3 scripts/pair-notebook-agent.py"
   },
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",

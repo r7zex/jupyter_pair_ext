@@ -151,6 +151,7 @@ let activeProxyRuntimeOptions: ProxyWebSocketRuntimeOptions = {};
 export function createProxiedNodeWebSocket(
   url: string,
   protocols?: string | string[],
+  socketOptions?: NodeWebSocket.ClientOptions,
 ): NodeWebSocket {
   let agent: Agent | undefined;
   try {
@@ -158,12 +159,18 @@ export function createProxiedNodeWebSocket(
   } catch {
     agent = undefined;
   }
+  const options = { ...socketOptions, ...(agent ? { agent } : {}) };
   const socket = protocols === undefined
-    ? new NodeWebSocket(url, agent ? { agent } : undefined)
-    : new NodeWebSocket(url, protocols, agent ? { agent } : undefined);
+    ? new NodeWebSocket(url, options)
+    : new NodeWebSocket(url, protocols, options);
   // Same crash-safety rationale as ProxyAwareWebSocket above.
   socket.on('error', () => { /* handled via close/reconnect */ });
   return socket;
+}
+
+/** HTTP control-plane requests use the same selected proxy as P2P signalling. */
+export function createRuntimeProxyAgent(url: string): Agent | undefined {
+  return createProxyAgent(url, activeProxyRuntimeOptions)?.agent;
 }
 
 /** Installs the proxy-aware WebSocket as the global used by Trystero. */

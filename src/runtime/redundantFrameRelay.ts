@@ -3,6 +3,7 @@ import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
 import { MqttFrameRelay } from './mqttFrameRelay';
 import { NostrFrameRelay } from './nostrRelay';
 import { IrohFrameRelay } from './irohFrameRelay';
+import { VpsFrameRelay, type VpsRelayConnection } from './vpsFrameRelay';
 import type { PeerIdentity } from '../core/types';
 
 const DEDUPE_TTL_MS = 120_000;
@@ -15,6 +16,7 @@ export interface RedundantFrameRelayOptions extends FrameRelayOptions {
   identityPrivateKey?: string;
   peers?: readonly PeerIdentity[];
   disableIroh?: boolean;
+  vps?: VpsRelayConnection | undefined;
 }
 
 /**
@@ -34,6 +36,7 @@ export class RedundantFrameRelay implements FrameRelay {
 
   constructor(options: RedundantFrameRelayOptions) {
     this.relays = options.channels ?? [
+      ...(options.vps ? [new VpsFrameRelay({ ...options, vps: options.vps })] : []),
       new NostrFrameRelay(options),
       new MqttFrameRelay(options),
       ...(options.identityPrivateKey && !options.disableIroh
