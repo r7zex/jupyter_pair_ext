@@ -1,0 +1,270 @@
+{
+  "date": "2026-10-08T14:42:26.930Z",
+  "platform": "linux",
+  "node": "v24.19.0",
+  "round": 2,
+  "interpretation": "2047 adversarial scenarios, not 2047 distinct defects or a frequency ranking",
+  "stages": [
+    {
+      "cases": 1024,
+      "tests": 1024,
+      "passes": 1024,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 512,
+      "tests": 512,
+      "passes": 512,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 256,
+      "tests": 256,
+      "passes": 256,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 128,
+      "tests": 128,
+      "passes": 128,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 64,
+      "tests": 64,
+      "passes": 64,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 32,
+      "tests": 32,
+      "passes": 32,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 16,
+      "tests": 16,
+      "passes": 16,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 8,
+      "tests": 8,
+      "passes": 8,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 4,
+      "tests": 4,
+      "passes": 4,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 2,
+      "tests": 2,
+      "passes": 2,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 1,
+      "tests": 1,
+      "passes": 1,
+      "failures": 0,
+      "pending": 0
+    }
+  ],
+  "baseRevision": "6b1a18624ca692251316d82a277124c35807a5f4",
+  "branch": "codex/vps-persistent-compute",
+  "initialStageResults": [
+    {
+      "cases": 1024,
+      "passes": 64,
+      "failures": 960,
+      "pending": 0
+    },
+    {
+      "cases": 512,
+      "passes": 320,
+      "failures": 192,
+      "pending": 0
+    },
+    {
+      "cases": 256,
+      "passes": 128,
+      "failures": 128,
+      "pending": 0
+    },
+    {
+      "cases": 128,
+      "passes": 128,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 64,
+      "passes": 32,
+      "failures": 32,
+      "pending": 0
+    },
+    {
+      "cases": 32,
+      "passes": 0,
+      "failures": 32,
+      "pending": 0
+    },
+    {
+      "cases": 16,
+      "passes": 16,
+      "failures": 0,
+      "pending": 0
+    },
+    {
+      "cases": 8,
+      "passes": 4,
+      "failures": 4,
+      "pending": 0
+    },
+    {
+      "cases": 4,
+      "passes": 0,
+      "failures": 4,
+      "pending": 0
+    }
+  ],
+  "initialResultsNotes": [
+    "Stages 2 and 1 passed after earlier fixes; no pre-fix result is inferred.",
+    "The 128-case matrix initially passed; its independent maximum-frame boundary regression failed before the envelope fix.",
+    "Four output-watch regressions and one Unicode-title regression failed outside the 64-case matrix."
+  ],
+  "previousRoundRegression": {
+    "date": "2026-10-08T14:42:12.674Z",
+    "platform": "linux",
+    "node": "v24.19.0",
+    "round": 1,
+    "interpretation": "2047 adversarial scenarios, not 2047 distinct defects or a frequency ranking",
+    "stages": [
+      {
+        "cases": 1024,
+        "tests": 1024,
+        "passes": 1024,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 512,
+        "tests": 512,
+        "passes": 512,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 256,
+        "tests": 256,
+        "passes": 256,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 128,
+        "tests": 128,
+        "passes": 128,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 64,
+        "tests": 64,
+        "passes": 64,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 32,
+        "tests": 32,
+        "passes": 32,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 16,
+        "tests": 16,
+        "passes": 16,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 8,
+        "tests": 8,
+        "passes": 8,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 4,
+        "tests": 4,
+        "passes": 4,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 2,
+        "tests": 2,
+        "passes": 2,
+        "failures": 0,
+        "pending": 0
+      },
+      {
+        "cases": 1,
+        "tests": 1,
+        "passes": 1,
+        "failures": 0,
+        "pending": 0
+      }
+    ]
+  },
+  "verification": {
+    "typescript": {
+      "suites": 115,
+      "tests": 4629,
+      "passes": 4629,
+      "pending": 0,
+      "failures": 0,
+      "start": "2026-10-08T14:42:09.321Z",
+      "end": "2026-10-08T14:43:44.452Z",
+      "duration": 95131
+    },
+    "python": {
+      "tests": 79,
+      "passes": 79,
+      "failures": 0,
+      "pending": 0,
+      "resourceWarningsAsErrors": true
+    },
+    "compile": "passed",
+    "eslint": "passed",
+    "pythonCompile": "passed",
+    "sourcePreflight": "passed: no sensitive paths",
+    "gitDiffCheck": "passed",
+    "nodeRuntimeWarnings": 0,
+    "expectedFaultDiagnostics": "Persistence fault-injection tests intentionally print four handled storage errors.",
+    "realCpuAcceptance": "passed: two-way encrypted Yjs source sync, once-only guest job, 30 CPU optimization steps, durable checkpoint, both editors disconnected, broker outage/restart and live-agent log recovery",
+    "tlsAndProxy": "passed: untrusted certificates rejected; trusted loopback TLS; no credential redirects; header/body/CONNECT total deadlines; EOF-delimited JSON timeout",
+    "nativeExtensionHost": "unavailable: no installed VS Code executable; UI API boundary substituted"
+  },
+  "limits": [
+    "Loopback Linux CPU and local generated TLS certificates; public VPS routing/certificates are unverified.",
+    "Physical GPUs, Windows service lifetime and native VS Code rendering are unverified.",
+    "GPU UUID inventory is simulated; CPU model optimization/checkpointing uses real detached Python processes.",
+    "OS DNS resolution can block before a socket exists; expired requests are rejected immediately after resolution."
+  ]
+}

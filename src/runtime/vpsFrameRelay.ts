@@ -8,6 +8,7 @@ import { createRelayAnnounceProof, decryptRelayPacket, deriveRelayFrameKey, encr
   encryptRelayReadinessProbe, verifyRelayAnnounceProof, verifyRelayReadinessProbe } from './relayCrypto';
 
 export interface VpsRelayConnection { url: string; token: string }
+const MAX_ENVELOPE_HEADER_BYTES = 512;
 
 /** The VPS can route ciphertext; only invitation holders can decrypt session frames. */
 export class VpsFrameRelay implements FrameRelay {
@@ -24,6 +25,7 @@ export class VpsFrameRelay implements FrameRelay {
 
   public constructor(private readonly options: FrameRelayOptions & { vps: VpsRelayConnection;
     socketFactory?: typeof createProxiedNodeWebSocket }) {
+    if (!VPS_ID.test(options.localPeerId)) throw new Error('Invalid VPS peer ID.');
     this.key = deriveRelayFrameKey(options.token, options.sessionId);
     const url = new URL(normalizeVpsUrl(options.vps.url) + '/v1/relay');
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -90,7 +92,10 @@ export class VpsFrameRelay implements FrameRelay {
     if (!this.ready || !this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('VPS relay is not connected.');
     if (bytes.length > MAX_WIRE_FRAME_BYTES || (toPeerId && !VPS_ID.test(toPeerId))) throw new Error('Invalid VPS relay frame.');
     if (this.socket.bufferedAmount > 128 * 1024 * 1024) throw new Error('VPS relay is congested.');
-    const envelope = encodeFrame('vpsData', { f: this.options.localPeerId, ...(toPeerId ? { to: toPeerId } : {}) }, bytes);
+    // A mesh frame has already paid its own wire header cost. Bound the small
+    // routing header separately so wrapping a maximum-size frame still works.
+    const header = encodeFrame('vpsData', { f: this.options.localPeerId, ...(toPeerId ? { to: toPeerId } : {}) });
+    const envelope = Buffer.concat([header, bytes]);
     this.socket.send(JSON.stringify({ t: 'data', f: this.options.localPeerId, to: toPeerId,
       d: encryptRelayPacket(this.key, envelope).toString('base64') }));
   }
@@ -111,9 +116,13 @@ export class VpsFrameRelay implements FrameRelay {
         return;
       }
       if (message.t !== 'data' || typeof message.d !== 'string' || (message.to && message.to !== this.options.localPeerId)) return;
-      const envelope = decodeFrame(decryptRelayPacket(this.key, Buffer.from(message.d, 'base64')));
+      const packet = decryptRelayPacket(this.key, Buffer.from(message.d, 'base64'));
+      if (packet.length < 5 || packet.length > MAX_WIRE_FRAME_BYTES + MAX_ENVELOPE_HEADER_BYTES + 5) return;
+      const headerLength = packet.readUInt32BE(1);
+      if (headerLength > MAX_ENVELOPE_HEADER_BYTES || headerLength + 5 > packet.length) return;
+      const envelope = decodeFrame(packet.subarray(0, headerLength + 5));
       if (envelope.type !== 'vpsData' || envelope.meta.f !== message.f || envelope.meta.to !== message.to) return;
-      const bytes = Buffer.from(envelope.payload);
+      const bytes = packet.subarray(headerLength + 5);
       if (bytes.length <= MAX_WIRE_FRAME_BYTES) this.onFrame(message.f, bytes);
     } catch { /* Invalid ciphertext or another session cannot enter the mesh. */ }
   }

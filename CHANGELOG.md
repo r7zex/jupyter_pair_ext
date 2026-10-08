@@ -7,6 +7,7 @@
 - Adds a durable VPS job broker and outbound-only Python agent. Detached training continues through editor shutdown, laptop shutdown, polling-agent restarts and VPS outages; durable receipts prevent automatic duplicate execution.
 - Includes deployment/service examples and CPU integration tests covering outage recovery, actual process cancellation, job persistence, role credentials, source paths and private relay reconnection.
 - Adds a staged 2047-scenario audit and fixes durable submission retries, live VPS changes, portable snapshots, UUID-pinned GPU selection, broker ownership/memory bounds and agent output/recovery errors. The full regression audit also fixes an early Jupyter interrupt race.
+- Adds a second independent 2047-scenario audit and fixes pre-launch cancellation, ambiguous GPU identities, malformed Unicode, maximum-size VPS frames, long notebook names, concurrent receipt cleanup, log-selection races and total agent HTTP deadlines. CPU training/checkpoint recovery is verified with both editors disconnected and the VPS temporarily unavailable.
 
 ## 0.5.30 - 2026-09-13 (preserve input after remote edits)
 

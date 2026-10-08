@@ -54,7 +54,38 @@ node scripts/make-artifacts.mjs --preflight-only
 
 `test:vps:audit` runs the batches in order and checks each expected case count. Its report records passes, failures and skipped cases separately. On Windows, the Linux SIGTERM/SIGKILL and acceptance cases are skipped rather than presented as verified. Set `PAIR_NOTEBOOK_AGENT_PYTHON` to choose the audit interpreter.
 
-The complete TypeScript suite covers CRDT/file synchronization, notebook/controller behavior, network matrices, proxy handling, relay handshakes and startup recovery alongside the new VPS tests. The separate Python suite contains 32 matrix cases and 7 additional agent regressions, including a 34 MiB output producer. [Recorded results](VPS_AUDIT_RESULTS.json) capture the final cloud run.
+The complete TypeScript suite covers CRDT/file synchronization, notebook/controller behavior, network matrices, proxy handling, relay handshakes and startup recovery alongside the new VPS tests. The original Python run contained 32 matrix cases and 7 additional agent regressions, including a 34 MiB output producer. [First-round results](VPS_AUDIT_RESULTS.json) preserve that run.
+
+## Second independent audit
+
+The second cycle adds another **2047 scenarios**, rather than renaming or recounting the first matrix. Both cycles are retained and rerun together. Counts below describe failing combinations before each fix, not distinct defects or bug frequency.
+
+| Batch | New coverage | Initial failing combinations | Final result |
+| --- | --- | ---: | --- |
+| 1024 | Valid Unicode/path/argument variations combined with broken source/argument Unicode, C1 label controls and noncanonical GPU indices | 960 | All pass |
+| 512 | Valid compute profiles combined with repeated physical GPU UUIDs, invalid UUID prefixes and malformed UUIDs | 192 | All pass |
+| 256 | UTF-8 byte splits, full/partial log retries and invalid completion combinations | 128 | All pass |
+| 128 | Binary payloads, destination binding, cross-session packets, readiness and teardown combinations | 0 | All pass |
+| 64 | Long ASCII/Unicode notebook names, directories, scope, dirty imports and mixed-language cells | 32 | All pass |
+| 32 | Cancellation persisted before launch, combined with missing GPU, damaged source, unsafe entrypoint, existing work files and restored receipt | 32 | All pass |
+| 16 | GPU UUID hex-case differences, reordered-input replay, running cancellation and broker restarts | 0 | All pass |
+| 8 | Endpoint-specific pending receipts and deletion by another editor after directory listing | 4 | All pass |
+| 4 | Slow headers/body over direct HTTP and an explicit HTTP proxy | 4 | All pass |
+| 2 | Real loopback HTTPS: default certificate rejection, trusted TLS deadline and redirect credential isolation | Checked after deadline fix | All pass |
+| 1 | Two-way Yjs source synchronization, repeated guest submission, real CPU optimization/checkpoints, disconnected editors, VPS outage and recovery with the polling agent still alive | 0 | Pass |
+
+Additional regressions reproduced a maximum-size mesh frame rejected by the VPS envelope, an earlier log selection replacing the latest after delayed credential loading, and endless polling after HTTP 401/403/404. A further check caught an emoji split by job-title truncation. These cases are outside the 2047-case matrix.
+
+The fixes reject malformed Unicode before accepting work; keep GPU indices canonical and GPU identities unique while matching UUID hex digits without case sensitivity; require exact integer completion codes; bound the VPS routing envelope separately from its payload; generate portable notebook filenames and Unicode-safe titles; persist cancellation before spawning or preparing sources; tolerate only genuinely missing reconciled receipts; and stop unrecoverable log polling with a reconnect/refresh action.
+
+The agent now enforces a total HTTP exchange deadline instead of resetting its wait whenever another byte arrives. Direct HTTP, an HTTP proxy, HTTPS body reads, HTTPS proxy CONNECT headers and valid EOF-delimited JSON are covered. TLS certificate verification, environment proxy configuration and redirect rejection remain enabled. OS DNS resolution can still exceed the requested deadline before a socket exists; after resolution, an expired request is rejected before sending credentials.
+
+```bash
+npm run test:vps:audit:round2 -- --report=/tmp/pair-vps-audit-round2.json
+python3 -W error::ResourceWarning test/vps_agent_audit.py -q
+```
+
+The HTTPS audit generates temporary local certificates using `openssl`; the installed agent itself still requires only Python's standard library. The current Python suite contains 79 checks. [Second-round results](VPS_AUDIT_ROUND2_RESULTS.json) record both matrices and the full regression run. Native VS Code rendering, physical GPU training and Windows service lifetime retain the limits below.
 
 ## Verification limits
 

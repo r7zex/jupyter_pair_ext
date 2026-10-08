@@ -3,10 +3,15 @@ import argparse
 import importlib.util
 import json
 import os
+import http.server
 from pathlib import Path
 import subprocess
+import ssl
 import sys
 import tempfile
+import threading
+import time
+import urllib.request
 import unittest
 from unittest.mock import Mock, patch
 
@@ -54,10 +59,204 @@ for case in range(32):
     setattr(Stage32, f"test_case_{case:02d}", execution_case(case))
 
 
+class Round2Stage32(unittest.TestCase):
+    pass
+
+
+def cancelled_bootstrap_case(mask):
+    def test(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-cancel-bootstrap-") as temporary:
+            root = Path(temporary)
+            args = argparse.Namespace(url="http://localhost:9999", id="pc", name="PC", token_file=None,
+                                      state=str(root / "state"), workspace=str(root), python=sys.executable)
+            with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), patch.object(agent_module.subprocess, "run", side_effect=OSError):
+                owner = agent_module.Agent(args)
+            try:
+                directory = owner.state / "jobs" / f"cancelled-{mask}"
+                directory.mkdir(parents=True)
+                source = "print('must never execute')" if not mask & 2 else "# broken unicode \ud800"
+                job = {"id": f"cancelled-{mask}", "agentId": "pc", "device": "gpu:7" if mask & 1 else "cpu",
+                       "entrypoint": "../train.py" if mask & 4 else "train.py", "args": [], "files": {"train.py": source}, "cancelRequested": True}
+                if mask & 8:
+                    (directory / "work").mkdir()
+                    (directory / "work" / "train.py").write_text("original receipt", encoding="utf-8")
+                if mask & 16:
+                    agent_module.atomic_json(directory / "manifest.json", {"job": job, "python": sys.executable,
+                                             "workspace": temporary, "cudaDevice": None if mask & 1 else ""})
+                # Force the runner to execute before ensure_job returns: cancellation
+                # must already be durable, regardless of OS process scheduling.
+                def immediate_runner(*_args, **_kwargs):
+                    agent_module.run_job(directory)
+                    return Mock(poll=lambda: 0)
+                with patch.object(owner, "inventory", return_value={"gpus": []}), patch.object(agent_module.subprocess, "Popen", side_effect=immediate_runner):
+                    owner.ensure_job(job)
+                if mask & 16:
+                    agent_module.run_job(directory)
+                self.assertEqual(agent_module.read_json(directory / "result.json"), {"status": "cancelled", "exitCode": -1})
+                self.assertEqual((directory / "output.log").read_bytes(), b"")
+                agent_module.run_job(directory)
+                self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "cancelled")
+            finally:
+                owner.lock.close()
+    return test
+
+
+for case in range(32):
+    setattr(Round2Stage32, f"test_case_{case:02d}", cancelled_bootstrap_case(case))
+
+
+class Round2Stage4(unittest.TestCase):
+    pass
+
+
+def deadline_case(mask):
+    def test(self):
+        class DripHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = b'{"job": null}'
+                headers = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n"
+                try:
+                    if mask & 1:
+                        for byte in headers:
+                            self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.02)
+                    else:
+                        self.wfile.write(headers); self.wfile.flush()
+                    for byte in body:
+                        self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.02)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DripHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            owner = agent_module.Agent.__new__(agent_module.Agent)
+            owner.endpoint = "http://compute.invalid" if mask & 2 else f"http://127.0.0.1:{server.server_port}"
+            owner.args = argparse.Namespace(id="pc"); owner.instance = "installation"; owner.token = "a" * 32
+            proxy = urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{server.server_port}"} if mask & 2 else {})
+            base = agent_module.DeadlineOpener(proxy) if hasattr(agent_module, "DeadlineOpener") else urllib.request.build_opener(proxy, agent_module.NoRedirect())
+            class ShortTimeout:
+                def open(self, request, timeout):
+                    return base.open(request, timeout=0.12)
+            owner.opener = ShortTimeout()
+            started = time.monotonic()
+            with self.assertRaises(Exception):
+                owner.request("poll", {})
+            self.assertLess(time.monotonic() - started, 0.45, "Dripping bytes must not extend the total request deadline")
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+    return test
+
+
+for case in range(4):
+    setattr(Round2Stage4, f"test_case_{case:02d}", deadline_case(case))
+
+
+class Round2Stage2(unittest.TestCase):
+    def tls_case(self, redirect):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-tls-") as temporary:
+            root = Path(temporary); certificate = root / "certificate.pem"; key = root / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+                            "-out", str(certificate), "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            requests = []
+            class TlsHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    pass
+
+                def do_POST(self):
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                    requests.append(self.path)
+                    if redirect:
+                        self.send_response(307); self.send_header("Location", "/credential-destination"); self.send_header("Content-Length", "0"); self.end_headers()
+                        return
+                    body = b'{"job": null}'
+                    self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                    try:
+                        for byte in body:
+                            self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.025)
+                    except (OSError, ssl.SSLError):
+                        pass
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TlsHandler)
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); tls.load_cert_chain(certificate, key)
+            server.socket = tls.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                request = urllib.request.Request(f"https://localhost:{server.server_port}/poll", data=b"{}", headers={"Authorization": "Bearer owner-test-only"})
+                with self.assertRaises(Exception):
+                    agent_module.DeadlineOpener(urllib.request.ProxyHandler({})).open(request, timeout=0.2)
+                self.assertEqual(requests, [], "Default TLS must reject an untrusted certificate before sending credentials")
+                trust = ssl.create_default_context(cafile=str(certificate))
+                opener = agent_module.DeadlineOpener(urllib.request.ProxyHandler({}), context=trust)
+                started = time.monotonic()
+                with self.assertRaises(Exception):
+                    with opener.open(request, timeout=0.12) as response:
+                        json.loads(response.read())
+                self.assertLess(time.monotonic() - started, 0.45)
+                self.assertEqual(requests, ["/poll"], "Redirects must never forward credentials to another path")
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    def test_trusted_tls_body_deadline_and_default_certificate_verification(self):
+        self.tls_case(False)
+
+    def test_trusted_tls_redirect_cannot_forward_credentials(self):
+        self.tls_case(True)
+
+
 class AgentRegressions(unittest.TestCase):
     def args(self, root, python=sys.executable):
         return argparse.Namespace(url="http://localhost:9999", id="pc", name="PC", token_file=None,
                                   state=str(root / "state"), workspace=str(root), python=python)
+
+    def test_https_proxy_connect_headers_obey_the_total_deadline(self):
+        class ConnectProxy(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_CONNECT(self):
+                try:
+                    for byte in b"HTTP/1.1 200 Connection established\r\n\r\n":
+                        self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.025)
+                except OSError:
+                    pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ConnectProxy)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            proxy = urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{server.server_port}"})
+            started = time.monotonic()
+            with self.assertRaises(Exception):
+                agent_module.DeadlineOpener(proxy).open(urllib.request.Request("https://compute.invalid/poll", data=b"{}"), timeout=0.12)
+            self.assertLess(time.monotonic() - started, 0.45)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    def test_valid_json_without_content_length_cannot_turn_expiry_into_success(self):
+        class EofResponse(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200); self.end_headers()
+                try:
+                    self.wfile.write(b'{"job": null}'); self.wfile.flush()
+                    for _ in range(40):
+                        self.wfile.write(b" "); self.wfile.flush(); time.sleep(0.025)
+                except OSError:
+                    pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), EofResponse)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/poll", data=b"{}")
+            with self.assertRaises(TimeoutError):
+                with agent_module.DeadlineOpener(urllib.request.ProxyHandler({})).open(request, timeout=0.12) as response:
+                    self.assertEqual(json.loads(response.read()), {"job": None})
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     def test_relative_interpreter_preserves_venv_symlink_after_changing_job_directory(self):
         if os.name == "nt":

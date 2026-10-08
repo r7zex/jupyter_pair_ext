@@ -316,6 +316,7 @@
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:e2e": "npm run compile && node scripts/run-vscode-e2e.mjs",
     "test:vps:audit": "node scripts/vps-audit.mjs",
+    "test:vps:audit:round2": "node scripts/vps-audit.mjs --round=2",
     "test:vps:agent": "python3 test/vps_agent_audit.py -q",
     "test:live": "npm run compile && node scripts/trystero-live-smoke.mjs",
     "test:live:relay": "npm run compile && node scripts/emergency-relay-live-smoke.mjs",

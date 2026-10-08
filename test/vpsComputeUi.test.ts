@@ -8,8 +8,8 @@ import { afterEach, beforeEach, describe, it } from 'mocha';
 import type * as vscode from 'vscode';
 import type { SessionRuntime } from '../src/runtime/session';
 import { VpsServer } from '../src/vps/server';
-import { VpsClient } from '../src/vps/client';
-import { type JobSubmission, MAX_JOB_BYTES, vpsSecretKey } from '../src/vps/protocol';
+import { VpsClient, VpsHttpError } from '../src/vps/client';
+import { type JobSubmission, MAX_JOB_BYTES, safeJobPath, validateSubmission, vpsSecretKey } from '../src/vps/protocol';
 
 let root: string;
 let endpoint = '';
@@ -20,6 +20,7 @@ let notebook: any;
 let documents: any[] = [];
 let pick: (items: any[], options: any) => Promise<any>;
 let output = '';
+let secretRead: ((key: string) => Promise<string | undefined>) | undefined;
 const configurationListeners = new Set<(event: any) => void>();
 const secrets = new Map<string, string>();
 const state = new Map<string, unknown>();
@@ -57,14 +58,14 @@ loader._load = originalLoad;
 let controller: InstanceType<typeof VpsComputeController>;
 function makeController(): InstanceType<typeof VpsComputeController> {
   return new VpsComputeController({ globalStorageUri: { fsPath: path.join(root, 'private') },
-    secrets: { get: async (key: string) => secrets.get(key), store: async (key: string, value: string) => { secrets.set(key, value); } },
+    secrets: { get: async (key: string) => secretRead ? secretRead(key) : secrets.get(key), store: async (key: string, value: string) => { secrets.set(key, value); } },
     globalState: { get: (key: string) => state.get(key), update: async (key: string, value: unknown) => { state.set(key, value); } },
   } as unknown as vscode.ExtensionContext, () => runtime as SessionRuntime | undefined);
 }
 async function setup(): Promise<void> {
   root = await mkdtemp(path.join(os.tmpdir(), 'pair-vps-ui-'));
   endpoint = ''; trusted = true; runtime = undefined; notebook = undefined; documents = [];
-  secrets.clear(); state.clear(); output = '';
+  secrets.clear(); state.clear(); output = ''; secretRead = undefined;
   editor = { document: { uri: { scheme: 'file', fsPath: path.join(root, 'train.py') }, getText: () => 'print("original")' } };
   pick = async (items) => items[0];
   controller = makeController();
@@ -100,6 +101,53 @@ describe('Stage 64 — source snapshot, dialog cancellation and concurrent edit 
   }
 });
 
+describe('Round 2 Stage 64 — portable notebook names and mixed-cell snapshots', () => {
+  beforeEach(setup); afterEach(teardown);
+  for (let mask = 0; mask < 64; mask++) {
+    it(`case ${mask}: a valid original notebook always produces a valid Python entrypoint`, async () => {
+      const stem = mask & 1 ? (mask & 2 ? '学'.repeat(80) : 't'.repeat(240)) : (mask & 2 ? '学習' : 'train');
+      const relative = `${mask & 4 ? 'pkg/' : ''}${stem}.ipynb`;
+      const project = new Map([['helper.py', 'VALUE=1']]);
+      runtime = { descriptor: { workingFolder: root }, project: { keys: () => project.keys(), kindOf: () => 'text',
+        text: (key: string) => ({ length: project.get(key)!.length, toString: () => project.get(key)! }) } };
+      if (mask & 16) documents = [{ uri: { scheme: 'file', fsPath: path.join(root, 'helper.py') }, isDirty: true, getText: () => 'VALUE=2' }];
+      const cells = [{ kind: 2, document: { languageId: 'python', getText: () => 'print("first")' } },
+        ...(mask & 32 ? [{ kind: 2, document: { languageId: 'javascript', getText: () => 'throw Error("not python")' } }] : []),
+        { kind: 2, document: { languageId: 'python', getText: () => 'print("second")' } }];
+      notebook = { notebook: { uri: { scheme: 'file', fsPath: path.join(root, relative) }, getCells: () => cells, cellAt: (index: number) => cells[index] }, selection: { start: cells.length - 1 } };
+      pick = async (items) => items[mask & 8 ? 1 : 0];
+      const snapshot = await (controller as any).sourceSnapshot();
+      assert.ok(safeJobPath(snapshot.entrypoint), 'Generated Python filename must respect the 255-byte portable limit');
+      const job = validateSubmission({ id: 'portable', agentId: 'pc', title: 'Training', device: 'cpu', args: [], ...snapshot });
+      assert.equal(job.files['helper.py'], mask & 16 ? 'VALUE=2' : 'VALUE=1');
+      assert.equal(job.files[job.entrypoint], mask & 8 ? 'print("second")' : 'print("first")\n\nprint("second")');
+      assert.equal(job.entrypoint.startsWith('pkg/'), !!(mask & 4));
+    });
+  }
+});
+
+describe('Round 2 output selection regressions', () => {
+  beforeEach(setup); afterEach(teardown);
+  it('keeps the latest selected job when earlier credential loading finishes late', async () => {
+    endpoint = 'http://localhost:9999'; secrets.set(vpsSecretKey(endpoint), 'a'.repeat(32));
+    let release!: (value: string) => void; let reads = 0;
+    secretRead = async () => ++reads === 1 ? new Promise<string>((resolve) => { release = resolve; }) : 'a'.repeat(32);
+    const original = VpsClient.prototype.job;
+    VpsClient.prototype.job = async (id) => ({ id, title: id, agentId: 'pc', device: 'cpu', status: 'succeeded', exitCode: 0, logStart: 0, logEnd: 0, log: '' } as any);
+    try {
+      const earlier = controller.showJob('earlier'); await controller.showJob('latest'); release('a'.repeat(32)); await earlier;
+      assert.match(output, /latest/); assert.doesNotMatch(output, /earlier/);
+    } finally { VpsClient.prototype.job = original; }
+  });
+  for (const status of [401, 403, 404]) it(`stops polling HTTP ${status} with an actionable message`, async () => {
+    endpoint = 'http://localhost:9999'; secrets.set(vpsSecretKey(endpoint), 'a'.repeat(32));
+    const original = VpsClient.prototype.job;
+    VpsClient.prototype.job = async () => { throw new VpsHttpError(status); };
+    try { await controller.showJob('missing'); assert.equal((controller as any).logTimer, undefined); assert.match(output, status === 404 ? /not found/i : /Connect to VPS/i); }
+    finally { VpsClient.prototype.job = original; }
+  });
+});
+
 describe('VPS compute UI recovery and lifecycle regressions', () => {
   let broker: VpsServer;
   let client: VpsClient;
@@ -117,6 +165,13 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       body: JSON.stringify({ instanceId: 'pc-installation', name: 'Compute PC', resources: { cpuCount: 4, python: 'python3', gpus: [] } }) });
     assert.equal(response.status, 200); await response.arrayBuffer();
   }
+  it('truncates a long job title without splitting a Unicode code point', async () => {
+    await register();
+    editor.document.uri.fsPath = path.join(root, 'a'.repeat(199) + '🧠.py');
+    await controller.submit();
+    const jobs = await client.jobs(); assert.equal(jobs.length, 1);
+    assert.equal(jobs[0]!.title, 'a'.repeat(199));
+  });
   it('retries the exact source and ID after an accepted request loses its response and the editor restarts', async () => {
     await register();
     const originalSubmit = VpsClient.prototype.submit;

@@ -9,7 +9,13 @@ export class PendingSubmissionStore {
   public async load(endpoint: string): Promise<JobSubmission | undefined> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     for (const name of (await readdir(this.directory)).filter((value) => /^[A-Za-z0-9_-]{1,128}\.json$/.test(value)).sort()) {
-      const receipt = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')) as { endpoint: string; job: unknown };
+      let contents: string;
+      try { contents = await readFile(path.join(this.directory, name), 'utf8'); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; // Another editor completed recovery after readdir.
+        throw error;
+      }
+      const receipt = JSON.parse(contents) as { endpoint: string; job: unknown };
       if (receipt.endpoint !== normalizeVpsUrl(endpoint)) continue;
       const job = validateSubmission(receipt.job);
       if (name !== `${job.id}.json`) throw new Error('Pending VPS submission is inconsistent. Inspect local extension storage before retrying.');

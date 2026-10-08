@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { atomicWriteFile } from '../core/atomicFile';
-import { AGENT_ONLINE_MS, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
+import { AGENT_ONLINE_MS, GPU_UUID, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
   type AgentResources, type JobStatus, type JobSummary, type VpsAgent, type VpsJob, jobSummary, submissionDigest, terminalJob, validateSubmission, visibleVpsText } from './protocol';
 
 export interface VpsServerOptions {
@@ -29,8 +29,9 @@ function resources(raw: any): AgentResources {
     || raw.gpus.some((gpu: any) => !gpu || typeof gpu !== 'object' || Array.isArray(gpu)
       || !Number.isInteger(gpu.index) || gpu.index < 0 || gpu.index > 999
       || !visibleVpsText(gpu.name, 200) || !Number.isFinite(gpu.memoryMb) || gpu.memoryMb < 0
-      || (gpu.uuid !== undefined && (typeof gpu.uuid !== 'string' || !/^GPU-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(gpu.uuid))))
-    || new Set(raw.gpus.map((gpu: any) => gpu.index)).size !== raw.gpus.length) {
+      || (gpu.uuid !== undefined && (typeof gpu.uuid !== 'string' || !GPU_UUID.test(gpu.uuid))))
+    || new Set(raw.gpus.map((gpu: any) => gpu.index)).size !== raw.gpus.length
+    || new Set(raw.gpus.filter((gpu: any) => gpu.uuid).map((gpu: any) => gpu.uuid.toLowerCase())).size !== raw.gpus.filter((gpu: any) => gpu.uuid).length) {
     throw new HttpError(400, 'Invalid compute inventory.');
   }
   return { cpuCount: raw.cpuCount, python: raw.python,
@@ -133,10 +134,10 @@ export class VpsServer {
         || (job.status === 'running' && (job.finishedAt !== undefined || job.exitCode !== undefined))
         || (terminalJob(job.status) && !Number.isSafeInteger(job.finishedAt))
         || (job.status === 'succeeded' && (job.exitCode !== 0 || !job.instanceId))
-        || (job.status === 'failed' && (!Number.isInteger(job.exitCode) || job.exitCode === 0))
+        || (job.status === 'failed' && (!Number.isSafeInteger(job.exitCode) || job.exitCode === 0))
         || (job.status === 'cancelled' && !job.cancelRequested)
-        || (job.status === 'interrupted' && (!job.instanceId || !Number.isInteger(job.exitCode)))
-        || (job.exitCode !== undefined && !Number.isInteger(job.exitCode))) throw new Error('VPS job store is inconsistent.');
+        || (job.status === 'interrupted' && (!job.instanceId || !Number.isSafeInteger(job.exitCode)))
+        || (job.exitCode !== undefined && !Number.isSafeInteger(job.exitCode))) throw new Error('VPS job store is inconsistent.');
     return job;
   }
 
@@ -255,7 +256,7 @@ export class VpsServer {
       const next = [...this.jobs.values()].find((job) => job.agentId === agentId && job.status === 'queued');
       if (!next) return { job: null };
       const payload = await this.load(next.id);
-      if (next.device !== 'cpu' && !this.agents.get(agentId)!.resources.gpus.some((gpu) => next.gpuUuid ? gpu.uuid === next.gpuUuid : `gpu:${gpu.index}` === next.device)) {
+      if (next.device !== 'cpu' && !this.agents.get(agentId)!.resources.gpus.some((gpu) => next.gpuUuid ? gpu.uuid?.toLowerCase() === next.gpuUuid.toLowerCase() : `gpu:${gpu.index}` === next.device)) {
         const failure = Buffer.from('The selected GPU is not available on this agent.\n');
         await this.save({ ...payload, status: 'failed', finishedAt: Date.now(), exitCode: -1,
           log: failure.toString('base64'), logStart: 0, logEnd: failure.length });
@@ -328,7 +329,7 @@ export class VpsServer {
     if (body.result !== undefined) {
       const result = body.result;
       const allowed: JobStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted'];
-      if (!result || !allowed.includes(result.status) || !Number.isInteger(result.exitCode)
+      if (!result || !allowed.includes(result.status) || !Number.isSafeInteger(result.exitCode)
         || (result.status === 'succeeded' && result.exitCode !== 0)
         || (result.status === 'failed' && result.exitCode === 0)
         || (result.status === 'cancelled' && !current.cancelRequested)) throw new HttpError(400, 'Invalid completion.');

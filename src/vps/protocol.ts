@@ -6,6 +6,7 @@ export const MAX_JOB_FILES = 256;
 export const MAX_LOG_CHUNK = 64 * 1024;
 export const LOG_RETENTION_BYTES = 1024 * 1024;
 export const AGENT_ONLINE_MS = 30_000;
+export const GPU_UUID = /^GPU-[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$/;
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 export type VpsDevice = 'cpu' | `gpu:${number}`;
@@ -75,8 +76,8 @@ export function safeJobPath(value: unknown): value is string {
 
 export function visibleVpsText(value: unknown, maximum: number): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= maximum
-    && [...value].every((character) => character.charCodeAt(0) > 31 && character.charCodeAt(0) !== 127)
-    && !/[\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF]/u.test(value);
+    && [...value].every((character) => character.charCodeAt(0) > 31 && (character.charCodeAt(0) < 127 || character.charCodeAt(0) > 159))
+    && !/[\uD800-\uDFFF\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF]/u.test(value);
 }
 
 export function validateSubmission(raw: unknown): JobSubmission {
@@ -84,16 +85,16 @@ export function validateSubmission(raw: unknown): JobSubmission {
   const job = raw as JobSubmission;
   if (typeof job.id !== 'string' || !VPS_ID.test(job.id) || typeof job.agentId !== 'string' || !VPS_ID.test(job.agentId)
     || !visibleVpsText(job.title, 200)
-    || typeof job.device !== 'string' || !/^(cpu|gpu:\d{1,3})$/.test(job.device) || !safeJobPath(job.entrypoint)
+    || typeof job.device !== 'string' || !/^(cpu|gpu:(?:0|[1-9]\d{0,2}))$/.test(job.device) || !safeJobPath(job.entrypoint)
     || (job.gpuUuid !== undefined && (job.device === 'cpu' || typeof job.gpuUuid !== 'string'
-      || !/^GPU-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(job.gpuUuid)))
+      || !GPU_UUID.test(job.gpuUuid)))
     || !job.entrypoint.endsWith('.py') || !job.files || typeof job.files !== 'object' || Array.isArray(job.files)
     || !Object.hasOwn(job.files, job.entrypoint) || !Array.isArray(job.args) || job.args.length > 100
-    || job.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0'))) {
+    || job.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || /[\uD800-\uDFFF]/u.test(arg))) {
     throw new Error('Invalid job target, Python entrypoint or arguments.');
   }
   const files = Object.entries(job.files);
-  if (files.length > MAX_JOB_FILES || files.some(([key, value]) => !safeJobPath(key) || typeof value !== 'string')) throw new Error('Invalid or oversized source snapshot.');
+  if (files.length > MAX_JOB_FILES || files.some(([key, value]) => !safeJobPath(key) || typeof value !== 'string' || /[\uD800-\uDFFF]/u.test(value))) throw new Error('Invalid or oversized source snapshot.');
   const names = files.map(([key]) => key.normalize('NFC').toLocaleUpperCase('en-US').toLocaleLowerCase('en-US'));
   if (new Set(names).size !== names.length || names.some((key) => names.some((other) => other.startsWith(`${key}/`)))) {
     throw new Error('Source snapshot contains conflicting file paths.');

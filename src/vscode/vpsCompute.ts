@@ -170,7 +170,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     const gpuUuid = selected.agent.resources.gpus.find((gpu) => `gpu:${gpu.index}` === selected.device)?.uuid;
     const job = validateSubmission({ id: randomUUID(), agentId: selected.agent.id, device: selected.device,
       ...(gpuUuid ? { gpuUuid } : {}),
-      title: path.basename(input.entrypoint).slice(0, 200), ...input, args: [] });
+      title: path.basename(input.entrypoint).slice(0, 200).replace(/[\uD800-\uDBFF]$/u, ''), ...input, args: [] });
     await this.pending.save(client.endpoint, job);
     await this.deliver(client, job);
   }
@@ -233,7 +233,15 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       const python = cells.filter((cell) => cell.kind === vscode.NotebookCellKind.Code && cell.document.languageId === 'python');
       if (!python.length) throw new Error('No Python code cells selected.');
       const code = python.map((cell) => cell.document.getText()).join('\n\n');
-      entrypoint = entrypoint.replace(/\.ipynb$/i, '') + `.pair-job-${randomUUID()}.py`;
+      const directory = path.posix.dirname(entrypoint);
+      const suffix = `.pair-job-${randomUUID()}.py`;
+      let stem = '';
+      const prefix = directory === '.' ? '' : `${directory}/`;
+      for (const character of path.posix.basename(entrypoint).replace(/\.ipynb$/i, '')) {
+        if (Buffer.byteLength(stem + character) > 255 - suffix.length || prefix.length + stem.length + character.length + suffix.length > 512) break;
+        stem += character;
+      }
+      entrypoint = prefix + stem + suffix;
       putSource(entrypoint, code);
     } else {
       if (!editor || !entrypoint.endsWith('.py')) throw new Error('Open a .py file or a Python notebook.');
@@ -264,9 +272,11 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   }
 
   public async showJob(id: string): Promise<void> {
-    const client = await this.client();
     const generation = ++this.logGeneration;
     if (this.logTimer) clearTimeout(this.logTimer);
+    this.logTimer = undefined;
+    const client = await this.client();
+    if (this.disposed || generation !== this.logGeneration) return;
     this.output.clear();
     this.output.show(true);
     let offset = 0;
@@ -291,8 +301,14 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
           this.output.appendLine(`\nStatus: ${job.status}${job.exitCode === undefined ? '' : ` • exit ${job.exitCode}`}`);
           this.refresh(); return;
         }
-      } catch {
+      } catch (error) {
         if (this.disposed || generation !== this.logGeneration) return;
+        if (error instanceof VpsHttpError && [401, 403, 404].includes(error.status)) {
+          this.output.appendLine(error.status === 404 ? '[Job not found on this VPS. Refresh VPS Jobs.]'
+            : '[VPS access denied. Use Connect to VPS to update your credentials.]');
+          this.logTimer = undefined;
+          return;
+        }
         if (!unavailable) this.output.appendLine('[VPS unavailable; reconnecting. Running jobs continue on their compute machines.]');
         unavailable = true;
       }

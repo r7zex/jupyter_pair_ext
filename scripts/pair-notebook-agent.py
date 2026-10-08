@@ -3,6 +3,7 @@
 import argparse
 import base64
 import csv
+import http.client
 import json
 import math
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -113,6 +115,10 @@ def run_job(directory):
         return
     process = None
     try:
+        if (directory / "cancel").exists():
+            (directory / "output.log").touch(mode=0o600)
+            atomic_json(directory / "result.json", {"status": "cancelled", "exitCode": -1})
+            return
         manifest = read_json(directory / "manifest.json")
         job = manifest["job"]
         work = directory / "work"
@@ -212,6 +218,109 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # Never forward an Authorization header to another endpoint.
 
 
+class RequestDeadline:
+    """Interrupt header/body reads even when a peer keeps dripping bytes."""
+    def __init__(self, timeout):
+        self.ends = time.monotonic() + timeout
+        self.lock = threading.Lock()
+        self.socket = None
+        self.expired = False
+        self.timer = threading.Timer(timeout, self.expire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def expire(self):
+        with self.lock:
+            self.expired = True
+            connection = self.socket
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def track(self, connection):
+        with self.lock:
+            self.socket = connection
+            remaining = self.ends - time.monotonic()
+            expired = self.expired or remaining <= 0
+        if expired:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+            raise TimeoutError("VPS request deadline exceeded")
+        connection.settimeout(remaining)
+        return connection
+
+    def close(self):
+        with self.lock:
+            self.socket = None
+        self.timer.cancel()
+
+
+class DeadlineResponse:
+    def __init__(self, response, deadline):
+        self.response, self.deadline = response, deadline
+
+    def __enter__(self):
+        return self.response
+
+    def __exit__(self, exception_type, *_args):
+        try:
+            self.response.close()
+        finally:
+            self.deadline.close()
+        if exception_type is None and (self.deadline.expired or time.monotonic() >= self.deadline.ends):
+            raise TimeoutError("VPS request deadline exceeded")
+
+
+class DeadlineOpener:
+    def __init__(self, *handlers, context=None):
+        self.handlers = handlers
+        self.context = context
+
+    def open(self, request, timeout):
+        deadline = RequestDeadline(timeout)
+
+        class TrackConnection:
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                create = self._create_connection
+                # Register before proxy CONNECT or TLS wrapping starts. HTTPS
+                # replaces the plain socket, so register its SSL socket as well.
+                self._create_connection = lambda *a, **kw: deadline.track(create(*a, **kw))
+
+            def connect(self):
+                super().connect()
+                deadline.track(self.sock)
+
+        class HttpConnection(TrackConnection, http.client.HTTPConnection):
+            pass
+
+        class HttpsConnection(TrackConnection, http.client.HTTPSConnection):
+            pass
+
+        class HttpHandler(urllib.request.HTTPHandler):
+            def http_open(self, req):
+                return self.do_open(HttpConnection, req)
+
+        class HttpsHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(HttpsConnection, req, context=self._context)
+
+        opener = urllib.request.build_opener(*self.handlers, NoRedirect(), HttpHandler(), HttpsHandler(context=self.context))
+        try:
+            return DeadlineResponse(opener.open(request, timeout=timeout), deadline)
+        except Exception as error:
+            deadline.expire()
+            deadline.close()
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            raise
+
+
 class Agent:
     def __init__(self, args):
         self.args = args
@@ -245,7 +354,7 @@ class Agent:
             raise ValueError("State directory belongs to a different agent ID")
         self.instance = identity["instanceId"]
         self.resources = self.inventory()
-        self.opener = urllib.request.build_opener(NoRedirect())
+        self.opener = DeadlineOpener()
         self.active_id = None
         self.children = []
         self.recovery_started = {}
@@ -288,10 +397,13 @@ class Agent:
             for field in ("id", "agentId", "entrypoint", "device", "gpuUuid", "files", "args"):
                 if field in job and job[field] != retained.get(field):
                     raise ValueError("The broker input disagrees with the retained execution receipt")
+        if job.get("cancelRequested") and not (directory / "cancel").exists():
+            (directory / "cancel").touch(mode=0o600)
+            sync_directory(directory)
         self.recovery_started.setdefault(job["id"], time.monotonic())
         if not manifest.exists():
             gpu = None if job["device"] == "cpu" else next((gpu for gpu in self.inventory()["gpus"] if
-                        (gpu["uuid"] == job["gpuUuid"] if job.get("gpuUuid") else "gpu:" + str(gpu["index"]) == job["device"])), None)
+                        (gpu["uuid"].lower() == job["gpuUuid"].lower() if job.get("gpuUuid") else "gpu:" + str(gpu["index"]) == job["device"])), None)
             atomic_json(manifest, {"job": job, "python": self.args.python,
                                    "workspace": self.args.workspace, "launchedAt": time.time(),
                                    "cudaDevice": "" if job["device"] == "cpu" else (gpu["uuid"] if gpu else None)})
