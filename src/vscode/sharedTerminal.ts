@@ -37,6 +37,7 @@ export class SharedTerminalController implements vscode.Disposable {
     const pty: vscode.Pseudoterminal = {
       onDidWrite: this.write.event, onDidClose: this.closeEvent.event,
       open: () => {
+        if (this.bound !== runtime || this.binding !== binding || this.currentRuntime() !== runtime) return;
         this.render(shared.view());
         this.write.fire(runtime.coordinator.isCurrentHost()
           ? '\r\n[Host shell: enter line commands; Ctrl+C stops the shell.]\r\n'
@@ -52,7 +53,9 @@ export class SharedTerminalController implements vscode.Disposable {
             const command = this.input;
             this.input = '';
             this.write.fire('\r\n');
-            if (command.trim()) void shared.execute(command).catch((error: unknown) => this.write.fire(`\r\n${String(error)}\r\n`));
+            if (command.trim()) void shared.execute(command).catch((error: unknown) => {
+              if (this.bound === runtime && this.binding === binding && this.currentRuntime() === runtime) this.write.fire(`\r\n${String(error)}\r\n`);
+            });
           } else if (character === '\x7f' || character === '\b') {
             if (this.input) { this.input = [...this.input].slice(0, -1).join(''); this.write.fire('\b \b'); }
           } else if (character >= ' ' && character !== '\x7f' && this.input.length < 8192) {

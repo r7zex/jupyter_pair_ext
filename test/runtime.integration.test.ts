@@ -18,7 +18,7 @@ import { NostrFrameRelay } from '../src/runtime/nostrRelay';
 import { VpsFrameRelay } from '../src/runtime/vpsFrameRelay';
 import { VpsServer } from '../src/vps/server';
 import { decodeFrame, encodeFrame } from '../src/core/wire';
-import { trainingProgram, trainingHelper, trainingData } from './support/modelTraining';
+import { trainingProgram, trainingHelper, trainingData, torchPython, torchDatasetSetup, torchTrainingProgram } from './support/modelTraining';
 import {
   createInMemoryTrysteroFactory,
   healInMemoryTrystero,
@@ -222,20 +222,27 @@ describe('production SessionRuntime integration', () => {
     } finally { releases.forEach((release) => release()); for (const kernel of created) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
   });
 
-  for (const vpsOnly of [false, true]) it(`trains a real model from host repository files and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
+  for (const useTorch of [false, true]) for (const vpsOnly of [false, true]) it(`trains a ${useTorch ? 'PyTorch model with binary host data' : 'real model from host repository files'} and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
     this.timeout(45_000);
-    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const pythonPath = useTorch ? torchPython : 'python3';
+    if (spawnSync(pythonPath, ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    if (useTorch && spawnSync(pythonPath, ['-c', "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)"]).status !== 0) this.skip();
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-training-'));
     const hostFolder = path.join(root, 'working');
     const backing = path.join(root, 'host-repository');
     const peerFolder = path.join(root, 'guest');
     await Promise.all([mkdir(hostFolder), mkdir(backing), mkdir(peerFolder)]);
     await mkdir(path.join(backing, '.git'));
-    await writeFile(path.join(backing, '.git', 'dataset.csv'), trainingData);
-    await writeFile(path.join(hostFolder, 'config.json'), JSON.stringify({ dataset: '.git/dataset.csv', delay: vpsOnly ? 0.8 : 0 }));
+    const dataset = useTorch ? '.git/dataset.pt' : '.git/dataset.csv';
+    const program = useTorch ? torchTrainingProgram : trainingProgram;
+    if (useTorch) {
+      const setup = spawnSync(pythonPath, ['-c', torchDatasetSetup, path.join(backing, dataset)], { encoding: 'utf8' });
+      assert.equal(setup.status, 0, setup.stderr);
+    } else await writeFile(path.join(backing, dataset), trainingData);
+    await writeFile(path.join(hostFolder, 'config.json'), JSON.stringify({ dataset, delay: vpsOnly ? 0.8 : 0 }));
     await writeFile(path.join(hostFolder, 'training_helpers.py'), trainingHelper);
     await writeFile(path.join(hostFolder, 'train.ipynb'), JSON.stringify({ cells: [
-      { cell_type: 'code', id: 'train', metadata: {}, source: [trainingProgram], outputs: [], execution_count: null },
+      { cell_type: 'code', id: 'train', metadata: {}, source: [program], outputs: [], execution_count: null },
     ], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
     const token = 'host-training-session-token-that-is-long-enough';
     const sessionId = `host-training-${Date.now()}`;
@@ -253,18 +260,18 @@ describe('production SessionRuntime integration', () => {
       }) as never);
     }
     const host = new SessionRuntime(descriptor({ sessionId, role: 'host', peerId: 'host', hostPeerId: 'host',
-      workingFolder: hostFolder, backingFolder: backing, pythonPath: 'python3' }), token, context(path.resolve('.')), logger());
+      workingFolder: hostFolder, backingFolder: backing, pythonPath }), token, context(path.resolve('.')), logger());
     let guest: any;
     try {
       await host.start();
       guest = new SessionRuntime(descriptor({ sessionId, role: 'peer', peerId: 'guest', hostPeerId: 'host',
-        workingFolder: peerFolder, pythonPath: 'python3', knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(path.resolve('.')), logger());
+        workingFolder: peerFolder, pythonPath, knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(path.resolve('.')), logger());
       await guest.start();
       await waitFor(() => guest.project.has('train.ipynb'), 5000, 'host notebook snapshot');
       const events: any[] = [];
-      const execution = guest.executeCell('train.ipynb', 'train', trainingProgram, (event: any) => events.push(event));
+      const execution = guest.executeCell('train.ipynb', 'train', program, (event: any) => events.push(event));
       if (broker) {
-        await waitFor(() => events.some((event) => String(event.content?.text).includes('TRAINING_STARTED')), 5000, 'VPS-only execution accepted');
+        await waitFor(() => events.some((event) => String(event.content?.text).includes('TRAINING_STARTED')), useTorch ? 10000 : 5000, 'VPS-only execution accepted');
         assert.equal(guest.snapshot().peers.find((peer: any) => peer.peerId === 'host').route, 'Relay');
         await broker.stop();
         await waitFor(() => fileExists(path.join(backing, 'checkpoints', 'model.json')), 5000, 'training finishes while VPS is down');
@@ -273,9 +280,15 @@ describe('production SessionRuntime integration', () => {
       const result = await execution;
       assert.equal(result.success, true, JSON.stringify(events));
       const model = JSON.parse(await readFile(path.join(backing, 'checkpoints', 'model.json'), 'utf8'));
-      assert.equal(model.epochs, 400);
+      assert.equal(model.epochs, useTorch ? 100 : 400);
+      if (useTorch) {
+        assert.equal(model.backend, 'pytorch'); assert.equal(model.steps, 300);
+        assert.equal(model.checkpoint_reloaded, true); assert.equal(model.optimizer_state_reloaded, true);
+        assert.ok(model.mse < 1e-10);
+        assert.ok((await readFile(path.join(backing, 'checkpoints', 'model.pt'))).byteLength > 0);
+      }
       assert.ok(Math.abs(model.weights[0] * 3 + model.weights[1] - 7) < 1e-4);
-      await assert.rejects(readFile(path.join(peerFolder, '.git', 'dataset.csv')), { code: 'ENOENT' });
+      await assert.rejects(readFile(path.join(peerFolder, dataset)), { code: 'ENOENT' });
       assert.ok(events.some((event) => String(event.content?.text).includes('"mse"')));
       const shared = guest.sharedTerminal(); shared.requestSnapshot();
       await assert.rejects(shared.execute('echo forbidden'), /Only the active session host/);
@@ -283,6 +296,15 @@ describe('production SessionRuntime integration', () => {
       await host.sharedTerminal().execute(process.platform === 'win32' ? 'echo host-command' : 'printf "host-command\\n"');
       await waitFor(() => shared.view().text.includes('host-command\n') || shared.view().text.includes('host-command\r\n'), 5000, 'shared host shell output');
       await assert.rejects(readFile(path.join(backing, 'forbidden-shell.txt')), { code: 'ENOENT' });
+      const replacement = path.join(root, 'replacement-repository');
+      await host.setBackingFolder(replacement);
+      await host.sharedTerminal().execute(process.platform === 'win32'
+        ? 'echo repository-reset> terminal-owner.txt & echo new-repository-command'
+        : 'printf "repository-reset\\n" > terminal-owner.txt; printf "new-repository-command\\n"');
+      await waitFor(() => shared.view().text.includes('new-repository-command\n') || shared.view().text.includes('new-repository-command\r\n'), 5000, 'terminal follows the new repository');
+      assert.ok(!shared.view().text.includes('host-command'), 'the guest must not retain the old repository terminal history');
+      assert.equal((await readFile(path.join(replacement, 'terminal-owner.txt'), 'utf8')).trim(), 'repository-reset');
+      await assert.rejects(readFile(path.join(backing, 'terminal-owner.txt')), { code: 'ENOENT' });
     } finally { await guest?.leave(); await host.leave(); await broker?.stop(); await rm(root, { recursive: true, force: true }); }
   });
 

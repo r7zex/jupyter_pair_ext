@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-09T04:45:29.692025+00:00",
+  "version": "0.5.33",
+  "branch": "codex/vps-persistent-compute",
+  "baseline_commit": "a27427b8a7e6ba74ac68190e75fa5adce70f77f4",
+  "environment": "managed cloud Linux, real shell processes, Jupyter, loopback VPS and Python agent",
+  "checks": {
+    "typescript_compile": "passed",
+    "eslint": "passed",
+    "full_typescript_suite": {
+      "passed": 4655,
+      "failed": 0,
+      "skipped": 0
+    },
+    "python_agent_audit": {
+      "passed": 79,
+      "failed": 0,
+      "resource_warnings_as_errors": true
+    },
+    "new_terminal_and_ui_regressions": {
+      "passed": 5,
+      "baseline_defects_reproduced": 2
+    },
+    "terminal_generation_ordering": "passed: new-output-first and stale snapshot/output cannot restore old repository history",
+    "terminal_process_restart": "passed: same host clock, fresh stream request, real replacement shells, old stream/reply rejection",
+    "terminal_input_authority": "passed: current host OS account and input only; guests view output and forged input is rejected",
+    "terminal_repository_switch": "passed after all four live model scenarios: new working directory, new guest history and no writes in old repository",
+    "native_callback_binding": "passed: delayed open/error from closed binding preserves current input/display",
+    "standard_library_training_pipelines": {
+      "passed": 3,
+      "maximum_mse": 1e-10,
+      "maximum_prediction_error": 0.0001
+    },
+    "pytorch_training_pipelines": {
+      "passed": 3,
+      "torch_version": "2.14.1+cpu",
+      "device": "cpu",
+      "dtype": "float64",
+      "routes": [
+        "live peer mesh",
+        "live VPS only with broker outage",
+        "detached owner agent with editor/broker stopped"
+      ],
+      "dataset": "real binary tensors kept in owner repository, absent from guest/job snapshots",
+      "data_loader": true,
+      "autograd": true,
+      "optimizer": "SGD with momentum 0.5",
+      "epochs": 100,
+      "optimizer_steps": 300,
+      "binary_checkpoint_reloaded": true,
+      "optimizer_state_reloaded": true,
+      "maximum_mse": 1e-10,
+      "maximum_prediction_error": 0.0001
+    },
+    "native_vscode_rendering": "not run: no native VS Code executable",
+    "physical_gpu_training": "not run",
+    "windows_process_lifetime": "not run",
+    "external_vps": "not run; user explicitly selected local-broker acceptance"
+  },
+  "distribution": {
+    "vsix": "pair-notebook-0.5.33.vsix",
+    "validation_tool": "scripts/make-artifacts.mjs"
+  }
+}

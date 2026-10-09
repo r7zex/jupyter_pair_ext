@@ -6,6 +6,7 @@ import type { WireFrame } from './wire';
 
 const HISTORY_CHARS = 128 * 1024;
 const CHUNK_CHARS = 16 * 1024;
+function terminalId(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value); }
 function retainedText(text: string): string {
   const tail = text.slice(-HISTORY_CHARS);
   const first = tail.charCodeAt(0);
@@ -26,6 +27,12 @@ export class SharedTerminal extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | undefined;
   private history = '';
   private generation: string = randomUUID();
+  private readonly streamId = randomUUID();
+  private generationIndex = 0;
+  private remoteGenerationIndex = -1;
+  private remoteStreamId: string | undefined;
+  private candidateStreamId: string | undefined;
+  private snapshotRequestId: string | undefined;
   private sequence = 0;
   private pending = '';
   private timer: NodeJS.Timeout | undefined;
@@ -39,18 +46,19 @@ export class SharedTerminal extends EventEmitter {
 
   public constructor(private readonly authority: TerminalAuthority) { super(); }
   public view(): TerminalView { return { text: this.history, reset: true }; }
-  public requestSnapshot(): void {
+  public requestSnapshot(fresh = false): void {
     if (this.closed || this.authority.isHost()) return;
     this.snapshotRequested = true;
-    this.send(this.authority.hostId(), 'shellSnapshotRequest', {});
-    if (!this.snapshotTimer) {
+    if (fresh || !this.snapshotRequestId) this.snapshotRequestId = randomUUID();
+    this.send(this.authority.hostId(), 'shellSnapshotRequest', { requestId: this.snapshotRequestId });
+    if (this.snapshotRequested && !this.snapshotTimer) {
       this.snapshotTimer = setTimeout(() => { this.snapshotTimer = undefined; if (this.snapshotRequested) this.requestSnapshot(); }, 2000);
       this.snapshotTimer.unref();
     }
   }
   public peerConnected(peer: string): void {
     if (this.authority.isHost()) this.sendSnapshot(peer);
-    else if (peer === this.authority.hostId()) this.requestSnapshot();
+    else if (peer === this.authority.hostId()) this.requestSnapshot(true);
   }
   public handle(frame: WireFrame, source: string): boolean {
     if (!['shellSnapshotRequest', 'shellSnapshot', 'shellOutput', 'shellInput'].includes(frame.type)) return false;
@@ -62,22 +70,60 @@ export class SharedTerminal extends EventEmitter {
       if (this.authority.isHost() && now - (this.requests.get(source) ?? 0) >= 1000) {
         if (this.requests.size >= 256) this.requests.clear();
         this.requests.set(source, now);
-        this.sendSnapshot(source);
+        this.sendSnapshot(source, terminalId(frame.meta.requestId) ? frame.meta.requestId : undefined);
       }
       return true;
     }
     if (this.authority.isHost() || source !== this.authority.hostId()) return true;
-    const { generation, sequence } = frame.meta;
-    if (typeof generation !== 'string' || !/^[0-9a-f-]{36}$/.test(generation)
+    const { generation, generationIndex, streamId, sequence, requestId } = frame.meta;
+    if (!terminalId(generation)
       || !Number.isSafeInteger(sequence) || Number(sequence) < 0 || frame.payload.byteLength > HISTORY_CHARS * 4) return true;
+    if (frame.type === 'shellSnapshot' && requestId !== undefined
+      && (!terminalId(requestId) || requestId !== this.snapshotRequestId)) return true;
+    let newerGeneration = false;
+    if (generationIndex !== undefined) {
+      if (!Number.isSafeInteger(generationIndex) || Number(generationIndex) < 0 || !terminalId(streamId)) return true;
+      if (streamId !== this.remoteStreamId) {
+        // A process restart may reuse the host clock and reset its counter.
+        // Adopt a different stream only after a response to our current nonce.
+        if (frame.type === 'shellSnapshot' && requestId !== undefined && requestId === this.snapshotRequestId) {
+          this.remoteStreamId = streamId;
+          this.remoteGenerationIndex = -1;
+        } else {
+          if (this.candidateStreamId !== streamId || !this.snapshotRequested) {
+            this.candidateStreamId = streamId;
+            this.requestSnapshot(true);
+          }
+          return true;
+        }
+      }
+      if (Number(generationIndex) < this.remoteGenerationIndex) return true;
+      if (Number(generationIndex) === this.remoteGenerationIndex && generation !== this.generation) return true;
+      newerGeneration = Number(generationIndex) > this.remoteGenerationIndex;
+      this.remoteGenerationIndex = Number(generationIndex);
+      if (newerGeneration && frame.type === 'shellOutput') {
+        // Remember the newest generation before asking for its history. Late
+        // snapshots from an old repository must not restore its terminal view.
+        this.generation = generation;
+        this.sequence = 0;
+        this.history = '';
+        this.emit('view', this.view());
+        this.requestSnapshot(true);
+        return true;
+      }
+    } else if (this.remoteGenerationIndex >= 0) return true;
     if (frame.type === 'shellSnapshot') {
-      if (generation === this.generation && Number(sequence) < this.sequence) return true;
+      if (!newerGeneration && generation === this.generation && Number(sequence) < this.sequence) return true;
       this.generation = generation;
       this.sequence = Number(sequence);
       this.history = retainedText(Buffer.from(frame.payload).toString('utf8'));
-      this.snapshotRequested = false;
-      if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
-      this.snapshotTimer = undefined;
+      if (!this.candidateStreamId || this.candidateStreamId === this.remoteStreamId || requestId === this.snapshotRequestId) {
+        this.snapshotRequested = false;
+        this.snapshotRequestId = undefined;
+        this.candidateStreamId = undefined;
+        if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+        this.snapshotTimer = undefined;
+      }
       this.emit('view', this.view());
     } else {
       if (generation === this.generation && Number(sequence) <= this.sequence) return true;
@@ -151,16 +197,17 @@ export class SharedTerminal extends EventEmitter {
       this.pending = this.pending.slice(end);
       this.sequence++;
       this.append(text);
-      this.send(undefined, 'shellOutput', { generation: this.generation, sequence: this.sequence }, Buffer.from(text));
+      this.send(undefined, 'shellOutput', { streamId: this.streamId, generation: this.generation, generationIndex: this.generationIndex, sequence: this.sequence }, Buffer.from(text));
     }
   }
   private append(text: string): void {
     this.history = retainedText(this.history + text);
     this.emit('view', { text, reset: false } satisfies TerminalView);
   }
-  private sendSnapshot(peer: string): void {
+  private sendSnapshot(peer: string, requestId?: string): void {
     this.flushOutput();
-    this.send(peer, 'shellSnapshot', { generation: this.generation, sequence: this.sequence }, Buffer.from(this.history));
+    this.send(peer, 'shellSnapshot', { streamId: this.streamId, generation: this.generation, generationIndex: this.generationIndex, sequence: this.sequence,
+      ...(requestId ? { requestId } : {}) }, Buffer.from(this.history));
   }
   private send(peer: string | undefined, type: string, meta: Record<string, unknown>, payload?: Uint8Array): void {
     try { this.authority.send(peer, type, meta, payload); }
@@ -175,12 +222,17 @@ export class SharedTerminal extends EventEmitter {
     this.history = '';
     this.sequence = 0;
     this.generation = randomUUID();
+    this.generationIndex++;
+    this.remoteGenerationIndex = -1;
+    this.remoteStreamId = undefined;
+    this.candidateStreamId = undefined;
+    this.snapshotRequestId = undefined;
     this.snapshotRequested = false;
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
     this.snapshotTimer = undefined;
     this.requests.clear();
     this.emit('view', this.view());
-    if (!this.closed && this.authority.isHost()) this.send(undefined, 'shellSnapshot', { generation: this.generation, sequence: 0 }, Buffer.alloc(0));
+    if (!this.closed && this.authority.isHost()) this.send(undefined, 'shellSnapshot', { streamId: this.streamId, generation: this.generation, generationIndex: this.generationIndex, sequence: 0 }, Buffer.alloc(0));
   }
   public interrupt(): void {
     if (!this.authority.isHost() || this.closed) throw new Error('Only the session host can interrupt the terminal.');

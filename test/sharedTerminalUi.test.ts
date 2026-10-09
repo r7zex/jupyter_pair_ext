@@ -73,4 +73,28 @@ describe('native shared terminal input authority', () => {
       assert.equal(shell.listenerCount('view'), 1);
     } finally { controller.dispose(); trusted = true; }
   });
+
+  it('ignores a delayed open and execution failure from a closed terminal binding', async () => {
+    terminals.length = 0; trusted = true;
+    let fail!: (error: Error) => void;
+    const commands: string[] = [];
+    const shell = Object.assign(new EventEmitter(), { view: () => ({ text: 'history', reset: true }), requestSnapshot: () => undefined,
+      execute: (command: string) => { commands.push(command); return commands.length === 1
+        ? new Promise<void>((_resolve, reject) => { fail = reject; }) : Promise.resolve(); } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true } });
+    const controller = new SharedTerminalController(() => runtime as unknown as SessionRuntime);
+    const output: string[] = [];
+    try {
+      controller.open(); const old = terminals[0]!.pty; old.open(undefined);
+      old.handleInput?.('old command\r'); await Promise.resolve(); old.close();
+      controller.open(); const current = terminals[1]!.pty;
+      current.onDidWrite((text) => output.push(text)); current.open(undefined);
+      current.handleInput?.('echo keep');
+      output.length = 0;
+      old.open(undefined); fail(new Error('old terminal error')); await Promise.resolve(); await Promise.resolve();
+      assert.deepEqual(output, [], 'stale callbacks must not reset current input or print into the new terminal');
+      current.handleInput?.(' me\r'); await Promise.resolve();
+      assert.deepEqual(commands, ['old command', 'echo keep me']);
+    } finally { controller.dispose(); }
+  });
 });

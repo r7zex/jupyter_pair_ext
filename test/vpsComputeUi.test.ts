@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import Module from 'node:module';
 import os from 'node:os';
@@ -11,7 +11,7 @@ import type { SessionRuntime } from '../src/runtime/session';
 import { VpsServer } from '../src/vps/server';
 import { VpsClient, VpsHttpError } from '../src/vps/client';
 import { type JobSubmission, MAX_JOB_BYTES, safeJobPath, validateSubmission, vpsSecretKey } from '../src/vps/protocol';
-import { trainingProgram, trainingHelper, trainingData } from './support/modelTraining';
+import { trainingProgram, trainingHelper, trainingData, torchPython, torchDatasetSetup, torchTrainingProgram } from './support/modelTraining';
 
 let root: string;
 let endpoint = '';
@@ -196,15 +196,23 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       body: JSON.stringify({ instanceId: 'pc-installation', name: 'Compute PC', resources: { cpuCount: 4, python: 'python3', gpus: [] } }) });
     assert.equal(response.status, 200); await response.arrayBuffer();
   }
-  it('trains from a real repository snapshot, reloads a model and recovers after the editor and VPS stop', async function () {
+  for (const useTorch of [false, true]) it(`trains ${useTorch ? 'PyTorch with binary owner data' : 'from a real repository snapshot'}, reloads a model and recovers after the editor and VPS stop`, async function () {
     this.timeout(20_000);
+    const pythonPath = useTorch ? torchPython : 'python3';
+    if (useTorch && spawnSync(pythonPath, ['-c', "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)"]).status !== 0) this.skip();
     const repository = path.join(root, 'repository');
     await mkdir(path.join(repository, 'experiments'), { recursive: true });
-    await writeFile(path.join(repository, 'config.json'), JSON.stringify({ dataset: 'data.csv', delay: 0.8 }));
+    const dataset = useTorch ? '.git/dataset.pt' : 'data.csv';
+    if (useTorch) {
+      await mkdir(path.join(repository, '.git'));
+      const setup = spawnSync(pythonPath, ['-c', torchDatasetSetup, path.join(repository, dataset)], { encoding: 'utf8' });
+      assert.equal(setup.status, 0, setup.stderr);
+    }
+    await writeFile(path.join(repository, 'config.json'), JSON.stringify({ dataset, delay: 0.8 }));
     await writeFile(path.join(repository, 'data.csv'), trainingData);
     await writeFile(path.join(repository, 'training_helpers.py'), 'raise RuntimeError("stale disk module")');
     workspaceFolders = [{ uri: { fsPath: repository } }];
-    editor = { document: { uri: { scheme: 'file', fsPath: path.join(repository, 'experiments', 'train.py') }, getText: () => trainingProgram } };
+    editor = { document: { uri: { scheme: 'file', fsPath: path.join(repository, 'experiments', 'train.py') }, getText: () => useTorch ? torchTrainingProgram : trainingProgram } };
     documents = [{ uri: { scheme: 'file', fsPath: path.join(repository, 'training_helpers.py') }, isDirty: true, getText: () => trainingHelper }];
     let daemon: ChildProcess | undefined;
     const until = async (check: () => Promise<boolean>): Promise<void> => {
@@ -212,7 +220,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       while (!await check()) { if (Date.now() > end) assert.fail('Model pipeline did not complete'); await new Promise((resolve) => setTimeout(resolve, 25)); }
     };
     try {
-      daemon = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'pc',
+      daemon = spawn(pythonPath, [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'pc',
         '--state', path.join(root, 'agent'), '--workspace', repository, '--poll-seconds', '0.1'],
       { env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore' });
       await until(async () => (await client.agents()).length === 1);
@@ -224,7 +232,14 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       await broker.stop();
       await until(async () => { try { await readFile(path.join(work, 'checkpoints', 'model.json')); return true; } catch { return false; } });
       const model = JSON.parse(await readFile(path.join(work, 'checkpoints', 'model.json'), 'utf8'));
-      assert.equal(model.epochs, 400);
+      assert.equal(model.epochs, useTorch ? 100 : 400);
+      if (useTorch) {
+        assert.equal(model.backend, 'pytorch'); assert.equal(model.steps, 300);
+        assert.equal(model.checkpoint_reloaded, true); assert.equal(model.optimizer_state_reloaded, true);
+        assert.ok(model.mse < 1e-10);
+        assert.ok((await readFile(path.join(work, 'checkpoints', 'model.pt'))).byteLength > 0);
+        await assert.rejects(readFile(path.join(work, dataset)), { code: 'ENOENT' });
+      }
       assert.ok(Math.abs(model.weights[0] * 3 + model.weights[1] - 7) < 1e-4);
       const port = Number(new URL(endpoint).port);
       broker = new VpsServer({ dataDirectory: path.join(root, 'broker'), clientToken: token, agentTokens: { pc: agentToken } });

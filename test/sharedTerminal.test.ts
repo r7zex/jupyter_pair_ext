@@ -60,6 +60,100 @@ describe('shared host command terminal', () => {
     } finally { guest.dispose(); }
   });
 
+  it('never restores an older shell generation after a repository reset, even when output arrives before its snapshot', () => {
+    const requests: string[] = [];
+    let requestId: unknown;
+    const guest = new SharedTerminal({ isHost: () => false, hostId: () => 'host', available: () => true,
+      directory: () => '', prepare: async () => undefined, send: (_peer, type, meta) => { requests.push(type); requestId = meta.requestId; } });
+    const streamId = randomUUID();
+    const old = randomUUID(); const current = randomUUID(); const next = randomUUID();
+    const frame = (type: string, generation: string, generationIndex: number, sequence: number, text: string, reply?: unknown): WireFrame =>
+      ({ type, meta: { streamId, generation, generationIndex, sequence, requestId: reply }, payload: Buffer.from(text) });
+    try {
+      guest.requestSnapshot();
+      guest.handle(frame('shellSnapshot', current, 1, 1, 'new repository', requestId), 'host');
+      requests.length = 0;
+      // The old generation need not have been seen by this newly joined guest.
+      guest.handle(frame('shellSnapshot', old, 0, 20, 'old repository'), 'host');
+      guest.handle(frame('shellOutput', old, 0, 21, 'old output'), 'host');
+      assert.equal(guest.view().text, 'new repository');
+      guest.handle(frame('shellOutput', next, 2, 3, 'output before snapshot'), 'host');
+      guest.handle(frame('shellSnapshot', current, 1, 30, 'late old snapshot'), 'host');
+      assert.notEqual(guest.view().text, 'late old snapshot');
+      guest.handle(frame('shellSnapshot', next, 2, 3, 'latest repository', requestId), 'host');
+      assert.equal(guest.view().text, 'latest repository');
+      assert.deepEqual(requests, ['shellSnapshotRequest']);
+    } finally { guest.dispose(); }
+  });
+
+  it('validates ordered metadata, rejects legacy rollback and accepts a new host with a fresh counter', () => {
+    let host = 'host';
+    let requestId: unknown; let streamId = randomUUID();
+    const guest = new SharedTerminal({ isHost: () => false, hostId: () => host, available: () => true,
+      directory: () => '', prepare: async () => undefined, send: (_peer, _type, meta) => { requestId = meta.requestId; } });
+    const generation = randomUUID();
+    const snapshot = (generationIndex: unknown, text: string, reply?: unknown): WireFrame => ({ type: 'shellSnapshot',
+      meta: { streamId, generation, generationIndex, sequence: 0, requestId: reply }, payload: Buffer.from(text) });
+    try {
+      guest.handle(snapshot(undefined, 'legacy'), host);
+      for (const invalid of [-1, 0.5, '0', NaN, Number.MAX_SAFE_INTEGER + 1]) guest.handle(snapshot(invalid, 'invalid'), host);
+      assert.equal(guest.view().text, 'legacy');
+      guest.requestSnapshot(); guest.handle(snapshot(5, 'ordered', requestId), host);
+      guest.handle(snapshot(undefined, 'legacy rollback'), host);
+      guest.handle({ ...snapshot(5, 'counter collision'), meta: { streamId, generation: randomUUID(), generationIndex: 5, sequence: 0 } }, host);
+      assert.equal(guest.view().text, 'ordered');
+      guest.reset(); host = 'new-host'; streamId = randomUUID();
+      guest.requestSnapshot(); guest.handle(snapshot(0, 'new host', requestId), host);
+      assert.equal(guest.view().text, 'new host');
+    } finally { guest.dispose(); }
+  });
+
+  it('accepts a restarted host with the same host clock only through a fresh snapshot response', () => {
+    let requestId: unknown;
+    const guest = new SharedTerminal({ isHost: () => false, hostId: () => 'host', available: () => true,
+      directory: () => '', prepare: async () => undefined, send: (_peer, _type, meta) => { requestId = meta.requestId; } });
+    const oldStream = randomUUID(); const newStream = randomUUID();
+    const oldGeneration = randomUUID(); const newGeneration = randomUUID();
+    const snapshot = (streamId: string, generation: string, generationIndex: number, text: string, reply?: unknown): WireFrame =>
+      ({ type: 'shellSnapshot', meta: { streamId, generation, generationIndex, sequence: 0, requestId: reply }, payload: Buffer.from(text) });
+    try {
+      guest.requestSnapshot();
+      guest.handle(snapshot(oldStream, oldGeneration, 5, 'before restart', requestId), 'host');
+      const oldRequest = requestId;
+      guest.peerConnected('host');
+      guest.handle(snapshot(newStream, newGeneration, 0, 'restarted host', requestId), 'host');
+      assert.equal(guest.view().text, 'restarted host');
+      guest.handle(snapshot(oldStream, randomUUID(), 20, 'late old stream'), 'host');
+      guest.handle(snapshot(oldStream, oldGeneration, 5, 'old reply', oldRequest), 'host');
+      assert.equal(guest.view().text, 'restarted host');
+    } finally { guest.dispose(); }
+  });
+
+  it('recovers real shell output from a replacement host process without replaying the previous stream', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-restart-'));
+    const common = { hostId: () => 'host', available: () => true, directory: () => root, prepare: async () => undefined };
+    let host: SharedTerminal;
+    const stale: WireFrame[] = [];
+    const guest = new SharedTerminal({ ...common, isHost: () => false,
+      send: (_peer, type, meta, payload = new Uint8Array()) => { host.handle({ type, meta, payload }, 'guest'); } });
+    const makeHost = () => new SharedTerminal({ ...common, isHost: () => true,
+      send: (_peer, type, meta, payload = new Uint8Array()) => { const frame = { type, meta, payload }; stale.push(frame); guest.handle(frame, 'host'); } });
+    const first = host = makeHost();
+    try {
+      first.reset(); first.reset();
+      await first.execute('echo before-restart');
+      await until(() => /(^|\r?\n)before-restart\r?\n/.test(guest.view().text));
+      const oldFrames = [...stale];
+      first.dispose(); host = makeHost(); guest.peerConnected('host');
+      await host.execute('echo after-restart');
+      await until(() => /(^|\r?\n)after-restart\r?\n/.test(guest.view().text));
+      const current = guest.view().text;
+      oldFrames.forEach((frame) => guest.handle(frame, 'host'));
+      assert.equal(guest.view().text, current);
+      assert.ok(!current.includes('before-restart'));
+    } finally { first.dispose(); host!.dispose(); guest.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it('cancels a prepared command when host authority changes and contains delivery failures', async () => {
     let finish!: () => void;
     let localHost = true;

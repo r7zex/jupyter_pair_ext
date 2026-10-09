@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.33 - 2026-10-09 (terminal recovery and PyTorch acceptance)
+
+- Orders shared-terminal generations so a delayed snapshot cannot restore the previous repository's output, including when new output arrives before its snapshot. Retains receive compatibility with older hosts until ordered metadata is observed.
+- Verifies new terminal streams through a fresh snapshot request, allowing host-process restart under the same host clock while rejecting old process snapshots and replies.
+- Ignores delayed open callbacks and execution failures from closed terminal bindings, preserving the new terminal's input and display.
+- Verifies real CPU PyTorch training from binary owner-repository data through the peer mesh, VPS-only host execution and detached-agent jobs. Exercises DataLoader, autograd, 100 epochs/300 steps, checkpoint/model/optimizer reload and prediction after broker outages.
+- Verifies that repository changes restart the host shell in its new directory and replace guest history through both live transport paths.
+
 ## 0.5.32 - 2026-10-09 (repository and kernel launch races)
 
 - Protects the host repository throughout notebook execution preparation and terminal file preparation, including replacement of the same folder. Rejects overlapping folder changes, execution, host transfer and session finalization during replacement; failures release the guard for a retry.
