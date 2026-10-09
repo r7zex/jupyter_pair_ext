@@ -1,6 +1,9 @@
 export const DEFAULT_TRANSFER_CHUNK_SIZE = 64 * 1024;
 export const MAX_TRANSFER_CHUNK_SIZE = 1024 * 1024;
 export const MAX_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024;
+// Bound the received-index sets and missing-chunk retry metadata independently
+// of file size. A 2 GiB file still fits with the normal 64 KiB chunks.
+export const MAX_TRANSFER_CHUNKS = 128 * 1024;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -27,6 +30,9 @@ export function validateIncomingTransfer(
     throw new Error(`Transfer chunk size must be an integer between 1 and ${MAX_TRANSFER_CHUNK_SIZE} bytes.`);
   }
   const requiredChunks = Math.max(1, Math.ceil(size / chunkSize));
+  if (requiredChunks > MAX_TRANSFER_CHUNKS) {
+    throw new Error(`Transfer exceeds the ${MAX_TRANSFER_CHUNKS}-chunk limit; use a larger chunk size.`);
+  }
   if (!Number.isSafeInteger(expectedChunks) || expectedChunks !== requiredChunks) {
     throw new Error(`Transfer chunk count must equal ${requiredChunks} for the declared size.`);
   }

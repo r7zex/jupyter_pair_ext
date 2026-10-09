@@ -67,6 +67,7 @@ import { EditorSynchronizer } from './vscode/sync';
 import { PairNotebookController } from './vscode/jupyterController';
 import { VpsComputeController, readVpsConnection } from './vscode/vpsCompute';
 import { SharedTerminalController } from './vscode/sharedTerminal';
+import { captureInitialWorkingCopy } from './vscode/initialWorkingCopy';
 import { closeIsolatedPairTabs, type PairTabCloseResult } from './vscode/sessionTabs';
 import {
   PROXY_CREDENTIAL_MIGRATION_KEY,
@@ -297,7 +298,11 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
       location: vscode.ProgressLocation.Notification,
       title: 'Pair Notebook: creating isolated working copy',
       cancellable: false,
-    }, async () => copyProject(backingFolder, workingFolder));
+    }, async () => copyProject(backingFolder, workingFolder, captureInitialWorkingCopy(
+      backingFolder,
+      vscode.workspace.textDocuments,
+      vscode.workspace.notebookDocuments,
+    )));
   } catch (error) {
     await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
     throw error;

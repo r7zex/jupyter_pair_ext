@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.37 - 2026-10-09 (host repository and training reliability)
+
+- Removes the ten-minute host and eleven-minute guest execution limits. Accepted training runs until completion, explicit cancellation or session closure; kernel crashes and rejected execution commands now settle promptly instead of leaving cells busy.
+- Preserves unsaved host text and notebook editors when creating the isolated project, rejects overlapping paths through symlink ancestors and refuses populated destinations.
+- Preserves host-only credentials, Git metadata and Python environments when shared folders are removed or materialized, and permits reattaching a matching repository containing only preserved private directories.
+- Bounds binary-transfer chunk bookkeeping while keeping normal streamed datasets up to 2 GiB supported.
+- Stops remaining POSIX shell-group processes after natural shell exit. The shared host terminal remains visible to all participants with host-only command input, reconnect feedback and correct split-CRLF output.
+- Keeps notebook cell boundaries and future-import state in VPS jobs, supports IPython magics when installed and stops submission execution at the first failed cell.
+- Repairs IPv6 proxy readiness/bypass and SOCKS4a remote DNS without invalidating stored credentials. Rechecks encrypted VPS relay readiness and reconnects half-open routes within the peer recovery window.
+- Updates `ip-address` to 10.7.3, clearing the production dependency audit, and adds branch CI for complete CPU PyTorch/Jupyter/VPS training plus native Extension Host checks.
+
+See [the critical audit](docs/HOST_TRAINING_AUDIT_0.5.37_2026-10-09.md) for reproduced failures, validation and deployment limits. Update the extension on all participants; external VPS/SSH acceptance depends on outbound access to the selected server.
+
 ## 0.5.36 - 2026-10-09 (critical training lifecycle fixes)
 
 - Contains detached training and its descendants when the runner crashes. A supervisor retains an execution lock through process-tree cleanup; recovery waits for both locks and never replays an accepted training intent. Adds POSIX process-group/subreaper cleanup and Windows Job Object containment.

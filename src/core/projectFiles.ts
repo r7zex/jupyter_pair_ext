@@ -13,7 +13,8 @@ import {
 import { SESSION_TERMINATION_MARKER } from './sessionTermination';
 import { MAX_TRANSFER_BYTES } from './transfer';
 import { newId } from './types';
-import { filesystemPathComparisonKey, portableRelativePath } from './projectPath';
+import { atomicWriteFile } from './atomicFile';
+import { filesystemPathComparisonKey, portablePathComparisonKey, portableRelativePath, safeRelativePath } from './projectPath';
 
 export const MAX_COLLABORATIVE_DOCUMENT_BYTES = 32 * 1024 * 1024;
 export const MAX_TRACKED_PROJECT_ENTRIES = 50_000;
@@ -84,22 +85,50 @@ export interface ProjectFile {
   hash: string;
 }
 
-export async function copyProject(source: string, destination: string): Promise<void> {
+export interface ProjectWorkingCopyFile {
+  relativePath: string;
+  bytes: Uint8Array;
+}
+
+export async function copyProject(
+  source: string,
+  destination: string,
+  workingCopies: readonly ProjectWorkingCopyFile[] = [],
+): Promise<void> {
   const sourceRoot = await realpath(source);
   const destinationRoot = path.resolve(destination);
   const sourceInfo = await stat(sourceRoot);
   if (!sourceInfo.isDirectory()) throw new Error('The selected project source must be a directory.');
-  if (pathsOverlap(sourceRoot, destinationRoot)) {
-    throw new Error('The project source and isolated working copy must not overlap.');
-  }
   try {
     const destinationInfo = await lstat(destinationRoot);
     if (destinationInfo.isSymbolicLink() || !destinationInfo.isDirectory()) {
       throw new Error('The isolated working copy must be a real directory.');
     }
+    if ((await readdir(destinationRoot)).length) {
+      throw new Error('The isolated working copy must be empty before copying a project.');
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  // Resolve the existing ancestor as well as the source. A destination below
+  // a directory symlink may otherwise point back inside the host repository.
+  if (pathsOverlap(sourceRoot, await resolveDestinationPath(destinationRoot))) {
+    throw new Error('The project source and isolated working copy must not overlap.');
+  }
+  const workingCopyKeys = new Set<string>();
+  const normalizedWorkingCopies = workingCopies.map((file) => {
+    const relativePath = safeRelativePath(file.relativePath);
+    if (!shouldTrackProjectPath(relativePath)) {
+      throw new Error('An editor working copy targets an excluded project path.');
+    }
+    if (file.bytes.byteLength > MAX_TRANSFER_BYTES) {
+      throw new Error(`Editor working copy exceeds the ${MAX_TRANSFER_BYTES}-byte transfer limit: ${relativePath}`);
+    }
+    const key = portablePathComparisonKey(relativePath);
+    if (workingCopyKeys.has(key)) throw new Error('Editor working copies contain duplicate or case-conflicting paths.');
+    workingCopyKeys.add(key);
+    return { relativePath, bytes: file.bytes };
+  });
   let trackedEntries = 0;
   await mkdir(destinationRoot, { recursive: true });
   await cp(sourceRoot, destinationRoot, {
@@ -109,18 +138,57 @@ export async function copyProject(source: string, destination: string): Promise<
       const relative = path.relative(sourceRoot, item);
       if (!relative) return true;
       if (relative && !shouldTrackProjectPath(relative)) return false;
+      const info = await lstat(item);
+      if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) return false;
       trackedEntries += 1;
       if (trackedEntries > MAX_TRACKED_PROJECT_ENTRIES) {
         throw new Error(`Project exceeds the ${MAX_TRACKED_PROJECT_ENTRIES}-entry limit.`);
       }
-      const info = await lstat(item);
-      if (info.isSymbolicLink()) return false;
       if (info.isFile() && info.size > MAX_TRANSFER_BYTES) {
         throw new Error(`Project file exceeds the ${MAX_TRANSFER_BYTES}-byte transfer limit: ${relative}`);
       }
       return true;
     },
   });
+  // Preserve unsaved host editor contents in the isolated copy without saving
+  // or rewriting the selected repository itself.
+  for (const file of normalizedWorkingCopies) {
+    const segments = file.relativePath.split(path.sep);
+    let target = destinationRoot;
+    for (let index = 0; index < segments.length; index += 1) {
+      target = path.join(target, segments[index] as string);
+      try {
+        const info = await lstat(target);
+        if (info.isSymbolicLink() || (index < segments.length - 1 && !info.isDirectory())) {
+          throw new Error('An editor working copy crosses an unsafe project path.');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        trackedEntries += 1;
+        if (trackedEntries > MAX_TRACKED_PROJECT_ENTRIES) {
+          throw new Error(`Project exceeds the ${MAX_TRACKED_PROJECT_ENTRIES}-entry limit.`);
+        }
+        if (index < segments.length - 1) await mkdir(target);
+      }
+    }
+    await atomicWriteFile(target, file.bytes);
+  }
+}
+
+async function resolveDestinationPath(destination: string): Promise<string> {
+  let ancestor = destination;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return path.join(await realpath(ancestor), ...missing.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.push(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
 }
 
 function pathsOverlap(left: string, right: string): boolean {

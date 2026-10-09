@@ -113,10 +113,12 @@ export function createProxyAgent(
   const credentials = proxy.username !== undefined || proxy.password !== undefined
     ? encodeURIComponent(proxy.username ?? '') + ':' + encodeURIComponent(proxy.password ?? '') + '@'
     : '';
-  const authority = proxy.host + ':' + proxy.port;
+  const host = proxy.host.includes(':') && !proxy.host.startsWith('[') ? `[${proxy.host}]` : proxy.host;
+  const authority = host + ':' + proxy.port;
   const credentialFreeProxyUrl = proxy.kind + '://' + authority;
   switch (proxy.kind) {
     case 'socks4':
+    case 'socks4a':
       return { agent: new SocksProxyAgent(proxy.kind + '://' + credentials + authority), proxy };
     case 'socks5':
     case 'socks5h':

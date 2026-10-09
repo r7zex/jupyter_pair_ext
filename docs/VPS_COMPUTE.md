@@ -161,6 +161,8 @@ The submitted snapshot is immutable for that job: later collaborative edits do n
 
 The P2P editor session retains its existing host availability rules. A persistent compute agent does not become the editor Session Host. Background jobs and their VPS view remain available independently of that editor session.
 
+Notebook jobs preserve cell boundaries, a shared Python namespace and future-import state. The selected environment can run IPython magics and shell syntax when IPython is installed; ordinary Python cells also work without it. The first failed cell stops the job. Source snapshots remain bounded text inputs; binary datasets stay in the owner-provisioned compute workspace.
+
 ## Verification in this branch
 
 Automated loopback checks cover credential separation, path validation, idempotent submissions, durable claims after a VPS restart, bounded/idempotent log replay, queued/running cancellation, encrypted P2P delivery and reconnection. A real Python agent test kills the polling daemon and stops the VPS while the detached program continues, then reconnects with the original state and verifies exactly one execution and recovered output. Additional real process tests kill the private supervisor, kill and terminate the detached runner, cancel training, and complete entrypoints that leave workers alive. They verify that descendants stop before completion or recovery, including Linux workers that create their own session, and that recovery never launches an accepted job again.

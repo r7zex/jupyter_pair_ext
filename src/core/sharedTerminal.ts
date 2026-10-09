@@ -179,6 +179,12 @@ export class SharedTerminal extends EventEmitter {
       if (this.child !== child) return;
       this.publish(`\n[Cannot start host shell: ${error.message}]\n`);
     });
+    child.on('exit', () => {
+      // Background commands can redirect all streams and outlive the shell.
+      // Releasing its handle before stopping the group would leave training
+      // alive after disposal and allow a repository switch around that work.
+      if (this.child === child && process.platform !== 'win32') this.stopProcessGroup(child);
+    });
     child.on('close', (code) => {
       if (this.child !== child) return;
       this.child = undefined;
@@ -254,9 +260,14 @@ export class SharedTerminal extends EventEmitter {
       const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
       killer.on('error', () => child.kill());
     } else {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+      this.stopProcessGroup(child);
     }
     child.stdin.destroy();
+  }
+  private stopProcessGroup(child: ChildProcessWithoutNullStreams): void {
+    if (!child.pid) return;
+    try { process.kill(-child.pid, 'SIGKILL'); }
+    catch { child.kill('SIGKILL'); }
   }
   public dispose(): void { this.closed = true; this.reset(); this.removeAllListeners(); }
 }

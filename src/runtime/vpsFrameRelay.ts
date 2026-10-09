@@ -9,6 +9,8 @@ import { createRelayAnnounceProof, decryptRelayPacket, deriveRelayFrameKey, encr
 
 export interface VpsRelayConnection { url: string; token: string }
 const MAX_ENVELOPE_HEADER_BYTES = 512;
+const PROBE_INTERVAL_MS = 10_000;
+const PROBE_TIMEOUT_MS = 10_000;
 
 /** The VPS can route ciphertext; only invitation holders can decrypt session frames. */
 export class VpsFrameRelay implements FrameRelay {
@@ -17,6 +19,7 @@ export class VpsFrameRelay implements FrameRelay {
   private socket: WebSocket | undefined;
   private reconnect: NodeJS.Timeout | undefined;
   private probeTimer: NodeJS.Timeout | undefined;
+  private nextProbeTimer: NodeJS.Timeout | undefined;
   private stopped = false;
   private ready = false;
   private nonce = '';
@@ -46,10 +49,7 @@ export class VpsFrameRelay implements FrameRelay {
     this.nonce = '';
     socket.on('open', () => {
       if (this.stopped || this.socket !== socket) return;
-      this.nonce = randomBytes(24).toString('hex');
-      socket.send(JSON.stringify({ t: 'probe', d: encryptRelayReadinessProbe(this.key, this.nonce) }));
-      this.probeTimer = setTimeout(() => socket.terminate(), 10_000);
-      this.probeTimer.unref();
+      this.probe(socket);
     });
     socket.on('message', (raw) => { if (!this.stopped && this.socket === socket) this.receive(raw.toString()); });
     socket.on('close', () => {
@@ -57,10 +57,33 @@ export class VpsFrameRelay implements FrameRelay {
       this.socket = undefined;
       this.ready = false;
       if (this.probeTimer) clearTimeout(this.probeTimer);
+      if (this.nextProbeTimer) clearTimeout(this.nextProbeTimer);
+      this.probeTimer = undefined;
+      this.nextProbeTimer = undefined;
+      this.nonce = '';
       if (!this.stopped) {
         this.scheduleReconnect();
       }
     });
+  }
+  private probe(socket: WebSocket): void {
+    if (this.stopped || this.socket !== socket) return;
+    this.nextProbeTimer = undefined;
+    this.nonce = randomBytes(24).toString('hex');
+    // Repeat the encrypted round trip so a half-open VPN/proxy route is
+    // replaced within the mesh's logical-peer recovery window.
+    this.probeTimer = setTimeout(() => {
+      if (this.stopped || this.socket !== socket) return;
+      this.ready = false;
+      socket.terminate();
+    }, PROBE_TIMEOUT_MS);
+    this.probeTimer.unref();
+    try {
+      socket.send(JSON.stringify({ t: 'probe', d: encryptRelayReadinessProbe(this.key, this.nonce) }));
+    } catch {
+      this.ready = false;
+      socket.terminate();
+    }
   }
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnect) return;
@@ -75,6 +98,7 @@ export class VpsFrameRelay implements FrameRelay {
     this.ready = false;
     if (this.reconnect) clearTimeout(this.reconnect);
     if (this.probeTimer) clearTimeout(this.probeTimer);
+    if (this.nextProbeTimer) clearTimeout(this.nextProbeTimer);
     this.socket?.terminate();
     this.socket = undefined;
   }
@@ -103,10 +127,18 @@ export class VpsFrameRelay implements FrameRelay {
     try {
       const message = JSON.parse(raw) as { t: string; f?: string; to?: string; proof?: string; d?: string };
       if (message.t === 'probe') {
-        if (!this.ready && this.nonce && typeof message.d === 'string' && verifyRelayReadinessProbe(this.key, this.nonce, message.d)) {
+        if (this.nonce && typeof message.d === 'string' && verifyRelayReadinessProbe(this.key, this.nonce, message.d)) {
+          const wasReady = this.ready;
           this.ready = true;
           if (this.probeTimer) clearTimeout(this.probeTimer);
-          this.sendAnnounce();
+          this.probeTimer = undefined;
+          this.nonce = '';
+          const socket = this.socket;
+          if (socket) {
+            this.nextProbeTimer = setTimeout(() => this.probe(socket), PROBE_INTERVAL_MS);
+            this.nextProbeTimer.unref();
+          }
+          if (!wasReady) this.sendAnnounce();
         }
         return;
       }

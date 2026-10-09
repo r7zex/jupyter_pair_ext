@@ -8,6 +8,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'mocha';
 import type * as vscode from 'vscode';
 import type { SessionRuntime } from '../src/runtime/session';
+import { CollaborativeProject } from '../src/core/crdt';
 import { VpsServer } from '../src/vps/server';
 import { VpsClient, VpsHttpError } from '../src/vps/client';
 import { type JobSubmission, MAX_JOB_BYTES, safeJobPath, validateSubmission, vpsSecretKey } from '../src/vps/protocol';
@@ -127,7 +128,8 @@ describe('Stage 64 — source snapshot, dialog cancellation and concurrent edit 
       if (mask & 8) { assert.equal(snapshot, undefined); return; }
       assert.ok(snapshot);
       assert.equal(snapshot.files['helper.py'], mask & 2 ? helper : mask & 4 ? 'VALUE=2' : 'VALUE=1');
-      assert.equal(snapshot.files[snapshot.entrypoint], mask & 1 ? 'print("second")' : 'print("first")\n\nprint("second")');
+      assert.equal(snapshot.files[snapshot.entrypoint]!.includes('first'), !(mask & 1));
+      assert.ok(snapshot.files[snapshot.entrypoint]!.includes('second'));
     });
   }
 });
@@ -151,7 +153,8 @@ describe('Round 2 Stage 64 — portable notebook names and mixed-cell snapshots'
       assert.ok(safeJobPath(snapshot.entrypoint), 'Generated Python filename must respect the 255-byte portable limit');
       const job = validateSubmission({ id: 'portable', agentId: 'pc', title: 'Training', device: 'cpu', args: [], ...snapshot });
       assert.equal(job.files['helper.py'], mask & 16 ? 'VALUE=2' : 'VALUE=1');
-      assert.equal(job.files[job.entrypoint], mask & 8 ? 'print("second")' : 'print("first")\n\nprint("second")');
+      assert.equal(job.files[job.entrypoint]!.includes('first'), !(mask & 8));
+      assert.ok(job.files[job.entrypoint]!.includes('second'));
       assert.equal(job.entrypoint.startsWith('pkg/'), !!(mask & 4));
     });
   }
@@ -196,8 +199,9 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       body: JSON.stringify({ instanceId: 'pc-installation', name: 'Compute PC', resources: { cpuCount: 4, python: 'python3', gpus: [] } }) });
     assert.equal(response.status, 200); await response.arrayBuffer();
   }
-  for (const useTorch of [false, true]) it(`trains ${useTorch ? 'PyTorch with binary owner data' : 'from a real repository snapshot'}, reloads a model and recovers after the editor and VPS stop`, async function () {
+  for (const mode of ['repository', 'torch', 'notebook']) it(`trains ${mode === 'torch' ? 'PyTorch with binary owner data' : mode === 'notebook' ? 'a collaborative notebook from host repository inputs' : 'from a real repository snapshot'}, reloads a model and recovers after the editor and VPS stop`, async function () {
     this.timeout(20_000);
+    const useTorch = mode === 'torch';
     const pythonPath = useTorch ? torchPython : 'python3';
     if (useTorch && spawnSync(pythonPath, ['-c', "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('torch') else 1)"]).status !== 0) this.skip();
     const repository = path.join(root, 'repository');
@@ -214,6 +218,22 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     workspaceFolders = [{ uri: { fsPath: repository } }];
     editor = { document: { uri: { scheme: 'file', fsPath: path.join(repository, 'experiments', 'train.py') }, getText: () => useTorch ? torchTrainingProgram : trainingProgram } };
     documents = [{ uri: { scheme: 'file', fsPath: path.join(repository, 'training_helpers.py') }, isDirty: true, getText: () => trainingHelper }];
+    let canonical: CollaborativeProject | undefined;
+    if (mode === 'notebook') {
+      canonical = new CollaborativeProject();
+      canonical.replaceText('config.json', JSON.stringify({ dataset, delay: 0.8 }));
+      canonical.replaceText('data.csv', trainingData);
+      canonical.replaceText('training_helpers.py', trainingHelper);
+      canonical.replaceText('.env', 'MUST_NOT_COPY=private');
+      runtime = { descriptor: { workingFolder: repository }, project: canonical };
+      const hasIPython = spawnSync(pythonPath, ['-c', 'import IPython'], { stdio: 'ignore' }).status === 0;
+      const cells = [hasIPython ? '%time notebook_setup = 42' : 'notebook_setup = 42',
+        'from __future__ import annotations\ndef validate_setup(value: MissingType):\n    assert value == 42\nvalidate_setup(notebook_setup)', trainingProgram]
+        .map((code) => ({ kind: 2, document: { languageId: 'python', getText: () => code } }));
+      notebook = { notebook: { uri: { scheme: 'file', fsPath: path.join(repository, 'experiments', 'train.ipynb') }, getCells: () => cells }, selection: { start: 0 } };
+    }
+    const computeWorkspace = useTorch ? repository : path.join(root, 'separate-compute-workspace');
+    await mkdir(computeWorkspace, { recursive: true });
     let daemon: ChildProcess | undefined;
     const until = async (check: () => Promise<boolean>): Promise<void> => {
       const end = Date.now() + 8000;
@@ -221,7 +241,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     };
     try {
       daemon = spawn(pythonPath, [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'pc',
-        '--state', path.join(root, 'agent'), '--workspace', repository, '--poll-seconds', '0.1'],
+        '--state', path.join(root, 'agent'), '--workspace', computeWorkspace, '--poll-seconds', '0.1'],
       { env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore' });
       await until(async () => (await client.agents()).length === 1);
       await controller.submit();
@@ -232,6 +252,8 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       await broker.stop();
       await until(async () => { try { await readFile(path.join(work, 'checkpoints', 'model.json')); return true; } catch { return false; } });
       const model = JSON.parse(await readFile(path.join(work, 'checkpoints', 'model.json'), 'utf8'));
+      assert.equal(await readFile(path.join(work, 'data.csv'), 'utf8'), trainingData);
+      await assert.rejects(readFile(path.join(work, '.env')), { code: 'ENOENT' });
       assert.equal(model.epochs, useTorch ? 100 : 400);
       if (useTorch) {
         assert.equal(model.backend, 'pytorch'); assert.equal(model.steps, 300);
@@ -249,6 +271,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       assert.match(Buffer.from(completed.log, 'base64').toString(), /"mse"/);
       assert.equal((await client.jobs()).length, 1);
     } finally {
+      canonical?.destroy();
       if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
         const exit = new Promise<void>((resolve) => daemon!.once('exit', () => resolve())); daemon.kill('SIGTERM'); await exit;
       }

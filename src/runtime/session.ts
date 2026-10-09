@@ -265,10 +265,6 @@ const MAX_REMOTE_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
 const MAX_REMOTE_INPUT_CHARACTERS = 64 * 1024;
 const MAX_REMOTE_EXECUTIONS = 4;
 const MAX_REMOTE_EXECUTIONS_PER_PEER = 2;
-/** A stuck kernel must end visibly instead of leaving a notebook cell Busy indefinitely. */
-const KERNEL_EXECUTION_TIMEOUT_MS = 10 * 60_000;
-/** Leave one extra minute for the terminal output/result to cross the route. */
-const REMOTE_EXECUTION_TIMEOUT_MS = KERNEL_EXECUTION_TIMEOUT_MS + 60_000;
 /** A routed request must be acknowledged before VS Code leaves the cell in a running state. */
 const EXECUTION_ACCEPT_TIMEOUT_MS = 45_000;
 /** Host waits only this long for the requested target-cell CRDT state to arrive. */
@@ -1439,12 +1435,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!pending || pending.executorId !== executorId || pending.accepted) return;
     clearTimeout(pending.timer);
     pending.accepted = true;
+    // Training can legitimately run for hours. Once the host has accepted the
+    // request, completion, explicit interruption or session closure owns its
+    // lifetime; route delivery deadlines must not become training deadlines.
+    pending.timer = undefined;
     this.recordExecutionDiagnostic('execution-accepted', requestId, executorId, 'execution-accepted');
-    pending.timer = setTimeout(() => {
-      if (this.pendingExecutions.get(requestId) !== pending) return;
-      this.pendingExecutions.delete(requestId);
-      pending.reject(new Error('Remote compute timed out after four hours.'));
-    }, REMOTE_EXECUTION_TIMEOUT_MS);
   }
 
   private acceptRemoteExecutionEvent(
@@ -6258,7 +6253,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       ...(executionOwner.cellId ? { cellId: executionOwner.cellId } : {}),
     });
     this.sendExecutionAccepted(sourceId, requestId);
-    let timeout: NodeJS.Timeout | undefined;
     let result: JupyterExecutionResult;
     try {
       this.recordExecutionDiagnostic('execution-started', requestId, sourceId, 'execution-started', {
@@ -6319,13 +6313,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         },
         materializeWorkspace,
       );
-      const timedOut = new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => {
-          void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
-          reject(new Error('Remote execution timed out after four hours.'));
-        }, REMOTE_EXECUTION_TIMEOUT_MS);
-      });
-      result = await Promise.race([execution, timedOut]);
+      result = await execution;
     } catch (error) {
       result = {
         requestId,
@@ -6333,7 +6321,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         content: { status: 'error', ename: 'KernelError', evalue: formatError(error) },
       };
     } finally {
-      if (timeout) clearTimeout(timeout);
       if (executionOwner.replayTimer) clearTimeout(executionOwner.replayTimer);
       this.executionOwners.delete(requestId);
     }
@@ -6607,17 +6594,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.notebookActiveExecutions.set(notebookKey, (this.notebookActiveExecutions.get(notebookKey) ?? 0) + 1);
     this.setKernelStatus(notebookKey, 'Busy');
     this.transition('executing', `Executing ${notebookKey} locally.`);
-    let executionTimeout: NodeJS.Timeout | undefined;
     try {
-      const timedOut = new Promise<never>((_resolve, reject) => {
-        executionTimeout = setTimeout(() => {
-          void kernel.interrupt().catch(() => undefined);
-          reject(new Error('Pair kernel execution timed out after ten minutes and was interrupted.'));
-        }, KERNEL_EXECUTION_TIMEOUT_MS);
-      });
       return await Promise.race([
         kernel.execute(requestId, code),
-        timedOut,
         this.terminalCancellation(),
       ]);
     } catch (error) {
@@ -6626,7 +6605,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       throw error;
     } finally {
-      if (executionTimeout) clearTimeout(executionTimeout);
       kernel.off('event', listener);
       if (this.executionOwners.get(requestId)?.peerId === this.descriptor.localPeer.peerId) this.executionOwners.delete(requestId);
       this.activeExecutions = Math.max(0, this.activeExecutions - 1);

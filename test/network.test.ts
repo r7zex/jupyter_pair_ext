@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'mocha';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import NodeWebSocket, { WebSocketServer as NodeWebSocketServer } from 'ws';
 
 import {
@@ -248,6 +249,7 @@ describe('proxy resolution', () => {
     assert.equal(parseProxyUrl('socks5://proxy.local:1080')?.kind, 'socks5');
     assert.equal(parseProxyUrl('socks5h://proxy.local:1080')?.kind, 'socks5h');
     assert.equal(parseProxyUrl('socks4://proxy.local:1080')?.kind, 'socks4');
+    assert.equal(parseProxyUrl('socks4a://proxy.local:1080')?.kind, 'socks4a');
     const auth = parseProxyUrl('http://user:p%40ss@proxy.local:3128');
     assert.equal(auth?.username, 'user');
     assert.equal(auth?.password, 'p@ss');
@@ -259,6 +261,48 @@ describe('proxy resolution', () => {
     assert.equal(parseProxyUrl('http://proxy.local')?.port, 80);
     assert.equal(parseProxyUrl('https://proxy.local')?.port, 443);
     assert.equal(parseProxyUrl('socks5://proxy.local')?.port, 1080);
+  });
+
+  it('uses bare IPv6 socket addresses and honours IPv6 bypass entries', () => {
+    assert.equal(parseProxyUrl('http://[::1]:3128')?.host, '::1');
+    assert.equal(isHostExcluded('[::1]', '[::1]:443', '443'), true);
+    assert.equal(isHostExcluded('::1', '::1', '443'), true);
+    assert.equal(isHostExcluded('[::1]', '[::1]:80', '443'), false);
+    assert.equal(resolveProxy('wss://[::1]', {
+      explicitProxy: 'http://proxy.local:3128', env: { NO_PROXY: '[::1]' },
+    }), undefined);
+    const proxy = createProxyAgent('wss://relay.example', {
+      explicitProxy: 'http://[::1]:3128', env: {},
+    });
+    assert.ok(proxy?.agent instanceof HttpsProxyAgent);
+    assert.equal(proxy.agent.proxy.hostname, '[::1]');
+    assert.equal(describeProxy(proxy.proxy), 'HTTP CONNECT [::1]:3128');
+  });
+
+  it('preserves remote DNS for SOCKS4a on proxy-only networks', () => {
+    const localDns = createProxyAgent('wss://relay.example', {
+      explicitProxy: 'socks4://proxy.local:1080', env: {},
+    });
+    const remoteDns = createProxyAgent('wss://relay.example', {
+      explicitProxy: 'socks4a://proxy.local:1080', env: {},
+    });
+    assert.ok(localDns?.agent instanceof SocksProxyAgent);
+    assert.ok(remoteDns?.agent instanceof SocksProxyAgent);
+    assert.equal(localDns.agent.shouldLookup, true);
+    assert.equal(remoteDns.agent.shouldLookup, false);
+    assert.equal(remoteDns.proxy.kind, 'socks4a');
+  });
+
+  it('keeps stored IPv6 and SOCKS4a proxy credentials valid after transport corrections', () => {
+    for (const [explicitProxy, binding] of [
+      ['http://alice@[::1]:3128', JSON.stringify(['http', '[::1]', 3128, 'alice'])],
+      ['socks4a://alice@proxy.local:1080', JSON.stringify(['socks4', 'proxy.local', 1080, 'alice'])],
+    ]) {
+      assert.equal(inspectExplicitProxyUrl(explicitProxy!)?.binding, binding);
+      assert.equal(resolveProxy('wss://relay.example', {
+        explicitProxy: explicitProxy!, explicitProxyPassword: { binding: binding!, password: 'stored-secret' }, env: {},
+      })?.password, 'stored-secret');
+    }
   });
 
   it('redacts credentials from proxy URLs', () => {

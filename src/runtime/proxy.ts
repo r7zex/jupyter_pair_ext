@@ -21,7 +21,7 @@
 
 import { URL } from 'node:url';
 
-export type ProxyKind = 'http' | 'https' | 'socks5' | 'socks5h' | 'socks4';
+export type ProxyKind = 'http' | 'https' | 'socks5' | 'socks5h' | 'socks4' | 'socks4a';
 
 export interface ProxyDescriptor {
   kind: ProxyKind;
@@ -107,14 +107,16 @@ export function parseProxyUrl(rawUrl: string): ProxyDescriptor | undefined {
   if (scheme === 'http' || scheme === 'https') kind = scheme;
   else if (scheme === 'socks5') kind = 'socks5';
   else if (scheme === 'socks5h') kind = 'socks5h';
-  else if (scheme === 'socks4' || scheme === 'socks4a') kind = 'socks4';
+  else if (scheme === 'socks4' || scheme === 'socks4a') kind = scheme;
   if (!kind) return undefined;
   const port = url.port ? Number(url.port)
     : kind === 'http' ? 80
       : kind === 'https' ? 443
         : 1080;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) return undefined;
-  const host = url.hostname;
+  // URL retains brackets around IPv6 literals, while net.connect expects the
+  // bare address. Add the brackets back only when constructing a URL/display.
+  const host = url.hostname.replace(/^\[|\]$/g, '');
   if (!host) return undefined;
   let username: string | undefined;
   let password: string | undefined;
@@ -135,9 +137,12 @@ export function parseProxyUrl(rawUrl: string): ProxyDescriptor | undefined {
 
 /** Stable non-secret identity for one explicit proxy endpoint and username. */
 export function proxyCredentialBinding(proxy: ProxyDescriptor): string {
+  // Keep the stored v1 endpoint identity stable when correcting socket/DNS
+  // handling: IPv6 URLs had brackets and SOCKS4a used the SOCKS4 auth scheme.
+  const host = proxy.host.includes(':') && !proxy.host.startsWith('[') ? `[${proxy.host}]` : proxy.host;
   return JSON.stringify([
-    proxy.kind,
-    proxy.host.toLowerCase(),
+    proxy.kind === 'socks4a' ? 'socks4' : proxy.kind,
+    host.toLowerCase(),
     proxy.port,
     proxy.username ?? '',
   ]);
@@ -234,7 +239,7 @@ function hostMatchesPattern(host: string, port: string, pattern: string): boolea
 
 export function isHostExcluded(host: string, noProxy: string | undefined, port = ''): boolean {
   if (!noProxy) return false;
-  const normalizedHost = host.toLowerCase();
+  const normalizedHost = host.toLowerCase().replace(/^\[|\]$/g, '');
   return noProxy.split(/[,;]/).some((pattern) => hostMatchesPattern(normalizedHost, port, pattern));
 }
 
@@ -299,11 +304,14 @@ export function resolveProxy(
 export function describeProxy(proxy: ProxyDescriptor | undefined): string {
   if (!proxy) return 'Direct';
   const auth = proxy.username !== undefined || proxy.password !== undefined ? 'authenticated ' : '';
+  const host = proxy.host.includes(':') && !proxy.host.startsWith('[') ? `[${proxy.host}]` : proxy.host;
+  const endpoint = `${host}:${proxy.port}`;
   switch (proxy.kind) {
-    case 'socks5': return `${auth}SOCKS5 ${proxy.host}:${proxy.port}`;
-    case 'socks5h': return `${auth}SOCKS5 (remote DNS) ${proxy.host}:${proxy.port}`;
-    case 'socks4': return `${auth}SOCKS4 ${proxy.host}:${proxy.port}`;
-    case 'https': return `${auth}HTTPS CONNECT ${proxy.host}:${proxy.port}`;
-    default: return `${auth}HTTP CONNECT ${proxy.host}:${proxy.port}`;
+    case 'socks5': return `${auth}SOCKS5 ${endpoint}`;
+    case 'socks5h': return `${auth}SOCKS5 (remote DNS) ${endpoint}`;
+    case 'socks4': return `${auth}SOCKS4 ${endpoint}`;
+    case 'socks4a': return `${auth}SOCKS4a (remote DNS) ${endpoint}`;
+    case 'https': return `${auth}HTTPS CONNECT ${endpoint}`;
+    default: return `${auth}HTTP CONNECT ${endpoint}`;
   }
 }

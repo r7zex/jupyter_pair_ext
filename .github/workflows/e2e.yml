@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - main
+      - codex/vps-persistent-compute
   push:
     branches:
       - main
+      - codex/vps-persistent-compute
   workflow_dispatch:
 
 permissions:

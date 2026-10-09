@@ -8,6 +8,7 @@ import type { VpsRelayConnection } from '../runtime/vpsFrameRelay';
 import { classifyFile, decodeUtf8ProjectFile, MAX_TRACKED_PROJECT_ENTRIES, shouldTrackProjectPath } from '../core/projectFiles';
 import { VpsClient, VpsHttpError } from '../vps/client';
 import { PendingSubmissionStore } from '../vps/pendingSubmission';
+import { pythonNotebookProgram } from '../vps/notebookProgram';
 import { type JobSubmission, type VpsAgent, type VpsDevice,
   MAX_JOB_BYTES, MAX_JOB_FILES, normalizeVpsUrl, safeJobPath, terminalJob, validateSubmission, vpsSecretKey } from '../vps/protocol';
 
@@ -261,7 +262,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       const cells = scope === 'all' ? notebook.notebook.getCells() : [notebook.notebook.cellAt(notebook.selection.start)];
       const python = cells.filter((cell) => cell.kind === vscode.NotebookCellKind.Code && cell.document.languageId === 'python');
       if (!python.length) throw new Error('No Python code cells selected.');
-      const code = python.map((cell) => cell.document.getText()).join('\n\n');
+      const code = pythonNotebookProgram(python.map((cell) => cell.document.getText()));
       const directory = path.posix.dirname(entrypoint);
       const suffix = `.pair-job-${randomUUID()}.py`;
       let stem = '';

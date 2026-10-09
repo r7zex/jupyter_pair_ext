@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import builtins
 import importlib.util
 import math
 import pathlib
 import sys
 import unittest
+from unittest.mock import Mock, patch
 from queue import Empty
 
 
@@ -97,6 +99,43 @@ class CorrelationTests(unittest.TestCase):
             MODULE.decode_code("not-base64!")
         with self.assertRaises(ValueError):
             MODULE.decode_code("A" * ((MODULE.MAX_CODE_BYTES * 4 // 3) + 5))
+
+    def test_kernel_death_finishes_pending_execution_and_reports_fatal(self) -> None:
+        manager = Mock()
+        manager.is_alive.return_value = False
+        emitted: list[dict[str, object]] = []
+        MODULE.PENDING["jupyter-id"] = {"requestId": "training"}
+        MODULE.AUXILIARY["completion-id"] = ("completion", "completionResult")
+        MODULE.STOP.clear()
+        try:
+            with patch.object(MODULE.STOP, "wait", return_value=False), patch.object(MODULE, "emit", side_effect=emitted.append):
+                MODULE.monitor_kernel(manager)
+            self.assertTrue(MODULE.STOP.is_set())
+            self.assertFalse(MODULE.PENDING)
+            self.assertFalse(MODULE.AUXILIARY)
+            self.assertEqual(emitted[0]["type"], "complete")
+            self.assertEqual(emitted[0]["requestId"], "training")
+            self.assertEqual(emitted[0]["content"]["ename"], "KernelDied")
+            self.assertEqual(emitted[1]["type"], "fatal")
+        finally:
+            MODULE.STOP.clear()
+            MODULE.PENDING.clear()
+            MODULE.AUXILIARY.clear()
+
+    def test_missing_ipykernel_reports_install_command_without_startup_wait(self) -> None:
+        emitted: list[dict[str, object]] = []
+        original_import = builtins.__import__
+
+        def import_without_ipykernel(name: str, *args: object, **kwargs: object) -> object:
+            if name == "ipykernel":
+                raise ModuleNotFoundError("No module named 'ipykernel'")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=import_without_ipykernel), patch.object(MODULE, "emit", side_effect=emitted.append):
+            self.assertEqual(MODULE.main(), 2)
+        self.assertEqual(emitted[0]["type"], "fatal")
+        self.assertIn("jupyter_client and ipykernel", emitted[0]["message"])
+        self.assertIn("-m pip install jupyter_client ipykernel", emitted[0]["installCommand"])
 
 
 if __name__ == "__main__":

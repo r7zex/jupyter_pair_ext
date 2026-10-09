@@ -7,6 +7,18 @@ describe('selected proxy readiness', () => {
     await assertProxyReachable({ env: {} });
   });
 
+  it('probes an IPv6 proxy listener without resolving the bracketed URL hostname', async () => {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '::1', resolve);
+    });
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    try { await assertProxyReachable({ explicitProxy: `http://[::1]:${address.port}`, env: {} }); }
+    finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+  });
+
   it('probes the selected endpoint without sending credentials and sanitizes refusal', async () => {
     let bytes = 0;
     const server = createServer((socket) => socket.on('data', (chunk) => { bytes += chunk.length; }));

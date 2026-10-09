@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdir, rename, rm } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, rename, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { atomicWriteFile, publishTemporaryFile, syncFileContents, temporarySibling } from './atomicFile';
-import { hashFileContents, MAX_TRACKED_PROJECT_ENTRIES, scanDirectories, scanProject } from './projectFiles';
+import { hashFileContents, MAX_TRACKED_PROJECT_ENTRIES, scanDirectories, scanProject, shouldTrackProjectPath } from './projectFiles';
 import { portablePathComparisonKey, relativePathsNested, safeRelativePath } from './projectPath';
 
 export { safeRelativePath } from './projectPath';
@@ -291,9 +291,9 @@ export class StorageAdapter extends EventEmitter {
       if (isSameOrChild(pendingPath, canonical)) this.pending.delete(pendingPath);
     }
     await this.enqueue(async () => {
-      const targets = [rm(await safeProjectTarget(this.options.workingRoot, safePath, true), { recursive: true, force: true })];
+      const targets = [removeSharedProjectPath(this.options.workingRoot, safePath)];
       if (this.backingRoot) {
-        targets.push(rm(await safeProjectTarget(this.backingRoot, safePath, true), { recursive: true, force: true }));
+        targets.push(removeSharedProjectPath(this.backingRoot, safePath));
       }
       await Promise.all(targets);
       this.lastFlushAt = Date.now();
@@ -513,8 +513,20 @@ async function inspectMaterializedProjectTree(
   for (const [key, directory] of expectedDirectories) {
     if (!seenDirectories.has(key)) missing.push(`${directory}/`);
   }
+  const privateDirectories = new Set<string>();
+  // Pruning leaves containers of host-only files in place. They are not
+  // additional shared state and must not force a destructive folder rewrite.
+  for (const directory of [...existingDirectories].sort((left, right) => right.split('/').length - left.split('/').length)) {
+    const entries = await readdir(await safeProjectTarget(targetRoot, directory, true), { withFileTypes: true });
+    if (entries.length && entries.every((entry) => {
+      const child = path.join(directory, entry.name);
+      return !shouldTrackProjectPath(child) || (!entry.isFile() && !entry.isDirectory())
+        || (entry.isDirectory() && privateDirectories.has(filesystemRelativeKey(child)));
+    })) privateDirectories.add(filesystemRelativeKey(directory));
+  }
   for (const directory of existingDirectories) {
-    if (!expectedDirectories.has(filesystemRelativeKey(directory))) extra.push(`${directory}/`);
+    const key = filesystemRelativeKey(directory);
+    if (!expectedDirectories.has(key) && !privateDirectories.has(key)) extra.push(`${directory}/`);
   }
   missing.sort();
   different.sort();
@@ -571,7 +583,10 @@ async function materializeProjectTree(
     const directoryKey = filesystemRelativeKey(directory);
     if (desiredDirectories.has(directoryKey)) continue;
     if ([...desired.keys()].some((file) => file.startsWith(`${directoryKey}/`))) continue;
-    await rm(await safeProjectTarget(targetRoot, directory, true), { recursive: true, force: true });
+    // scanProject deliberately excludes credentials, VCS metadata and local
+    // environments. Recursively removing a filtered directory would delete
+    // those host-only descendants as a side effect of pruning shared files.
+    await removeEmptyDirectory(await safeProjectTarget(targetRoot, directory, true));
   }
   return new Set(desired.values());
 }
@@ -607,6 +622,36 @@ function validateMaterializationManifest(
 
 function isSameOrChild(value: string, parent: string): boolean {
   return value === parent || value.startsWith(`${parent}/`);
+}
+
+/** A synchronized deletion cannot remove host-only files hidden from peers. */
+async function removeSharedProjectPath(root: string, relativePath: string): Promise<void> {
+  const target = await safeProjectTarget(root, relativePath, true);
+  let info;
+  try {
+    info = await lstat(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!info.isDirectory()) {
+    await rm(target, { force: true });
+    return;
+  }
+  for (const entry of await readdir(target, { withFileTypes: true })) {
+    const child = path.join(relativePath, entry.name);
+    if (!shouldTrackProjectPath(child) || (!entry.isFile() && !entry.isDirectory())) continue;
+    await removeSharedProjectPath(root, child);
+  }
+  await removeEmptyDirectory(target);
+}
+
+async function removeEmptyDirectory(target: string): Promise<void> {
+  try {
+    await rmdir(target);
+  } catch (error) {
+    if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+  }
 }
 
 async function renameOrPending(source: string, target: string, pendingWriteWillCreateTarget: boolean): Promise<void> {

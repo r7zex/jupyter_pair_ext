@@ -1,0 +1,84 @@
+{
+  "version": "0.5.37",
+  "date": "2026-10-09",
+  "branch": "codex/vps-persistent-compute",
+  "baseline": "a95f9198fc91ff31496d22ede0ac9a1c7e762c03",
+  "verification": {
+    "compile": "passed",
+    "lint": "passed",
+    "typescript": {
+      "passed": 4700,
+      "failed": 0,
+      "skipped": 0,
+      "forbidPending": true
+    },
+    "pythonBridge": {
+      "passed": 9,
+      "failed": 0,
+      "skipped": 0
+    },
+    "pythonAgent": {
+      "passed": 90,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 34.174,
+      "resourceWarningsAsErrors": true
+    },
+    "postReviewStorageRetest": {
+      "passed": 136,
+      "failed": 0,
+      "addsToUniqueCount": false
+    },
+    "productionDependencyAudit": {
+      "vulnerabilities": 0,
+      "updatedIpAddress": "10.7.3"
+    },
+    "nativeAssets": {
+      "verifiedPlatforms": 7
+    }
+  },
+  "training": {
+    "models": [
+      "standard_library_linear_fit",
+      "cpu_pytorch"
+    ],
+    "execution": [
+      "host_jupyter",
+      "host_shared_terminal",
+      "detached_python_agent"
+    ],
+    "transport": [
+      "peer_mesh",
+      "loopback_vps_only"
+    ],
+    "checkpointReload": true,
+    "optimizerReloadForTorch": true,
+    "brokerOutageRecovery": true,
+    "torchVersion": "2.14.1+cpu",
+    "jupyterClientVersion": "8.10.0",
+    "ipykernelVersion": "7.4.0"
+  },
+  "terminal": {
+    "executionAccount": "current_host_extension_process_account",
+    "guestView": true,
+    "guestCommandInput": false,
+    "remoteShellInputRejected": true,
+    "notebookPythonIsTrustedCode": true
+  },
+  "externalVps": {
+    "status": "blocked_by_cloud_network_policy",
+    "sshAuthenticated": false,
+    "tcpAllowlistEmpty": true,
+    "tcpProxy": "connection_refused",
+    "httpProxyConnect": "403 Forbidden",
+    "credentialsStoredInProject": false
+  },
+  "limits": [
+    "No physical GPU training",
+    "No local native VS Code; branch CI configured",
+    "No native Windows process containment execution",
+    "No physical internet peer topology acceptance",
+    "Detached agents require owner-provisioned binary data; text snapshot limited to 4 MiB and 256 files",
+    "No elapsed-hours soak; previous deadlines tested with accelerated timers"
+  ]
+}

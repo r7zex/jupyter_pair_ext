@@ -20,6 +20,7 @@ These documents preserve version-specific evidence and incident context. Their v
 - [0.5.34 host training input recovery verification](HOST_TRAINING_AUDIT_0.5.34_2026-10-09.md)
 - [0.5.35 shared-terminal training environment verification](HOST_TRAINING_AUDIT_0.5.35_2026-10-09.md)
 - [0.5.36 critical training lifecycle verification](HOST_TRAINING_AUDIT_0.5.36_2026-10-09.md)
+- [0.5.37 host repository, training and VPS critical audit](HOST_TRAINING_AUDIT_0.5.37_2026-10-09.md)
 - [Changelog](../CHANGELOG.md)
 
 The exact two-computer Flowseal/zapret-to-Karing acceptance scenario remains recorded as **NOT RUN**. Deterministic and public-network checks must not be represented as that physical acceptance test.

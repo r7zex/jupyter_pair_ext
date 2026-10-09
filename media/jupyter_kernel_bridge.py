@@ -22,6 +22,7 @@ from typing import Any
 
 WRITE_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
+KERNEL_LIFECYCLE_LOCK = threading.Lock()
 STOP = threading.Event()
 PAUSE_CHANNELS = threading.Event()
 PENDING: dict[str, dict[str, Any]] = {}
@@ -351,14 +352,34 @@ def stdin_loop(client: Any) -> None:
                   "content": serializable(message.get("content", {}))})
 
 
-def fail_pending(reason: str) -> None:
+def fail_pending(reason: str, error_name: str = "KernelRestarted") -> None:
     with STATE_LOCK:
         pending = list(PENDING.values())
         PENDING.clear()
         AUXILIARY.clear()
     for item in pending:
         emit({"type": "complete", "requestId": item["requestId"], "success": False,
-              "content": {"status": "abort", "ename": "KernelRestarted", "evalue": reason}})
+              "content": {"status": "abort", "ename": error_name, "evalue": reason}})
+
+
+def monitor_kernel(manager: Any) -> None:
+    """A crashed kernel cannot publish the reply/idle messages needed to finish a cell."""
+    while not STOP.wait(0.5):
+        with KERNEL_LIFECYCLE_LOCK:
+            if STOP.is_set():
+                return
+            try:
+                alive = manager.is_alive()
+            except Exception as exc:
+                reason = f"Could not check Jupyter kernel health: {exc}"
+            else:
+                if alive:
+                    continue
+                reason = "Jupyter kernel exited unexpectedly. Restart the kernel to continue."
+            fail_pending(reason, "KernelDied")
+            STOP.set()
+            emit({"type": "fatal", "message": reason})
+            return
 
 
 def wait_for_parent_message(
@@ -396,6 +417,9 @@ def wait_for_parent_message(
 
 def main() -> int:
     try:
+        # Check both in the selected environment before waiting for a kernel
+        # subprocess that cannot start without ipykernel.
+        import ipykernel
         from jupyter_client import KernelManager
     except BaseException:
         emit({
@@ -431,6 +455,7 @@ def main() -> int:
     threading.Thread(target=iopub_loop, args=(client, manager), daemon=True).start()
     for target in (shell_loop, stdin_loop):
         threading.Thread(target=target, args=(client,), daemon=True).start()
+    threading.Thread(target=monitor_kernel, args=(manager,), daemon=True).start()
 
     command: dict[str, Any] = {}
     try:
@@ -484,16 +509,17 @@ def main() -> int:
                         schedule_interrupt(manager, jupyter_id)
                     emit({"type": "commandResult", "command": "interrupt", "requestId": request_id})
                 elif kind == "restart":
-                    fail_pending("Kernel restarted")
-                    PAUSE_CHANNELS.set()
-                    try:
-                        time.sleep(0.25)
-                        manager.restart_kernel(now=True)
-                        client.wait_for_ready(timeout=30)
-                        info_id = client.kernel_info()
-                        wait_for_parent_message(client.get_shell_msg, info_id, 10, "kernel_info_reply")
-                    finally:
-                        PAUSE_CHANNELS.clear()
+                    with KERNEL_LIFECYCLE_LOCK:
+                        fail_pending("Kernel restarted")
+                        PAUSE_CHANNELS.set()
+                        try:
+                            time.sleep(0.25)
+                            manager.restart_kernel(now=True)
+                            client.wait_for_ready(timeout=30)
+                            info_id = client.kernel_info()
+                            wait_for_parent_message(client.get_shell_msg, info_id, 10, "kernel_info_reply")
+                        finally:
+                            PAUSE_CHANNELS.clear()
                     emit({"type": "commandResult", "command": "restart", "requestId": request_id})
                 elif kind == "complete":
                     with STATE_LOCK:

@@ -354,6 +354,14 @@ export class JupyterKernel extends EventEmitter {
             content: event.content ?? {},
           });
         }
+      } else if (event.type === 'commandError') {
+        // Rejected execute commands never produce an execute_reply/idle pair.
+        // Settle their callers here instead of leaving a cell permanently busy.
+        const pending = this.pending.get(event.requestId);
+        if (pending) {
+          this.pending.delete(event.requestId);
+          pending.reject(new Error(event.message ?? 'Jupyter execution command failed.'));
+        }
       }
     }
     this.emit('event', event);
