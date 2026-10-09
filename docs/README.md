@@ -15,6 +15,7 @@ These documents preserve version-specific evidence and incident context. Their v
 - [0.5.4 network reliability release record](network-reliability-handoff.md)
 - [0.5.4 execution and host-transfer repair record](execution-host-transfer-repair-plan.md)
 - [0.5.31 host training and terminal verification](HOST_TRAINING_AUDIT_2026-10-08.md)
+- [0.5.32 repository preparation and kernel concurrency verification](HOST_TRAINING_AUDIT_2026-10-09.md)
 - [Changelog](../CHANGELOG.md)
 
 The exact two-computer Flowseal/zapret-to-Karing acceptance scenario remains recorded as **NOT RUN**. Deterministic and public-network checks must not be represented as that physical acceptance test.

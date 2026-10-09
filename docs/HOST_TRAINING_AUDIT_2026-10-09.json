@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-09T04:04:59.581969+00:00",
+  "version": "0.5.32",
+  "branch": "codex/vps-persistent-compute",
+  "baseline_commit": "fdd982f4f46ac2e174166f8b89439ba8974b41f5",
+  "environment": "managed cloud Linux, Node 24.19.0, real loopback VPS and Python processes",
+  "checks": {
+    "typescript_compile": "passed",
+    "eslint": "passed",
+    "full_typescript_suite": {
+      "passed": 4647,
+      "failed": 0,
+      "skipped": 0
+    },
+    "new_repository_and_lifecycle_regressions": {
+      "passed": 7,
+      "baseline_failures_reproduced": 4
+    },
+    "python_agent_audit": {
+      "passed": 79,
+      "failed": 0,
+      "resource_warnings_as_errors": true
+    },
+    "host_repository_model_training": "passed through guest requests and real Jupyter",
+    "vps_only_host_model_training": "passed with direct discovery disabled and broker stopped during execution",
+    "repository_snapshot_agent_training": "passed with nested imports, JSON, CSV, dirty module, editor shutdown and broker outage",
+    "model_assertions": {
+      "gradient_descent_steps": 400,
+      "maximum_mse": 1e-10,
+      "maximum_prediction_error": 0.0001,
+      "checkpoint_reloaded": true
+    },
+    "shared_terminal": "passed: host OS shell, guest view-only, forged-input rejection, snapshot recovery and repository preparation exclusion",
+    "concurrent_notebook_requests": "passed: one real Jupyter kernel and shared Python variables",
+    "host_transfer_during_preparation": "passed between two running SessionRuntime participants; no late kernel on former host",
+    "native_vscode_e2e": {
+      "status": "unavailable",
+      "reason": "No native VS Code executable in the cloud environment"
+    },
+    "physical_gpu_training": "not run",
+    "windows_process_lifetime": "not run",
+    "external_vps": "not run; user selected local-broker acceptance"
+  },
+  "distribution": {
+    "vsix": "pair-notebook-0.5.32.vsix",
+    "validation_tool": "scripts/make-artifacts.mjs"
+  }
+}

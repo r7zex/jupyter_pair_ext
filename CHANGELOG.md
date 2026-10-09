@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.32 - 2026-10-09 (repository and kernel launch races)
+
+- Protects the host repository throughout notebook execution preparation and terminal file preparation, including replacement of the same folder. Rejects overlapping folder changes, execution, host transfer and session finalization during replacement; failures release the guard for a retry.
+- Rechecks session, host and compute-target authority after asynchronous preparation, preventing late kernel launches after shutdown or host transfer.
+- Reuses the notebook kernel installed by a concurrent request instead of starting a second Python process with separate variables.
+- Adds regression checks for preparation, replacement rollback, lifecycle cancellation and concurrent real Jupyter execution. Revalidates host-file model training and local VPS outage recovery.
+
 ## 0.5.31 - 2026-10-08 (VPS compute, host repository execution and shared terminal)
 
 - Adds a shared host command terminal in the sidebar and Command Palette. Every authenticated participant can view it; only the current host can type or interrupt commands. Output is bounded and recovered after route replacement, and old host shells stop on transfer or session shutdown.

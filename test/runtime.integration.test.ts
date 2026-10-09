@@ -68,6 +68,160 @@ afterEach(() => {
 });
 
 describe('production SessionRuntime integration', () => {
+  it('blocks execution and another folder change while the host repository is being replaced', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-repository-switch-'));
+    const working = path.join(root, 'working');
+    await mkdir(working);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'repository-switch', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'repository-switch-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let release!: () => void;
+    try {
+      await runtime.start();
+      const materialize = runtime.materializeBackingFolder.bind(runtime);
+      let blockOnce = true;
+      runtime.materializeBackingFolder = async () => {
+        if (blockOnce) { blockOnce = false; await new Promise<void>((resolve) => { release = resolve; }); }
+        await materialize();
+      };
+      const changing = runtime.setBackingFolder(path.join(root, 'replacement'));
+      await waitFor(() => Boolean(release), 1000, 'repository materialization begins');
+      runtime.prepareWorkingCopy = async () => { throw new Error('Execution reached repository preparation during replacement'); };
+      const checks = Promise.allSettled([
+        assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /repository.*changing/i),
+        assert.rejects(runtime.sharedTerminal().execute('echo forbidden'), /active session host/),
+        assert.rejects(runtime.setBackingFolder(path.join(root, 'second')), /repository.*changing/i),
+        assert.rejects(runtime.transferHost('guest'), /repository.*changing/i),
+        assert.rejects(runtime.endSession(), /repository.*changing/i),
+      ]);
+      release();
+      await changing;
+      for (const check of await checks) if (check.status === 'rejected') throw check.reason;
+      assert.equal(runtime.descriptor.backingFolder, path.join(root, 'replacement'));
+      runtime.prepareWorkingCopy = undefined;
+      await runtime.sharedTerminal().execute('echo repository-ready');
+      await waitFor(() => runtime.sharedTerminal().view().text.includes('repository-ready'), 1000, 'terminal available after replacement');
+    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const kind of ['notebook', 'terminal']) it(`protects the host repository throughout ${kind} preparation and releases the guard on failure`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-execution-preparation-'));
+    const working = path.join(root, 'working');
+    await mkdir(working);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'execution-preparation', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'execution-preparation-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let release!: () => void;
+    try {
+      await runtime.start();
+      const original = runtime.descriptor.backingFolder;
+      runtime.prepareWorkingCopy = async () => { await new Promise<void>((resolve) => { release = resolve; }); throw new Error('Preparation failed'); };
+      const execution = assert.rejects(kind === 'notebook'
+        ? runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined)
+        : runtime.sharedTerminal().execute('echo never'), /Preparation failed/);
+      await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
+      try {
+        await assert.rejects(runtime.setBackingFolder(path.join(root, 'replacement')), /Finish or stop.*execution/i);
+        await assert.rejects(runtime.setBackingFolder(original), /Finish or stop.*execution/i);
+      }
+      finally { release(); await execution; }
+      assert.equal(runtime.descriptor.backingFolder, original);
+      runtime.prepareWorkingCopy = undefined;
+      await runtime.setBackingFolder(path.join(root, 'replacement'));
+      assert.equal(runtime.descriptor.backingFolder, path.join(root, 'replacement'));
+    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('restores the previous repository and permits a retry after replacement fails', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-repository-rollback-'));
+    const working = path.join(root, 'working'); await mkdir(working);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'repository-rollback', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'repository-rollback-token-that-is-long-enough', context(path.resolve('.')), logger());
+    try {
+      await runtime.start();
+      const original = runtime.descriptor.backingFolder;
+      const materialize = runtime.materializeBackingFolder.bind(runtime);
+      runtime.materializeBackingFolder = async () => { throw new Error('Disk unavailable'); };
+      await assert.rejects(runtime.setBackingFolder(path.join(root, 'replacement')), /Disk unavailable/);
+      assert.equal(runtime.descriptor.backingFolder, original);
+      runtime.materializeBackingFolder = materialize;
+      await runtime.setBackingFolder(path.join(root, 'replacement'));
+      assert.equal(runtime.descriptor.backingFolder, path.join(root, 'replacement'));
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('does not create a kernel after the session closes during execution preparation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-preparation-close-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'preparation-close', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: root, pythonPath: 'python3' }),
+    'preparation-close-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let release!: () => void;
+    runtime.prepareWorkingCopy = () => new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), SessionClosedError);
+      await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
+      await runtime.leave(); release(); await execution;
+      assert.equal(runtime.kernels.size, 0, 'shutdown must not leave a new orphan kernel');
+      await assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), SessionClosedError);
+    } finally { release?.(); for (const kernel of runtime.kernels.values()) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('does not create a kernel after host authority changes during execution preparation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-preparation-transfer-'));
+    const working = path.join(root, 'host'); const peerFolder = path.join(root, 'guest');
+    await Promise.all([mkdir(working), mkdir(peerFolder)]);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'preparation-transfer', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'preparation-transfer-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let guest: any;
+    let release!: () => void;
+    try {
+      await runtime.start();
+      guest = new SessionRuntime(descriptor({ sessionId: 'preparation-transfer', role: 'peer', peerId: 'guest',
+        hostPeerId: 'host', workingFolder: peerFolder, pythonPath: 'python3', knownPeers: [{ ...runtime.descriptor.localPeer }] }),
+      'preparation-transfer-token-that-is-long-enough', context(path.resolve('.')), logger());
+      await guest.start();
+      runtime.prepareHostRepositoryBinaries = () => new Promise<void>((resolve) => { release = resolve; });
+      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /paused|Host.*changed/);
+      await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
+      await runtime.transferHost('guest');
+      assert.equal(runtime.descriptor.role, 'peer');
+      await waitFor(() => guest.descriptor.role === 'host', 1000, 'host transfer finalization arrives');
+      assert.equal(guest.descriptor.role, 'host');
+      release(); await execution;
+      assert.equal(runtime.kernels.size, 0);
+      assert.equal(runtime.descriptor.backingFolder, '');
+    } finally { release?.(); await Promise.allSettled([runtime.leave(), guest?.leave()]); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('shares one real kernel when two notebook executions finish preparation together', async function () {
+    this.timeout(20_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-concurrent-kernel-'));
+    const working = path.join(root, 'working'); await Promise.all([mkdir(working), mkdir(`${working}-backing`)]);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'concurrent-kernel', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'concurrent-kernel-token-that-is-long-enough', context(path.resolve('.')), logger());
+    const releases: Array<() => void> = [];
+    const created = new Set<any>();
+    const counts: number[] = [];
+    runtime.prepareHostRepositoryBinaries = () => new Promise<void>((resolve) => releases.push(resolve));
+    runtime.on('kernel', () => { for (const kernel of runtime.kernels.values()) created.add(kernel); });
+    try {
+      await runtime.start();
+      const runs = [1, 2].map(() => runtime.executeCell('work.ipynb', 'a', "runs = globals().get('runs', 0) + 1; print(runs)", (event: any) => {
+        if (event.messageType === 'stream' && /^\s*\d+\s*$/.test(event.content.text)) counts.push(Number(event.content.text));
+      }));
+      await waitFor(() => releases.length === 2, 1000, 'both kernel preparations reach the filesystem barrier');
+      releases.forEach((release) => release());
+      const results = await Promise.all(runs);
+      assert.ok(results.every((result) => result.success));
+      assert.equal(created.size, 1, 'simultaneous preparation must not launch separate kernels');
+      assert.deepEqual(counts.sort(), [1, 2], 'both requests must use the same Python variables');
+    } finally { releases.forEach((release) => release()); for (const kernel of created) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
   for (const vpsOnly of [false, true]) it(`trains a real model from host repository files and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
     this.timeout(45_000);
     if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();

@@ -664,6 +664,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly kernelStatuses = new Map<string, 'Idle' | 'Busy' | 'Offline'>();
   private readonly notebookActiveExecutions = new Map<string, number>();
   private activeExecutions = 0;
+  private repositoryOperations = 0;
+  private changingBackingFolder = false;
   private computeEpoch = 0;
   private closed = false;
   private closeReason: SessionCloseReason = 'explicit-leave';
@@ -1150,6 +1152,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public async transferHost(targetPeerId: string): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can transfer the host role.');
     if (this.endingSession) throw new Error('The session is already being ended.');
+    if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait before transferring the host role.');
     const target = this.transport.peerRuntime().find((peer) => peer.peerId === targetPeerId && peer.online);
     if (!target) throw new Error('The selected participant is offline.');
     const next: HostClock = {
@@ -1262,9 +1265,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.hostTerminal) this.hostTerminal = new SharedTerminal({
       isHost: () => this.coordinator.isCurrentHost(),
       hostId: () => this.coordinator.clock.hostId,
-      available: () => !this.closed && !this.waitingForHostFolder && !this.endingSession,
+      available: () => !this.closed && !this.waitingForHostFolder && !this.endingSession && !this.changingBackingFolder,
       directory: () => this.descriptor.backingFolder || this.descriptor.workingFolder,
-      prepare: async () => { await this.prepareWorkingCopy?.(); await this.flush(); await this.prepareHostRepositoryBinaries(); },
+      prepare: async () => {
+        this.assertExecutionAvailable();
+        this.repositoryOperations++;
+        try { await this.prepareWorkingCopy?.(); await this.flush(); await this.prepareHostRepositoryBinaries(); }
+        finally { this.repositoryOperations--; }
+      },
       send: (peer, type, meta, payload) => {
         if (this.closed) return;
         const framed = { ...meta, clock: this.coordinator.clock };
@@ -1300,9 +1308,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     onRequestId?: (requestId: string) => void,
   ): Promise<JupyterExecutionResult> {
-    if (this.waitingForHostFolder) {
-      throw new Error('The session is paused until the new host chooses a folder.');
-    }
+    this.assertExecutionAvailable();
     const requestId = newId();
     onRequestId?.(requestId);
     const target = this.computeForNotebook(notebookKey);
@@ -2130,6 +2136,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.coordinator.isCurrentHost()) {
       throw new Error('Only the current Session Host can end the session for everyone.');
     }
+    if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait before ending the session.');
     this.endingSession = true;
     try {
       await this.awaitSessionEndFence();
@@ -6483,6 +6490,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onEvent: (event: JupyterKernelEvent) => void,
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
+    const clock = this.coordinator.clock;
+    const assertAuthority = () => {
+      this.assertExecutionAvailable();
+      if (!this.coordinator.isCurrentHost() || !sameClock(clock, this.coordinator.clock)
+        || target.executorId !== this.descriptor.localPeer.peerId
+        || !sameComputeTarget(target, this.computeForNotebook(notebookKey))) {
+        throw new Error('The Session Host or notebook compute target changed before execution could start.');
+      }
+    };
+    assertAuthority();
+    this.repositoryOperations++;
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
     this.project.on('documentRenamed', onRename);
     try {
@@ -6490,11 +6508,19 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // private/unshared datasets and local project resources stay available.
     if (materializeWorkspace) {
       await this.prepareWorkingCopy?.();
+      assertAuthority();
       await this.flush();
     }
+    assertAuthority();
     let kernel = this.kernels.get(notebookKey);
     if (!kernel) {
       await this.prepareHostRepositoryBinaries();
+      assertAuthority();
+      // Another request can install the same notebook's kernel while the
+      // repository barrier is awaiting I/O. Reuse it instead of leaking a process.
+      kernel = this.kernels.get(notebookKey);
+    }
+    if (!kernel) {
       if (this.kernels.size >= MAX_LIVE_KERNELS) {
         const idleCandidate = [...this.kernels.keys()]
           .filter((key) => (this.notebookActiveExecutions.get(key) ?? 0) === 0)
@@ -6575,7 +6601,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           : `Execution finished for ${notebookKey}.`);
       }
     }
-    } finally { this.project.off('documentRenamed', onRename); }
+    } finally { this.project.off('documentRenamed', onRename); this.repositoryOperations--; }
+  }
+
+  private assertExecutionAvailable(): void {
+    if (this.closed) throw this.sessionClosedError();
+    if (this.endingSession) throw new Error('The host is finalizing the session.');
+    if (this.waitingForHostFolder) throw new Error('The session is paused until the new host chooses a folder.');
+    if (this.changingBackingFolder) throw new Error('The host repository is changing. Try again after the folder is ready.');
   }
 
   private setKernelStatus(notebookKey: string, status: 'Idle' | 'Busy' | 'Offline'): void {
@@ -6636,26 +6669,36 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async setBackingFolder(folder: string, mode: BackingFolderMode = 'replace'): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the shared backing folder.');
-    const resolved = await this.validateBackingFolder(folder);
-    if (!this.storage) throw new Error('Session storage is not ready.');
+    if (this.closed) throw this.sessionClosedError();
+    if (this.endingSession) throw new Error('The host is finalizing the session.');
+    if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait for the current folder change to finish.');
+    if (this.repositoryOperations > 0 || this.activeExecutions > 0) throw new Error('Finish or stop notebook execution and terminal preparation before changing the host repository.');
+    const storage = this.storage;
+    const clock = this.coordinator.clock;
     const previous = this.descriptor.backingFolder;
-    if (previous !== resolved && this.activeExecutions > 0) throw new Error('Finish or stop notebook execution before changing the host repository.');
-    if (mode === 'reuse-existing') {
-      const snapshot = await this.collectMaterialization();
-      const inspection = await this.storage.bindExistingBacking(
-        resolved,
-        snapshot.documents,
-        snapshot.binaries,
-        snapshot.directories,
-      );
-      if (!inspection.matches) throw new BackingFolderMismatchError(inspection);
-    } else {
-      this.storage.setBackingRoot(resolved);
-    }
-    this.descriptor.backingFolder = resolved;
+    const ownsFolder = () => !this.closed && this.coordinator.isCurrentHost() && sameClock(clock, this.coordinator.clock);
+    const assertAuthority = () => {
+      if (!ownsFolder() || this.endingSession) throw new Error('The Session Host changed or closed while choosing its repository.');
+    };
+    this.changingBackingFolder = true;
     try {
+      const resolved = await this.validateBackingFolder(folder);
+      assertAuthority();
+      if (!storage) throw new Error('Session storage is not ready.');
+      if (mode === 'reuse-existing') {
+        const snapshot = await this.collectMaterialization();
+        assertAuthority();
+        const inspection = await storage.bindExistingBacking(resolved, snapshot.documents, snapshot.binaries, snapshot.directories);
+        assertAuthority();
+        if (!inspection.matches) throw new BackingFolderMismatchError(inspection);
+      } else {
+        storage.setBackingRoot(resolved);
+      }
+      this.descriptor.backingFolder = resolved;
       if (mode === 'replace') await this.materializeBackingFolder();
+      assertAuthority();
       await this.persistDescriptor();
+      assertAuthority();
       if (previous !== resolved) {
         for (const [key, kernel] of this.kernels) { kernel.stop(); this.setKernelStatus(key, 'Offline'); }
         this.kernels.clear();
@@ -6663,11 +6706,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.hostTerminal?.reset();
       }
       await this.onHostStorageReady(this.descriptor.localPeer.peerId);
+      assertAuthority();
       this.transport.broadcast('hostStorageReady', { clock: this.coordinator.clock });
     } catch (error) {
-      this.descriptor.backingFolder = previous;
-      this.storage.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
+      if (ownsFolder()) {
+        this.descriptor.backingFolder = previous;
+        storage?.setBackingRoot(previous && !this.waitingForHostFolder ? previous : undefined);
+      } else {
+        storage?.setBackingRoot(undefined);
+      }
       throw error;
+    } finally {
+      this.changingBackingFolder = false;
     }
   }
 

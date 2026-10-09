@@ -18,7 +18,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 
 ## Install
 
-Version **0.5.31** is available from the `codex/vps-persistent-compute` branch. Build its VSIX with `npm ci` and `npm run package`, then install `pair-notebook-0.5.31.vsix` on every participant's computer. Branch pushes do not publish a GitHub Release automatically; the latest published release can have an earlier version.
+Version **0.5.32** is available from the `codex/vps-persistent-compute` branch. Build its VSIX with `npm ci` and `npm run package`, then install `pair-notebook-0.5.32.vsix` on every participant's computer. Branch pushes do not publish a GitHub Release automatically; the latest published release can have an earlier version.
 
 Open the [latest GitHub Release](https://github.com/r7zex/jupyter_pair_ext/releases/latest), download its single `pair-notebook-<version>.vsix` file, and install it on **both computers** from **Extensions: Install from VSIX...**, or run:
 
@@ -145,7 +145,9 @@ Editing state remains in the CRDT during the short folder-selection pause, so an
 
 Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. The Jupyter kernel runs from the host backing repository, so relative paths and `PAIR_NOTEBOOK_WORKSPACE` can read the host's own datasets, including files omitted from guest snapshots. Activating a shared notebook selects the Pair Jupyter controller without restarting its kernel; Pair Run also selects the controller explicitly. Stop cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
 
-The shared terminal uses the host's operating-system account and starts in that same repository. It keeps shell variables and `cd` changes between commands. Guest terminals are view only, and incoming remote shell-input frames are rejected. This command terminal supports line commands and streamed output; full-screen TTY tools and interactive password prompts require the host's ordinary local terminal. Closing its tab preserves the shell until the session ends; Ctrl+C stops the shell and its child commands, and the next command starts a fresh shell. All participants must install 0.5.31 to use the shared terminal.
+The shared terminal uses the host's operating-system account and starts in that same repository. It keeps shell variables and `cd` changes between commands. Guest terminals are view only, and incoming remote shell-input frames are rejected. This command terminal supports line commands and streamed output; full-screen TTY tools and interactive password prompts require the host's ordinary local terminal. Closing its tab preserves the shell until the session ends; Ctrl+C stops the shell and its child commands, and the next command starts a fresh shell. Install 0.5.32 on every participant's computer for the shared terminal and current repository/launch fixes.
+
+Choose a different host repository after notebook execution and terminal file preparation finish. While a folder change is in progress, new execution, another folder change, host transfer and session finalization are rejected with a retry message. A failed change restores the previous repository and permits another attempt. Simultaneous requests for the same notebook share one kernel; shutdown or host transfer during preparation prevents that request from launching a new kernel.
 
 The terminal input restriction is specific to the terminal. Trusted collaborators can still execute notebook Python on the host, including operating-system calls, as described below.
 
