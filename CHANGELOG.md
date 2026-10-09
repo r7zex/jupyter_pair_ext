@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.34 - 2026-10-09 (training input recovery)
+
+- Restores missing canonical modules, configuration and notebooks before host terminal commands and notebook execution. Restores missing binary dependencies before every cell, including cells in an already running kernel.
+- Retains existing host files, private datasets, generated checkpoints and Python variables during recovery. Uses atomic, hash-verified binary publication; failed preparation rejects execution and permits a retry.
+- Adds real Jupyter and shell recovery regressions and revalidates the complete CPU model-training pipelines through the peer mesh, local VPS relay and detached owner agent.
+
 ## 0.5.33 - 2026-10-09 (terminal recovery and PyTorch acceptance)
 
 - Orders shared-terminal generations so a delayed snapshot cannot restore the previous repository's output, including when new output arrives before its snapshot. Retains receive compatibility with older hosts until ordered metadata is observed.

@@ -1270,7 +1270,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       prepare: async () => {
         this.assertExecutionAvailable();
         this.repositoryOperations++;
-        try { await this.prepareWorkingCopy?.(); await this.flush(); await this.prepareHostRepositoryBinaries(); }
+        try { await this.prepareWorkingCopy?.(); await this.flush(); await this.prepareHostRepositoryFiles(); }
         finally { this.repositoryOperations--; }
       },
       send: (peer, type, meta, payload) => {
@@ -1283,22 +1283,30 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     return this.hostTerminal;
   }
 
-  private async prepareHostRepositoryBinaries(): Promise<void> {
+  private async prepareHostRepositoryFiles(): Promise<void> {
     const root = this.descriptor.backingFolder;
     if (!this.coordinator.isCurrentHost() || !root || !this.storage) return;
-    for (const [key, version] of this.binaryVersions) {
+    let restoreDocuments = false;
+    for (const key of [...this.project.keys(), ...this.binaryVersions.keys()]) {
       if (this.effectiveFileState(key)?.deleted) continue;
       try {
         const target = await safeProjectTarget(root, key, true);
         const info = await stat(target);
-        if (!info.isFile()) throw new Error(`Host binary dependency is not a file: ${key}`);
+        if (!info.isFile()) throw new Error(`Host project dependency is not a file: ${key}`);
       }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        // Stream missing canonical assets without removing host-only resources.
-        await this.storage.mirrorBinaryToBacking(key, version.hash);
+        // Restore missing canonical inputs without replacing host edits or
+        // removing private datasets and generated checkpoints.
+        const version = this.binaryVersions.get(key);
+        if (version) await this.storage.mirrorBinaryToBacking(key, version.hash);
+        else if (this.project.has(key)) {
+          this.storage.schedule(key);
+          restoreDocuments = true;
+        }
       }
     }
+    if (restoreDocuments) await this.storage.flush();
   }
 
   public async executeCell(
@@ -6512,14 +6520,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       await this.flush();
     }
     assertAuthority();
+    // A running kernel still needs dependencies removed since its last cell.
+    await this.prepareHostRepositoryFiles();
+    assertAuthority();
+    // Re-read after the filesystem barrier: another request can have installed
+    // this notebook's kernel while preparation was awaiting I/O.
     let kernel = this.kernels.get(notebookKey);
-    if (!kernel) {
-      await this.prepareHostRepositoryBinaries();
-      assertAuthority();
-      // Another request can install the same notebook's kernel while the
-      // repository barrier is awaiting I/O. Reuse it instead of leaking a process.
-      kernel = this.kernels.get(notebookKey);
-    }
     if (!kernel) {
       if (this.kernels.size >= MAX_LIVE_KERNELS) {
         const idleCandidate = [...this.kernels.keys()]

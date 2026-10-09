@@ -182,7 +182,7 @@ describe('production SessionRuntime integration', () => {
         hostPeerId: 'host', workingFolder: peerFolder, pythonPath: 'python3', knownPeers: [{ ...runtime.descriptor.localPeer }] }),
       'preparation-transfer-token-that-is-long-enough', context(path.resolve('.')), logger());
       await guest.start();
-      runtime.prepareHostRepositoryBinaries = () => new Promise<void>((resolve) => { release = resolve; });
+      runtime.prepareHostRepositoryFiles = () => new Promise<void>((resolve) => { release = resolve; });
       const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /paused|Host.*changed/);
       await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
       await runtime.transferHost('guest');
@@ -206,7 +206,7 @@ describe('production SessionRuntime integration', () => {
     const releases: Array<() => void> = [];
     const created = new Set<any>();
     const counts: number[] = [];
-    runtime.prepareHostRepositoryBinaries = () => new Promise<void>((resolve) => releases.push(resolve));
+    runtime.prepareHostRepositoryFiles = () => new Promise<void>((resolve) => releases.push(resolve));
     runtime.on('kernel', () => { for (const kernel of runtime.kernels.values()) created.add(kernel); });
     try {
       await runtime.start();
@@ -220,6 +220,69 @@ describe('production SessionRuntime integration', () => {
       assert.equal(created.size, 1, 'simultaneous preparation must not launch separate kernels');
       assert.deepEqual(counts.sort(), [1, 2], 'both requests must use the same Python variables');
     } finally { releases.forEach((release) => release()); for (const kernel of created) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const kind of ['notebook', 'terminal']) it(`restores missing canonical training inputs before ${kind} execution while retaining the running kernel and private host data`, async function () {
+    this.timeout(20_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-input-recovery-'));
+    const working = path.join(root, 'working'); const backing = path.join(root, 'host');
+    await Promise.all([mkdir(working), mkdir(backing)]);
+    const binary = Buffer.from([0, 1, 2, 255]);
+    await writeFile(path.join(working, 'dataset.bin'), binary);
+    await writeFile(path.join(working, 'training_helpers.py'), 'VALUE = 73\n');
+    const runtime = new SessionRuntime(descriptor({ sessionId: `input-recovery-${kind}`, role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, backingFolder: backing, pythonPath: 'python3' }),
+    'input-recovery-token-that-is-long-enough', context(path.resolve('.')), logger());
+    try {
+      await runtime.start();
+      assert.ok(runtime.binaryVersions.has('dataset.bin'));
+      assert.ok(runtime.project.has('training_helpers.py'));
+      const first = await runtime.executeCell('work.ipynb', 'a', 'preserved = 73', () => undefined);
+      assert.equal(first.success, true);
+      const kernel = runtime.kernels.get('work.ipynb');
+      await runtime.flush();
+      await mkdir(path.join(backing, '.git'));
+      const privateData = path.join(backing, '.git', 'private-dataset.bin');
+      await writeFile(privateData, binary);
+      await Promise.all(['dataset.bin', 'training_helpers.py'].map((key) => rm(path.join(backing, key))));
+      if (kind === 'notebook') {
+        const events: any[] = [];
+        const result = await runtime.executeCell('work.ipynb', 'b',
+          'from pathlib import Path\nfrom training_helpers import VALUE\nassert preserved == VALUE == 73\nassert Path("dataset.bin").read_bytes() == bytes([0, 1, 2, 255])',
+          (event: any) => events.push(event));
+        assert.equal(result.success, true, JSON.stringify(events.filter((event) => event.messageType === 'error').map((event) => ({ ename: event.content.ename, evalue: event.content.evalue }))));
+      } else {
+        await runtime.sharedTerminal().execute('echo inputs-restored');
+        await waitFor(() => runtime.sharedTerminal().view().text.includes('inputs-restored\n')
+          || runtime.sharedTerminal().view().text.includes('inputs-restored\r\n'), 1000, 'terminal input preparation completes');
+      }
+      assert.deepEqual(await readFile(path.join(backing, 'dataset.bin')), binary);
+      assert.equal(await readFile(path.join(backing, 'training_helpers.py'), 'utf8'), 'VALUE = 73\n');
+      assert.deepEqual(await readFile(privateData), binary, 'private host assets survive recovery');
+      assert.equal(runtime.kernels.get('work.ipynb'), kernel, 'recovery must retain Python variables in the running kernel');
+      // Existing host edits and training outputs must not be replaced by the
+      // canonical copy while checking for missing dependencies.
+      await writeFile(path.join(backing, 'training_helpers.py'), 'VALUE = 81\n');
+      const checkpoint = path.join(backing, 'checkpoints', 'model.pt');
+      await mkdir(path.dirname(checkpoint)); await writeFile(checkpoint, binary);
+      // A corrupt canonical binary cannot be published or allow code to run.
+      await writeFile(path.join(working, 'dataset.bin'), Buffer.from([9, 8, 7]));
+      await rm(path.join(backing, 'dataset.bin'));
+      await assert.rejects(kind === 'notebook'
+        ? runtime.executeCell('work.ipynb', 'c', 'preserved = 999', () => undefined)
+        : runtime.sharedTerminal().execute('echo forbidden-recovery'), /Binary changed while/);
+      assert.equal(runtime.repositoryOperations, 0, 'a failed recovery releases repository preparation');
+      assert.ok(!runtime.sharedTerminal().view().text.includes('forbidden-recovery'), 'failed preparation cannot submit a shell command');
+      await assert.rejects(readFile(path.join(backing, 'dataset.bin')), { code: 'ENOENT' });
+      await writeFile(path.join(working, 'dataset.bin'), binary);
+      const retry = await runtime.executeCell('work.ipynb', 'd', 'assert preserved == 73', () => undefined);
+      assert.equal(retry.success, true, 'recovery can be retried without executing the rejected cell or losing kernel state');
+      assert.deepEqual(await readFile(path.join(backing, 'dataset.bin')), binary);
+      assert.equal(await readFile(path.join(backing, 'training_helpers.py'), 'utf8'), 'VALUE = 81\n');
+      assert.deepEqual(await readFile(checkpoint), binary, 'training checkpoints survive recovery');
+      assert.deepEqual(await readFile(privateData), binary);
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
   });
 
   for (const useTorch of [false, true]) for (const vpsOnly of [false, true]) it(`trains a ${useTorch ? 'PyTorch model with binary host data' : 'real model from host repository files'} and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
@@ -268,8 +331,13 @@ describe('production SessionRuntime integration', () => {
         workingFolder: peerFolder, pythonPath, knownPeers: [{ ...host.descriptor.localPeer }] }), token, context(path.resolve('.')), logger());
       await guest.start();
       await waitFor(() => guest.project.has('train.ipynb'), 5000, 'host notebook snapshot');
+      const warmup = await guest.executeCell('train.ipynb', 'train', 'training_warm_state = 41', () => undefined);
+      assert.equal(warmup.success, true);
+      const trainingKernel = host.kernels.get('train.ipynb');
+      await host.flush();
+      await Promise.all(['config.json', 'training_helpers.py', 'train.ipynb'].map((key) => rm(path.join(backing, key))));
       const events: any[] = [];
-      const execution = guest.executeCell('train.ipynb', 'train', program, (event: any) => events.push(event));
+      const execution = guest.executeCell('train.ipynb', 'train', `assert training_warm_state == 41\n${program}`, (event: any) => events.push(event));
       if (broker) {
         await waitFor(() => events.some((event) => String(event.content?.text).includes('TRAINING_STARTED')), useTorch ? 10000 : 5000, 'VPS-only execution accepted');
         assert.equal(guest.snapshot().peers.find((peer: any) => peer.peerId === 'host').route, 'Relay');
@@ -279,6 +347,10 @@ describe('production SessionRuntime integration', () => {
       }
       const result = await execution;
       assert.equal(result.success, true, JSON.stringify(events));
+      assert.equal(host.kernels.get('train.ipynb'), trainingKernel, 'guest training restores inputs without restarting the kernel');
+      assert.equal(JSON.parse(await readFile(path.join(backing, 'config.json'), 'utf8')).dataset, dataset);
+      assert.equal(await readFile(path.join(backing, 'training_helpers.py'), 'utf8'), trainingHelper);
+      assert.equal(JSON.parse(await readFile(path.join(backing, 'train.ipynb'), 'utf8')).nbformat, 4);
       const model = JSON.parse(await readFile(path.join(backing, 'checkpoints', 'model.json'), 'utf8'));
       assert.equal(model.epochs, useTorch ? 100 : 400);
       if (useTorch) {
