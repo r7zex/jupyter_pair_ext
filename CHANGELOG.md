@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.36 - 2026-10-09 (critical training lifecycle fixes)
+
+- Contains detached training and its descendants when the runner crashes. A supervisor retains an execution lock through process-tree cleanup; recovery waits for both locks and never replays an accepted training intent. Adds POSIX process-group/subreaper cleanup and Windows Job Object containment.
+- Masks CUDA devices for CPU-selected Jupyter kernels, including startup and restart, instead of removing the mask and exposing every GPU.
+- Stops deleted or replaced notebook kernels, removes per-notebook compute/interpreter state, and cancels requests preparing for a deleted notebook. Recreated files start with clean Python state. Rename over another notebook preserves the source kernel and variables; the old target's completion cannot change the source's Busy counter or status.
+- Requires explicit shared-terminal interruption before replacing the host repository, including the same folder, preserving running terminal training until the host stops it.
+- Rejects an entire overlong terminal command instead of silently executing a truncated prefix, with bounded Unicode/paste handling and lifecycle resets.
+- Revalidates complete host-data model training through Jupyter, shared terminal and detached VPS agents. Update the extension on all participants and the Python agent script on each compute owner.
+
 ## 0.5.35 - 2026-10-09 (shared-terminal training environment)
 
 - Sets the shared shell's `PAIR_NOTEBOOK_WORKSPACE` to its owner's repository, replacing a stale inherited value. The path remains stable after `cd` and is refreshed after shell/repository reset.

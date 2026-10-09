@@ -88,6 +88,12 @@ def clean_environment():
 def stop_process(process):
     if process.poll() is not None:
         return
+    if process.stdin is not None:
+        # The private supervisor retains its execution lock until the whole tree
+        # is stopped. Do not kill that lock owner while it is cleaning up.
+        process.stdin.close()
+        process.wait()
+        return
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -105,6 +111,219 @@ def stop_process(process):
                 pass
 
 
+class WindowsJob:
+    """An OS-owned process tree; closing its handle also covers supervisor crashes."""
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                                              "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_longlong) for name in ("TotalUserTime", "TotalKernelTime", "ThisPeriodTotalUserTime", "ThisPeriodTotalKernelTime")] + [
+                (name, wintypes.DWORD) for name in ("TotalPageFaultCount", "TotalProcesses", "ActiveProcesses", "TotalTerminatedProcesses")]
+
+        self.ctypes, self.accounting = ctypes, Accounting
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+            "QueryInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+            "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = arguments, result
+        self.handle = self.kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign(self, process):
+        if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+    def stop(self):
+        if not self.kernel.TerminateJobObject(self.handle, 1):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        while True:
+            accounting = self.accounting()
+            if not self.kernel.QueryInformationJobObject(self.handle, 1, self.ctypes.byref(accounting), self.ctypes.sizeof(accounting), None):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            if accounting.ActiveProcesses == 0:
+                return
+            time.sleep(0.02)
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+def training_command(directory):
+    manifest = read_json(directory / "manifest.json")
+    job = manifest["job"]
+    return [manifest["python"], "-u", str(directory / "work" / job["entrypoint"]), *job["args"]]
+
+
+def gated_training(directory):
+    # On Windows the supervisor assigns this helper to a kill-on-close Job
+    # Object before opening the gate. No user code can escape the assignment.
+    if sys.stdin.buffer.read(1) != b"1":
+        return
+    process = subprocess.Popen(training_command(directory), stdin=subprocess.DEVNULL)
+    atomic_json(directory / "execution.json", {"exitCode": process.wait()})
+
+
+def adopt_training_descendants():
+    if sys.platform != "linux":
+        return False
+    Path("/proc/self/stat").read_bytes()
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    libc.prctl.restype = ctypes.c_int
+    # PR_SET_CHILD_SUBREAPER: orphaned DataLoader workers become our children,
+    # allowing us to wait for their actual exit before releasing execution.lock.
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "Cannot supervise training descendants")
+    return True
+
+
+def reap_training_descendants():
+    while True:
+        try:
+            exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return
+        if exited is not None:
+            os.waitpid(exited.si_pid, 0)
+            continue
+        # A worker may have opened its own session. As a subreaper we own its
+        # unreaped PID, so these live child IDs cannot be reused underneath us.
+        # Repeating after each exit also reaches newly adopted grandchildren.
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                # stat's comm field may itself contain spaces or parentheses.
+                fields = (entry / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if int(fields[1]) == os.getpid():
+                try:
+                    os.kill(int(entry.name), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        time.sleep(0.02)
+
+
+def supervise_job(directory):
+    held_lock = lock_file(directory / "execution.lock")
+    if held_lock is None:
+        return
+    process, tree, adopted, gate_opened = None, None, False, False
+    disconnected = threading.Event()
+
+    def watch_runner():
+        try:
+            # A daemon blocked in BufferedReader can abort Python at shutdown.
+            os.read(sys.stdin.fileno(), 1)
+        finally:
+            disconnected.set()
+
+    watcher = threading.Thread(target=watch_runner, daemon=True)
+    watcher.start()
+    try:
+        if (directory / "result.json").exists() or (directory / "cancel").exists() or disconnected.is_set():
+            atomic_json(directory / "execution.json", {"exitCode": -1})
+            return
+        if os.name == "nt":
+            tree = WindowsJob()
+            process = subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--gated-training", str(directory)],
+                                       stdin=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            tree.assign(process)
+            if not disconnected.is_set() and not (directory / "cancel").exists():
+                process.stdin.write(b"1")
+                process.stdin.flush()
+                gate_opened = True
+            else:
+                process.stdin.close()
+            while process.poll() is None and not disconnected.wait(0.1):
+                pass
+        else:
+            # Observe exit without reaping the group leader. Its PID stays
+            # reserved until descendants have been killed, even on normal exit.
+            if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+                raise RuntimeError("This platform cannot safely supervise a process group")
+            # An inherited SIGCHLD ignore handler would auto-reap children and
+            # invalidate the PID reservation used during process-tree cleanup.
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            adopted = adopt_training_descendants()
+            process = subprocess.Popen(training_command(directory), stdin=subprocess.DEVNULL, start_new_session=True)
+            while not disconnected.wait(0.1):
+                if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    break
+    finally:
+        try:
+            if process is not None:
+                if process.stdin is not None:
+                    process.stdin.close()
+                if tree is not None:
+                    # Also removes descendants left by a normally exited parent.
+                    while True:
+                        try:
+                            tree.stop()
+                            break
+                        except OSError:
+                            # Keep the lock while Windows has not confirmed that
+                            # every process has exited; retry transient OS errors.
+                            time.sleep(0.2)
+                elif os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        # Preserve the existing grace period for finally blocks. An
+                        # unreaped leader anchors the group throughout cleanup.
+                        if disconnected.is_set():
+                            deadline = time.monotonic() + 5
+                            while time.monotonic() < deadline and os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                                time.sleep(0.05)
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                exit_code = process.wait()
+                if tree is not None and not gate_opened:
+                    exit_code = -1
+                if adopted:
+                    reap_training_descendants()
+                if os.name != "nt" or not (directory / "execution.json").exists():
+                    atomic_json(directory / "execution.json", {"exitCode": exit_code})
+        finally:
+            if tree is not None:
+                tree.close()
+            held_lock.close()
+
+
 def run_job(directory):
     """Detached runner has no network dependency and does not possess the VPS token."""
     held_lock = lock_file(directory / "run.lock")
@@ -113,7 +332,7 @@ def run_job(directory):
     if (directory / "result.json").exists():
         held_lock.close()
         return
-    process = None
+    process, adopted = None, False
     try:
         if (directory / "cancel").exists():
             (directory / "output.log").touch(mode=0o600)
@@ -147,8 +366,13 @@ def run_job(directory):
             if (directory / "cancel").exists():
                 atomic_json(directory / "result.json", {"status": "cancelled", "exitCode": -1})
                 return
-            process = subprocess.Popen([manifest["python"], "-u", str(work / job["entrypoint"]), *job["args"]],
-                                       cwd=work, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            if sys.platform == "linux":
+                # If the private supervisor itself crashes, this surviving
+                # runner must adopt and stop its training tree before reporting.
+                signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+                adopted = adopt_training_descendants()
+            process = subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--supervise-job", str(directory)],
+                                       cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, **options)
 
             drain_errors = []
@@ -188,13 +412,10 @@ def run_job(directory):
                     stop_process(process)
                     break
                 time.sleep(0.2)
-            exit_code = process.wait()
-            # Close descendants that inherited stdout after the main training process exited.
-            if os.name != "nt":
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            if process.wait() != 0:
+                raise RuntimeError("Training supervision failed")
+            exit_code = read_json(directory / "execution.json")["exitCode"]
+            cancelled = cancelled or (directory / "cancel").exists()
             reader.join(timeout=5)
             if reader.is_alive():
                 raise RuntimeError("Output stream did not close")
@@ -207,10 +428,16 @@ def run_job(directory):
     except Exception:
         if process is not None:
             stop_process(process)
+        if adopted:
+            reap_training_descendants()
         with (directory / "output.log").open("ab") as log:
             log.write(b"\nPair Notebook runner failed. Check the configured Python environment and local agent storage.\n")
         atomic_json(directory / "result.json", {"status": "failed", "exitCode": -1})
     finally:
+        if process is not None and process.stdin is not None:
+            process.stdin.close()
+        if adopted:
+            reap_training_descendants()
         if process is not None and process.stdout is not None:
             process.stdout.close()
         held_lock.close()
@@ -421,10 +648,18 @@ class Agent:
         elif not (directory / "result.json").exists() and time.monotonic() - self.recovery_started[job["id"]] > 10:
             runner_lock = lock_file(directory / "run.lock")
             if runner_lock is not None:
-                with (directory / "output.log").open("ab") as stream:
-                    stream.write(b"\nRunner was interrupted. This job will not be automatically rerun.\n")
-                atomic_json(directory / "result.json", {"status": "interrupted", "exitCode": -1})
-                runner_lock.close()
+                try:
+                    execution_lock = lock_file(directory / "execution.lock")
+                    if execution_lock is not None:
+                        try:
+                            if not (directory / "result.json").exists():
+                                with (directory / "output.log").open("ab") as stream:
+                                    stream.write(b"\nRunner was interrupted. This job will not be automatically rerun.\n")
+                                atomic_json(directory / "result.json", {"status": "interrupted", "exitCode": -1})
+                        finally:
+                            execution_lock.close()
+                finally:
+                    runner_lock.close()
         return directory
 
     def tick(self):
@@ -472,7 +707,15 @@ def main():
     parser.add_argument("--python", default=sys.executable, help="Owner-selected training environment (never supplied by a job)")
     parser.add_argument("--poll-seconds", type=float, default=2)
     parser.add_argument("--run-job", help=argparse.SUPPRESS)
+    parser.add_argument("--supervise-job", help=argparse.SUPPRESS)
+    parser.add_argument("--gated-training", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.supervise_job:
+        supervise_job(Path(args.supervise_job).resolve())
+        return
+    if args.gated_training:
+        gated_training(Path(args.gated_training).resolve())
+        return
     if args.run_job:
         run_job(Path(args.run_job).resolve())
         return

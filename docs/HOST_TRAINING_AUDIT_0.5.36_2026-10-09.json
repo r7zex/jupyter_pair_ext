@@ -1,0 +1,80 @@
+{
+  "version": "0.5.36",
+  "date": "2026-10-09",
+  "branch": "codex/vps-persistent-compute",
+  "baselineCommit": "3ad515a881ae70412d168ea0142365e254f20a2e",
+  "findings": [
+    {
+      "priority": "P1",
+      "failure": "Detached runner death left orphan training and permitted interrupted reconciliation",
+      "fix": "Process supervision and runner/execution locks through descendant cleanup, without intent replay"
+    },
+    {
+      "priority": "P1",
+      "failure": "Deleted and recreated notebook retained old kernel variables and running work",
+      "fix": "Stop kernel, cancel pending preparation and clear notebook-specific settings; recreated file starts clean"
+    },
+    {
+      "priority": "P1",
+      "failure": "Host repository replacement killed live shared-terminal training",
+      "fix": "Require explicit Ctrl+C before replacing a repository while its shell is live"
+    },
+    {
+      "priority": "P2",
+      "failure": "CPU kernel launch removed CUDA visibility mask",
+      "fix": "Empty CUDA_VISIBLE_DEVICES for CPU launch/restart, explicit GPU index for GPU selection"
+    },
+    {
+      "priority": "P2",
+      "failure": "Overlong terminal input executed a truncated prefix",
+      "fix": "Reject the whole line with bounded overflow tracking"
+    }
+  ],
+  "prepublicationReview": [
+    "Overwrite-rename must clean destination before moving source runtime state",
+    "Old destination completion must not decrement moved source execution counter",
+    "Private-supervisor death must not orphan Linux training or publish a premature result"
+  ],
+  "verification": {
+    "status": "passed",
+    "compile": "passed",
+    "lint": "passed",
+    "typescript": { "passed": 4670, "failed": 0, "skipped": 0 },
+    "python": { "passed": 90, "failed": 0, "skipped": 0, "seconds": 33.655, "resourceWarningsAsErrors": true },
+    "finalPythonChangeRetest": { "durableVpsCases": 23, "detachedModelCases": 2, "addsToUniqueCount": false },
+    "independentProcessChecks": [
+      "Supervisor SIGKILL: training and ordinary worker dead before failure publication",
+      "Supervisor SIGKILL: training and independent-session worker dead before failure publication",
+      "Normal completion: independent-session child and grandchild dead before result",
+      "Cancellation: SIGTERM checkpoint handler completes within grace period"
+    ],
+    "targetedChecks": {
+      "terminalCpuDeletion": 24,
+      "subsequentLifecycle": 5,
+      "overlappingLifecycle": 4
+    },
+    "training": {
+      "status": "passed",
+      "liveNotebookRuns": 4,
+      "nestedTerminalRuns": 4,
+      "detachedAgentRuns": 2,
+      "models": ["standard_library_linear_fit", "cpu_pytorch"],
+      "transports": ["peer_mesh", "local_vps_only"],
+      "torchEpochs": 100,
+      "torchSteps": 300,
+      "torchMseUpperBound": 1e-10,
+      "torchPredictionErrorUpperBound": 1e-4,
+      "checkpointReload": ["model", "optimizer"],
+      "ownerBinaryDataPrivate": true,
+      "outageRecovery": ["live_notebook", "shared_terminal", "detached_agent"]
+    }
+  },
+  "limitations": [
+    "External deployed VPS not accessed; owner chose a real local VPS broker and agent",
+    "VS Code and model-fixture Trystero topology boundaries substituted; production runtime and processes exercised",
+    "No physical GPU training; CPU mask verified in a real Jupyter process",
+    "Windows Job Object implementation source-reviewed, native execution unverified",
+    "Guest terminal restriction does not sandbox trusted notebook Python",
+    "Shared terminal is a persistent line-command terminal, not a full-screen TTY"
+  ]
+}

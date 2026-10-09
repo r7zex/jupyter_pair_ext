@@ -5,6 +5,7 @@ import json
 import os
 import http.server
 from pathlib import Path
+import signal
 import subprocess
 import ssl
 import sys
@@ -350,6 +351,216 @@ class AgentRegressions(unittest.TestCase):
                     directory = agent.ensure_job(job)
                 self.assertEqual(agent_module.read_json(directory / "manifest.json")["cudaDevice"], GPU_UUID)
                 agent.lock.close()
+
+
+class ProcessTreeRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="pair-agent-process-tree-")
+        self.root = Path(self.temporary.name)
+        args = argparse.Namespace(url="http://localhost:9999", id="pc", name="PC", token_file=None,
+                                  state=str(self.root / "state"), workspace=str(self.root), python=sys.executable)
+        with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), patch.object(agent_module.subprocess, "run", side_effect=OSError):
+            self.owner = agent_module.Agent(args)
+        self.pids = []
+
+    def running(self, pid):
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                return False
+            try:
+                return kernel.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT
+            finally:
+                kernel.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            status = Path(f"/proc/{pid}/stat")
+            return not status.exists() or status.read_text().split(") ", 1)[1].split()[0] != "Z"
+        except ProcessLookupError:
+            return False
+
+    def tearDown(self):
+        for child in self.owner.children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+        # Failure cleanup also handles the original orphan regression, so the
+        # audit cannot leave background workers mutating owner files.
+        for pid in self.pids:
+            if self.running(pid):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.owner.lock.close()
+        self.temporary.cleanup()
+
+    def wait_for(self, condition, message):
+        deadline = time.monotonic() + 10
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail(message)
+            time.sleep(0.02)
+
+    def start_training_tree(self, exit_code=None, separate_session=False):
+        worker = ("import os, signal, time\nfrom pathlib import Path\n"
+                  "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                  "root = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])\n"
+                  "(root / 'worker.pid').write_text(str(os.getpid()))\n"
+                  "print('DataLoader worker started', flush=True)\n"
+                  "while True:\n"
+                  " with (root / 'worker.heartbeat').open('ab') as stream: stream.write(b'x')\n"
+                  " time.sleep(0.01)\n")
+        source = ("import os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
+                  "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                  "root = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])\n"
+                  "(root / 'training.pid').write_text(str(os.getpid()))\n"
+                  "subprocess.Popen([sys.executable, '-u', '-c', " + repr(worker) + f"], start_new_session={separate_session!r})\n"
+                  "while not (root / 'finish').exists():\n"
+                  " with (root / 'training.heartbeat').open('ab') as stream: stream.write(b'x')\n"
+                  " time.sleep(0.01)\n"
+                  f"sys.exit({0 if exit_code is None else exit_code})\n")
+        self.job = {"id": "process-tree", "agentId": "pc", "device": "cpu", "entrypoint": "train.py",
+                    "args": [], "files": {"train.py": source}, "cancelRequested": False}
+        self.directory = self.owner.ensure_job(self.job)
+        self.runner = self.owner.children[0]
+        self.wait_for(lambda: all((self.root / name).exists() for name in ("training.pid", "worker.pid", "training.heartbeat", "worker.heartbeat")),
+                      "Training and DataLoader worker did not start")
+        self.pids = [int((self.root / name).read_text()) for name in ("training.pid", "worker.pid")]
+        self.assertTrue(all(self.running(pid) for pid in self.pids))
+
+    def assert_tree_stopped(self):
+        self.assertFalse(any(self.running(pid) for pid in self.pids), "Completion must wait for training and its DataLoader worker")
+        sizes = [(self.root / name).stat().st_size for name in ("training.heartbeat", "worker.heartbeat")]
+        time.sleep(0.15)
+        self.assertEqual(sizes, [(self.root / name).stat().st_size for name in ("training.heartbeat", "worker.heartbeat")])
+
+    def crashed_runner(self, terminate, separate_session=False):
+        self.start_training_tree(separate_session=separate_session)
+        self.runner.terminate() if terminate else self.runner.kill()
+        self.runner.wait(timeout=5)
+        self.owner.recovery_started[self.job["id"]] = time.monotonic() - 11
+
+        def recovered():
+            self.owner.ensure_job(self.job)
+            return (self.directory / "result.json").exists()
+
+        with patch.object(agent_module.subprocess, "Popen") as replay:
+            self.wait_for(recovered, "Crash cleanup did not release its execution lock")
+            self.owner.ensure_job({**self.job, "cancelRequested": True})
+            replay.assert_not_called()
+        self.assertEqual(agent_module.read_json(self.directory / "result.json"), {"status": "interrupted", "exitCode": -1})
+        self.assert_tree_stopped()
+
+    def test_runner_kill_stops_training_and_dataloader_before_recovery(self):
+        self.crashed_runner(False)
+
+    def test_runner_terminate_stops_training_and_dataloader_before_recovery(self):
+        self.crashed_runner(True)
+
+    def test_runner_kill_stops_a_worker_that_created_its_own_session(self):
+        if sys.platform != "linux" and os.name != "nt":
+            self.skipTest("Requires Linux subreaper or Windows Job Object containment")
+        self.crashed_runner(False, separate_session=True)
+
+    def crashed_supervisor(self, separate_session):
+        if sys.platform != "linux":
+            self.skipTest("Requires Linux runner subreaper and /proc ownership lookup")
+        self.start_training_tree(separate_session=separate_session)
+        fields = Path(f"/proc/{self.pids[0]}/stat").read_bytes().rsplit(b") ", 1)[1].split()
+        supervisor = int(fields[1])
+        self.assertNotEqual(supervisor, self.runner.pid)
+        os.kill(supervisor, signal.SIGKILL)
+        # Observe the publication boundary first: a broker can see result.json
+        # while the runner is still alive, including a blocked output close.
+        self.wait_for(lambda: (self.directory / "result.json").exists(), "Supervisor crash cleanup did not finish")
+        self.assertEqual(agent_module.read_json(self.directory / "result.json"), {"status": "failed", "exitCode": -1})
+        self.assert_tree_stopped()
+        self.runner.wait(timeout=10)
+
+    def test_supervisor_kill_stops_training_and_dataloader_before_failed_result(self):
+        self.crashed_supervisor(False)
+
+    def test_supervisor_kill_stops_a_worker_that_created_its_own_session(self):
+        self.crashed_supervisor(True)
+
+    def test_cancellation_stops_training_and_dataloader_before_result(self):
+        self.start_training_tree()
+        self.owner.ensure_job({**self.job, "cancelRequested": True})
+        self.runner.wait(timeout=10)
+        self.assertEqual(agent_module.read_json(self.directory / "result.json")["status"], "cancelled")
+        self.assert_tree_stopped()
+
+    def complete_training(self, exit_code):
+        self.start_training_tree(exit_code)
+        (self.root / "finish").touch()
+        self.runner.wait(timeout=10)
+        self.assertEqual(agent_module.read_json(self.directory / "result.json"),
+                         {"status": "succeeded" if exit_code == 0 else "failed", "exitCode": exit_code})
+        self.assert_tree_stopped()
+
+    def test_success_stops_surviving_dataloader_and_preserves_exit_code(self):
+        self.complete_training(0)
+
+    def test_failure_stops_surviving_dataloader_and_preserves_exit_code(self):
+        self.complete_training(3)
+
+    def test_inherited_sigchld_ignore_cannot_reap_the_group_leader_early(self):
+        if os.name == "nt":
+            self.skipTest("SIGCHLD is a POSIX signal")
+        spawn = subprocess.Popen
+
+        def ignore_sigchld(*args, **kwargs):
+            kwargs["preexec_fn"] = lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+            return spawn(*args, **kwargs)
+
+        with patch.object(agent_module.subprocess, "Popen", side_effect=ignore_sigchld):
+            self.start_training_tree(3)
+        (self.root / "finish").touch()
+        self.runner.wait(timeout=10)
+        self.assertEqual(agent_module.read_json(self.directory / "result.json"), {"status": "failed", "exitCode": 3})
+        self.assert_tree_stopped()
+
+    def test_success_stops_a_worker_that_created_its_own_session(self):
+        if sys.platform != "linux" and os.name != "nt":
+            self.skipTest("Requires Linux subreaper or Windows Job Object containment")
+        self.start_training_tree(0, separate_session=True)
+        (self.root / "finish").touch()
+        self.runner.wait(timeout=10)
+        self.assertEqual(agent_module.read_json(self.directory / "result.json"), {"status": "succeeded", "exitCode": 0})
+        self.assert_tree_stopped()
+
+    def test_recovery_waits_for_execution_lock_without_replaying_intent(self):
+        directory = self.owner.state / "jobs" / "locked"
+        directory.mkdir(parents=True)
+        job = {"id": "locked"}
+        agent_module.atomic_json(directory / "manifest.json", {"job": job})
+        self.owner.recovery_started[job["id"]] = time.monotonic() - 11
+        held = agent_module.lock_file(directory / "execution.lock")
+        self.assertIsNotNone(held)
+        try:
+            with patch.object(agent_module.subprocess, "Popen") as replay:
+                self.owner.ensure_job(job)
+                self.owner.ensure_job(job)
+                replay.assert_not_called()
+            self.assertFalse((directory / "result.json").exists())
+        finally:
+            held.close()
+        with patch.object(agent_module.subprocess, "Popen") as replay:
+            self.owner.ensure_job(job)
+            self.owner.ensure_job(job)
+            replay.assert_not_called()
+        self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "interrupted")
 
 
 if __name__ == "__main__":

@@ -1956,6 +1956,37 @@ describe('per-notebook execution queues', () => {
 });
 
 describe('compute launch and recent projects', () => {
+  it('hides CUDA devices for a CPU target regardless of inherited GPU visibility', () => {
+    for (const baseEnvironment of [{ PATH: '/bin' }, { PATH: '/bin', CUDA_VISIBLE_DEVICES: '2,3' }]) {
+      const launch = kernelLaunchSpec('/envs/project/python', './media/jupyter_kernel_bridge.py', '/work/project', undefined, baseEnvironment);
+      assert.equal(launch.env.CUDA_VISIBLE_DEVICES, '');
+      assert.equal(launch.env.PATH, '/bin');
+    }
+  });
+
+  it('keeps CUDA hidden in a real CPU Jupyter kernel after startup and restart', async function () {
+    this.timeout(45_000);
+    const python = process.env.PAIR_NOTEBOOK_TEST_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+    try {
+      await execFileAsync(python, ['-c', 'import jupyter_client,ipykernel'], { timeout: 5000 });
+    } catch {
+      this.skip();
+      return;
+    }
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-cpu-kernel-'));
+    const bridge = path.resolve(__dirname, '../../media/jupyter_kernel_bridge.py');
+    const kernel = new PythonKernel(python, bridge, root);
+    try {
+      const assertion = 'import os\nassert os.environ.get("CUDA_VISIBLE_DEVICES") == "", "CPU target exposed CUDA devices"';
+      assert.equal((await kernel.execute('cpu-startup', assertion)).success, true);
+      await kernel.restart();
+      assert.equal((await kernel.execute('cpu-restart', assertion)).success, true);
+    } finally {
+      kernel.stop();
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+    }
+  });
+
   it('propagates the chosen interpreter and exact CUDA device to the bridge process', () => {
     const launch = kernelLaunchSpec('/envs/project/python', './media/jupyter_kernel_bridge.py', '/work/project', 3, {
       PATH: '/bin', CUDA_VISIBLE_DEVICES: 'old',

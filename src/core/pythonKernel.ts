@@ -83,8 +83,9 @@ export function kernelLaunchSpec(
     PAIR_NOTEBOOK_CWD: workingDirectory,
     PAIR_NOTEBOOK_WORKSPACE: workingDirectory,
   };
-  if (cudaDevice !== undefined) env.CUDA_VISIBLE_DEVICES = String(cudaDevice);
-  else delete env.CUDA_VISIBLE_DEVICES;
+  // An unset mask exposes every GPU. A CPU target must hide CUDA even when
+  // the extension host inherited a visible device from its launching shell.
+  env.CUDA_VISIBLE_DEVICES = cudaDevice !== undefined ? String(cudaDevice) : '';
   return {
     command: pythonPath,
     args: [path.resolve(bridgePath)],

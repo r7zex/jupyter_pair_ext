@@ -35,6 +35,53 @@ loader._load = originalLoad;
 if (cached) require.cache[modulePath] = cached; else delete require.cache[modulePath];
 
 describe('native shared terminal input authority', () => {
+  it('rejects an entire overlong pasted command without executing its truncated prefix', async () => {
+    terminals.length = 0; trusted = true;
+    const commands: string[] = [];
+    const shell = Object.assign(new EventEmitter(), { view: () => ({ text: '', reset: true }), requestSnapshot: () => undefined,
+      execute: async (command: string) => { commands.push(command); } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true } });
+    const controller = new SharedTerminalController(() => runtime as unknown as SessionRuntime);
+    const output: string[] = [];
+    try {
+      controller.open(); const pty = terminals[0]!.pty;
+      pty.onDidWrite((text) => output.push(text)); pty.open(undefined);
+      // Truncation would remove the redirection and run a different command.
+      pty.handleInput?.('printf ORIGINAL'.padEnd(8192, ' ') + ' > report.txt\r');
+      // Chunk boundaries and a two-unit Unicode character must not evade the bound.
+      pty.handleInput?.('x'.repeat(8191)); pty.handleInput?.('🧠\r');
+      pty.handleInput?.('x'.repeat(8192)); pty.handleInput?.('overflow\b\r');
+      await Promise.resolve();
+      assert.deepEqual(commands, [], 'no prefix of an overlong command may reach the host shell');
+      assert.equal(output.filter((text) => text.includes('8192')).length, 3);
+      const exactLimit = 'x'.repeat(8190) + '🧠';
+      pty.handleInput?.(exactLimit + '\r'); pty.handleInput?.('echo recovered\r');
+      await Promise.resolve();
+      assert.deepEqual(commands, [exactLimit, 'echo recovered']);
+    } finally { controller.dispose(); }
+  });
+
+  it('clears rejected input on interruption, host changes, history resets and terminal rebinding', async () => {
+    terminals.length = 0; trusted = true;
+    const commands: string[] = []; let interrupts = 0;
+    const shell = Object.assign(new EventEmitter(), { view: () => ({ text: '', reset: true }), requestSnapshot: () => undefined,
+      execute: async (command: string) => { commands.push(command); }, interrupt: () => { interrupts++; } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true } });
+    const controller = new SharedTerminalController(() => runtime as unknown as SessionRuntime);
+    const overflow = 'x'.repeat(8193);
+    try {
+      controller.open(); const pty = terminals[0]!.pty; pty.open(undefined);
+      pty.handleInput?.(overflow + '\x03echo interrupted\r');
+      pty.handleInput?.(overflow); runtime.emit('hostChanged'); pty.handleInput?.('echo host changed\r');
+      pty.handleInput?.(overflow); shell.emit('view', { text: '', reset: true }); pty.handleInput?.('echo reset\r');
+      pty.handleInput?.(overflow); pty.close(); controller.open();
+      const rebound = terminals[1]!.pty; rebound.open(undefined); rebound.handleInput?.('echo reopened\r');
+      await Promise.resolve();
+      assert.equal(interrupts, 1);
+      assert.deepEqual(commands, ['echo interrupted', 'echo host changed', 'echo reset', 'echo reopened']);
+    } finally { controller.dispose(); }
+  });
+
   it('blocks guest typing/paste/control keys and permits only current host input', async () => {
     terminals.length = 0; trusted = true;
     let isHost = false;

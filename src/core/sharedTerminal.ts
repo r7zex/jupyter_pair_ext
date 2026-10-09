@@ -137,6 +137,8 @@ export class SharedTerminal extends EventEmitter {
     }
     return true;
   }
+  public isRunning(): boolean { return Boolean(this.child) || this.queued > 0; }
+
   public async execute(command: string): Promise<void> {
     if (this.closed || !this.authority.isHost() || !this.authority.available()) throw new Error('Only the active session host can enter terminal commands.');
     if (!command || command.length > 8192 || /[\uD800-\uDFFF]/u.test(command)

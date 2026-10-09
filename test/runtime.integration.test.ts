@@ -68,6 +68,168 @@ afterEach(() => {
 });
 
 describe('production SessionRuntime integration', () => {
+  for (const sameFolder of [false, true]) it(`preserves terminal training until the host explicitly interrupts before ${sameFolder ? 'replacing the same' : 'changing the'} repository`, async function () {
+    this.timeout(20_000);
+    if (spawnSync('python3', ['-c', 'pass']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-terminal-folder-'));
+    const working = path.join(root, 'working'); const backing = path.join(root, 'host');
+    await Promise.all([mkdir(working), mkdir(backing)]);
+    await writeFile(path.join(working, 'training.py'), 'from pathlib import Path\nimport time\nPath("training.started").write_text("started")\ntime.sleep(0.8)\nPath("training.finished").write_text("finished")\n');
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'terminal-folder', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, backingFolder: backing, pythonPath: 'python3' }),
+    'terminal-folder-token-that-is-long-enough', context(path.resolve('.')), logger());
+    try {
+      await runtime.start();
+      await runtime.sharedTerminal().execute('python3 training.py');
+      await waitFor(() => fileExists(path.join(backing, 'training.started')), 2000, 'real terminal training starts');
+      const replacement = sameFolder ? backing : path.join(root, 'replacement');
+      await assert.rejects(runtime.setBackingFolder(replacement), /Stop.*terminal.*Ctrl.C/i);
+      assert.equal(runtime.descriptor.backingFolder, backing);
+      await waitFor(() => fileExists(path.join(backing, 'training.finished')), 2000, 'training is not killed by folder selection');
+      runtime.sharedTerminal().interrupt();
+      await runtime.setBackingFolder(replacement);
+      assert.equal(runtime.descriptor.backingFolder, replacement);
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const deleteDirectory of [false, true]) it(`drops the live kernel and compute settings when ${deleteDirectory ? 'its parent directory' : 'a notebook'} is deleted, then recreates a clean notebook`, async function () {
+    this.timeout(20_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-delete-'));
+    const working = path.join(root, 'working'); await mkdir(path.join(working, 'notebooks'), { recursive: true });
+    const key = 'notebooks/work.ipynb'; const source = path.join(working, key);
+    const notebook = (code: string) => JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', metadata: {}, source: [code], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+    await writeFile(source, notebook('old_value = 731'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'notebook-delete', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'notebook-delete-token-that-is-long-enough', context(path.resolve('.')), logger());
+    try {
+      await runtime.start();
+      assert.equal((await runtime.executeCell(key, 'a', 'old_value = 731', () => undefined)).success, true);
+      const oldKernel = runtime.kernels.get(key);
+      runtime.descriptor.notebookPythonPaths[key] = 'python3';
+      runtime.descriptor.notebookCompute[key] = { ...runtime.computeForNotebook(key) };
+      const deleted = deleteDirectory ? path.dirname(source) : source;
+      await rm(deleted, { recursive: true });
+      await runtime.onLocalDelete(fakeVscode.Uri.file(deleted));
+      assert.ok(!runtime.kernels.has(key), 'deleted notebooks must release their kernel');
+      assert.ok(!runtime.kernelStatuses.has(key));
+      assert.ok(!runtime.kernelLastUsed.has(key));
+      assert.equal(runtime.descriptor.notebookPythonPaths[key], undefined);
+      assert.equal(runtime.descriptor.notebookCompute[key], undefined);
+      await mkdir(path.dirname(source), { recursive: true });
+      await writeFile(source, notebook('assert "old_value" not in globals()'));
+      await runtime.onLocalFile(fakeVscode.Uri.file(source), 'create');
+      assert.ok(runtime.project.has(key));
+      assert.equal((await runtime.executeCell(key, 'a', 'assert "old_value" not in globals()', () => undefined)).success, true);
+      assert.notEqual(runtime.kernels.get(key), oldKernel);
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('stops a running deleted notebook without recreating its status or publishing a late checkpoint', async function () {
+    this.timeout(20_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-running-notebook-delete-'));
+    const working = path.join(root, 'working'); await mkdir(working);
+    const key = 'work.ipynb'; const source = path.join(working, key);
+    await writeFile(source, JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', metadata: {}, source: ['print(1)'], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'running-delete', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'running-delete-token-that-is-long-enough', context(path.resolve('.')), logger());
+    try {
+      await runtime.start();
+      let started = false;
+      const execution = assert.rejects(runtime.executeCell(key, 'a',
+        'from pathlib import Path\nimport time\nprint("DELETION_STARTED", flush=True)\ntime.sleep(2)\nPath("late-checkpoint.json").write_text("unexpected")',
+        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('DELETION_STARTED')) started = true; }), /kernel stopped|deleted|cancelled/i);
+      await waitFor(() => started, 5000, 'real notebook training begins');
+      await rm(source); await runtime.onLocalDelete(fakeVscode.Uri.file(source));
+      await execution;
+      assert.equal(runtime.activeExecutions, 0);
+      assert.ok(!runtime.kernels.has(key));
+      assert.ok(!runtime.kernelStatuses.has(key), 'old execution cleanup must not restore an Idle entry for the deleted notebook');
+      await new Promise((resolve) => setTimeout(resolve, 2200));
+      await assert.rejects(readFile(path.join(runtime.descriptor.backingFolder, 'late-checkpoint.json')), { code: 'ENOENT' });
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('preserves running training and its Busy counter when a notebook replaces another live notebook by rename', async function () {
+    this.timeout(25_000);
+    if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-overwrite-rename-'));
+    const working = path.join(root, 'working'); await mkdir(working);
+    const content = JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', metadata: {}, source: ['print(1)'], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+    await Promise.all(['source.ipynb', 'target.ipynb'].map((key) => writeFile(path.join(working, key), content)));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'overwrite-rename', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'overwrite-rename-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let sourceExecution: Promise<any> | undefined;
+    let targetExecution: Promise<any> | undefined;
+    try {
+      await runtime.start();
+      await runtime.executeCell('source.ipynb', 'a', 'retained_value = 731', () => undefined);
+      await runtime.executeCell('target.ipynb', 'a', 'discarded_value = 17', () => undefined);
+      const sourceKernel = runtime.kernels.get('source.ipynb');
+      const sourceCompute = { ...runtime.computeForNotebook('source.ipynb') };
+      runtime.descriptor.notebookCompute['source.ipynb'] = sourceCompute;
+      runtime.descriptor.notebookPythonPaths['source.ipynb'] = 'python3';
+      let sourceStarted = false; let targetStarted = false;
+      sourceExecution = runtime.executeCell('source.ipynb', 'a',
+        'import time\nprint("SOURCE_STARTED", flush=True)\ntime.sleep(3)\nretained_value += 1',
+        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('SOURCE_STARTED')) sourceStarted = true; });
+      void sourceExecution!.catch(() => undefined);
+      // Attach the rejection handler before deletion can stop the old target.
+      targetExecution = assert.rejects(runtime.executeCell('target.ipynb', 'a',
+        'import time\nprint("TARGET_STARTED", flush=True)\ntime.sleep(30)',
+        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('TARGET_STARTED')) targetStarted = true; }), /kernel stopped|deleted|cancelled/i);
+      await waitFor(() => sourceStarted && targetStarted, 5000, 'both live kernels begin execution');
+      await rm(path.join(working, 'target.ipynb'));
+      await rename(path.join(working, 'source.ipynb'), path.join(working, 'target.ipynb'));
+      await runtime.onLocalRename(fakeVscode.Uri.file(path.join(working, 'source.ipynb')), fakeVscode.Uri.file(path.join(working, 'target.ipynb')));
+      await targetExecution;
+      assert.equal(runtime.kernels.get('target.ipynb'), sourceKernel, 'only the replaced target kernel may stop');
+      assert.deepEqual(runtime.descriptor.notebookCompute['target.ipynb'], sourceCompute);
+      assert.equal(runtime.descriptor.notebookPythonPaths['target.ipynb'], 'python3');
+      assert.equal(runtime.notebookActiveExecutions.get('target.ipynb'), 1, 'old target cleanup must not decrement source training');
+      assert.equal(runtime.kernelStatuses.get('target.ipynb'), 'Busy');
+      assert.equal(runtime.kernels.has('source.ipynb'), false);
+      assert.equal((await sourceExecution).success, true);
+      assert.equal(runtime.notebookActiveExecutions.has('target.ipynb'), false);
+      assert.equal(runtime.kernelStatuses.get('target.ipynb'), 'Idle');
+      const events: any[] = [];
+      assert.equal((await runtime.executeCell('target.ipynb', 'a', 'assert "discarded_value" not in globals(); print(retained_value)', (event: any) => events.push(event))).success, true);
+      assert.ok(events.some((event) => event.messageType === 'stream' && String(event.content.text).includes('732')));
+    } finally {
+      await runtime.leave();
+      await Promise.allSettled([sourceExecution, targetExecution]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels notebook preparation when the notebook is deleted and recreated before the filesystem barrier completes', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-preparation-delete-'));
+    const working = path.join(root, 'working'); await mkdir(working);
+    const key = 'work.ipynb'; const source = path.join(working, key);
+    const content = JSON.stringify({ cells: [{ cell_type: 'code', id: 'a', metadata: {}, source: ['print(1)'], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+    await writeFile(source, content);
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'preparation-delete', role: 'host', peerId: 'host',
+      hostPeerId: 'host', workingFolder: working, pythonPath: 'python3' }),
+    'preparation-delete-token-that-is-long-enough', context(path.resolve('.')), logger());
+    let release!: () => void;
+    try {
+      await runtime.start();
+      runtime.prepareWorkingCopy = () => new Promise<void>((resolve) => { release = resolve; });
+      const execution = assert.rejects(runtime.executeCell(key, 'a', 'print(1)', () => undefined), /notebook.*deleted|notebook.*replaced/i);
+      await waitFor(() => Boolean(release), 1000, 'notebook preparation starts');
+      await rm(source); await runtime.onLocalDelete(fakeVscode.Uri.file(source));
+      await writeFile(source, content.replace('print(1)', 'print(2)'));
+      await runtime.onLocalFile(fakeVscode.Uri.file(source), 'create');
+      release(); await execution;
+      assert.equal(runtime.kernels.size, 0, 'a deleted request must not launch a kernel for its replacement');
+      assert.equal(runtime.repositoryOperations, 0);
+    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it('blocks execution and another folder change while the host repository is being replaced', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-repository-switch-'));
     const working = path.join(root, 'working');
@@ -395,6 +557,7 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => shared.view().text.includes('host-command\n') || shared.view().text.includes('host-command\r\n'), 5000, 'shared host shell output');
       await assert.rejects(readFile(path.join(backing, 'forbidden-shell.txt')), { code: 'ENOENT' });
       const replacement = path.join(root, 'replacement-repository');
+      host.sharedTerminal().interrupt();
       await host.setBackingFolder(replacement);
       await host.sharedTerminal().execute(process.platform === 'win32'
         ? 'echo repository-reset> terminal-owner.txt & echo new-repository-command'

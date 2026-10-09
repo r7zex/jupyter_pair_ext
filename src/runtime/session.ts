@@ -2644,6 +2644,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // Cell payload collection is irreversible, so the CRDT layer asks the
     // runtime whether every known participant is currently present.
     this.project.collectionGuard = (now) => this.isGarbageCollectionSafe(now);
+    this.project.on('documentDeleted', (key: string, kind: string) => {
+      if (kind === 'notebook') this.deleteNotebookRuntimeState(key);
+    });
     this.project.on('cellStateRepaired', (key: string, ids: string[]) => {
       this.log.appendLine(`[debug] Removed order entries without cell state in ${key}: ${ids.join(', ')}`);
     });
@@ -3343,8 +3346,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
               await this.acceptFileState(conflict.losingPath, conflict.tombstone, sourceId, false, true);
             }
             this.renameFileStates(effectiveFrom, to, fromState, toState);
-            this.renameNotebookRuntimeState(effectiveFrom, to);
             this.project.renameDocument(effectiveFrom, to);
+            this.renameNotebookRuntimeState(effectiveFrom, to);
             this.renameBinaryVersions(effectiveFrom, to);
             this.renameDirectories(effectiveFrom, to);
             this.recordRenameOrigin(from, to, toState);
@@ -3740,6 +3743,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.kernels.get(key)?.stop();
       this.kernels.delete(key);
       this.kernelLastUsed.delete(key);
+      this.notebookActiveExecutions.delete(key);
       this.cancelNotebookExecutions(key, 'Compute changed; stale execution result discarded.');
       this.setKernelStatus(key, 'Offline');
     }
@@ -4346,8 +4350,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const toState = this.nextFileState(kind, false);
 
     this.renameFileStates(rawFrom, rawTo, fromState, toState);
-    this.renameNotebookRuntimeState(rawFrom, rawTo);
     this.project.renameDocument(rawFrom, rawTo);
+    this.renameNotebookRuntimeState(rawFrom, rawTo);
     this.renameBinaryVersions(rawFrom, rawTo);
     this.renameDirectories(rawFrom, rawTo);
     this.recordRenameOrigin(rawFrom, rawTo, toState);
@@ -4720,10 +4724,33 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private async applyDeletedPath(relativePath: string, suppressWatcher = true): Promise<void> {
     if (suppressWatcher) this.suppressDelete(relativePath);
+    this.deleteNotebookRuntimeState(relativePath);
     this.project.deleteDocument(relativePath);
     this.deleteBinaryVersions(relativePath);
     this.deleteDirectories(relativePath);
     await this.storage?.remove(relativePath);
+  }
+
+  private deleteNotebookRuntimeState(relativePath: string): void {
+    const matches = (key: string) => key !== '*' && (key === relativePath || key.startsWith(`${relativePath}/`));
+    const keys = new Set([
+      ...this.kernels.keys(), ...this.kernelStatuses.keys(), ...this.kernelLastUsed.keys(), ...this.notebookActiveExecutions.keys(),
+      ...[...this.pendingExecutions.values()].map((pending) => pending.notebookKey),
+      ...Object.keys(this.descriptor.notebookCompute ?? {}),
+      ...Object.keys(this.descriptor.notebookPythonPaths ?? {}),
+    ].filter(matches));
+    for (const key of keys) {
+      this.kernels.get(key)?.stop();
+      this.kernels.delete(key);
+      this.kernelLastUsed.delete(key);
+      this.notebookActiveExecutions.delete(key);
+      this.cancelNotebookExecutions(key, 'The notebook was deleted or replaced; its execution was cancelled.');
+      if (this.descriptor.notebookCompute) delete this.descriptor.notebookCompute[key];
+      if (this.descriptor.notebookPythonPaths) delete this.descriptor.notebookPythonPaths[key];
+      this.setKernelStatus(key, 'Offline');
+      this.kernelStatuses.delete(key);
+    }
+    if (keys.size) this.publishKernelPresence();
   }
 
   private suppressDelete(relativePath: string): void {
@@ -6499,8 +6526,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
     const clock = this.coordinator.clock;
+    let notebookDeleted = false;
     const assertAuthority = () => {
       this.assertExecutionAvailable();
+      if (notebookDeleted) throw new Error('The notebook was deleted or replaced before execution could start.');
       if (!this.coordinator.isCurrentHost() || !sameClock(clock, this.coordinator.clock)
         || target.executorId !== this.descriptor.localPeer.peerId
         || !sameComputeTarget(target, this.computeForNotebook(notebookKey))) {
@@ -6510,7 +6539,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     assertAuthority();
     this.repositoryOperations++;
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
+    const onDelete = (key: string) => { if (key === notebookKey) notebookDeleted = true; };
     this.project.on('documentRenamed', onRename);
+    this.project.on('documentDeleted', onDelete);
     try {
     // Flush canonical edits first, then execute in the host repository so
     // private/unshared datasets and local project resources stay available.
@@ -6556,8 +6587,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (!currentKey) return;
         this.kernels.delete(currentKey);
         this.kernelLastUsed.delete(currentKey);
+        this.notebookActiveExecutions.delete(currentKey);
         this.setKernelStatus(currentKey, 'Offline');
       });
+      this.notebookActiveExecutions.delete(notebookKey);
       this.kernels.set(notebookKey, kernel);
     }
     this.kernelLastUsed.set(notebookKey, Date.now());
@@ -6597,17 +6630,23 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       kernel.off('event', listener);
       if (this.executionOwners.get(requestId)?.peerId === this.descriptor.localPeer.peerId) this.executionOwners.delete(requestId);
       this.activeExecutions = Math.max(0, this.activeExecutions - 1);
-      const notebookExecutions = Math.max(0, (this.notebookActiveExecutions.get(notebookKey) ?? 1) - 1);
-      if (notebookExecutions) this.notebookActiveExecutions.set(notebookKey, notebookExecutions);
-      else this.notebookActiveExecutions.delete(notebookKey);
-      this.setKernelStatus(notebookKey, notebookExecutions ? 'Busy' : 'Idle');
+      if (this.kernels.get(notebookKey) === kernel) {
+        const notebookExecutions = Math.max(0, (this.notebookActiveExecutions.get(notebookKey) ?? 1) - 1);
+        if (notebookExecutions) this.notebookActiveExecutions.set(notebookKey, notebookExecutions);
+        else this.notebookActiveExecutions.delete(notebookKey);
+        this.setKernelStatus(notebookKey, notebookExecutions ? 'Busy' : 'Idle');
+      }
       if (this.runtimeState !== 'kernel-failed') {
         this.transition(this.activeExecutions ? 'executing' : 'ready', this.activeExecutions
           ? 'Another notebook execution is still active.'
           : `Execution finished for ${notebookKey}.`);
       }
     }
-    } finally { this.project.off('documentRenamed', onRename); this.repositoryOperations--; }
+    } finally {
+      this.project.off('documentRenamed', onRename);
+      this.project.off('documentDeleted', onDelete);
+      this.repositoryOperations--;
+    }
   }
 
   private assertExecutionAvailable(): void {
@@ -6679,6 +6718,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (this.endingSession) throw new Error('The host is finalizing the session.');
     if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait for the current folder change to finish.');
     if (this.repositoryOperations > 0 || this.activeExecutions > 0) throw new Error('Finish or stop notebook execution and terminal preparation before changing the host repository.');
+    if (this.hostTerminal?.isRunning()) throw new Error('Stop the shared host terminal with Ctrl+C before changing the host repository. This preserves running terminal commands until you explicitly stop them.');
     const storage = this.storage;
     const clock = this.coordinator.clock;
     const previous = this.descriptor.backingFolder;
