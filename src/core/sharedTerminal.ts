@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { WireFrame } from './wire';
 
@@ -158,8 +159,11 @@ export class SharedTerminal extends EventEmitter {
   private startShell(): ChildProcessWithoutNullStreams {
     const windows = process.platform === 'win32';
     const shell = windows ? process.env.ComSpec || 'cmd.exe' : process.env.SHELL || '/bin/sh';
+    const directory = this.authority.directory();
     const child = spawn(shell, windows ? ['/d', '/q', '/k', 'chcp 65001>nul'] : [], {
-      cwd: this.authority.directory(), env: { ...process.env, TERM: 'dumb' },
+      cwd: directory,
+      env: { ...process.env, TERM: 'dumb', PAIR_NOTEBOOK_WORKSPACE: directory,
+        PYTHONPATH: directory + (process.env.PYTHONPATH ? path.delimiter + process.env.PYTHONPATH : '') },
       stdio: 'pipe', windowsHide: true, detached: !windows,
     });
     this.child = child;

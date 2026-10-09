@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.35 - 2026-10-09 (shared-terminal training environment)
+
+- Sets the shared shell's `PAIR_NOTEBOOK_WORKSPACE` to its owner's repository, replacing a stale inherited value. The path remains stable after `cd` and is refreshed after shell/repository reset.
+- Prepends the owner repository to `PYTHONPATH` while retaining inherited Python module paths, allowing nested terminal entrypoints to import project modules.
+- Adds real-shell environment regressions and verifies complete standard-library and PyTorch training from nested terminal scripts, including owner-only binary datasets, model/optimizer reload and guest output recovery after a VPS outage.
+
 ## 0.5.34 - 2026-10-09 (training input recovery)
 
 - Restores missing canonical modules, configuration and notebooks before host terminal commands and notebook execution. Restores missing binary dependencies before every cell, including cells in an already running kernel.

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -12,6 +13,63 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 describe('shared host command terminal', () => {
+  it('keeps the owner repository identity after cd and refreshes it when the shell resets', async function () {
+    if (process.platform === 'win32') this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-owner-'));
+    const first = path.join(root, 'first repository'); const second = path.join(root, 'second repository');
+    await Promise.all([mkdir(first), mkdir(second)]);
+    let directory = first;
+    const inherited = process.env.PAIR_NOTEBOOK_WORKSPACE;
+    process.env.PAIR_NOTEBOOK_WORKSPACE = '/stale-owner-workspace';
+    const host = new SharedTerminal({ isHost: () => true, hostId: () => 'host', available: () => true,
+      directory: () => directory, prepare: async () => undefined, send: () => undefined });
+    try {
+      await host.execute('mkdir nested; cd nested');
+      await host.execute('printf "%s" "$PAIR_NOTEBOOK_WORKSPACE" > ../owner.txt; pwd > ../cwd.txt; printf "FIRST_OWNER_READY\\n"');
+      await until(() => host.view().text.includes('FIRST_OWNER_READY\n'));
+      assert.equal(await readFile(path.join(first, 'owner.txt'), 'utf8'), first);
+      assert.equal((await readFile(path.join(first, 'cwd.txt'), 'utf8')).trim(), path.join(first, 'nested'));
+      directory = second; host.reset();
+      await host.execute('printf "%s" "$PAIR_NOTEBOOK_WORKSPACE" > owner.txt; printf "SECOND_OWNER_READY\\n"');
+      await until(() => host.view().text.includes('SECOND_OWNER_READY\n'));
+      assert.equal(await readFile(path.join(second, 'owner.txt'), 'utf8'), second);
+    } finally {
+      if (inherited === undefined) delete process.env.PAIR_NOTEBOOK_WORKSPACE;
+      else process.env.PAIR_NOTEBOOK_WORKSPACE = inherited;
+      host.dispose(); await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('imports host root and inherited Python modules from a nested command entrypoint', async function () {
+    if (process.platform === 'win32' || spawnSync('python3', ['-c', 'pass']).status !== 0) this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-imports-'));
+    const repository = path.join(root, 'host'); const inheritedModules = path.join(root, 'python-environment');
+    await Promise.all([mkdir(repository), mkdir(inheritedModules)]);
+    await mkdir(path.join(repository, 'nested'));
+    await writeFile(path.join(repository, 'owner_helper.py'), 'VALUE = 73\n');
+    await writeFile(path.join(inheritedModules, 'environment_helper.py'), 'VALUE = 81\n');
+    await writeFile(path.join(repository, 'nested', 'inspect_owner.py'),
+      'import json\nfrom pathlib import Path\nimport owner_helper, environment_helper\n'
+      + 'result = {"owner": owner_helper.VALUE, "environment": environment_helper.VALUE}\n'
+      + '(Path(__file__).resolve().parent.parent / "imports.json").write_text(json.dumps(result))\n'
+      + 'print("OWNER_IMPORTS_READY", flush=True)\n');
+    const inherited = process.env.PYTHONPATH;
+    process.env.PYTHONPATH = inheritedModules + (inherited ? path.delimiter + inherited : '');
+    const host = new SharedTerminal({ isHost: () => true, hostId: () => 'host', available: () => true,
+      directory: () => repository, prepare: async () => undefined, send: () => undefined });
+    try {
+      await host.execute('cd nested');
+      await host.execute('python3 inspect_owner.py');
+      await until(() => host.view().text.includes('OWNER_IMPORTS_READY\n') || host.view().text.includes('ModuleNotFoundError'));
+      assert.ok(host.view().text.includes('OWNER_IMPORTS_READY\n'), host.view().text);
+      assert.deepEqual(JSON.parse(await readFile(path.join(repository, 'imports.json'), 'utf8')), { owner: 73, environment: 81 });
+    } finally {
+      if (inherited === undefined) delete process.env.PYTHONPATH;
+      else process.env.PYTHONPATH = inherited;
+      host.dispose(); await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('executes in the host repository, preserves shell state and replays output to guests', async function () {
     if (process.platform === 'win32') this.skip();
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-'));

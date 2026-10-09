@@ -1,0 +1,78 @@
+{
+  "date": "2026-10-09",
+  "version": "0.5.35",
+  "branch": "codex/vps-persistent-compute",
+  "baseline_commit": "672d4b0903273a679439712c787be28f7a3a4699",
+  "environment": "managed cloud Linux; real filesystem, shell, Jupyter, local VPS broker and Python agent",
+  "checks": {
+    "typescript_compile": "passed",
+    "eslint": "passed",
+    "full_typescript_suite": {
+      "passed": 4659,
+      "failed": 0,
+      "skipped": 0
+    },
+    "python_agent_audit": {
+      "passed": 79,
+      "failed": 0,
+      "resource_warnings_as_errors": true
+    },
+    "new_real_shell_regressions": {
+      "passed": 2,
+      "baseline_cases_failed": 2,
+      "stale_inherited_workspace_replaced": true,
+      "repository_path_with_spaces": true,
+      "workspace_stable_after_cd": true,
+      "workspace_refreshed_after_repository_reset": true,
+      "root_project_module_imports_from_nested_entrypoint": true,
+      "inherited_python_modules_preserved": true
+    },
+    "model_training_runs": {
+      "passed": 10,
+      "standard_library": 5,
+      "pytorch": 5,
+      "torch_version": "2.14.1+cpu",
+      "device": "cpu",
+      "guest_jupyter_runs": 4,
+      "host_terminal_runs": 4,
+      "detached_owner_agent_runs": 2,
+      "routes": ["peer mesh", "VPS only", "detached agent with local broker"],
+      "owner_repository_dataset_loading": true,
+      "checkpoint_reload_and_evaluation": true,
+      "maximum_mse": 1e-10,
+      "maximum_prediction_error": 0.0001
+    },
+    "terminal_training": {
+      "passed": 4,
+      "nested_entrypoint_after_cd": true,
+      "owner_workspace_environment_used_for_config_and_data": true,
+      "project_module_import": true,
+      "binary_dataset_only_in_owner_repository": true,
+      "separate_terminal_checkpoint": true,
+      "pytorch_model_and_optimizer_reloaded": true,
+      "guest_receives_training_progress_and_completion": true,
+      "vps_stops_during_training": true,
+      "host_checkpoint_completed_while_vps_down": true,
+      "guest_completion_output_recovers_after_vps_restart": true
+    },
+    "pytorch_details_per_run": {
+      "data_loader": true,
+      "autograd": true,
+      "optimizer": "SGD with momentum 0.5",
+      "epochs": 100,
+      "optimizer_steps": 300,
+      "binary_checkpoint_reloaded": true,
+      "optimizer_state_reloaded": true
+    },
+    "shared_terminal_authority": "passed: current host OS account and input only; guest output and forged-input rejection",
+    "previous_repository_and_terminal_recovery": "passed in the full suite",
+    "native_vscode_rendering": "not run: no native VS Code executable",
+    "physical_gpu_training": "not run",
+    "windows_process_lifetime": "not run",
+    "external_vps": "not run; user selected local-broker acceptance"
+  },
+  "distribution": {
+    "vsix": "pair-notebook-0.5.35.vsix",
+    "validation_tool": "scripts/make-artifacts.mjs"
+  }
+}

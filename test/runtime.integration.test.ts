@@ -304,6 +304,13 @@ describe('production SessionRuntime integration', () => {
     } else await writeFile(path.join(backing, dataset), trainingData);
     await writeFile(path.join(hostFolder, 'config.json'), JSON.stringify({ dataset, delay: vpsOnly ? 0.8 : 0 }));
     await writeFile(path.join(hostFolder, 'training_helpers.py'), trainingHelper);
+    await mkdir(path.join(hostFolder, 'cli'));
+    const terminalProgram = program.replace('root = Path.cwd()', "root = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])")
+      .replaceAll("root / 'checkpoints'", "root / 'terminal-checkpoints'")
+      .replace("'TORCH_TRAINING_STARTED'", "'TERMINAL_TRAINING_STARTED'")
+      .replace("'TRAINING_STARTED'", "'TERMINAL_TRAINING_STARTED'");
+    await writeFile(path.join(hostFolder, 'cli', 'train_cli.py'), terminalProgram
+      + '\nassert Path.cwd() == root / "cli"\nprint("TERMINAL_MODEL_DONE", flush=True)\n');
     await writeFile(path.join(hostFolder, 'train.ipynb'), JSON.stringify({ cells: [
       { cell_type: 'code', id: 'train', metadata: {}, source: [program], outputs: [], execution_count: null },
     ], metadata: {}, nbformat: 4, nbformat_minor: 5 }));
@@ -365,6 +372,25 @@ describe('production SessionRuntime integration', () => {
       const shared = guest.sharedTerminal(); shared.requestSnapshot();
       await assert.rejects(shared.execute('echo forbidden'), /Only the active session host/);
       guest.transport.sendTo('host', 'shellInput', { clock: guest.coordinator.clock }, Buffer.from('echo forbidden > forbidden-shell.txt'));
+      await host.sharedTerminal().execute('cd cli');
+      await host.sharedTerminal().execute(quoteShellArgument(pythonPath) + ' train_cli.py');
+      if (broker) {
+        await waitFor(() => shared.view().text.includes('TERMINAL_TRAINING_STARTED\n')
+          || shared.view().text.includes('TERMINAL_TRAINING_STARTED\r\n'), 10000, 'VPS guest receives terminal training progress');
+        await broker.stop();
+        await waitFor(() => fileExists(path.join(backing, 'terminal-checkpoints', 'model.json')), 5000, 'terminal model finishes while VPS is down');
+        broker = new VpsServer(brokerOptions); await broker.start(port);
+      }
+      await waitFor(() => shared.view().text.includes('TERMINAL_MODEL_DONE\n')
+        || shared.view().text.includes('TERMINAL_MODEL_DONE\r\n'), 10000, 'guest receives completed terminal model training');
+      const terminalModel = JSON.parse(await readFile(path.join(backing, 'terminal-checkpoints', 'model.json'), 'utf8'));
+      assert.equal(terminalModel.epochs, useTorch ? 100 : 400);
+      assert.ok(Math.abs(terminalModel.weights[0] * 3 + terminalModel.weights[1] - 7) < 1e-4);
+      if (useTorch) {
+        assert.ok(terminalModel.mse < 1e-10); assert.equal(terminalModel.steps, 300);
+        assert.equal(terminalModel.checkpoint_reloaded, true); assert.equal(terminalModel.optimizer_state_reloaded, true);
+        assert.ok((await readFile(path.join(backing, 'terminal-checkpoints', 'model.pt'))).byteLength > 0);
+      }
       await host.sharedTerminal().execute(process.platform === 'win32' ? 'echo host-command' : 'printf "host-command\\n"');
       await waitFor(() => shared.view().text.includes('host-command\n') || shared.view().text.includes('host-command\r\n'), 5000, 'shared host shell output');
       await assert.rejects(readFile(path.join(backing, 'forbidden-shell.txt')), { code: 'ENOENT' });
@@ -4716,6 +4742,11 @@ function logger(): any {
   return { appendLine: (message: string) => {
     if (process.env.PAIR_NOTEBOOK_TEST_LOG === '1') process.stderr.write(`${message}\n`);
   } };
+}
+
+function quoteShellArgument(value: string): string {
+  if (process.platform === 'win32') return '"' + value + '"';
+  return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
 function createVscodeBoundary(): any {
