@@ -7,6 +7,11 @@ import { type JobSubmission, normalizeVpsUrl, validateSubmission, VPS_ID } from 
 export class PendingSubmissionStore {
   public constructor(private readonly directory: string) {}
   public async load(endpoint: string): Promise<JobSubmission | undefined> {
+    for await (const job of this.list(endpoint)) return job;
+    return undefined;
+  }
+  /** Iterate one receipt at a time so multiple editor windows do not multiply snapshot memory. */
+  public async *list(endpoint: string): AsyncGenerator<JobSubmission> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     for (const name of (await readdir(this.directory)).filter((value) => /^[A-Za-z0-9_-]{1,128}\.json$/.test(value)).sort()) {
       let contents: string;
@@ -19,9 +24,8 @@ export class PendingSubmissionStore {
       if (receipt.endpoint !== normalizeVpsUrl(endpoint)) continue;
       const job = validateSubmission(receipt.job);
       if (name !== `${job.id}.json`) throw new Error('Pending VPS submission is inconsistent. Inspect local extension storage before retrying.');
-      return job;
+      yield job;
     }
-    return undefined;
   }
   public async save(endpoint: string, job: JobSubmission): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });

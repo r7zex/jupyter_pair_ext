@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.38 - 2026-10-10 (persistent research and confirmed stops)
+
+- Requires fresh exact typed `CONFIRM` for managed notebook/terminal stops and destructive editor-session operations. Executor challenges bind identity, authority and exact runs; unconfirmed remote interrupts fail closed. Observer disconnect and notebook UI deletion no longer interrupt accepted running work.
+- Adds broker-issued durable cancellation challenges, scoped session emergency stops, authenticated operator/member/viewer permissions, project access checks and `cancel_pending` until executor acknowledgement. Duplicate confirmed delivery is idempotent and session stop closes further admission in that scope.
+- Pins owner-prepared dataset manifests at submission and streams verified resumable copies into immutable per-run workspaces. Project sources, config, cwd and project imports are isolated; the owner-selected installed Python environment remains owner-managed.
+- Preserves natural completion in a late cancellation race, requests cooperative termination of supervised descendants before bounded escalation, and keeps unrelated processes outside cancellation.
+- Restores job observation across editor restarts with bounded output and explicitly stale cached state. Adds a deliberate new standalone compute-session action after a scoped stop.
+- Adds an explicitly synthetic chronological anti-fraud baseline/MLP reference with full-state retained atomic checkpoints, deterministic CPU resume checks, validation-selected operating thresholds, saved provenance and generated multi-seed paper tables.
+- Adds an independently supervised soak runner and version-specific evidence. The real Linux CPU loopback run completed 4 hours 27.668 seconds with one launch and recovered broker/observer outages; external VPS and native Windows/GPU require separate verification.
+
+See [persistent research operations](docs/PERSISTENT_RESEARCH.md) and the 0.5.38 audit. Upgrade all editors and agents together; this branch push does not publish a Release or deploy production services.
+
 ## 0.5.37 - 2026-10-09 (host repository and training reliability)
 
 - Removes the ten-minute host and eleven-minute guest execution limits. Accepted training runs until completion, explicit cancellation or session closure; kernel crashes and rejected execution commands now settle promptly instead of leaving cells busy.

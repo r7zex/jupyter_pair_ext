@@ -126,7 +126,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.runVpsJob', (id?: string) => vpsCompute.submit(id));
   register(context, 'pairNotebook.showVpsJobs', () => vpsCompute.showJobs());
   register(context, 'pairNotebook.showVpsJob', (id: string) => vpsCompute.showJob(id));
-  register(context, 'pairNotebook.cancelVpsJob', () => vpsCompute.cancel());
+  register(context, 'pairNotebook.cancelVpsJob', (id?: string) => vpsCompute.cancel(id));
+  register(context, 'pairNotebook.stopVpsSession', () => vpsCompute.stopSession());
+  register(context, 'pairNotebook.startComputeSession', () => vpsCompute.startComputeSession());
+  register(context, 'pairNotebook.stopInteractiveSession', () => requireRuntime().confirmOperation('stop-session'));
   register(context, 'pairNotebook.refreshVpsJobs', async () => vpsCompute.refresh());
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
   status.command = 'pairNotebook.openPanel';
@@ -862,11 +865,12 @@ async function leaveActiveSession(
 async function leaveSession(): Promise<void> {
   const active = requireRuntime();
   const answer = await vscode.window.showWarningMessage(
-    'Leave the current Pair Notebook session? The isolated working copy is kept for recovery.',
+    'Leave the editor session? Background jobs on the independent compute agent keep running and remain available in Compute Jobs. Active interactive kernels and the host shell require a separate CONFIRM before stopping. The isolated working copy is kept for recovery.',
     { modal: true },
     'Leave Session',
   );
   if (answer !== 'Leave Session') return;
+  if (!await active.confirmOperation('leave')) return;
   const context = requireActivationContext();
   await leaveActiveSession(context, Date.now(), 'explicit-leave', active);
   await forgetWorkspaceSession(context, active.descriptor);
@@ -907,6 +911,7 @@ async function endSession(): Promise<void> {
     'Завершить для всех',
   );
   if (answer !== 'Завершить для всех') return;
+  if (!await active.confirmOperation('end-session')) return;
   await active.endSession();
   await forgetEndedSession(requireActivationContext(), active.descriptor);
   void vscode.window.showInformationMessage(waitingForHostFolder
@@ -962,6 +967,7 @@ async function transferHost(): Promise<void> {
     'Transfer',
   );
   if (confirm !== 'Transfer') return;
+  if (!await active.confirmOperation('transfer-host')) return;
   await active.transferHost(target.peerId);
   void vscode.window.showInformationMessage(`Host transferred to ${target.label}. Waiting for their host folder.`);
 }
@@ -1041,6 +1047,7 @@ async function chooseHostFolder(active: SessionRuntime): Promise<void> {
         if (retry === 'Выбрать другую папку') continue;
         return;
       }
+      if (!await active.confirmOperation('replace-repository')) return;
       await active.setBackingFolder(folder, 'replace');
       void vscode.window.showInformationMessage(`Pair Notebook: текущее состояние записано в ${folder}; сессия продолжена.`);
       return;
@@ -1057,6 +1064,7 @@ async function chooseHostFolder(active: SessionRuntime): Promise<void> {
     }
     if (inspection.matches) {
       try {
+        if (!await active.confirmOperation('replace-repository')) return;
         await active.setBackingFolder(folder, 'reuse-existing');
         void vscode.window.showInformationMessage(`Pair Notebook: общая папка ${folder} проверена и подключена без перезаписи; сессия продолжена.`);
         return;
@@ -1076,6 +1084,7 @@ async function chooseHostFolder(active: SessionRuntime): Promise<void> {
     );
     if (decision === 'Выбрать другую папку') continue;
     if (decision !== 'Записать текущую сессию') return;
+    if (!await active.confirmOperation('replace-repository')) return;
     await active.setBackingFolder(folder, 'replace');
     void vscode.window.showInformationMessage(`Pair Notebook: состояние сессии записано в ${folder}; сессия продолжена.`);
     return;
@@ -1179,7 +1188,9 @@ async function changeCompute(): Promise<void> {
     { modal: true },
     'Switch',
   );
-  if (confirm === 'Switch') active.changeCompute(selected.peerId, notebookKey, selected.device, selected.pythonPath);
+  if (confirm === 'Switch' && await active.confirmOperation('change-compute', notebookKey)) {
+    active.changeCompute(selected.peerId, notebookKey, selected.device, selected.pythonPath);
+  }
 }
 
 /**
@@ -1513,6 +1524,10 @@ async function selectPythonEnvironment(): Promise<void> {
     title: 'Python executable', value: current, ignoreFocusOut: true,
   });
   if (!selected) return;
+  const selectedRuntime = runtime;
+  const activeNotebook = vscode.window.activeNotebookEditor?.notebook;
+  const activeNotebookKey = selectedRuntime && activeNotebook ? selectedRuntime.notebookKey(activeNotebook.uri) : undefined;
+  if (selectedRuntime && !await selectedRuntime.confirmOperation('change-compute', activeNotebookKey)) return;
   await configuration.update('pythonPath', selected, vscode.ConfigurationTarget.Global);
   if (picked.environment.executable && !picked.environment.jupyterReady) {
     const install = `"${selected}" -m pip install jupyter_client ipykernel`;

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import Module from 'node:module';
@@ -11,6 +11,7 @@ import type { SessionRuntime } from '../src/runtime/session';
 import { CollaborativeProject } from '../src/core/crdt';
 import { VpsServer } from '../src/vps/server';
 import { VpsClient, VpsHttpError } from '../src/vps/client';
+import { PendingSubmissionStore } from '../src/vps/pendingSubmission';
 import { type JobSubmission, MAX_JOB_BYTES, safeJobPath, validateSubmission, vpsSecretKey } from '../src/vps/protocol';
 import { trainingProgram, trainingHelper, trainingData, torchPython, torchDatasetSetup, torchTrainingProgram } from './support/modelTraining';
 
@@ -25,6 +26,9 @@ let workspaceFolders: any[] | undefined;
 let pick: (items: any[], options: any) => Promise<any>;
 let output = '';
 let secretRead: ((key: string) => Promise<string | undefined>) | undefined;
+let inputText: string | undefined;
+let inputOptions: any[] = [];
+let information: string[] = [];
 const configurationListeners = new Set<(event: any) => void>();
 const secrets = new Map<string, string>();
 const state = new Map<string, unknown>();
@@ -47,7 +51,9 @@ const boundary = {
     createOutputChannel: () => ({ clear: () => { output = ''; }, show: () => undefined,
       append: (value: string) => { output += value; }, appendLine: (value: string) => { output += value + '\n'; }, dispose: () => undefined }),
     showQuickPick: async (items: any[], options: any) => pick(items, options),
-    showInformationMessage: async () => undefined,
+    showInputBox: async (options: any) => { inputOptions.push(options); return inputText; },
+    showWarningMessage: async () => 'Cancel job',
+    showInformationMessage: async (message: string) => { information.push(message); return undefined; },
   },
 };
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
@@ -72,6 +78,7 @@ async function setup(): Promise<void> {
   endpoint = ''; trusted = true; runtime = undefined; notebook = undefined; documents = [];
   workspaceFolders = undefined;
   secrets.clear(); state.clear(); output = ''; secretRead = undefined;
+  inputText = undefined; inputOptions = []; information = [];
   editor = { document: { uri: { scheme: 'file', fsPath: path.join(root, 'train.py') }, getText: () => 'print("original")' } };
   pick = async (items) => items[0];
   controller = makeController();
@@ -207,10 +214,16 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     const repository = path.join(root, 'repository');
     await mkdir(path.join(repository, 'experiments'), { recursive: true });
     const dataset = useTorch ? '.git/dataset.pt' : 'data.csv';
+    let dataManifest: string | undefined;
+    let datasetDigest: string | undefined;
     if (useTorch) {
       await mkdir(path.join(repository, '.git'));
       const setup = spawnSync(pythonPath, ['-c', torchDatasetSetup, path.join(repository, dataset)], { encoding: 'utf8' });
       assert.equal(setup.status, 0, setup.stderr);
+      const bytes = await readFile(path.join(repository, dataset));
+      datasetDigest = createHash('sha256').update(bytes).digest('hex');
+      dataManifest = path.join(root, 'owner-data-manifest.json');
+      await writeFile(dataManifest, JSON.stringify({ version: 'ui-owner-data-v1', files: [{ path: dataset, size: bytes.length, sha256: datasetDigest }] }));
     }
     await writeFile(path.join(repository, 'config.json'), JSON.stringify({ dataset, delay: 0.8 }));
     await writeFile(path.join(repository, 'data.csv'), trainingData);
@@ -225,7 +238,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       canonical.replaceText('data.csv', trainingData);
       canonical.replaceText('training_helpers.py', trainingHelper);
       canonical.replaceText('.env', 'MUST_NOT_COPY=private');
-      runtime = { descriptor: { workingFolder: repository }, project: canonical };
+      runtime = { descriptor: { workingFolder: repository, projectId: 'research-project', sessionId: 'research-session' }, project: canonical };
       const hasIPython = spawnSync(pythonPath, ['-c', 'import IPython'], { stdio: 'ignore' }).status === 0;
       const cells = [hasIPython ? '%time notebook_setup = 42' : 'notebook_setup = 42',
         'from __future__ import annotations\ndef validate_setup(value: MissingType):\n    assert value == 42\nvalidate_setup(notebook_setup)', trainingProgram]
@@ -241,7 +254,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     };
     try {
       daemon = spawn(pythonPath, [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'pc',
-        '--state', path.join(root, 'agent'), '--workspace', computeWorkspace, '--poll-seconds', '0.1'],
+        '--state', path.join(root, 'agent'), '--workspace', computeWorkspace, ...(dataManifest ? ['--data-manifest', dataManifest] : []), '--poll-seconds', '0.1'],
       { env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore' });
       await until(async () => (await client.agents()).length === 1);
       await controller.submit();
@@ -260,7 +273,8 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
         assert.equal(model.checkpoint_reloaded, true); assert.equal(model.optimizer_state_reloaded, true);
         assert.ok(model.mse < 1e-10);
         assert.ok((await readFile(path.join(work, 'checkpoints', 'model.pt'))).byteLength > 0);
-        await assert.rejects(readFile(path.join(work, dataset)), { code: 'ENOENT' });
+        assert.equal(createHash('sha256').update(await readFile(path.join(work, dataset))).digest('hex'), datasetDigest);
+        assert.equal(submitted.dataset?.version, 'ui-owner-data-v1');
       }
       assert.ok(Math.abs(model.weights[0] * 3 + model.weights[1] - 7) < 1e-4);
       const port = Number(new URL(endpoint).port);
@@ -337,6 +351,206 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       for (const callback of configurationListeners) callback({ affectsConfiguration: (key: string) => key === 'pairNotebook.vpsUrl' });
       release(await original.call(client, 'log-watch'));
       await watch; assert.equal(output, '');
+    } finally { VpsClient.prototype.job = original; }
+  });
+
+  for (const text of [undefined, '', 'confirm', 'Confirm', ' CONFIRM', 'CONFIRM ', 'CONFIRM\n']) {
+    it(`does not send stop intent for input ${JSON.stringify(text) ?? 'dialog dismissed'}`, async () => {
+      await client.submit({ id: 'protected-stop', agentId: 'pc', title: 'anti-fraud baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+      inputText = text;
+      await controller.cancel('protected-stop');
+      assert.equal((await client.job('protected-stop')).cancelRequested, false);
+      assert.equal((await client.job('protected-stop')).status, 'queued');
+      assert.equal(inputOptions.length, 1);
+      assert.equal(inputOptions[0].value, '');
+      assert.match(inputOptions[0].prompt, /protected-stop/);
+      assert.match(inputOptions[0].prompt, /anti-fraud baseline/);
+      assert.match(inputOptions[0].prompt, /executor: pc \(cpu\)/);
+      assert.match(inputOptions[0].prompt, /elapsed: not started/);
+      assert.match(inputOptions[0].prompt, /last checkpoint: not reported/);
+      assert.match(inputOptions[0].prompt, /DataLoader workers/);
+      assert.match(inputOptions[0].prompt, /may be lost/);
+      assert.equal(inputOptions[0].validateInput('CONFIRM'), undefined);
+      assert.ok(inputOptions[0].validateInput('confirm'));
+    });
+  }
+
+  it('never uses an unconfirmed legacy cancellation call even when its button is accepted', async () => {
+    await client.submit({ id: 'legacy-button', agentId: 'pc', title: 'baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    const original = VpsClient.prototype.cancel;
+    let unconfirmedCalls = 0;
+    VpsClient.prototype.cancel = async (id) => { unconfirmedCalls++; return (await client.jobs()).find((job) => job.id === id)!; };
+    inputText = '';
+    try { await controller.cancel(); assert.equal(unconfirmedCalls, 0); }
+    finally { VpsClient.prototype.cancel = original; }
+    assert.equal((await client.job('legacy-button')).status, 'queued');
+  });
+
+  it('requires a fresh empty confirmation for each selected run', async () => {
+    for (const id of ['stop-first', 'stop-second']) await client.submit({ id, agentId: 'pc', title: id, device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    inputText = 'CONFIRM';
+    await controller.cancel('stop-first');
+    assert.equal((await client.job('stop-first')).status, 'cancelled');
+    assert.equal((await client.job('stop-second')).status, 'queued');
+    inputText = undefined;
+    await controller.cancel('stop-second');
+    assert.equal((await client.job('stop-second')).status, 'queued');
+    assert.deepEqual(inputOptions.map((options) => options.value), ['', '']);
+  });
+
+  it('shows cancel_pending until a disconnected executor acknowledges process cleanup', async () => {
+    await client.submit({ id: 'offline-stop', agentId: 'pc', title: 'long baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    await register(); // The real broker claims this job; there is no worker to acknowledge cancellation.
+    assert.equal((await client.job('offline-stop')).status, 'running');
+    inputText = 'CONFIRM';
+    await controller.cancel('offline-stop');
+    const job = await client.job('offline-stop');
+    assert.equal(job.status, 'cancel_pending');
+    assert.equal(job.finishedAt, undefined);
+    assert.match(information.at(-1)!, /awaiting executor connection and acknowledgement/);
+    const groups = await controller.getChildren();
+    const item = (await controller.getChildren(groups[1]))[0]!;
+    assert.match(String(item.description), /cancel_pending/);
+    assert.doesNotMatch(String(item.description), /cancelled/);
+  });
+
+  it('stops only frozen jobs in the current project session and blocks further submissions there', async () => {
+    runtime = { descriptor: { projectId: 'fraud-project', sessionId: 'session-a', workingFolder: root } };
+    for (const [id, projectId, sessionId] of [['own-run', 'fraud-project', 'session-a'], ['other-session', 'fraud-project', 'session-b'], ['other-project', 'other-project', 'session-a']]) {
+      await client.submit({ id: id!, projectId: projectId!, sessionId: sessionId!, agentId: 'pc', title: id!, device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    }
+    inputText = 'CONFIRM'; await controller.stopSession();
+    assert.equal((await client.job('own-run')).status, 'cancelled');
+    assert.equal((await client.job('other-session')).status, 'queued');
+    assert.equal((await client.job('other-project')).status, 'queued');
+    assert.match(inputOptions[0].prompt, /own-run/);
+    assert.doesNotMatch(inputOptions[0].prompt, /other-session|other-project/);
+    await assert.rejects(client.submit({ id: 'late-run', projectId: 'fraud-project', sessionId: 'session-a', agentId: 'pc', title: 'late', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] }));
+  });
+
+  it('rejects a session change while typed confirmation is open', async () => {
+    runtime = { descriptor: { projectId: 'fraud-project', sessionId: 'session-a', workingFolder: root } };
+    await client.submit({ id: 'old-session-run', projectId: 'fraud-project', sessionId: 'session-a', agentId: 'pc', title: 'old', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    const originalInput = boundary.window.showInputBox;
+    boundary.window.showInputBox = async () => { runtime.descriptor.sessionId = 'session-b'; return 'CONFIRM'; };
+    try { await assert.rejects(controller.stopSession(), /session or project changed/); }
+    finally { boundary.window.showInputBox = originalInput; }
+    assert.equal((await client.job('old-session-run')).status, 'queued');
+  });
+
+  it('saves immutable collaborative project and session identity before source delivery', async () => {
+    await register();
+    const canonical = new CollaborativeProject();
+    runtime = { descriptor: { projectId: 'fraud-project', sessionId: 'session-a', workingFolder: root }, project: canonical };
+    try {
+      await controller.submit();
+      const job = (await client.jobs())[0]!;
+      assert.equal(job.projectId, 'fraud-project'); assert.equal(job.sessionId, 'session-a');
+      runtime.descriptor.sessionId = 'session-b';
+      assert.equal((await client.job(job.id)).sessionId, 'session-a');
+    } finally { canonical.destroy(); }
+  });
+
+  it('explicitly opens a fresh standalone scope after emergency stop without changing old jobs', async () => {
+    await register(); await controller.submit();
+    const original = (await client.jobs())[0]!;
+    inputText = 'CONFIRM'; await controller.stopSession();
+    const fresh = await controller.startComputeSession();
+    assert.ok(fresh); assert.notEqual(fresh, original.sessionId);
+    await controller.submit();
+    const jobs = await client.jobs(); assert.equal(jobs.length, 2);
+    assert.equal((await client.job(original.id)).status, 'cancelled');
+    assert.equal(jobs.find((job) => job.id !== original.id)!.sessionId, fresh);
+  });
+
+  it('does not let a standalone scope action override a collaborative session identity', async () => {
+    runtime = { descriptor: { projectId: 'fraud-project', sessionId: 'shared-session', workingFolder: root } };
+    await assert.rejects(controller.startComputeSession(), /collaborative session owns/);
+    assert.equal(runtime.descriptor.sessionId, 'shared-session');
+  });
+
+  it('releases an ambiguous local submission only after its exact scope is durably stopped', async () => {
+    await register();
+    const original = VpsClient.prototype.submit;
+    VpsClient.prototype.submit = async () => { throw new Error('Request never reached the broker'); };
+    try { await assert.rejects(controller.submit(), /Could not confirm/); }
+    finally { VpsClient.prototype.submit = original; }
+    assert.equal((await client.jobs()).length, 0);
+    inputText = 'CONFIRM'; await controller.stopSession();
+    const fresh = await controller.startComputeSession();
+    await controller.submit();
+    const jobs = await client.jobs(); assert.equal(jobs.length, 1); assert.equal(jobs[0]!.sessionId, fresh);
+  });
+
+  it('clears all stopped-scope receipts across editor windows while preserving a foreign scope receipt', async () => {
+    runtime = { descriptor: { projectId: 'fraud-project', sessionId: 'session-a', workingFolder: root } };
+    const store = new PendingSubmissionStore(path.join(root, 'private', 'pending-vps-jobs'));
+    for (const [id, projectId, sessionId] of [['000-foreign', 'other-project', 'session-b'], ['same-window', 'fraud-project', 'session-a'], ['other-window', 'fraud-project', 'session-a']]) {
+      await store.save(endpoint, { id: id!, projectId: projectId!, sessionId: sessionId!, agentId: 'pc', title: id!, device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    }
+    inputText = 'CONFIRM'; await controller.stopSession();
+    const remaining: string[] = [];
+    for await (const receipt of store.list(endpoint)) remaining.push(receipt.id);
+    assert.deepEqual(remaining, ['000-foreign']);
+    assert.equal((await store.load(endpoint))!.id, '000-foreign');
+  });
+
+  it('reattaches the saved job after observer restart without submitting any program', async () => {
+    await client.submit({ id: 'reattach-run', agentId: 'pc', title: 'same experiment', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    await controller.showJob('reattach-run');
+    controller.dispose(); output = '';
+    const originalSubmit = VpsClient.prototype.submit;
+    VpsClient.prototype.submit = async () => { assert.fail('Reattaching must never submit a program'); };
+    try {
+      controller = makeController();
+      const deadline = Date.now() + 2000;
+      while (!output.includes('reattach-run')) {
+        if (Date.now() > deadline) assert.fail('Observer did not restore the saved job');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal((await client.jobs()).length, 1);
+    } finally { VpsClient.prototype.submit = originalSubmit; }
+  });
+
+  it('keeps cached job state explicitly stale during a broker outage', async () => {
+    await client.submit({ id: 'cached-run', agentId: 'pc', title: 'cached', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    const groups = await controller.getChildren();
+    await controller.getChildren(groups[1]);
+    await broker.stop();
+    const items = await controller.getChildren(groups[1]);
+    assert.match(String(items[1]!.description), /observation unavailable.*last known queued/);
+    assert.equal(items[1]!.command!.command, 'pairNotebook.showVpsJob');
+  });
+
+  it('bounds the observed output window across UTF-8 split pages and overlapping replay', async () => {
+    const stream = Buffer.from('x🧠'.repeat(300_000) + '\nSTREAM_COMPLETE\n', 'utf8');
+    const original = VpsClient.prototype.job;
+    const offsets: number[] = [];
+    VpsClient.prototype.job = async (id, offset = 0) => {
+      offsets.push(offset);
+      const start = Math.max(0, offset - 7); // Replay part of the prior page; UI must skip it.
+      const end = Math.min(stream.length, offset + 64 * 1024);
+      return { id, agentId: 'pc', title: 'verbose training', device: 'cpu', entrypoint: 'train.py',
+        status: end === stream.length ? 'succeeded' : 'running', createdAt: Date.now(), startedAt: Date.now(),
+        cancelRequested: false, logStart: start, logEnd: end, log: stream.subarray(start, end).toString('base64'),
+      } as Awaited<ReturnType<VpsClient['job']>>;
+    };
+    try {
+      await controller.showJob('bounded-observation');
+      while (offsets.at(-1)! + 64 * 1024 < stream.length) {
+        const timer = (controller as any).logTimer as NodeJS.Timeout & { _onTimeout: () => void };
+        assert.ok(timer);
+        const nextPoll = timer._onTimeout;
+        clearTimeout(timer);
+        nextPoll(); // Advance only observation polling; this is not a duration/soak test.
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.ok(Buffer.byteLength(output, 'utf8') <= 1024 * 1024);
+      }
+      assert.match(output, /Visible output window rotated/);
+      assert.match(output, /STREAM_COMPLETE/);
+      assert.match(output, /Status: succeeded/);
+      assert.doesNotMatch(output, /\uFFFD/);
+      assert.deepEqual(offsets, Array.from({ length: offsets.length }, (_, index) => index * 64 * 1024));
     } finally { VpsClient.prototype.job = original; }
   });
 });

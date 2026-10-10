@@ -1,7 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createRuntimeProxyAgent } from '../runtime/proxyWebSocket';
-import { type JobSubmission, type JobSummary, type VpsAgent, type VpsJob, normalizeVpsUrl } from './protocol';
+import { type CancellationChallenge, type CancellationRequest, type CancellationResult,
+  type JobSubmission, type JobSummary, type VpsAgent, type VpsJob, normalizeVpsUrl } from './protocol';
 
 export class VpsHttpError extends Error {
   public constructor(public readonly status: number) { super(`VPS request failed (HTTP ${status}).`); }
@@ -20,7 +21,16 @@ export class VpsClient {
   public job(id: string, offset?: number): Promise<Omit<VpsJob, 'files' | 'args'>> {
     return this.request('GET', `/v1/jobs/${encodeURIComponent(id)}${offset === undefined ? '' : `?offset=${offset}`}`);
   }
-  public cancel(id: string): Promise<JobSummary> { return this.request('POST', `/v1/jobs/${encodeURIComponent(id)}/cancel`, {}); }
+  public requestCancellation(request: CancellationRequest): Promise<CancellationChallenge> {
+    return this.request('POST', '/v1/confirmations', request);
+  }
+  public applyCancellation(confirmationId: string, text: string): Promise<CancellationResult> {
+    return this.request('POST', `/v1/confirmations/${encodeURIComponent(confirmationId)}/apply`, { text });
+  }
+  /** Compatibility route still requires a challenge for this exact job. */
+  public cancel(id: string, confirmationId?: string, text?: string): Promise<JobSummary> {
+    return this.request('POST', `/v1/jobs/${encodeURIComponent(id)}/cancel`, { confirmationId, text });
+  }
 
   private request<T>(method: string, route: string, body?: unknown): Promise<T> {
     const url = new URL(this.endpoint + route);

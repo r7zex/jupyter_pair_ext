@@ -1,5 +1,6 @@
 """Real subprocess and agent recovery checks; no CUDA hardware is claimed here."""
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -352,6 +353,49 @@ class AgentRegressions(unittest.TestCase):
                 self.assertEqual(agent_module.read_json(directory / "manifest.json")["cudaDevice"], GPU_UUID)
                 agent.lock.close()
 
+    def test_workspace_and_pythonpath_use_only_the_retained_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-isolation-") as temporary:
+            root = Path(temporary)
+            host = root / "owner"
+            host.mkdir()
+            (host / "config.txt").write_text("mutable owner config")
+            source = ("import json, os\nfrom pathlib import Path\n"
+                      "print(json.dumps({'cwd': str(Path.cwd()), 'workspace': os.environ['PAIR_NOTEBOOK_WORKSPACE'], "
+                      "'pythonpath': os.environ['PYTHONPATH'], 'config': "
+                      "(Path(os.environ['PAIR_NOTEBOOK_WORKSPACE']) / 'config.txt').read_text()}))\n")
+            job = {"id": "isolated", "device": "cpu", "entrypoint": "nested/train.py", "args": [],
+                   "files": {"nested/train.py": source, "config.txt": "retained config"}}
+            directory = root / "job"
+            directory.mkdir()
+            agent_module.atomic_json(directory / "manifest.json", {"job": job, "python": sys.executable, "workspace": str(host)})
+            with patch.dict(os.environ, {"PYTHONPATH": str(host)}):
+                agent_module.run_job(directory)
+            output = json.loads((directory / "output.log").read_text())
+            self.assertEqual(output, {"cwd": str(directory / "work"), "workspace": str(directory / "work"),
+                                      "pythonpath": str(directory / "work"), "config": "retained config"})
+
+    def test_natural_completion_is_not_relabelled_by_a_late_cancel(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-finish-race-") as temporary:
+            root = Path(temporary)
+            with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), patch.object(agent_module.Agent, "inventory", return_value={"gpus": []}):
+                owner = agent_module.Agent(self.args(root))
+            try:
+                directory = owner.ensure_job({"id": "finish-race", "device": "cpu", "entrypoint": "train.py", "args": [],
+                                              "files": {"train.py": "print('finished', flush=True)"}, "cancelRequested": False})
+                deadline = time.monotonic() + 5
+                while not (directory / "execution.json").exists():
+                    self.assertLess(time.monotonic(), deadline, "Execution did not complete")
+                    time.sleep(0.001)
+                (directory / "cancel").touch()
+                owner.children[0].wait(timeout=5)
+                self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "succeeded")
+            finally:
+                for child in owner.children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+                owner.lock.close()
+
 
 class ProcessTreeRegressions(unittest.TestCase):
     def setUp(self):
@@ -412,7 +456,7 @@ class ProcessTreeRegressions(unittest.TestCase):
                 self.fail(message)
             time.sleep(0.02)
 
-    def start_training_tree(self, exit_code=None, separate_session=False):
+    def start_training_tree(self, exit_code=None, separate_session=False, redirected=False, cooperative=False):
         worker = ("import os, signal, time\nfrom pathlib import Path\n"
                   "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                   "root = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])\n"
@@ -421,11 +465,17 @@ class ProcessTreeRegressions(unittest.TestCase):
                   "while True:\n"
                   " with (root / 'worker.heartbeat').open('ab') as stream: stream.write(b'x')\n"
                   " time.sleep(0.01)\n")
+        if cooperative:
+            worker = worker.replace("import os, signal, time", "import os, signal, sys, time").replace(
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(0.2), "
+                "(Path(os.environ['PAIR_NOTEBOOK_WORKSPACE']) / 'worker-graceful.txt').write_text('cleaned'), sys.exit(0)))")
         source = ("import os, signal, subprocess, sys, time\nfrom pathlib import Path\n"
                   "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                   "root = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])\n"
                   "(root / 'training.pid').write_text(str(os.getpid()))\n"
-                  "subprocess.Popen([sys.executable, '-u', '-c', " + repr(worker) + f"], start_new_session={separate_session!r})\n"
+                  "subprocess.Popen([sys.executable, '-u', '-c', " + repr(worker) + f"], start_new_session={separate_session!r}, "
+                  f"stdout={'subprocess.DEVNULL' if redirected else 'None'}, stderr={'subprocess.DEVNULL' if redirected else 'None'})\n"
                   "while not (root / 'finish').exists():\n"
                   " with (root / 'training.heartbeat').open('ab') as stream: stream.write(b'x')\n"
                   " time.sleep(0.01)\n"
@@ -433,6 +483,7 @@ class ProcessTreeRegressions(unittest.TestCase):
         self.job = {"id": "process-tree", "agentId": "pc", "device": "cpu", "entrypoint": "train.py",
                     "args": [], "files": {"train.py": source}, "cancelRequested": False}
         self.directory = self.owner.ensure_job(self.job)
+        self.root = self.directory / "work"
         self.runner = self.owner.children[0]
         self.wait_for(lambda: all((self.root / name).exists() for name in ("training.pid", "worker.pid", "training.heartbeat", "worker.heartbeat")),
                       "Training and DataLoader worker did not start")
@@ -501,6 +552,49 @@ class ProcessTreeRegressions(unittest.TestCase):
         self.assertEqual(agent_module.read_json(self.directory / "result.json")["status"], "cancelled")
         self.assert_tree_stopped()
 
+    def test_cancellation_stops_redirected_separate_session_workers_and_preserves_unrelated_process(self):
+        if sys.platform != "linux" and os.name != "nt":
+            self.skipTest("Requires Linux subreaper or Windows Job Object containment")
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.start_training_tree(separate_session=True, redirected=True)
+            self.owner.ensure_job({**self.job, "cancelRequested": True})
+            self.runner.wait(timeout=10)
+            self.assertEqual(agent_module.read_json(self.directory / "result.json")["status"], "cancelled")
+            self.assert_tree_stopped()
+            self.assertIsNone(unrelated.poll(), "An unrelated Python process must survive session cancellation")
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
+
+    def test_poller_restart_retains_the_training_tree_without_replaying(self):
+        self.start_training_tree()
+        self.owner.lock.close()
+        args = argparse.Namespace(url="http://localhost:9999", id="pc", name="PC", token_file=None,
+                                  state=str(Path(self.temporary.name) / "state"), workspace=self.temporary.name, python=sys.executable)
+        with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), patch.object(agent_module.Agent, "inventory", return_value={"gpus": []}):
+            replacement = agent_module.Agent(args)
+        replacement.children = self.owner.children
+        self.owner = replacement
+        with patch.object(agent_module.subprocess, "Popen") as replay:
+            self.owner.ensure_job(self.job)
+            replay.assert_not_called()
+        self.assertTrue(all(self.running(pid) for pid in self.pids))
+        self.owner.ensure_job({**self.job, "cancelRequested": True})
+        self.runner.wait(timeout=10)
+        self.assert_tree_stopped()
+
+    def test_separate_session_worker_gets_a_graceful_cleanup_before_escalation(self):
+        if sys.platform != "linux":
+            self.skipTest("Linux pidfd descendant signaling is verified separately from Windows Job Objects")
+        self.start_training_tree(separate_session=True, redirected=True, cooperative=True)
+        self.owner.ensure_job({**self.job, "cancelRequested": True})
+        self.runner.wait(timeout=10)
+        self.assertEqual((self.root / "worker-graceful.txt").read_text(), "cleaned")
+        self.assertEqual(agent_module.read_json(self.directory / "result.json")["status"], "cancelled")
+        self.assert_tree_stopped()
+
     def complete_training(self, exit_code):
         self.start_training_tree(exit_code)
         (self.root / "finish").touch()
@@ -561,6 +655,163 @@ class ProcessTreeRegressions(unittest.TestCase):
             self.owner.ensure_job(job)
             replay.assert_not_called()
         self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "interrupted")
+
+
+class PreparedDataRegressions(unittest.TestCase):
+    def manifest(self, root, payload=b"\x00\xff owner binary data \x80", name="данные с пробелом/sample.bin"):
+        source = root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(payload)
+        return {"version": "owner-data-v1", "files": [{"path": name, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}]}
+
+    def launch(self, root, data, files=None, declared=True):
+        directory = root / "run"
+        directory.mkdir()
+        identity = agent_module.dataset_identity(agent_module.data_manifest(data))
+        job = {"id": "prepared-data", "device": "cpu", "entrypoint": "nested/train.py", "args": [],
+               "files": files or {"nested/train.py": "print('started')"}}
+        if declared:
+            job["dataset"] = {"version": identity["version"], "sha256": identity["sha256"]}
+        agent_module.atomic_json(directory / "manifest.json", {"job": job, "python": sys.executable,
+                                 "workspace": str(root / "owner"), "dataManifest": data})
+        agent_module.run_job(directory)
+        return directory
+
+    def test_binary_unicode_relative_paths_are_copied_and_owner_private_files_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="pair-data-") as temporary:
+            root = Path(temporary)
+            owner = root / "owner"
+            data = self.manifest(owner)
+            (owner / ".env").write_text("OWNER_SECRET=must remain private")
+            name = data["files"][0]["path"]
+            source = ("import hashlib, json, os\nfrom pathlib import Path\n"
+                      "data = Path(" + repr(name) + ").read_bytes()\n"
+                      "print(json.dumps({'sha256': hashlib.sha256(data).hexdigest(), 'version': os.environ['PAIR_NOTEBOOK_DATA_VERSION']}))\n")
+            directory = self.launch(root, data, {"nested/train.py": source})
+            self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "succeeded")
+            output = json.loads((directory / "output.log").read_text())
+            self.assertEqual(output, {"sha256": data["files"][0]["sha256"], "version": "owner-data-v1"})
+            self.assertEqual((directory / "work" / name).read_bytes(), (owner / name).read_bytes())
+            self.assertTrue((owner / ".env").exists())
+            self.assertFalse((directory / "work" / ".env").exists())
+            self.assertEqual(agent_module.read_json(directory / "input-identity.json")["dataset"], agent_module.dataset_identity(data))
+
+    def test_changed_data_and_undeclared_identity_fail_before_python(self):
+        for mutation in ("changed", "missing", "undeclared", "collision"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(prefix="pair-data-reject-") as temporary:
+                root = Path(temporary)
+                data = self.manifest(root / "owner")
+                name = data["files"][0]["path"]
+                files = {"nested/train.py": "raise RuntimeError('must never execute')"}
+                if mutation == "changed":
+                    (root / "owner" / name).write_bytes(b"x" * data["files"][0]["size"])
+                elif mutation == "missing":
+                    (root / "owner" / name).unlink()
+                elif mutation == "collision":
+                    files[name] = "source attempting to replace binary data"
+                directory = self.launch(root, data, files, declared=mutation != "undeclared")
+                result = agent_module.read_json(directory / "result.json")
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("reason", result)
+                self.assertFalse((directory / "execution.json").exists())
+                self.assertNotIn("must never execute", (directory / "output.log").read_text())
+
+    def test_symlinks_inside_workspace_are_verified_and_external_symlinks_rejected(self):
+        if os.name == "nt":
+            self.skipTest("Symlink creation depends on Windows developer mode")
+        for external in (False, True):
+            with self.subTest(external=external), tempfile.TemporaryDirectory(prefix="pair-data-symlink-") as temporary:
+                root = Path(temporary)
+                data = self.manifest(root / "owner")
+                name = data["files"][0]["path"]
+                original = root / "owner" / name
+                payload = original.read_bytes()
+                target = (root if external else root / "owner") / "target.bin"
+                target.write_bytes(payload)
+                original.unlink()
+                original.symlink_to(target)
+                directory = self.launch(root, data)
+                result = agent_module.read_json(directory / "result.json")
+                self.assertEqual(result["status"], "failed" if external else "succeeded")
+                if external:
+                    self.assertIn("outside", result["reason"])
+
+    def test_streaming_copy_resumes_a_cancelled_partial_and_checks_the_retained_prefix(self):
+        with tempfile.TemporaryDirectory(prefix="pair-data-resume-") as temporary:
+            root = Path(temporary)
+            data = self.manifest(root / "owner", payload=bytes(range(256)) * 16384)
+            work = root / "run" / "work"
+            work.mkdir(parents=True)
+            checks = 0
+            def cancel():
+                nonlocal checks
+                checks += 1
+                return checks >= 4
+            with self.assertRaises(agent_module.PreparationCancelled):
+                agent_module.copy_verified_data(root / "owner", work, data, cancel)
+            target = work / data["files"][0]["path"]
+            self.assertFalse(target.exists())
+            staging = next(work.parent.glob("data-staging-*"))
+            partial = next(staging.iterdir())
+            self.assertGreater(partial.stat().st_size, 0)
+            self.assertLess(partial.stat().st_size, data["files"][0]["size"])
+            agent_module.copy_verified_data(root / "owner", work, data, lambda: False)
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), data["files"][0]["sha256"])
+            self.assertFalse(partial.exists())
+            target.unlink()
+            partial.write_bytes(b"wrong prefix")
+            with self.assertRaises(agent_module.PreparationError):
+                agent_module.copy_verified_data(root / "owner", work, data, lambda: False)
+            self.assertFalse(target.exists())
+
+    def test_staging_cli_retries_without_running_python_and_preserves_existing_files(self):
+        with tempfile.TemporaryDirectory(prefix="pair-data-cli-") as temporary:
+            root = Path(temporary)
+            data = self.manifest(root / "owner", payload=bytes(range(256)) * 1024)
+            manifest = root / "manifest.json"
+            agent_module.atomic_json(manifest, data)
+            destination = root / "staged"
+            destination.mkdir()
+            (destination / ".env").write_text("private destination settings")
+            command = [sys.executable, agent_module.__file__, "--workspace", str(root / "owner"), "--data-manifest", str(manifest),
+                       "--stage-data", str(destination)]
+            first = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertEqual(json.loads(first.stdout), agent_module.dataset_identity(data))
+            self.assertEqual((destination / ".env").read_text(), "private destination settings")
+            self.assertEqual(agent_module.read_json(destination / "owner-data-manifest.json"), data)
+            self.assertFalse((destination / "execution.json").exists())
+
+    def test_source_changes_after_preparation_do_not_change_the_running_dataset(self):
+        with tempfile.TemporaryDirectory(prefix="pair-data-immutable-") as temporary:
+            root = Path(temporary)
+            data = self.manifest(root / "owner")
+            name = data["files"][0]["path"]
+            source = ("from pathlib import Path\nimport hashlib\n"
+                      "Path(" + repr(str(root / "owner" / name)) + ").write_bytes(b'owner dataset changed after preparation')\n"
+                      "print(hashlib.sha256(Path(" + repr(name) + ").read_bytes()).hexdigest())\n")
+            directory = self.launch(root, data, {"nested/train.py": source})
+            self.assertEqual(agent_module.read_json(directory / "result.json")["status"], "succeeded")
+            self.assertEqual((directory / "output.log").read_text().strip(), data["files"][0]["sha256"])
+            self.assertNotEqual((directory / "work" / name).read_bytes(), (root / "owner" / name).read_bytes())
+
+    def test_staging_does_not_follow_a_destination_directory_symlink(self):
+        if os.name == "nt":
+            self.skipTest("Symlink creation depends on Windows developer mode")
+        with tempfile.TemporaryDirectory(prefix="pair-data-target-symlink-") as temporary:
+            root = Path(temporary)
+            data = self.manifest(root / "owner", name="data/sample.bin")
+            outside = root / "private"
+            outside.mkdir()
+            work = root / "run" / "work"
+            work.mkdir(parents=True)
+            (work / "data").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(agent_module.PreparationError):
+                agent_module.copy_verified_data(root / "owner", work, data, lambda: False)
+            self.assertFalse((outside / "sample.bin").exists())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+{
+  "experiment_name": "synthetic-infrastructure-reference",
+  "model": "logistic",
+  "seed": 7,
+  "device": "cpu",
+  "epochs": 12,
+  "batch_size": 128,
+  "learning_rate": 0.01,
+  "checkpoint_every_epochs": 1,
+  "use_history": true,
+  "amp": false,
+  "split": {
+    "train_end": 2400,
+    "validation_start": 2500,
+    "validation_end": 3200,
+    "test_start": 3300,
+    "test_end": 4000,
+    "gap": 100
+  },
+  "operating_point": {
+    "max_fpr": 0.02,
+    "review_fraction": 0.05,
+    "false_positive_cost": 1.0,
+    "false_negative_cost": 20.0
+  }
+}

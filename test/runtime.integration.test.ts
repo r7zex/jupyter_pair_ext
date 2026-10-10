@@ -86,10 +86,10 @@ describe('production SessionRuntime integration', () => {
       await assert.rejects(runtime.setBackingFolder(replacement), /Stop.*terminal.*Ctrl.C/i);
       assert.equal(runtime.descriptor.backingFolder, backing);
       await waitFor(() => fileExists(path.join(backing, 'training.finished')), 2000, 'training is not killed by folder selection');
-      runtime.sharedTerminal().interrupt();
+      { const terminal = runtime.sharedTerminal(); const challenge = terminal.requestInterrupt(); await terminal.interrupt({ challengeId: challenge.id, value: 'CONFIRM' }); }
       await runtime.setBackingFolder(replacement);
       assert.equal(runtime.descriptor.backingFolder, replacement);
-    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   for (const deleteDirectory of [false, true]) it(`drops the live kernel and compute settings when ${deleteDirectory ? 'its parent directory' : 'a notebook'} is deleted, then recreates a clean notebook`, async function () {
@@ -123,10 +123,10 @@ describe('production SessionRuntime integration', () => {
       assert.ok(runtime.project.has(key));
       assert.equal((await runtime.executeCell(key, 'a', 'assert "old_value" not in globals()', () => undefined)).success, true);
       assert.notEqual(runtime.kernels.get(key), oldKernel);
-    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
-  it('stops a running deleted notebook without recreating its status or publishing a late checkpoint', async function () {
+  it('preserves accepted computation and its checkpoint after deleting its notebook', async function () {
     this.timeout(20_000);
     if (spawnSync('python3', ['-c', 'import jupyter_client,ipykernel']).status !== 0) this.skip();
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-running-notebook-delete-'));
@@ -139,18 +139,15 @@ describe('production SessionRuntime integration', () => {
     try {
       await runtime.start();
       let started = false;
-      const execution = assert.rejects(runtime.executeCell(key, 'a',
-        'from pathlib import Path\nimport time\nprint("DELETION_STARTED", flush=True)\ntime.sleep(2)\nPath("late-checkpoint.json").write_text("unexpected")',
-        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('DELETION_STARTED')) started = true; }), /kernel stopped|deleted|cancelled/i);
+      const execution = runtime.executeCell(key, 'a',
+        'from pathlib import Path\nimport time\nprint("DELETION_STARTED", flush=True)\ntime.sleep(2)\nPath("late-checkpoint.json").write_text("completed")',
+        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('DELETION_STARTED')) started = true; });
       await waitFor(() => started, 5000, 'real notebook training begins');
       await rm(source); await runtime.onLocalDelete(fakeVscode.Uri.file(source));
-      await execution;
+      assert.equal((await execution).success, true);
       assert.equal(runtime.activeExecutions, 0);
-      assert.ok(!runtime.kernels.has(key));
-      assert.ok(!runtime.kernelStatuses.has(key), 'old execution cleanup must not restore an Idle entry for the deleted notebook');
-      await new Promise((resolve) => setTimeout(resolve, 2200));
-      await assert.rejects(readFile(path.join(runtime.descriptor.backingFolder, 'late-checkpoint.json')), { code: 'ENOENT' });
-    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+      assert.equal(await readFile(path.join(runtime.descriptor.backingFolder, 'late-checkpoint.json'), 'utf8'), 'completed');
+    } finally { await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   it('preserves running training and its Busy counter when a notebook replaces another live notebook by rename', async function () {
@@ -179,14 +176,16 @@ describe('production SessionRuntime integration', () => {
         (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('SOURCE_STARTED')) sourceStarted = true; });
       void sourceExecution!.catch(() => undefined);
       // Attach the rejection handler before deletion can stop the old target.
-      targetExecution = assert.rejects(runtime.executeCell('target.ipynb', 'a',
+      targetExecution = runtime.executeCell('target.ipynb', 'a',
         'import time\nprint("TARGET_STARTED", flush=True)\ntime.sleep(30)',
-        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('TARGET_STARTED')) targetStarted = true; }), /kernel stopped|deleted|cancelled/i);
+        (event: any) => { if (event.messageType === 'stream' && String(event.content.text).includes('TARGET_STARTED')) targetStarted = true; });
       await waitFor(() => sourceStarted && targetStarted, 5000, 'both live kernels begin execution');
+      const targetStop = await runtime.requestExecutionStop('interrupt', 'target.ipynb');
+      await runtime.applyExecutionStop(targetStop, 'CONFIRM');
       await rm(path.join(working, 'target.ipynb'));
       await rename(path.join(working, 'source.ipynb'), path.join(working, 'target.ipynb'));
       await runtime.onLocalRename(fakeVscode.Uri.file(path.join(working, 'source.ipynb')), fakeVscode.Uri.file(path.join(working, 'target.ipynb')));
-      await targetExecution;
+      assert.equal((await targetExecution).success, false);
       assert.equal(runtime.kernels.get('target.ipynb'), sourceKernel, 'only the replaced target kernel may stop');
       assert.deepEqual(runtime.descriptor.notebookCompute['target.ipynb'], sourceCompute);
       assert.equal(runtime.descriptor.notebookPythonPaths['target.ipynb'], 'python3');
@@ -200,13 +199,13 @@ describe('production SessionRuntime integration', () => {
       assert.equal((await runtime.executeCell('target.ipynb', 'a', 'assert "discarded_value" not in globals(); print(retained_value)', (event: any) => events.push(event))).success, true);
       assert.ok(events.some((event) => event.messageType === 'stream' && String(event.content.text).includes('732')));
     } finally {
-      await runtime.leave();
+      await runtime.disposeAsync();
       await Promise.allSettled([sourceExecution, targetExecution]);
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('cancels notebook preparation when the notebook is deleted and recreated before the filesystem barrier completes', async () => {
+  it('keeps accepted notebook preparation when the document is deleted and recreated', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-preparation-delete-'));
     const working = path.join(root, 'working'); await mkdir(working);
     const key = 'work.ipynb'; const source = path.join(working, key);
@@ -219,15 +218,15 @@ describe('production SessionRuntime integration', () => {
     try {
       await runtime.start();
       runtime.prepareWorkingCopy = () => new Promise<void>((resolve) => { release = resolve; });
-      const execution = assert.rejects(runtime.executeCell(key, 'a', 'print(1)', () => undefined), /notebook.*deleted|notebook.*replaced/i);
+      const execution = runtime.executeCell(key, 'a', 'print(1)', () => undefined);
       await waitFor(() => Boolean(release), 1000, 'notebook preparation starts');
       await rm(source); await runtime.onLocalDelete(fakeVscode.Uri.file(source));
       await writeFile(source, content.replace('print(1)', 'print(2)'));
       await runtime.onLocalFile(fakeVscode.Uri.file(source), 'create');
-      release(); await execution;
-      assert.equal(runtime.kernels.size, 0, 'a deleted request must not launch a kernel for its replacement');
+      release(); assert.equal((await execution).success, true);
+      assert.equal(runtime.kernels.size, 1, 'accepted code runs once despite document replacement');
       assert.equal(runtime.repositoryOperations, 0);
-    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { release?.(); await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   it('blocks execution and another folder change while the host repository is being replaced', async () => {
@@ -263,7 +262,7 @@ describe('production SessionRuntime integration', () => {
       runtime.prepareWorkingCopy = undefined;
       await runtime.sharedTerminal().execute('echo repository-ready');
       await waitFor(() => runtime.sharedTerminal().view().text.includes('repository-ready'), 1000, 'terminal available after replacement');
-    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { release?.(); await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   for (const kind of ['notebook', 'terminal']) it(`protects the host repository throughout ${kind} preparation and releases the guard on failure`, async () => {
@@ -291,7 +290,7 @@ describe('production SessionRuntime integration', () => {
       runtime.prepareWorkingCopy = undefined;
       await runtime.setBackingFolder(path.join(root, 'replacement'));
       assert.equal(runtime.descriptor.backingFolder, path.join(root, 'replacement'));
-    } finally { release?.(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { release?.(); await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   it('restores the previous repository and permits a retry after replacement fails', async () => {
@@ -310,10 +309,10 @@ describe('production SessionRuntime integration', () => {
       runtime.materializeBackingFolder = materialize;
       await runtime.setBackingFolder(path.join(root, 'replacement'));
       assert.equal(runtime.descriptor.backingFolder, path.join(root, 'replacement'));
-    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
-  it('does not create a kernel after the session closes during execution preparation', async () => {
+  it('requires CONFIRM before leaving while execution preparation is active', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-preparation-close-'));
     const runtime = new SessionRuntime(descriptor({ sessionId: 'preparation-close', role: 'host', peerId: 'host',
       hostPeerId: 'host', workingFolder: root, pythonPath: 'python3' }),
@@ -321,12 +320,16 @@ describe('production SessionRuntime integration', () => {
     let release!: () => void;
     runtime.prepareWorkingCopy = () => new Promise<void>((resolve) => { release = resolve; });
     try {
-      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), SessionClosedError);
+      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /confirmed.*stop|cancelled/i);
       await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
-      await runtime.leave(); release(); await execution;
+      await assert.rejects(runtime.leave(), /typed CONFIRM/);
+      const challenge = await runtime.requestExecutionStop('leave');
+      const confirmed = runtime.applyExecutionStop(challenge, 'CONFIRM');
+      release(); await Promise.all([confirmed, execution]);
+      await runtime.leave();
       assert.equal(runtime.kernels.size, 0, 'shutdown must not leave a new orphan kernel');
       await assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), SessionClosedError);
-    } finally { release?.(); for (const kernel of runtime.kernels.values()) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { release?.(); for (const kernel of runtime.kernels.values()) kernel.stop(); await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   it('does not create a kernel after host authority changes during execution preparation', async () => {
@@ -345,8 +348,12 @@ describe('production SessionRuntime integration', () => {
       'preparation-transfer-token-that-is-long-enough', context(path.resolve('.')), logger());
       await guest.start();
       runtime.prepareHostRepositoryFiles = () => new Promise<void>((resolve) => { release = resolve; });
-      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /paused|Host.*changed/);
+      const execution = assert.rejects(runtime.executeCell('work.ipynb', 'a', 'print(1)', () => undefined), /confirmed.*stop|cancelled/i);
       await waitFor(() => Boolean(release), 1000, 'execution preparation begins');
+      await assert.rejects(runtime.transferHost('guest'), /typed CONFIRM/);
+      const challenge = await runtime.requestExecutionStop('transfer-host');
+      const confirmed = runtime.applyExecutionStop(challenge, 'CONFIRM');
+      release(); await Promise.all([confirmed, execution]);
       await runtime.transferHost('guest');
       assert.equal(runtime.descriptor.role, 'peer');
       await waitFor(() => guest.descriptor.role === 'host', 1000, 'host transfer finalization arrives');
@@ -354,7 +361,7 @@ describe('production SessionRuntime integration', () => {
       release(); await execution;
       assert.equal(runtime.kernels.size, 0);
       assert.equal(runtime.descriptor.backingFolder, '');
-    } finally { release?.(); await Promise.allSettled([runtime.leave(), guest?.leave()]); await rm(root, { recursive: true, force: true }); }
+    } finally { release?.(); await Promise.allSettled([runtime.disposeAsync(), guest?.disposeAsync()]); await rm(root, { recursive: true, force: true }); }
   });
 
   it('shares one real kernel when two notebook executions finish preparation together', async function () {
@@ -381,7 +388,7 @@ describe('production SessionRuntime integration', () => {
       assert.ok(results.every((result) => result.success));
       assert.equal(created.size, 1, 'simultaneous preparation must not launch separate kernels');
       assert.deepEqual(counts.sort(), [1, 2], 'both requests must use the same Python variables');
-    } finally { releases.forEach((release) => release()); for (const kernel of created) kernel.stop(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { releases.forEach((release) => release()); for (const kernel of created) kernel.stop(); await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   for (const kind of ['notebook', 'terminal']) it(`restores missing canonical training inputs before ${kind} execution while retaining the running kernel and private host data`, async function () {
@@ -444,7 +451,7 @@ describe('production SessionRuntime integration', () => {
       assert.equal(await readFile(path.join(backing, 'training_helpers.py'), 'utf8'), 'VALUE = 81\n');
       assert.deepEqual(await readFile(checkpoint), binary, 'training checkpoints survive recovery');
       assert.deepEqual(await readFile(privateData), binary);
-    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+    } finally { await runtime.disposeAsync(); await rm(root, { recursive: true, force: true }); }
   });
 
   for (const useTorch of [false, true]) for (const vpsOnly of [false, true]) it(`trains a ${useTorch ? 'PyTorch model with binary host data' : 'real model from host repository files'} and shares a host-only command terminal over ${vpsOnly ? 'VPS only with outage recovery' : 'the peer mesh'}`, async function () {
@@ -557,7 +564,7 @@ describe('production SessionRuntime integration', () => {
       await waitFor(() => shared.view().text.includes('host-command\n') || shared.view().text.includes('host-command\r\n'), 5000, 'shared host shell output');
       await assert.rejects(readFile(path.join(backing, 'forbidden-shell.txt')), { code: 'ENOENT' });
       const replacement = path.join(root, 'replacement-repository');
-      host.sharedTerminal().interrupt();
+      { const terminal = host.sharedTerminal(); const challenge = terminal.requestInterrupt(); await terminal.interrupt({ challengeId: challenge.id, value: 'CONFIRM' }); }
       await host.setBackingFolder(replacement);
       await host.sharedTerminal().execute(process.platform === 'win32'
         ? 'echo repository-reset> terminal-owner.txt & echo new-repository-command'
@@ -566,7 +573,7 @@ describe('production SessionRuntime integration', () => {
       assert.ok(!shared.view().text.includes('host-command'), 'the guest must not retain the old repository terminal history');
       assert.equal((await readFile(path.join(replacement, 'terminal-owner.txt'), 'utf8')).trim(), 'repository-reset');
       await assert.rejects(readFile(path.join(backing, 'terminal-owner.txt')), { code: 'ENOENT' });
-    } finally { await guest?.leave(); await host.leave(); await broker?.stop(); await rm(root, { recursive: true, force: true }); }
+    } finally { await guest?.disposeAsync(); await host.disposeAsync(); await broker?.stop(); await rm(root, { recursive: true, force: true }); }
   });
 
   it('cancels snapshot discovery and permits another attempt with the same destination', async () => {
@@ -667,7 +674,7 @@ describe('production SessionRuntime integration', () => {
       assert.equal(host.snapshot().peers.some((peer: any) => peer.peerId === 'joining-peer'), false, 'bootstrap connections are not session participants');
     } finally {
       host.descriptor.mode = 'host-only';
-      await host.leave();
+      await host.disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -752,7 +759,7 @@ describe('production SessionRuntime integration', () => {
       setInMemoryTrysteroSendObserver(undefined);
       healInMemoryTrystero();
       host.descriptor.mode = 'host-only';
-      await host.leave();
+      await host.disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -828,7 +835,7 @@ describe('production SessionRuntime integration', () => {
       assert.equal(await readFile(path.join(joiningFolder, 'relay-only.txt'), 'utf8'), 'delivered without WebRTC');
     } finally {
       host.descriptor.mode = 'host-only';
-      await host.leave();
+      await host.disposeAsync();
       await new Promise<void>((resolve) => hub.close(() => resolve()));
       configureMeshNetwork({});
       MeshTransport.setRoomFactoryForTesting(runtimeRoomFactory);
@@ -1020,7 +1027,7 @@ describe('production SessionRuntime integration', () => {
       fakeVscode.window.activeTextEditor = undefined;
       host.descriptor.mode = 'host-only';
       if (peer) peer.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), peer?.leave?.()]);
+      await Promise.allSettled([host.disposeAsync(), peer?.disposeAsync?.()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1083,7 +1090,7 @@ describe('production SessionRuntime integration', () => {
     } finally {
       healInMemoryTrystero();
       for (const runtime of [host, peerB, peerC].filter(Boolean)) runtime.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), peerB?.leave?.(), peerC?.leave?.()]);
+      await Promise.allSettled([host.disposeAsync(), peerB?.disposeAsync?.(), peerC?.disposeAsync?.()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1135,11 +1142,11 @@ describe('production SessionRuntime integration', () => {
       healInMemoryTrystero();
       if (!host.snapshot().closed) {
         host.descriptor.mode = 'host-only';
-        await host.leave().catch(() => undefined);
+        await host.disposeAsync().catch(() => undefined);
       }
       if (alpha) alpha.descriptor.mode = 'host-only';
       if (beta) beta.descriptor.mode = 'host-only';
-      await Promise.allSettled([alpha?.leave(), beta?.leave()]);
+      await Promise.allSettled([alpha?.disposeAsync(), beta?.disposeAsync()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1180,7 +1187,7 @@ describe('runtime repair invariants', () => {
       assert.equal((runtime as any).fileStates.get('Folder/original.txt').deleted, true);
       assert.equal((runtime as any).fileStates.get('folder/original.txt').deleted, false);
     } finally {
-      await runtime.leave();
+      await runtime.disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1247,7 +1254,7 @@ describe('runtime repair invariants', () => {
     } finally {
       first.descriptor.mode = 'host-only';
       second.descriptor.mode = 'host-only';
-      await Promise.allSettled([first.leave(), second.leave()]);
+      await Promise.allSettled([first.disposeAsync(), second.disposeAsync()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1275,7 +1282,7 @@ describe('runtime repair invariants', () => {
     } finally {
       fakeVscode.window.activeNotebookEditor = undefined;
       runtime.descriptor.mode = 'host-only';
-      await runtime.leave();
+      await runtime.disposeAsync();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1920,7 +1927,7 @@ describe('remote NotebookController rendering', () => {
     }
   });
 
-  it('interrupts an active execution when its cell is deleted and does not end it twice', async () => {
+  it('retires a deleted cell UI while accepted computation remains running', async () => {
     const pairController = new PairNotebookController(logger());
     const notebook = notebookForController('active-cell-delete');
     const cell = fakeCell('while True: pass', notebook);
@@ -1963,7 +1970,7 @@ describe('remote NotebookController rendering', () => {
 
       pairController.releaseCellState(cell);
 
-      await waitFor(() => interruptCount === 1, 1000, 'deleted-cell interrupt');
+      assert.equal(interruptCount, 0, 'deleting a cell must not send an interrupt');
       assert.equal(execution.ended, true);
       assert.equal(execution.endSuccess, undefined);
       finishExecution({ requestId: 'deleted-cell-request', success: true, content: { status: 'ok' } });
@@ -3427,7 +3434,7 @@ describe('compute and lifecycle regression coverage', () => {
       host.descriptor.mode = 'host-only';
       if (peer) peer.descriptor.mode = 'host-only';
       if (third) third.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), peer?.leave(), third?.leave()]);
+      await Promise.allSettled([host.disposeAsync(), peer?.disposeAsync(), third?.disposeAsync()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -3484,7 +3491,7 @@ describe('compute and lifecycle regression coverage', () => {
       await peer.setBackingFolder(backing, 'reuse-existing');
       assert.equal((await peer.collectMaterialization()).documents.length, 2);
     } finally {
-      await Promise.allSettled([host.leave(), peer?.leave()]);
+      await Promise.allSettled([host.disposeAsync(), peer?.disposeAsync()]);
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
@@ -3516,7 +3523,7 @@ describe('compute and lifecycle regression coverage', () => {
       assert.equal(runtime.kernels.size, 1);
       assert.equal(runtime.project.has('work.ipynb'), false);
     } finally {
-      await runtime.leave();
+      await runtime.disposeAsync();
       await rm(folder, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       await rm(`${folder}-backing`, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     }
@@ -3604,7 +3611,7 @@ describe('compute and lifecycle regression coverage', () => {
       stale = new SessionRuntime(staleDescriptor, token, context(extensionRoot), logger());
       await assert.rejects(stale.start(), /has already ended/);
     } finally {
-      await Promise.allSettled([host.leave(), peer?.leave?.(), stale?.leave?.()]);
+      await Promise.allSettled([host.disposeAsync(), peer?.disposeAsync?.(), stale?.disposeAsync?.()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -3670,7 +3677,7 @@ describe('compute and lifecycle regression coverage', () => {
       await assert.rejects(staleHost.start(), /has already ended/);
       await staleHost.leave();
     } finally {
-      await Promise.allSettled([host.leave(), peer?.leave()]);
+      await Promise.allSettled([host.disposeAsync(), peer?.disposeAsync()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -3932,6 +3939,7 @@ describe('standard VS Code NotebookController production path', () => {
         calls.push(`${key}:${id}:end`);
         return { requestId: id, success: true, content: { status: 'ok' } };
       },
+      confirmOperation: async (action: string, key: string) => { calls.push(`${key}:${action}`); return true; },
       interruptNotebook: async (key: string) => { calls.push(`${key}:interrupt`); },
       restartNotebook: async (key: string) => { calls.push(`${key}:restart`); },
       reportWaitingForInput: (key: string) => { calls.push(`${key}:waiting-input`); },
@@ -4055,7 +4063,8 @@ describe('standard VS Code NotebookController production path', () => {
     const limitedOutputs = fakeVscode.__executions[limitedExecutionIndex].outputs;
     assert.equal(limitedOutputs.length, 1_024);
     assert.match(Buffer.from(limitedOutputs.at(-1).items[0].data).toString('utf8'), /Output was truncated/);
-    assert.ok(calls.includes('B:interrupt'), 'an unrenderable output backlog interrupts the kernel');
+    assert.ok(!calls.includes('B:interrupt'), 'display pressure must not interrupt accepted computation');
+    assert.equal(fakeVscode.__executions[limitedExecutionIndex].endSuccess, true, 'truncated display retains the successful kernel result');
 
     computeExecutorId = 'host';
     outputPublishCount = 0;
@@ -4440,7 +4449,7 @@ describe('local-first text replication and legacy text intents', () => {
     } finally {
       if (guest) guest.descriptor.mode = 'host-only';
       host.descriptor.mode = 'host-only';
-      await Promise.allSettled([host.leave(), guest?.leave?.()]);
+      await Promise.allSettled([host.disposeAsync(), guest?.disposeAsync?.()]);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -4716,7 +4725,7 @@ describe('identity and lifecycle regressions', () => {
       assert.equal((runtime as any).transport.options.localPeer.displayName, 'Renamed Host');
     } finally {
       runtime.descriptor.mode = 'host-only';
-      await runtime.leave().catch(() => undefined);
+      await runtime.disposeAsync().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -4761,7 +4770,7 @@ describe('identity and lifecycle regressions', () => {
       assert.equal(peer.snapshot().clock.hostId, 'host');
     } finally {
       if (peer) peer.descriptor.mode = 'host-only';
-      await Promise.allSettled([peer?.leave?.()]);
+      await Promise.allSettled([peer?.disposeAsync?.()]);
       await rm(root, { recursive: true, force: true });
     }
   });

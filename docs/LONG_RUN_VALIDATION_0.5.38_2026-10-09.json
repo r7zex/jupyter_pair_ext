@@ -1,0 +1,133 @@
+{
+  "boundaries": {
+    "acceleratedTimersProveElapsedHours": false,
+    "localNativeVscode": "not_available",
+    "localProductionBrokerAgent": "actually_running_loopback_production_processes",
+    "loopbackIsExternalVps": false,
+    "physicalGpu": "not_available",
+    "realExternalVps": "not_tested_no_current_destination_or_credentials",
+    "remoteCiMatrix": "configured_result_must_be_reported_separately",
+    "syntheticInfrastructureFixtureProvesScientificAdvantage": false,
+    "twoPhysicalInternetPeers": "not_tested",
+    "windowsProcessContainment": "not_tested_in_linux_workspace"
+  },
+  "observedEnvironment": {
+    "codeExecutableAvailable": false,
+    "nvidiaSmiExecutableAvailable": false,
+    "os": "Linux",
+    "pythonVersion": "3.12.14"
+  },
+  "reportDate": "2026-10-09",
+  "runnerWorkloadSmoke": {
+    "elapsedHoursClaim": false,
+    "latestCheckpointStep": 3,
+    "metrics": 3,
+    "modelAndOptimizerReloadChecked": true,
+    "previousCheckpointStep": 2,
+    "result": "passed",
+    "steps": 3
+  },
+  "soak": {
+    "actualElapsedSeconds": 39.84463095664978,
+    "buildIdentity": "uncommitted_0.5.38_implementation_from_baseline_HEAD_identified_by_frozen_file_hashes",
+    "checkpointEverySteps": 60,
+    "completedElapsedHours": false,
+    "computationWallClockLimit": null,
+    "evidenceCapturedAtUtc": "2026-10-09T20:22:40.576194+00:00",
+    "implementationFrozenBeforeRun": true,
+    "independentOfOpenChat": true,
+    "initialAttemptFailure": {
+      "computationAccepted": false,
+      "errno": 1,
+      "kind": "sandbox_local_socket_permission_error",
+      "retry": "authorized_network_permission_in_fresh_state_directory"
+    },
+    "naturalCompletionCondition": "configured_algorithmic_step_count",
+    "plannedMinimumWorkloadSeconds": 14400,
+    "processesDetachedFromInitiatingShell": true,
+    "result": "running_not_elapsed_hours_completed",
+    "runId": "soak-8face0e4ab42d957",
+    "runner": "scripts/persistent-soak.py",
+    "snapshot": {
+      "actualElapsedSeconds": 39.84463095664978,
+      "checkpoint": null,
+      "computationWallClockLimit": null,
+      "dataset": {
+        "declared": {
+          "sha256": "f4f1c744ad1515e0e3f53866141acc08a2a8d389e7291f00904a3c2891893ddf",
+          "version": "soak-fixture-v1"
+        },
+        "isolatedFileSha256": "bcd3dd2861af666ef3c007850b158d23e3071f60c11093ec0d1ea4480cd3eec4"
+      },
+      "error": "URLError",
+      "faultEvents": [
+        {
+          "event": "broker_started",
+          "pid": 5595,
+          "timestamp": 1791577317.8076065
+        },
+        {
+          "event": "polling_agent_started",
+          "pid": 5596,
+          "timestamp": 1791577317.8080225
+        },
+        {
+          "event": "job_accepted",
+          "runId": "soak-8face0e4ab42d957",
+          "timestamp": 1791577318.8199327
+        },
+        {
+          "event": "broker_offline_started",
+          "timestamp": 1791577353.8560803
+        }
+      ],
+      "formatVersion": 1,
+      "implementation": {
+        "agentSha256": "96f48b29a10e4a523a987dc376fbb55053b80c0b222ac5f314d556561a25a08b",
+        "brokerSha256": "16240e87691aff13cdc170a8b448823b8a7f0834f069477a38c0adf8457b2a83",
+        "gitHeadBeforeRun": "97042cc8d46ca842f3dc0885e347316c3246b45a",
+        "nodeVersion": "v24.19.0",
+        "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+        "protocolSha256": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e",
+        "pythonVersion": "3.12.14",
+        "workloadSha256": "b461a80a6374bc9ad5bdb9de0a69bdf7b21786bfd246dcc8d1e1162c7ad9298b"
+      },
+      "job": null,
+      "metricsPath": "/workspace/pair-notebook-soak-20261009-run1/agent/jobs/soak-8face0e4ab42d957/work/artifacts/soak-8face0e4ab42d957/metrics.jsonl",
+      "observedAt": 1791577358.8586662,
+      "pids": {
+        "broker": 5595,
+        "monitor": 5594,
+        "pollingAgent": 5596,
+        "training": 5650
+      },
+      "plannedMinimumWorkloadSeconds": 14400.0,
+      "progress": {
+        "elapsedSeconds": 39.062073945999146,
+        "globalUpdate": 780,
+        "loss": 0.0841776518823555,
+        "runId": "soak-8face0e4ab42d957",
+        "step": 39,
+        "syntheticAccuracy": 0.97265625,
+        "timestamp": 1791577358.076114
+      },
+      "rssKiB": {
+        "broker": null,
+        "monitor": 18048,
+        "pollingAgent": 30672,
+        "training": 10184
+      },
+      "runId": "soak-8face0e4ab42d957",
+      "startedAt": 1791577319.0140355,
+      "state": "waiting_for_broker",
+      "uniqueTrainingLaunches": 1,
+      "validationBoundary": "production broker/agent and real Linux CPU/process/filesystem; loopback only"
+    },
+    "stateDirectory": "/workspace/pair-notebook-soak-20261009-run1",
+    "status": "waiting_for_broker",
+    "stdoutEverySteps": 300,
+    "uniqueTrainingLaunches": 1,
+    "workload": "explicit_14400_step_synthetic_stdlib_logistic_CPU_baseline"
+  },
+  "targetVersion": "0.5.38"
+}

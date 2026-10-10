@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -9,8 +9,29 @@ import { classifyFile, decodeUtf8ProjectFile, MAX_TRACKED_PROJECT_ENTRIES, shoul
 import { VpsClient, VpsHttpError } from '../vps/client';
 import { PendingSubmissionStore } from '../vps/pendingSubmission';
 import { pythonNotebookProgram } from '../vps/notebookProgram';
-import { type JobSubmission, type VpsAgent, type VpsDevice,
-  MAX_JOB_BYTES, MAX_JOB_FILES, normalizeVpsUrl, safeJobPath, terminalJob, validateSubmission, vpsSecretKey } from '../vps/protocol';
+import { type CancellationChallenge, type ComputeScope, type JobSubmission, type JobSummary, type VpsAgent, type VpsDevice,
+  MAX_JOB_BYTES, MAX_JOB_FILES, normalizeVpsUrl, safeJobPath, terminalJob, validateSubmission, validComputeScope, vpsSecretKey } from '../vps/protocol';
+
+const OBSERVATION_KEY = 'pairNotebook.vpsObservation';
+const JOB_CACHE_KEY = 'pairNotebook.vpsJobCache';
+const MAX_VISIBLE_OUTPUT_BYTES = 1024 * 1024;
+
+function elapsed(job: JobSummary): string {
+  if (job.startedAt === undefined) return 'not started';
+  const seconds = Math.max(0, Math.floor(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000));
+  return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds / 60) % 60}m ${seconds % 60}s`;
+}
+
+function jobState(job: JobSummary): string {
+  return job.cancelRequested && !terminalJob(job.status) ? 'cancel_pending — awaiting executor stop acknowledgement' : job.status;
+}
+
+function jobDetails(job: JobSummary): string {
+  return `Experiment: ${job.title}; job/run ID: ${job.id}; executor: ${job.agentId} (${job.device}); elapsed: ${elapsed(job)}; `
+    + `session: ${job.sessionId ?? 'legacy unscoped'}; project: ${job.projectId ?? 'legacy unscoped'}; `
+    + `${job.dataset ? `data: ${job.dataset.version} (${job.dataset.sha256}); ` : ''}`
+    + `last checkpoint: not reported by this executor${job.failureReason ? `; failure: ${job.failureReason}` : ''}`;
+}
 
 export async function readVpsConnection(context: vscode.ExtensionContext): Promise<VpsRelayConnection | undefined> {
   if (!vscode.workspace.isTrusted) return undefined;
@@ -39,6 +60,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private logGeneration = 0;
   private disposed = false;
   private submitting = false;
+  private visibleOutputBytes = 0;
   private readonly settingsSubscription: vscode.Disposable;
   private readonly pending: PendingSubmissionStore;
 
@@ -52,6 +74,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     });
     this.refreshTimer = setInterval(() => { if (this.view.visible) this.refresh(); }, 10_000);
     this.refreshTimer.unref();
+    setImmediate(() => { void this.restoreObservation().catch(() => undefined); }).unref();
   }
   public dispose(): void {
     this.disposed = true;
@@ -88,22 +111,31 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
         });
       }
       const jobs = await client.jobs();
+      await this.context.globalState.update(JOB_CACHE_KEY, { endpoint: client.endpoint, jobs: jobs.slice(0, 100) });
       if (!jobs.length) return [new ComputeItem('No background jobs yet')];
-      return jobs.slice(0, 100).map((job) => {
-        const result = new ComputeItem(job.title);
-        result.id = job.id;
-        result.description = `${job.status}${job.cancelRequested && !terminalJob(job.status) ? ' • cancellation requested' : ''} • ${job.agentId} • ${job.device}`;
-        result.tooltip = `Job: ${job.id}\n${new Date(job.createdAt).toLocaleString()}\nClick to watch output`;
-        result.iconPath = new vscode.ThemeIcon(job.status === 'running' ? 'sync~spin' : job.status === 'succeeded' ? 'pass' : 'tasklist');
-        result.command = { command: 'pairNotebook.showVpsJob', title: 'Show job output', arguments: [job.id] };
-        return result;
-      });
+      return jobs.slice(0, 100).map((job) => this.jobItem(job));
     } catch (error) {
       const auth = error instanceof VpsHttpError && [401, 403].includes(error.status);
       const retry = new ComputeItem(auth ? 'VPS access denied — click to reconnect' : 'VPS unavailable — click to retry');
       retry.command = { command: auth ? 'pairNotebook.connectVps' : 'pairNotebook.refreshVpsJobs', title: 'Retry VPS connection' };
+      const cached = this.context.globalState.get<{ endpoint: string; jobs: JobSummary[] }>(JOB_CACHE_KEY);
+      const configured = vscode.workspace.getConfiguration('pairNotebook').get<string>('vpsUrl', '').trim();
+      if (!auth && item?.group === 'jobs' && cached?.endpoint === configured.replace(/\/+$/, '')) {
+        return [retry, ...cached.jobs.slice(0, 100).map((job) => this.jobItem(job, true))];
+      }
       return [retry];
     }
+  }
+
+  private jobItem(job: JobSummary, unavailable = false): ComputeItem {
+    const result = new ComputeItem(job.title);
+    result.id = job.id;
+    result.description = `${unavailable ? 'observation unavailable • last known ' : ''}${jobState(job)} • ${job.agentId} • ${job.device} • ${elapsed(job)}`;
+    result.tooltip = `${jobDetails(job)}\n${new Date(job.createdAt).toLocaleString()}\nClick to reattach output; this does not execute the job again`;
+    result.iconPath = new vscode.ThemeIcon(job.cancelRequested && !terminalJob(job.status) ? 'debug-pause'
+      : job.status === 'running' ? 'sync~spin' : job.status === 'succeeded' ? 'pass' : 'tasklist');
+    result.command = { command: 'pairNotebook.showVpsJob', title: 'Show job output', arguments: [job.id] };
+    return result;
   }
 
   private async client(): Promise<VpsClient> {
@@ -156,6 +188,8 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     }
     const pending = await this.pending.load(client.endpoint);
     if (pending) { await this.deliver(client, pending); return; }
+    const runtime = this.currentRuntime();
+    const scope = await this.computeScope();
     const agents = await client.agents();
     const targets = agents.filter((agent) => typeof preferredAgent !== 'string' || agent.id === preferredAgent).flatMap((agent) => [
       this.target(agent, 'cpu'), ...agent.resources.gpus.map((gpu) => this.target(agent, `gpu:${gpu.index}`, `${gpu.name} • ${gpu.memoryMb} MB`)),
@@ -170,9 +204,14 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     if (this.disposed || !current || current.url !== client.endpoint || current.token !== initial.token) {
       throw new Error('The VPS configuration changed during selection. Start the submission again.');
     }
+    if (runtime !== this.currentRuntime() || !this.sameScope(scope, await this.computeScope())) {
+      throw new Error('The session or project changed during selection. Start the submission again.');
+    }
     const gpuUuid = selected.agent.resources.gpus.find((gpu) => `gpu:${gpu.index}` === selected.device)?.uuid;
     const job = validateSubmission({ id: randomUUID(), agentId: selected.agent.id, device: selected.device,
+      ...scope,
       ...(gpuUuid ? { gpuUuid } : {}),
+      ...(selected.agent.resources.dataset ? { dataset: { version: selected.agent.resources.dataset.version, sha256: selected.agent.resources.dataset.sha256 } } : {}),
       title: path.basename(input.entrypoint).slice(0, 200).replace(/[\uD800-\uDBFF]$/u, ''), ...input, args: [] });
     await this.pending.save(client.endpoint, job);
     await this.deliver(client, job);
@@ -183,13 +222,38 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     catch { throw new Error(`Could not confirm job ${job.id}. Open VPS Jobs to check it; the next submission will reconcile this request first.`); }
     await this.pending.clear(job.id);
     this.refresh();
-    void vscode.window.showInformationMessage('Background job submitted. It will keep running when you close VS Code or switch off this computer.');
+    void vscode.window.showInformationMessage('Background job submitted. Reattach through VPS Jobs after closing the editor; the compute machine must stay powered on.');
     await this.showJob(job.id);
   }
 
   private target(agent: VpsAgent, device: VpsDevice, detail?: string): vscode.QuickPickItem & { agent: VpsAgent; device: VpsDevice } {
     return { label: `${agent.name} • ${device === 'cpu' ? 'CPU' : `GPU ${device.slice(4)}`}`,
-      description: `${agent.online ? 'online' : 'offline — queue for later'} • ${agent.id}`, detail: detail ?? `${agent.resources.cpuCount} CPU threads`, agent, device };
+      description: `${agent.online ? 'online' : 'offline — queue for later'} • ${agent.id}`,
+      detail: `${detail ?? `${agent.resources.cpuCount} CPU threads`} • ${agent.resources.dataset
+        ? `prepared data ${agent.resources.dataset.version} (${agent.resources.dataset.sha256}, ${agent.resources.dataset.files} files)`
+        : 'No prepared data manifest; binary host datasets are not transferred by the source snapshot'}`, agent, device };
+  }
+
+  private sameScope(left: ComputeScope, right: ComputeScope): boolean {
+    return left.projectId === right.projectId && left.sessionId === right.sessionId;
+  }
+
+  private async computeScope(): Promise<ComputeScope> {
+    const descriptor = this.currentRuntime()?.descriptor;
+    if (descriptor) {
+      if (!validComputeScope(descriptor)) throw new Error('The current session has no valid compute identity. Reopen the session before submitting or stopping its jobs.');
+      return { projectId: descriptor.projectId, sessionId: descriptor.sessionId };
+    }
+    const uri = vscode.window.activeNotebookEditor?.notebook.uri ?? vscode.window.activeTextEditor?.document.uri;
+    const folder = vscode.workspace.workspaceFolders?.find((item) => uri && safeJobPath(path.relative(item.uri.fsPath, uri.fsPath).split(path.sep).join('/')))?.uri.fsPath
+      ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? (uri ? path.dirname(uri.fsPath) : undefined);
+    if (!folder) throw new Error('Open a project before submitting or stopping its VPS jobs.');
+    const identity = path.resolve(folder);
+    const projectId = createHash('sha256').update(process.platform === 'win32' ? identity.toLowerCase() : identity).digest('hex');
+    const key = `pairNotebook.vpsStandaloneSession.${projectId}`;
+    let sessionId = this.context.globalState.get<string>(key);
+    if (!sessionId) { sessionId = randomUUID(); await this.context.globalState.update(key, sessionId); }
+    return { projectId, sessionId };
   }
 
   private async sourceSnapshot(): Promise<Pick<JobSubmission, 'entrypoint' | 'files'> | undefined> {
@@ -284,21 +348,105 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   public async showJobs(): Promise<void> {
     const jobs = await (await this.client()).jobs();
     const selected = await vscode.window.showQuickPick(jobs.map((job) => ({ label: job.title,
-      description: `${job.status} • ${job.agentId} • ${job.device}`, detail: job.id, job })), { title: 'Shared VPS jobs' });
+      description: `${jobState(job)} • ${job.agentId} • ${job.device} • ${elapsed(job)}`, detail: jobDetails(job), job })), { title: 'Shared VPS jobs' });
     if (!selected) return;
     await this.showJob(selected.job.id);
   }
 
-  public async cancel(): Promise<void> {
+  public async cancel(id?: string): Promise<void> {
     const client = await this.client();
-    const selected = await vscode.window.showQuickPick((await client.jobs()).filter((job) => !terminalJob(job.status)).map((job) => ({
-      label: job.title, description: `${job.status} • ${job.agentId}`, detail: job.id, job,
-    })), { title: 'Cancel background job' });
+    const jobs = (await client.jobs()).filter((job) => !terminalJob(job.status));
+    const selected = typeof id === 'string' ? jobs.find((job) => job.id === id)
+      : (await vscode.window.showQuickPick(jobs.map((job) => ({ label: job.title, description: `${jobState(job)} • ${job.agentId}`,
+        detail: jobDetails(job), job })), { title: 'Stop one background job' }))?.job;
     if (!selected) return;
-    if (await vscode.window.showWarningMessage(`Cancel ${selected.job.title}?`, { modal: true }, 'Cancel job') !== 'Cancel job') return;
-    await client.cancel(selected.job.id);
+    const scope = selected.projectId && selected.sessionId ? { projectId: selected.projectId, sessionId: selected.sessionId } : undefined;
+    const challenge = await client.requestCancellation({ action: 'cancel_job', targetIds: [selected.id], ...(scope ? { scope } : {}) });
+    await this.confirmCancellation(client, challenge);
+  }
+
+  public async stopSession(): Promise<void> {
+    const runtime = this.currentRuntime();
+    const scope = await this.computeScope();
+    const client = await this.client();
+    const challenge = await client.requestCancellation({ action: 'stop_session', scope });
+    await this.confirmCancellation(client, challenge, async () => runtime === this.currentRuntime() && this.sameScope(scope, await this.computeScope()));
+  }
+
+  /** Explicitly replace a standalone intake scope after an emergency stop. */
+  public async startComputeSession(): Promise<string | undefined> {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before starting a compute session.');
+    if (this.currentRuntime()) throw new Error('A collaborative session owns this compute scope. Start a new collaborative session to obtain a new scope.');
+    const scope = await this.computeScope();
+    const selected = await vscode.window.showQuickPick([
+      { label: 'Start a new compute session', description: 'New submissions use a fresh scope; existing jobs remain observable by their IDs', start: true },
+      { label: 'Keep the current compute session', start: false },
+    ], { title: 'Standalone VPS compute session' });
+    if (!selected?.start) return undefined;
+    if (this.disposed || this.currentRuntime() || !this.sameScope(scope, await this.computeScope())) {
+      throw new Error('The project or collaborative session changed during selection. Start the action again.');
+    }
+    const sessionId = randomUUID();
+    await this.context.globalState.update(`pairNotebook.vpsStandaloneSession.${scope.projectId}`, sessionId);
     this.refresh();
-    void vscode.window.showInformationMessage('Cancellation requested. A disconnected agent will receive it when its connection returns.');
+    void vscode.window.showInformationMessage(`New compute session: ${sessionId}. Existing jobs remain available through VPS Jobs.`);
+    return sessionId;
+  }
+
+  private async confirmCancellation(client: VpsClient, challenge: CancellationChallenge, stillCurrent?: () => Promise<boolean>): Promise<void> {
+    const details = challenge.targets.map(jobDetails).join(' | ') || 'No currently active jobs; further submissions in this session will be blocked.';
+    const text = await vscode.window.showInputBox({ title: challenge.action === 'stop_session' ? 'Emergency stop: current project session' : 'Stop the selected background job',
+      value: '', ignoreFocusOut: true,
+      prompt: `${challenge.scope ? `Scope: project ${challenge.scope.projectId}, session ${challenge.scope.sessionId}. ` : ''}${details} | Stops the managed training process, subprocesses and DataLoader workers for these exact IDs. State after the last completed checkpoint may be lost. Type CONFIRM exactly.`,
+      validateInput: (value) => value === 'CONFIRM' ? undefined : 'Type the exact uppercase word CONFIRM with no spaces.' });
+    if (text !== 'CONFIRM') return;
+    const connection = await readVpsConnection(this.context);
+    if (this.disposed || !connection || connection.url !== client.endpoint || (stillCurrent && !await stillCurrent())) {
+      throw new Error('The VPS, session or project changed while confirmation was open. Nothing was cancelled; start the action again.');
+    }
+    const result = await client.applyCancellation(challenge.id, text);
+    if (challenge.action === 'stop_session' && challenge.scope) {
+      for await (const pending of this.pending.list(client.endpoint)) if (validComputeScope(pending) && this.sameScope(pending, challenge.scope)) {
+        // The broker has durably closed this scope. A delayed unaccepted request
+        // can no longer commit; any accepted target was frozen into this stop.
+        await this.pending.clear(pending.id);
+      }
+    }
+    this.refresh();
+    // A replayed operation returns its original durable receipt. Observe current
+    // execution states before describing a stop that may have completed since.
+    const observed = await client.jobs().catch(() => result.jobs);
+    const pending = observed.filter((job) => result.targetIds.includes(job.id) && !terminalJob(job.status));
+    const message = pending.length
+      ? 'Stop intent saved. cancel_pending: awaiting executor connection and acknowledgement that its managed processes stopped.'
+      : 'Stop confirmed. The selected executions have reached a terminal state.';
+    void vscode.window.showInformationMessage(message + (challenge.action === 'stop_session' ? ' This project session is closed to new submissions.' : ''));
+  }
+
+  private async restoreObservation(): Promise<void> {
+    const saved = this.context.globalState.get<{ endpoint: string; id: string }>(OBSERVATION_KEY);
+    const generation = this.logGeneration;
+    if (!saved || this.disposed || generation !== 0) return;
+    const connection = await readVpsConnection(this.context);
+    if (this.disposed || generation !== this.logGeneration || !connection || connection.url !== saved.endpoint) return;
+    await this.showJob(saved.id);
+  }
+
+  private appendOutput(value: string): void {
+    let bytes = Buffer.from(value, 'utf8');
+    if (this.visibleOutputBytes + bytes.length > MAX_VISIBLE_OUTPUT_BYTES) {
+      this.output.clear();
+      const notice = '[Visible output window rotated. Retained broker output is available by reattaching; experiment metrics and checkpoints belong in saved artifacts.]\n';
+      this.output.append(notice);
+      this.visibleOutputBytes = Buffer.byteLength(notice);
+    }
+    if (bytes.length > MAX_VISIBLE_OUTPUT_BYTES - this.visibleOutputBytes) {
+      let start = bytes.length - (MAX_VISIBLE_OUTPUT_BYTES - this.visibleOutputBytes);
+      while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+      bytes = bytes.subarray(start);
+    }
+    this.output.append(bytes.toString('utf8'));
+    this.visibleOutputBytes += bytes.length;
   }
 
   public async showJob(id: string): Promise<void> {
@@ -307,39 +455,46 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     this.logTimer = undefined;
     const client = await this.client();
     if (this.disposed || generation !== this.logGeneration) return;
+    await this.context.globalState.update(OBSERVATION_KEY, { endpoint: client.endpoint, id });
+    if (this.disposed || generation !== this.logGeneration) return;
     this.output.clear();
+    this.visibleOutputBytes = 0;
     this.output.show(true);
     let offset = 0;
     let headerShown = false;
     let unavailable = false;
+    let lastState = '';
     let decoder = new StringDecoder('utf8');
     const poll = async (): Promise<void> => {
       try {
         const job = await client.job(id, offset);
         if (this.disposed || generation !== this.logGeneration) return;
-        if (!headerShown) { this.output.appendLine(`${job.title} • ${job.agentId} • ${job.device}\nJob: ${job.id}`); headerShown = true; }
+        if (!headerShown) { this.appendOutput(`${jobDetails(job)}\n`); headerShown = true; }
+        const state = jobState(job);
+        if (state !== lastState) { this.appendOutput(`[State: ${state}]\n`); lastState = state; }
+        if (unavailable) this.appendOutput('[Observation reattached to the same job; execution was not restarted.]\n');
         unavailable = false;
         if (offset < job.logStart) {
-          this.output.append(decoder.end()); decoder = new StringDecoder('utf8');
-          this.output.appendLine('[Earlier output is retained only on the compute machine.]'); offset = job.logStart;
+          this.appendOutput(decoder.end()); decoder = new StringDecoder('utf8');
+          this.appendOutput('[Earlier output exceeds broker retention; check executor artifacts for retained history.]\n'); offset = job.logStart;
         }
         const bytes = Buffer.from(job.log, 'base64').subarray(Math.max(0, offset - job.logStart));
-        this.output.append(decoder.write(bytes));
+        this.appendOutput(decoder.write(bytes));
         offset = job.logEnd;
         if (terminalJob(job.status)) {
-          this.output.append(decoder.end());
-          this.output.appendLine(`\nStatus: ${job.status}${job.exitCode === undefined ? '' : ` • exit ${job.exitCode}`}`);
+          this.appendOutput(decoder.end());
+          this.appendOutput(`\nStatus: ${job.status}${job.exitCode === undefined ? '' : ` • exit ${job.exitCode}`}${job.failureReason ? ` • ${job.failureReason}` : ''}\n`);
           this.refresh(); return;
         }
       } catch (error) {
         if (this.disposed || generation !== this.logGeneration) return;
         if (error instanceof VpsHttpError && [401, 403, 404].includes(error.status)) {
-          this.output.appendLine(error.status === 404 ? '[Job not found on this VPS. Refresh VPS Jobs.]'
-            : '[VPS access denied. Use Connect to VPS to update your credentials.]');
+          this.appendOutput(error.status === 404 ? '[Job not found on this VPS. Refresh VPS Jobs.]\n'
+            : '[VPS access denied. Use Connect to VPS to update your credentials.]\n');
           this.logTimer = undefined;
           return;
         }
-        if (!unavailable) this.output.appendLine('[VPS unavailable; reconnecting. Running jobs continue on their compute machines.]');
+        if (!unavailable) this.appendOutput('[Observation unavailable; reconnecting to the same job. Loss of observation does not confirm execution stopped.]\n');
         unavailable = true;
       }
       if (!this.disposed && generation === this.logGeneration) {

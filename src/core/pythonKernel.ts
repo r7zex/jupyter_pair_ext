@@ -12,7 +12,7 @@ const MAX_EXECUTION_CODE_BYTES = 32 * 1024 * 1024;
 const MAX_KERNEL_STDIN_BUFFER_BYTES = 64 * 1024 * 1024;
 const BRIDGE_MESSAGE_TYPES = new Set([
   'ready', 'fatal', 'accepted', 'iopub', 'shell', 'inputRequest', 'complete',
-  'commandResult', 'completionResult', 'kernelInfoResult', 'channelError', 'commandError',
+  'commandResult', 'completionResult', 'kernelInfoResult', 'channelError', 'commandError', 'kernelProcess',
 ]);
 
 export interface JupyterKernelEvent {
@@ -26,6 +26,7 @@ export interface JupyterKernelEvent {
   success?: boolean | undefined;
   executionCount?: number | null | undefined;
   command?: string | undefined;
+  kernelPid?: number | undefined;
   channel?: string | undefined;
   message?: string | undefined;
   traceback?: string | undefined;
@@ -53,6 +54,7 @@ interface ReadyMessage {
   type: 'ready';
   pythonExecutable: string;
   kernelInfo: Record<string, any>;
+  kernelPid?: number | undefined;
 }
 
 interface FatalMessage {
@@ -101,6 +103,8 @@ export class JupyterKernel extends EventEmitter {
   private starting: Promise<ReadyMessage> | undefined;
   private ready: ReadyMessage | undefined;
   private stopping = false;
+  private kernelPid: number | undefined;
+  private confirmedStop: Promise<void> | undefined;
 
   public constructor(
     private readonly pythonPath: string,
@@ -114,6 +118,7 @@ export class JupyterKernel extends EventEmitter {
   public async start(): Promise<ReadyMessage> {
     if (this.ready && this.process && !this.process.killed) return this.ready;
     if (this.starting) return this.starting;
+    this.confirmedStop = undefined;
     this.starting = this.spawnBridge();
     try {
       return await this.starting;
@@ -174,17 +179,51 @@ export class JupyterKernel extends EventEmitter {
     return event.content ?? {};
   }
 
+  /** A confirmed stop covers the kernel process group, including redirected workers. */
+  public async stopConfirmed(): Promise<void> {
+    if (this.confirmedStop) return this.confirmedStop;
+    const child = this.process;
+    const kernelPid = this.kernelPid;
+    const operation = async () => {
+      this.stopping = true;
+      try {
+        if (child && !child.killed) {
+          try { await this.command('interrupt', 1000); } catch { /* escalation below */ }
+          try { this.send({ command: 'shutdown' }); } catch { /* bridge already unavailable */ }
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 750));
+        if (process.platform === 'win32' && child?.pid) {
+          await new Promise<void>((resolve, reject) => {
+            const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+            killer.once('error', reject);
+            killer.once('close', (code) => code === 0 || child.exitCode !== null ? resolve() : reject(new Error(`Jupyter process tree stop failed (${code}).`)));
+          });
+        } else {
+          const signalKernelGroup = (signal: NodeJS.Signals) => {
+            if (!kernelPid) return;
+            try { process.kill(-kernelPid, signal); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+          };
+          signalKernelGroup('SIGTERM');
+          await new Promise<void>((resolve) => setTimeout(resolve, 750));
+          signalKernelGroup('SIGKILL');
+          if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        }
+      } finally {
+        if (this.process === child) {
+          this.process = undefined; this.ready = undefined; this.kernelPid = undefined;
+          this.rejectAll(new Error('Jupyter execution cancelled by a confirmed stop.'));
+        }
+      }
+    };
+    this.confirmedStop = operation();
+    return this.confirmedStop;
+  }
+
   public stop(): void {
-    this.stopping = true;
-    if (this.process && !this.process.killed) {
-      try { this.send({ command: 'shutdown' }); } catch { /* already gone */ }
-      const child = this.process;
-      const timer = setTimeout(() => child.kill(), 1000);
-      timer.unref();
-    }
-    this.rejectAll(new Error('Jupyter kernel stopped.'));
-    this.process = undefined;
-    this.ready = undefined;
+    // Internal lifecycle cleanup cannot show UI; explicit user commands are
+    // fenced by SessionRuntime before they reach this process owner.
+    void this.stopConfirmed().catch((error) => this.emit('protocolError', asError(error)));
   }
 
   private spawnBridge(): Promise<ReadyMessage> {
@@ -238,6 +277,12 @@ export class JupyterKernel extends EventEmitter {
           return;
         }
         const message = parsed as unknown as ReadyMessage | FatalMessage | JupyterKernelEvent;
+        if ((parsed as Record<string, unknown>).type === 'kernelProcess') {
+          const pid = (parsed as Record<string, unknown>).kernelPid;
+          if (!Number.isSafeInteger(pid) || Number(pid) <= 0) { failProtocol(new Error('Invalid owned kernel PID.')); return; }
+          if (this.process === child) this.kernelPid = Number(pid);
+          return;
+        }
         if (message.type === 'ready') {
           if (typeof message.pythonExecutable !== 'string' || !isRecord(message.kernelInfo)) {
             failProtocol(new Error('Invalid Jupyter bridge ready message.'));
@@ -245,6 +290,7 @@ export class JupyterKernel extends EventEmitter {
           }
           if (this.process !== child) return;
           this.ready = message;
+          if (Number.isSafeInteger(message.kernelPid) && Number(message.kernelPid) > 0) this.kernelPid = message.kernelPid;
           if (!settled) {
             settled = true;
             clearTimeout(startupTimer);
@@ -334,6 +380,7 @@ export class JupyterKernel extends EventEmitter {
   }
 
   private handleEvent(event: JupyterKernelEvent): void {
+    if (Number.isSafeInteger(event.kernelPid) && Number(event.kernelPid) > 0) this.kernelPid = event.kernelPid;
     if (event.requestId) {
       const waiter = this.commands.get(event.requestId);
       const isExpected = waiter && ['commandResult', 'completionResult', 'kernelInfoResult', 'commandError'].includes(event.type);

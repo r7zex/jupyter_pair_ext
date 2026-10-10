@@ -44,7 +44,7 @@ describe('shared terminal process lifecycle', () => {
           catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
         });
         assert.ok(workerPid);
-        if (operation === 'interrupt') terminal.interrupt();
+        if (operation === 'interrupt') { const challenge = terminal.requestInterrupt(); await terminal.interrupt({ challengeId: challenge.id, value: 'CONFIRM' }); }
         if (operation === 'dispose') terminal.dispose();
         await until(() => !terminal.isRunning());
         await until(() => !processRunning(workerPid!));

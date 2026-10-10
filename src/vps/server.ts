@@ -5,14 +5,33 @@ import os from 'node:os';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { atomicWriteFile } from '../core/atomicFile';
-import { AGENT_ONLINE_MS, GPU_UUID, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
-  type AgentResources, type JobStatus, type JobSummary, type VpsAgent, type VpsJob, jobSummary, submissionDigest, terminalJob, validateSubmission, visibleVpsText } from './protocol';
+import { AGENT_ONLINE_MS, CANCELLATION_CONFIRMATION_MS, GPU_UUID, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
+  type AgentResources, type CancellationChallenge, type CancellationResult, type ComputeScope, type JobStatus, type JobSummary,
+  type VpsAgent, type VpsJob, jobSummary, submissionDigest, terminalJob, validComputeScope, validDatasetIdentity, validateSubmission, visibleVpsText } from './protocol';
+
+export interface VpsClientPrincipal {
+  token: string;
+  role: 'operator' | 'member' | 'viewer';
+  /** Omission means the credential is trusted for all configured projects. */
+  projectIds?: string[];
+}
+
+interface Principal extends VpsClientPrincipal { id: string; generation: string }
+interface CancellationOperation extends CancellationChallenge {
+  principalGeneration: string;
+  targetRuns: Array<{ id: string; createdAt: number }>;
+  state: 'pending' | 'applying' | 'applied';
+  appliedAt?: number;
+  result?: CancellationResult;
+}
 
 export interface VpsServerOptions {
   dataDirectory: string;
   clientToken: string;
   /** One independent credential per owner-approved compute machine. */
   agentTokens: Record<string, string>;
+  /** The existing shared clientToken remains an explicitly trusted team operator. */
+  clientPrincipals?: Record<string, VpsClientPrincipal>;
 }
 
 class HttpError extends Error {
@@ -30,11 +49,14 @@ function resources(raw: any): AgentResources {
       || !Number.isInteger(gpu.index) || gpu.index < 0 || gpu.index > 999
       || !visibleVpsText(gpu.name, 200) || !Number.isFinite(gpu.memoryMb) || gpu.memoryMb < 0
       || (gpu.uuid !== undefined && (typeof gpu.uuid !== 'string' || !GPU_UUID.test(gpu.uuid))))
+    || (raw.dataset !== undefined && (!validDatasetIdentity(raw.dataset) || !Number.isSafeInteger(raw.dataset.files)
+      || raw.dataset.files < 1 || raw.dataset.files > 100_000))
     || new Set(raw.gpus.map((gpu: any) => gpu.index)).size !== raw.gpus.length
     || new Set(raw.gpus.filter((gpu: any) => gpu.uuid).map((gpu: any) => gpu.uuid.toLowerCase())).size !== raw.gpus.filter((gpu: any) => gpu.uuid).length) {
     throw new HttpError(400, 'Invalid compute inventory.');
   }
   return { cpuCount: raw.cpuCount, python: raw.python,
+    ...(raw.dataset ? { dataset: { version: raw.dataset.version, sha256: raw.dataset.sha256, files: raw.dataset.files } } : {}),
     gpus: raw.gpus.map((gpu: any) => ({ index: gpu.index, name: gpu.name, memoryMb: gpu.memoryMb,
       ...(gpu.uuid ? { uuid: gpu.uuid } : {}) })) };
 }
@@ -46,6 +68,10 @@ export class VpsServer {
   private readonly jobs = new Map<string, JobSummary>();
   private readonly agents = new Map<string, VpsAgent>();
   private readonly agentTokens: Map<string, string>;
+  private readonly principals: Principal[];
+  private readonly authorityGeneration = randomUUID();
+  private readonly confirmations = new Map<string, CancellationOperation>();
+  private readonly stoppedScopes = new Set<string>();
   private serial: Promise<unknown> = Promise.resolve();
   private readonly requests = new Set<Promise<void>>();
   private readonly server = http.createServer((request, response) => {
@@ -61,19 +87,31 @@ export class VpsServer {
   private lockOwner: string | undefined;
 
   public constructor(private readonly options: VpsServerOptions) {
-    const tokens = [options.clientToken, ...Object.values(options.agentTokens)];
+    const grants = Object.entries(options.clientPrincipals ?? {});
+    const tokens = [options.clientToken, ...Object.values(options.agentTokens), ...grants.map(([, grant]) => grant.token)];
     if (tokens.some((token) => typeof token !== 'string' || !/^[A-Za-z0-9_-]{32,256}$/.test(token))
       || new Set(tokens).size !== tokens.length || Object.keys(options.agentTokens).some((id) => !VPS_ID.test(id))) {
       throw new Error('Use distinct random client and agent tokens (32–256 URL-safe characters) and valid agent IDs.');
     }
     this.agentTokens = new Map(Object.entries(options.agentTokens));
+    if (grants.some(([id, grant]) => !VPS_ID.test(id) || id === 'team-operator'
+      || !['operator', 'member', 'viewer'].includes(grant.role)
+      || (grant.projectIds !== undefined && (!Array.isArray(grant.projectIds) || grant.projectIds.some((project) => !VPS_ID.test(project)))))) {
+      throw new Error('Invalid VPS client principal or project permissions.');
+    }
+    this.principals = [['team-operator', { token: options.clientToken, role: 'operator' }], ...grants]
+      .map(([id, grant]) => {
+        const rights = grant as VpsClientPrincipal;
+        return { ...rights, id: id as string, generation: createHash('sha256')
+          .update(JSON.stringify({ id, token: rights.token, role: rights.role, projectIds: rights.projectIds })).digest('hex') };
+      });
     this.server.requestTimeout = 10_000;
     this.server.headersTimeout = 10_000;
     this.server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url ?? '/', 'http://localhost');
       const room = url.searchParams.get('room') ?? '';
       const peer = url.searchParams.get('peer') ?? '';
-      if (this.closing || url.pathname !== '/v1/relay' || !this.authorized(request, this.options.clientToken)
+      if (this.closing || url.pathname !== '/v1/relay' || !this.principals.some((principal) => this.authorized(request, principal.token))
         || !/^[a-f0-9]{64}$/.test(room) || !VPS_ID.test(peer) || this.sockets.clients.size >= 128
         || (this.rooms.get(room)?.has(peer) ?? false)) {
         socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
@@ -101,6 +139,7 @@ export class VpsServer {
     const ordered = [...this.jobs.values()].sort((a, b) => a.createdAt - b.createdAt);
     this.jobs.clear();
     for (const job of ordered) this.jobs.set(job.id, job);
+    await this.loadConfirmations();
     await new Promise<void>((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(port, host, () => { this.server.off('error', reject); resolve(); });
@@ -120,18 +159,21 @@ export class VpsServer {
     const job = JSON.parse(await readFile(path.join(this.options.dataDirectory, `${id}.json`), 'utf8')) as VpsJob;
     validateSubmission(job);
     if (id !== job.id || !Number.isSafeInteger(job.createdAt) || job.createdAt < 0
-        || !['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(job.status)
+        || !['queued', 'running', 'cancel_pending', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(job.status)
         || !Number.isSafeInteger(job.logStart) || !Number.isSafeInteger(job.logEnd) || job.logStart < 0 || job.logEnd < job.logStart
         || typeof job.cancelRequested !== 'boolean' || typeof job.log !== 'string'
         || Buffer.from(job.log, 'base64').toString('base64') !== job.log
         || Buffer.from(job.log, 'base64').length !== job.logEnd - job.logStart || job.logEnd - job.logStart > LOG_RETENTION_BYTES
         || (job.instanceId !== undefined && (typeof job.instanceId !== 'string' || !VPS_ID.test(job.instanceId)))
-        || (job.status === 'running' && (!job.instanceId || !Number.isSafeInteger(job.startedAt)))
+        || (['running', 'cancel_pending'].includes(job.status) && (!job.instanceId || !Number.isSafeInteger(job.startedAt)))
+        || (job.status === 'cancel_pending' && !job.cancelRequested)
+        || (job.ownerIdentity !== undefined && !VPS_ID.test(job.ownerIdentity))
+        || (job.failureReason !== undefined && !visibleVpsText(job.failureReason, 2000))
         || (job.startedAt !== undefined && (!Number.isSafeInteger(job.startedAt) || job.startedAt < 0))
         || (job.finishedAt !== undefined && (!Number.isSafeInteger(job.finishedAt) || job.finishedAt < 0))
         || (job.status === 'queued' && (job.cancelRequested || job.instanceId !== undefined || job.startedAt !== undefined
           || job.finishedAt !== undefined || job.exitCode !== undefined || job.logEnd !== 0))
-        || (job.status === 'running' && (job.finishedAt !== undefined || job.exitCode !== undefined))
+        || (['running', 'cancel_pending'].includes(job.status) && (job.finishedAt !== undefined || job.exitCode !== undefined))
         || (terminalJob(job.status) && !Number.isSafeInteger(job.finishedAt))
         || (job.status === 'succeeded' && (job.exitCode !== 0 || !job.instanceId))
         || (job.status === 'failed' && (!Number.isSafeInteger(job.exitCode) || job.exitCode === 0))
@@ -207,8 +249,9 @@ export class VpsServer {
       if (this.closing) throw new HttpError(503, 'VPS broker is stopping.');
       const url = new URL(request.url ?? '/', 'http://localhost');
       const agentRoute = /^\/v1\/agents\/([A-Za-z0-9_-]{1,128})\/(poll|report)$/.exec(url.pathname);
-      const token = agentRoute ? this.agentTokens.get(agentRoute[1]!) : this.options.clientToken;
-      if (!token || !this.authorized(request, token)) throw new HttpError(401, 'Unauthorized.');
+      const token = agentRoute ? this.agentTokens.get(agentRoute[1]!) : undefined;
+      const principal = agentRoute ? undefined : this.principals.find((candidate) => this.authorized(request, candidate.token));
+      if (agentRoute ? !token || !this.authorized(request, token) : !principal) throw new HttpError(401, 'Unauthorized.');
       let body: any;
       if (request.method === 'POST') {
         const chunks: Buffer[] = [];
@@ -224,7 +267,7 @@ export class VpsServer {
       }
       clearTimeout(deadline);
       if (this.closing) throw new HttpError(503, 'VPS broker is stopping.');
-      const operation = this.serial.then(() => this.dispatch(request.method ?? '', url.pathname, body, agentRoute, url.searchParams.get('offset')));
+      const operation = this.serial.then(() => this.dispatch(request.method ?? '', url.pathname, body, agentRoute, url.searchParams.get('offset'), principal));
       this.serial = operation.catch(() => undefined);
       response.end(JSON.stringify(await operation));
     } catch (error) {
@@ -238,13 +281,177 @@ export class VpsServer {
     this.jobs.set(job.id, jobSummary(job));
   }
 
-  private async dispatch(method: string, route: string, body: any, agentRoute: RegExpExecArray | null, logOffset: string | null): Promise<unknown> {
+  private scopeKey(scope: ComputeScope): string { return JSON.stringify([scope.projectId, scope.sessionId]); }
+
+  private inScope(job: JobSummary, scope: ComputeScope): boolean {
+    return job.projectId === scope.projectId && job.sessionId === scope.sessionId;
+  }
+
+  private checkProject(principal: Principal, projectId: string | undefined): void {
+    if (principal.projectIds && (!projectId || !principal.projectIds.includes(projectId))) {
+      throw new HttpError(403, 'This credential does not control this project.');
+    }
+  }
+
+  private canReadProject(principal: Principal | undefined, job: JobSummary): boolean {
+    return !!principal && (!principal.projectIds || (!!job.projectId && principal.projectIds.includes(job.projectId)));
+  }
+
+  private cancellationPermission(principal: Principal, action: CancellationChallenge['action'], targets: JobSummary[]): CancellationChallenge['requiredPermission'] {
+    if (principal.role === 'viewer' || (action === 'stop_session' && principal.role !== 'operator')
+      || (principal.role === 'member' && targets.some((job) => job.ownerIdentity !== principal.id))) {
+      throw new HttpError(403, 'This credential cannot stop the requested compute.');
+    }
+    for (const job of targets) this.checkProject(principal, job.projectId);
+    return action === 'stop_session' ? 'stop_session' : principal.role === 'operator' ? 'cancel_any' : 'cancel_own';
+  }
+
+  private async persistConfirmations(): Promise<void> {
+    const directory = path.join(this.options.dataDirectory, '.confirmations');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await atomicWriteFile(path.join(directory, 'operations.json'), JSON.stringify([...this.confirmations.values()]));
+  }
+
+  private async loadConfirmations(): Promise<void> {
+    this.confirmations.clear();
+    this.stoppedScopes.clear();
+    let records: unknown;
+    try { records = JSON.parse(await readFile(path.join(this.options.dataDirectory, '.confirmations', 'operations.json'), 'utf8')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+    if (!Array.isArray(records) || records.length > 1000) throw new Error('VPS cancellation ledger is inconsistent.');
+    for (const value of records) {
+      const operation = value as CancellationOperation;
+      if (!operation || !VPS_ID.test(operation.id) || this.confirmations.has(operation.id)
+        || !['cancel_job', 'stop_session'].includes(operation.action) || !['pending', 'applying', 'applied'].includes(operation.state)
+        || !VPS_ID.test(operation.identity) || typeof operation.principalGeneration !== 'string'
+        || !/^[a-f0-9]{64}$/.test(operation.principalGeneration) || !VPS_ID.test(operation.authorityGeneration)
+        || !['cancel_own', 'cancel_any', 'stop_session'].includes(operation.requiredPermission)
+        || !Number.isSafeInteger(operation.createdAt) || !Number.isSafeInteger(operation.expiresAt)
+        || operation.expiresAt !== operation.createdAt + CANCELLATION_CONFIRMATION_MS
+        || !Array.isArray(operation.targets) || !Array.isArray(operation.targetIds) || !Array.isArray(operation.targetRuns)
+        || operation.targets.length !== operation.targetIds.length || operation.targetRuns.length !== operation.targetIds.length
+        || new Set(operation.targetIds).size !== operation.targetIds.length
+        || operation.targetRuns.some((run, index) => !run || !VPS_ID.test(run.id) || run.id !== operation.targetIds[index]
+          || !Number.isSafeInteger(run.createdAt) || operation.targets[index]?.id !== run.id || operation.targets[index]?.createdAt !== run.createdAt)
+        || (operation.scope !== undefined && !validComputeScope(operation.scope))
+        || (operation.action === 'stop_session' && !operation.scope)
+        || (operation.action === 'cancel_job' && operation.targetIds.length !== 1)
+        || (operation.state !== 'pending' && !Number.isSafeInteger(operation.appliedAt))
+        || (operation.state === 'applied' && (!operation.result || operation.result.confirmationId !== operation.id))) {
+        throw new Error('VPS cancellation ledger is inconsistent.');
+      }
+      // Unapplied dialogs belong to the old broker authority epoch. Confirmed
+      // intents and replay receipts survive a restart and are recovered below.
+      if (operation.state !== 'pending') this.confirmations.set(operation.id, operation);
+      if (operation.state !== 'pending' && operation.action === 'stop_session') this.stoppedScopes.add(this.scopeKey(operation.scope!));
+    }
+    for (const operation of this.confirmations.values()) {
+      if (operation.state === 'applying') await this.finishCancellation(operation);
+    }
+  }
+
+  private async requestCancellation(body: any, principal: Principal): Promise<CancellationChallenge> {
+    if (!body || !['cancel_job', 'stop_session'].includes(body.action)
+      || Object.keys(body).some((key) => !['action', 'scope', 'targetIds'].includes(key))
+      || (body.scope !== undefined && !validComputeScope(body.scope))) throw new HttpError(400, 'Invalid cancellation action or scope.');
+    let targets: JobSummary[];
+    if (body.action === 'cancel_job') {
+      if (!Array.isArray(body.targetIds) || body.targetIds.length !== 1 || typeof body.targetIds[0] !== 'string' || !VPS_ID.test(body.targetIds[0])) {
+        throw new HttpError(400, 'One exact job target is required.');
+      }
+      const job = this.jobs.get(body.targetIds[0]);
+      if (!job) throw new HttpError(404, 'Job not found.');
+      if (terminalJob(job.status)) throw new HttpError(409, 'The target run has already finished.');
+      if (body.scope ? !this.inScope(job, body.scope) : validComputeScope(job)) throw new HttpError(409, 'The target does not match the exact project/session scope.');
+      targets = [jobSummary(job)];
+    } else {
+      if (!validComputeScope(body.scope) || body.targetIds !== undefined) throw new HttpError(400, 'Session stop requires an exact scope and server-selected targets.');
+      this.checkProject(principal, body.scope.projectId);
+      targets = [...this.jobs.values()].filter((job) => this.inScope(job, body.scope) && !terminalJob(job.status)).map(jobSummary);
+    }
+    const requiredPermission = this.cancellationPermission(principal, body.action, targets);
+    const now = Date.now();
+    for (const [id, old] of this.confirmations) if (old.state === 'pending' && old.expiresAt <= now) this.confirmations.delete(id);
+    if (this.confirmations.size >= 1000 || [...this.confirmations.values()].reduce((sum, old) => sum + old.targetIds.length, targets.length) > 20_000) {
+      throw new HttpError(409, 'Cancellation audit ledger is full. Archive it before requesting another stop.');
+    }
+    const operation: CancellationOperation = { id: randomUUID(), action: body.action,
+      ...(body.scope ? { scope: { projectId: body.scope.projectId, sessionId: body.scope.sessionId } } : {}),
+      targetIds: targets.map((job) => job.id), targets, identity: principal.id, requiredPermission,
+      authorityGeneration: this.authorityGeneration, principalGeneration: principal.generation,
+      createdAt: now, expiresAt: now + CANCELLATION_CONFIRMATION_MS,
+      targetRuns: targets.map((job) => ({ id: job.id, createdAt: job.createdAt })), state: 'pending' };
+    this.confirmations.set(operation.id, operation);
+    await this.persistConfirmations();
+    return { id: operation.id, action: operation.action,
+      ...(operation.scope ? { scope: operation.scope } : {}), targetIds: [...operation.targetIds],
+      targets: operation.targets.map(jobSummary), identity: operation.identity, requiredPermission: operation.requiredPermission,
+      authorityGeneration: operation.authorityGeneration, createdAt: operation.createdAt, expiresAt: operation.expiresAt };
+  }
+
+  private async applyCancellation(id: string, body: any, principal: Principal): Promise<CancellationResult> {
+    if (!body || body.text !== 'CONFIRM' || Object.keys(body).some((key) => key !== 'text')) {
+      throw new HttpError(403, 'Type the exact string CONFIRM for this operation.');
+    }
+    const operation = this.confirmations.get(id);
+    if (!operation) throw new HttpError(409, 'Confirmation is unknown or belongs to an earlier authority.');
+    if (operation.identity !== principal.id || operation.principalGeneration !== principal.generation) {
+      throw new HttpError(403, 'Confirmation belongs to another authenticated principal or authority.');
+    }
+    if (this.cancellationPermission(principal, operation.action, operation.targets) !== operation.requiredPermission) {
+      throw new HttpError(403, 'Confirmation permissions have changed.');
+    }
+    if (operation.state === 'applied') return operation.result!;
+    if (operation.state === 'pending') {
+      if (operation.expiresAt <= Date.now() || operation.authorityGeneration !== this.authorityGeneration) throw new HttpError(409, 'Confirmation has expired or authority has changed.');
+      for (const target of operation.targetRuns) {
+        const current = this.jobs.get(target.id);
+        if (!current || current.createdAt !== target.createdAt || terminalJob(current.status)) throw new HttpError(409, 'The confirmed run is no longer active. Request a new confirmation.');
+      }
+      if (operation.action === 'stop_session') {
+        const current = [...this.jobs.values()].filter((job) => this.inScope(job, operation.scope!) && !terminalJob(job.status));
+        if (current.length !== operation.targetIds.length || current.some((job) => !operation.targetIds.includes(job.id))) {
+          throw new HttpError(409, 'The session target list has changed. Request a new confirmation.');
+        }
+      }
+      operation.state = 'applying';
+      operation.appliedAt = Date.now();
+      // Persist the authorized intent before changing any jobs. A crash can be
+      // recovered without expanding the frozen target list or losing consent.
+      await this.persistConfirmations();
+    }
+    return this.finishCancellation(operation);
+  }
+
+  private async finishCancellation(operation: CancellationOperation): Promise<CancellationResult> {
+    if (operation.action === 'stop_session') this.stoppedScopes.add(this.scopeKey(operation.scope!));
+    const jobs: JobSummary[] = [];
+    for (const target of operation.targetRuns) {
+      const current = this.jobs.get(target.id);
+      if (!current || current.createdAt !== target.createdAt) throw new Error('Confirmed run identity changed during cancellation recovery.');
+      const job = await this.load(target.id);
+      if (!terminalJob(job.status)) {
+        const cancelled: VpsJob = { ...job, cancelRequested: true,
+          ...(job.status === 'queued' ? { status: 'cancelled', finishedAt: Date.now() } : { status: 'cancel_pending' }) };
+        await this.save(cancelled);
+        jobs.push(jobSummary(cancelled));
+      } else jobs.push(jobSummary(job));
+    }
+    const result: CancellationResult = { confirmationId: operation.id, action: operation.action,
+      ...(operation.scope ? { scope: operation.scope } : {}), targetIds: [...operation.targetIds], jobs, appliedAt: operation.appliedAt! };
+    operation.result = result;
+    operation.state = 'applied';
+    await this.persistConfirmations();
+    return result;
+  }
+
+  private async dispatch(method: string, route: string, body: any, agentRoute: RegExpExecArray | null, logOffset: string | null, principal?: Principal): Promise<unknown> {
     if (agentRoute && method === 'POST') {
       const agentId = agentRoute[1]!;
       if (typeof body.instanceId !== 'string' || !VPS_ID.test(body.instanceId)) throw new HttpError(400, 'Invalid agent instance.');
       if (agentRoute[2] === 'report') return this.report(agentId, body);
       if (!visibleVpsText(body.name, 128)) throw new HttpError(400, 'Invalid agent name.');
-      const running = [...this.jobs.values()].find((job) => job.agentId === agentId && job.status === 'running');
+      const running = [...this.jobs.values()].find((job) => job.agentId === agentId && ['running', 'cancel_pending'].includes(job.status));
       if (running && running.instanceId !== body.instanceId) {
         throw new HttpError(409, 'A different agent installation owns the running job. Restore its state directory.');
       }
@@ -256,6 +463,12 @@ export class VpsServer {
       const next = [...this.jobs.values()].find((job) => job.agentId === agentId && job.status === 'queued');
       if (!next) return { job: null };
       const payload = await this.load(next.id);
+      const dataset = this.agents.get(agentId)!.resources.dataset;
+      if ((dataset || next.dataset) && (!dataset || !next.dataset || dataset.version !== next.dataset.version || dataset.sha256 !== next.dataset.sha256)) {
+        await this.save({ ...payload, status: 'failed', finishedAt: Date.now(), exitCode: -1,
+          failureReason: 'Prepared dataset identity does not match this job. Re-submit against the current dataset version.' });
+        return { job: null };
+      }
       if (next.device !== 'cpu' && !this.agents.get(agentId)!.resources.gpus.some((gpu) => next.gpuUuid ? gpu.uuid?.toLowerCase() === next.gpuUuid.toLowerCase() : `gpu:${gpu.index}` === next.device)) {
         const failure = Buffer.from('The selected GPU is not available on this agent.\n');
         await this.save({ ...payload, status: 'failed', finishedAt: Date.now(), exitCode: -1,
@@ -269,20 +482,35 @@ export class VpsServer {
     if (method === 'GET' && route === '/v1/agents') {
       return [...this.agents.values()].map((agent) => ({ ...agent, online: Date.now() - agent.lastSeen < AGENT_ONLINE_MS }));
     }
-    if (method === 'GET' && route === '/v1/jobs') return [...this.jobs.values()].reverse().map(jobSummary);
+    if (method === 'GET' && route === '/v1/jobs') return [...this.jobs.values()].reverse()
+      .filter((job) => this.canReadProject(principal, job)).map(jobSummary);
+    if (method === 'POST' && route === '/v1/confirmations') {
+      if (!principal) throw new HttpError(403, 'A client principal is required.');
+      return this.requestCancellation(body, principal);
+    }
+    const confirmation = /^\/v1\/confirmations\/([A-Za-z0-9_-]{1,128})\/apply$/.exec(route);
+    if (method === 'POST' && confirmation) {
+      if (!principal) throw new HttpError(403, 'A client principal is required.');
+      return this.applyCancellation(confirmation[1]!, body, principal);
+    }
     if (method === 'POST' && route === '/v1/jobs') {
+      if (!principal || principal.role === 'viewer') throw new HttpError(403, 'This credential cannot submit compute.');
       let input;
       try { input = validateSubmission(body); } catch { throw new HttpError(400, 'Invalid or oversized Python job.'); }
       if (!this.agentTokens.has(input.agentId)) throw new HttpError(400, 'Unknown compute agent.');
+      this.checkProject(principal, input.projectId);
       const existing = this.jobs.get(input.id);
       if (existing) {
+        this.checkProject(principal, existing.projectId);
+        if (principal.role === 'member' && existing.ownerIdentity !== principal.id) throw new HttpError(403, 'This job ID belongs to another authenticated submitter.');
         // A retry after a lost HTTP response cannot start the same training twice.
         if (submissionDigest(await this.load(existing.id)) !== submissionDigest(input)) throw new HttpError(409, 'Job ID already has different input.');
         return jobSummary(existing);
       }
+      if (validComputeScope(input) && this.stoppedScopes.has(this.scopeKey(input))) throw new HttpError(409, 'This session has stopped accepting compute launches. Start a new session.');
       if (this.jobs.size >= 1000) throw new HttpError(409, 'Job store is full. Archive completed jobs first.');
       const createdAt = Math.max(Date.now(), ...[...this.jobs.values()].map((job) => job.createdAt + 1));
-      const job: VpsJob = { ...input, status: 'queued', createdAt, cancelRequested: false, logStart: 0, logEnd: 0, log: '' };
+      const job: VpsJob = { ...input, ownerIdentity: principal.id, status: 'queued', createdAt, cancelRequested: false, logStart: 0, logEnd: 0, log: '' };
       await this.save(job);
       return jobSummary(job);
     }
@@ -290,6 +518,7 @@ export class VpsServer {
     if (match) {
       const summary = this.jobs.get(match[1]!);
       if (!summary) throw new HttpError(404, 'Job not found.');
+      if (!principal || !this.canReadProject(principal, summary)) throw new HttpError(403, 'This credential cannot access this project.');
       const job = await this.load(summary.id);
       if (method === 'GET' && !match[2]) {
         if (logOffset !== null && (!/^\d+$/.test(logOffset) || !Number.isSafeInteger(Number(logOffset)))) throw new HttpError(400, 'Invalid log offset.');
@@ -298,11 +527,13 @@ export class VpsServer {
           log: Buffer.from(job.log, 'base64').subarray(start - job.logStart).toString('base64') };
       }
       if (method === 'POST' && match[2]) {
-        if (terminalJob(job.status)) return jobSummary(job);
-        const cancelled: VpsJob = { ...job, cancelRequested: true,
-          ...(job.status === 'queued' ? { status: 'cancelled' as const, finishedAt: Date.now() } : {}) };
-        await this.save(cancelled);
-        return jobSummary(cancelled);
+        if (!principal || typeof body.confirmationId !== 'string') throw new HttpError(403, 'A bound cancellation challenge and exact CONFIRM are required.');
+        const challenge = this.confirmations.get(body.confirmationId);
+        if (!challenge || challenge.action !== 'cancel_job' || challenge.targetIds.length !== 1 || challenge.targetIds[0] !== job.id) {
+          throw new HttpError(409, 'Confirmation does not target this job.');
+        }
+        const result = await this.applyCancellation(body.confirmationId, { text: body.text }, principal);
+        return result.jobs[0];
       }
     }
     throw new HttpError(404, 'Route not found.');
@@ -332,7 +563,8 @@ export class VpsServer {
       if (!result || !allowed.includes(result.status) || !Number.isSafeInteger(result.exitCode)
         || (result.status === 'succeeded' && result.exitCode !== 0)
         || (result.status === 'failed' && result.exitCode === 0)
-        || (result.status === 'cancelled' && !current.cancelRequested)) throw new HttpError(400, 'Invalid completion.');
+        || (result.status === 'cancelled' && !current.cancelRequested)
+        || (result.reason !== undefined && !visibleVpsText(result.reason, 2000))) throw new HttpError(400, 'Invalid completion.');
     }
     if (terminalJob(current.status)) {
       if (append.length || (body.result !== undefined && (body.result.status !== current.status || body.result.exitCode !== current.exitCode))) {
@@ -349,7 +581,8 @@ export class VpsServer {
     }
     if (body.result !== undefined) {
       const result = body.result;
-      updated = { ...updated, status: result.status, exitCode: result.exitCode, finishedAt: Date.now() };
+      updated = { ...updated, status: result.status, exitCode: result.exitCode, finishedAt: Date.now(),
+        ...(result.reason ? { failureReason: result.reason } : {}) };
     }
     if (append.length || body.result !== undefined) await this.save(updated);
     return { offset: updated.logEnd, cancelRequested: updated.cancelRequested };

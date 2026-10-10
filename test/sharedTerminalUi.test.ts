@@ -35,6 +35,30 @@ loader._load = originalLoad;
 if (cached) require.cache[modulePath] = cached; else delete require.cache[modulePath];
 
 describe('native shared terminal input authority', () => {
+  it('ignores input and repeated Ctrl+C while confirmation is open and resumes after dismissal without stopping', async () => {
+    terminals.length = 0; trusted = true;
+    const commands: string[] = []; let prompts = 0; let interrupts = 0;
+    let dismiss!: (confirmed: boolean) => void;
+    const shell = Object.assign(new EventEmitter(), { view: () => ({ text: '', reset: true }), requestSnapshot: () => undefined,
+      execute: async (command: string) => { commands.push(command); }, interrupt: () => { interrupts++; } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true },
+      confirmOperation: (action: string) => {
+        assert.equal(action, 'terminal-interrupt'); prompts++;
+        return new Promise<boolean>((resolve) => { dismiss = resolve; });
+      } });
+    const controller = new SharedTerminalController(() => runtime as unknown as SessionRuntime);
+    try {
+      controller.open(); const pty = terminals[0]!.pty; pty.open(undefined);
+      pty.handleInput?.('\x03echo pasted suffix\r');
+      pty.handleInput?.('echo during prompt\r\x03\r');
+      assert.equal(prompts, 1); assert.equal(interrupts, 0); assert.deepEqual(commands, []);
+      dismiss(false); await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(interrupts, 0);
+      pty.handleInput?.('echo after dismissal\r'); await Promise.resolve();
+      assert.deepEqual(commands, ['echo after dismissal']);
+    } finally { controller.dispose(); }
+  });
+
   it('rejects an entire overlong pasted command without executing its truncated prefix', async () => {
     terminals.length = 0; trusted = true;
     const commands: string[] = [];
@@ -66,12 +90,15 @@ describe('native shared terminal input authority', () => {
     const commands: string[] = []; let interrupts = 0;
     const shell = Object.assign(new EventEmitter(), { view: () => ({ text: '', reset: true }), requestSnapshot: () => undefined,
       execute: async (command: string) => { commands.push(command); }, interrupt: () => { interrupts++; } });
-    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => true },
+      confirmOperation: async (action: string) => { assert.equal(action, 'terminal-interrupt'); interrupts++; return true; } });
     const controller = new SharedTerminalController(() => runtime as unknown as SessionRuntime);
     const overflow = 'x'.repeat(8193);
     try {
       controller.open(); const pty = terminals[0]!.pty; pty.open(undefined);
-      pty.handleInput?.(overflow + '\x03echo interrupted\r');
+      pty.handleInput?.(overflow + '\x03echo discarded while confirming\r');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      pty.handleInput?.('echo interrupted\r');
       pty.handleInput?.(overflow); runtime.emit('hostChanged'); pty.handleInput?.('echo host changed\r');
       pty.handleInput?.(overflow); shell.emit('view', { text: '', reset: true }); pty.handleInput?.('echo reset\r');
       pty.handleInput?.(overflow); pty.close(); controller.open();
@@ -88,7 +115,8 @@ describe('native shared terminal input authority', () => {
     const commands: string[] = []; let interrupts = 0;
     const shell = Object.assign(new EventEmitter(), { view: () => ({ text: 'history\n', reset: true }),
       requestSnapshot: () => undefined, execute: async (command: string) => { commands.push(command); }, interrupt: () => { interrupts++; } });
-    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => isHost } });
+    const runtime = Object.assign(new EventEmitter(), { sharedTerminal: () => shell, coordinator: { isCurrentHost: () => isHost },
+      confirmOperation: async (action: string) => { assert.equal(action, 'terminal-interrupt'); interrupts++; return true; } });
     let current: SessionRuntime | undefined = runtime as unknown as SessionRuntime;
     const controller = new SharedTerminalController(() => current);
     try {

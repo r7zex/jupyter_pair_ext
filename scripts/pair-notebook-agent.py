@@ -3,6 +3,7 @@
 import argparse
 import base64
 import csv
+import hashlib
 import http.client
 import json
 import math
@@ -25,6 +26,109 @@ import uuid
 MAX_LOG = 32 * 1024 * 1024
 CHUNK = 64 * 1024
 ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+SHA256 = re.compile(r"^[a-f0-9]{64}$")
+
+
+class PreparationError(ValueError):
+    """A safe, actionable preparation error; never includes credentials/paths."""
+
+
+class PreparationCancelled(Exception):
+    pass
+
+
+def data_manifest(value):
+    if not isinstance(value, dict) or not isinstance(value.get("version"), str) or not 0 < len(value["version"]) <= 200 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in value["version"]) \
+            or not isinstance(value.get("files"), list) or len(value["files"]) > 100000:
+        raise PreparationError("Invalid prepared data manifest; provide version and path/size/sha256 entries.")
+    files, names = [], set()
+    for item in value["files"]:
+        if not isinstance(item, dict) or not safe_path(item.get("path")) or type(item.get("size")) is not int \
+                or item["size"] < 0 or not isinstance(item.get("sha256"), str) or not SHA256.fullmatch(item["sha256"]):
+            raise PreparationError("Invalid prepared data manifest; provide version and path/size/sha256 entries.")
+        name = unicodedata.normalize("NFC", item["path"]).casefold()
+        if name in names:
+            raise PreparationError("Prepared data manifest contains conflicting file paths.")
+        names.add(name)
+        files.append({"path": item["path"], "size": item["size"], "sha256": item["sha256"]})
+    if any("/".join(name.split("/")[:index]) in names for name in names for index in range(1, len(name.split("/")))):
+        raise PreparationError("Prepared data manifest contains conflicting file paths.")
+    return {"version": value["version"], "files": sorted(files, key=lambda item: item["path"])}
+
+
+def dataset_identity(manifest):
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return {"version": manifest["version"], "sha256": hashlib.sha256(encoded).hexdigest(), "files": len(manifest["files"])}
+
+
+def copy_verified_data(source_root, work, manifest, cancelled):
+    """Bounded, resumable local staging. Publish only complete hash-verified files."""
+    try:
+        source_root = Path(source_root).resolve(strict=True)
+    except OSError as error:
+        raise PreparationError("The owner-selected data workspace is unavailable on this compute agent.") from error
+    for item in manifest["files"]:
+        if cancelled():
+            raise PreparationCancelled()
+        try:
+            source = (source_root / item["path"]).resolve(strict=True)
+            if not source.is_relative_to(source_root) or not source.is_file() or source.stat().st_size != item["size"]:
+                raise PreparationError("Prepared data is missing, changed, or outside the owner-selected workspace.")
+        except OSError as error:
+            raise PreparationError("Prepared data is missing. Stage the declared dataset on the selected compute agent.") from error
+        target = work / item["path"]
+        for parent in (target, *target.parents):
+            if parent.is_symlink():
+                raise PreparationError("Prepared data target must not contain symlinks.")
+            if parent == work:
+                break
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        staging = work.parent / ("data-staging-" + hashlib.sha256(str(work).encode("utf-8")).hexdigest()[:16])
+        if staging.is_symlink():
+            raise PreparationError("Prepared data staging directory must not be a symlink.")
+        staging.mkdir(exist_ok=True, mode=0o700)
+        partial = staging / hashlib.sha256(item["path"].encode("utf-8")).hexdigest()
+        if target.is_symlink() or partial.is_symlink():
+            raise PreparationError("Prepared data target must not be a symlink.")
+        digest = hashlib.sha256()
+        # Completed files can be reused by explicit staging retries, but never
+        # trusted by name alone. Both the prefix and new bytes are hashed.
+        retained = target if target.exists() else partial
+        offset = 0
+        if retained.exists():
+            with retained.open("rb") as stream:
+                while True:
+                    block = stream.read(CHUNK)
+                    if not block:
+                        break
+                    if cancelled():
+                        raise PreparationCancelled()
+                    digest.update(block)
+                    offset += len(block)
+        if offset > item["size"] or (target.exists() and (offset != item["size"] or digest.hexdigest() != item["sha256"])):
+            raise PreparationError("Prepared data snapshot failed its integrity check. Prepare a fresh run.")
+        if target.exists():
+            continue
+        with source.open("rb") as original, partial.open("ab") as destination:
+            original.seek(offset)
+            while True:
+                if cancelled():
+                    raise PreparationCancelled()
+                block = original.read(CHUNK)
+                if not block:
+                    break
+                destination.write(block)
+                digest.update(block)
+                offset += len(block)
+                if offset > item["size"]:
+                    raise PreparationError("Prepared data changed size while staging. Update its manifest before submitting a new run.")
+            destination.flush()
+            os.fsync(destination.fileno())
+        if offset != item["size"] or digest.hexdigest() != item["sha256"]:
+            raise PreparationError("Prepared data changed or failed its integrity check. Update its manifest before submitting a new run.")
+        os.replace(partial, target)
+        sync_directory(target.parent)
 
 
 def sync_directory(directory):
@@ -174,6 +278,23 @@ class WindowsJob:
                 return
             time.sleep(0.02)
 
+    def graceful_stop(self, process):
+        # Console hosts deliver SIGBREAK to the isolated training group. Service
+        # hosts may have no console; the Job Object still provides a bounded
+        # fallback that contains every descendant.
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        except (OSError, ValueError):
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            accounting = self.accounting()
+            if not self.kernel.QueryInformationJobObject(self.handle, 1, self.ctypes.byref(accounting), self.ctypes.sizeof(accounting), None):
+                return
+            if accounting.ActiveProcesses == 0:
+                return
+            time.sleep(0.05)
+
     def close(self):
         if self.handle:
             self.kernel.CloseHandle(self.handle)
@@ -210,7 +331,54 @@ def adopt_training_descendants():
     return True
 
 
-def reap_training_descendants():
+def owned_live_children(excluded=()):
+    """Only unreaped children of this subreaper; never unrelated host processes."""
+    live = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal() or int(entry.name) in excluded:
+            continue
+        try:
+            fields = (entry / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if int(fields[1]) == os.getpid() and fields[0] != b"Z":
+            live.append(int(entry.name))
+    return live
+
+
+def signal_owned_tree(sig):
+    """Give detached workers a graceful signal without a reusable PID race."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return
+    root = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal() or int(entry.name) == root:
+            continue
+        handle = None
+        try:
+            pid = int(entry.name)
+            handle = os.pidfd_open(pid)
+            # Keep the signal recipient anchored in the kernel while checking
+            # its live parent chain. Orphaned workers lead to our subreaper.
+            fields = (entry / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+            parent, seen = int(fields[1]), {pid}
+            while parent > 1 and parent != root and parent not in seen:
+                seen.add(parent)
+                fields = Path(f"/proc/{parent}/stat").read_bytes().rsplit(b") ", 1)[1].split()
+                parent = int(fields[1])
+            if parent == root:
+                signal.pidfd_send_signal(handle, sig)
+        except (OSError, ProcessLookupError):
+            continue
+        finally:
+            if handle is not None:
+                os.close(handle)
+
+
+def reap_training_descendants(grace_ends=None):
+    grace_ends = time.monotonic() + 5 if grace_ends is None else grace_ends
+    signalled = set()
+    signal_owned_tree(signal.SIGTERM)
     while True:
         try:
             exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -222,19 +390,15 @@ def reap_training_descendants():
         # A worker may have opened its own session. As a subreaper we own its
         # unreaped PID, so these live child IDs cannot be reused underneath us.
         # Repeating after each exit also reaches newly adopted grandchildren.
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdecimal():
-                continue
+        for pid in owned_live_children():
             try:
-                # stat's comm field may itself contain spaces or parentheses.
-                fields = (entry / "stat").read_bytes().rsplit(b") ", 1)[1].split()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue
-            if int(fields[1]) == os.getpid():
-                try:
-                    os.kill(int(entry.name), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                if time.monotonic() >= grace_ends:
+                    os.kill(pid, signal.SIGKILL)
+                elif pid not in signalled:
+                    os.kill(pid, signal.SIGTERM)
+                    signalled.add(pid)
+            except ProcessLookupError:
+                pass
         time.sleep(0.02)
 
 
@@ -242,7 +406,7 @@ def supervise_job(directory):
     held_lock = lock_file(directory / "execution.lock")
     if held_lock is None:
         return
-    process, tree, adopted, gate_opened = None, None, False, False
+    process, tree, adopted, gate_opened, cancelled = None, None, False, False, False
     disconnected = threading.Event()
 
     def watch_runner():
@@ -256,7 +420,7 @@ def supervise_job(directory):
     watcher.start()
     try:
         if (directory / "result.json").exists() or (directory / "cancel").exists() or disconnected.is_set():
-            atomic_json(directory / "execution.json", {"exitCode": -1})
+            atomic_json(directory / "execution.json", {"exitCode": -1, "cancelled": (directory / "cancel").exists()})
             return
         if os.name == "nt":
             tree = WindowsJob()
@@ -269,8 +433,10 @@ def supervise_job(directory):
                 gate_opened = True
             else:
                 process.stdin.close()
-            while process.poll() is None and not disconnected.wait(0.1):
-                pass
+            while process.poll() is None:
+                if disconnected.wait(0.1):
+                    cancelled = process.poll() is None and (directory / "cancel").exists()
+                    break
         else:
             # Observe exit without reaping the group leader. Its PID stays
             # reserved until descendants have been killed, even on normal exit.
@@ -280,16 +446,24 @@ def supervise_job(directory):
             # invalidate the PID reservation used during process-tree cleanup.
             signal.signal(signal.SIGCHLD, signal.SIG_DFL)
             adopted = adopt_training_descendants()
+            if not adopted:
+                raise PreparationError("Durable process tree supervision requires Linux or Windows on this compute agent.")
             process = subprocess.Popen(training_command(directory), stdin=subprocess.DEVNULL, start_new_session=True)
-            while not disconnected.wait(0.1):
+            while True:
+                interrupted = disconnected.wait(0.1)
                 if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    break
+                if interrupted:
+                    cancelled = (directory / "cancel").exists()
                     break
     finally:
         try:
             if process is not None:
+                cleanup_ends = time.monotonic() + 5
                 if process.stdin is not None:
                     process.stdin.close()
                 if tree is not None:
+                    tree.graceful_stop(process)
                     # Also removes descendants left by a normally exited parent.
                     while True:
                         try:
@@ -301,13 +475,25 @@ def supervise_job(directory):
                             time.sleep(0.2)
                 elif os.name != "nt":
                     try:
+                        signal_owned_tree(signal.SIGTERM)
                         os.killpg(process.pid, signal.SIGTERM)
-                        # Preserve the existing grace period for finally blocks. An
-                        # unreaped leader anchors the group throughout cleanup.
-                        if disconnected.is_set():
-                            deadline = time.monotonic() + 5
-                            while time.monotonic() < deadline and os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                                time.sleep(0.05)
+                        # Allow every worker its finally blocks, including those
+                        # adopted after the main process exits or creates a new
+                        # session. The unreaped leader still anchors its group.
+                        signalled = set()
+                        while time.monotonic() < cleanup_ends:
+                            leader_alive = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None
+                            live_children = owned_live_children((process.pid,)) if adopted else []
+                            if not leader_alive and not live_children:
+                                break
+                            for pid in live_children:
+                                if pid not in signalled:
+                                    try:
+                                        os.kill(pid, signal.SIGTERM)
+                                        signalled.add(pid)
+                                    except ProcessLookupError:
+                                        pass
+                            time.sleep(0.05)
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
@@ -315,9 +501,10 @@ def supervise_job(directory):
                 if tree is not None and not gate_opened:
                     exit_code = -1
                 if adopted:
-                    reap_training_descendants()
-                if os.name != "nt" or not (directory / "execution.json").exists():
-                    atomic_json(directory / "execution.json", {"exitCode": exit_code})
+                    reap_training_descendants(cleanup_ends)
+                if os.name == "nt" and (directory / "execution.json").exists():
+                    exit_code = read_json(directory / "execution.json")["exitCode"]
+                atomic_json(directory / "execution.json", {"exitCode": exit_code, "cancelled": cancelled})
         finally:
             if tree is not None:
                 tree.close()
@@ -341,8 +528,31 @@ def run_job(directory):
         manifest = read_json(directory / "manifest.json")
         job = manifest["job"]
         work = directory / "work"
+        if work.is_symlink():
+            raise PreparationError("The isolated run workspace must not be a symlink.")
         if not safe_path(job["entrypoint"]) or not job["entrypoint"].endswith(".py"):
             raise ValueError("Invalid Python entrypoint")
+        work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        prepared = manifest.get("dataManifest")
+        if prepared is not None:
+            prepared = data_manifest(prepared)
+            declared = job.get("dataset")
+            identity = dataset_identity(prepared)
+            if declared != {"version": identity["version"], "sha256": identity["sha256"]}:
+                raise PreparationError("Prepared dataset identity does not match this job. Re-submit against the current dataset version.")
+            names = {unicodedata.normalize("NFC", name).casefold() for name in job["files"]}
+            for item in prepared["files"]:
+                data_name = unicodedata.normalize("NFC", item["path"]).casefold()
+                if data_name in names or any(data_name.startswith(name + "/") or name.startswith(data_name + "/") for name in names):
+                    raise PreparationError("Source snapshot and prepared dataset contain conflicting file paths.")
+            copy_verified_data(manifest["workspace"], work, prepared, lambda: (directory / "cancel").exists())
+        elif job.get("dataset") is not None:
+            raise PreparationError("This compute agent has no prepared dataset. Configure --data-manifest before submitting a data-dependent run.")
+        source_identity = hashlib.sha256(json.dumps(job["files"], sort_keys=True, separators=(",", ":"),
+                                                   ensure_ascii=True).encode("ascii")).hexdigest()
+        input_identity = {"sourceSha256": source_identity, "dataset": dataset_identity(prepared) if prepared is not None else None,
+                          "python": manifest["python"]}
+        atomic_json(directory / "input-identity.json", input_identity)
         for name, content in job["files"].items():
             if not safe_path(name) or not isinstance(content, str):
                 raise ValueError("Invalid source snapshot")
@@ -351,11 +561,14 @@ def run_job(directory):
             with target.open("x", encoding="utf-8", newline="") as stream:
                 stream.write(content)
         env = clean_environment()
-        env["PAIR_NOTEBOOK_WORKSPACE"] = manifest["workspace"]
+        env["PAIR_NOTEBOOK_WORKSPACE"] = str(work)
         env["PAIR_NOTEBOOK_JOB_ID"] = job["id"]
+        env["PAIR_NOTEBOOK_SOURCE_SHA256"] = source_identity
+        env["PAIR_NOTEBOOK_DATA_SHA256"] = input_identity["dataset"]["sha256"] if prepared is not None else ""
+        env["PAIR_NOTEBOOK_DATA_VERSION"] = prepared["version"] if prepared is not None else ""
         # Python otherwise adds only the entrypoint's directory to sys.path.
         # A notebook/script in a subdirectory must still import root modules.
-        env["PYTHONPATH"] = str(work) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["PYTHONPATH"] = str(work)
         cuda_device = manifest.get("cudaDevice", "" if job["device"] == "cpu" else None)
         if cuda_device is None:
             raise ValueError("Selected GPU is no longer available; restart the agent to refresh its inventory")
@@ -414,8 +627,11 @@ def run_job(directory):
                 time.sleep(0.2)
             if process.wait() != 0:
                 raise RuntimeError("Training supervision failed")
-            exit_code = read_json(directory / "execution.json")["exitCode"]
-            cancelled = cancelled or (directory / "cancel").exists()
+            execution = read_json(directory / "execution.json")
+            exit_code = execution["exitCode"]
+            # The supervisor observes the training exit before the cancellation
+            # pipe. A late cancellation must retain an already finished result.
+            cancelled = execution.get("cancelled", cancelled)
             reader.join(timeout=5)
             if reader.is_alive():
                 raise RuntimeError("Output stream did not close")
@@ -425,14 +641,22 @@ def run_job(directory):
             os.fsync(log.fileno())
         atomic_json(directory / "result.json", {"status": "cancelled" if cancelled else ("succeeded" if exit_code == 0 else "failed"),
                                                "exitCode": exit_code})
-    except Exception:
+    except PreparationCancelled:
+        (directory / "output.log").touch(mode=0o600)
+        atomic_json(directory / "result.json", {"status": "cancelled", "exitCode": -1})
+    except Exception as error:
         if process is not None:
             stop_process(process)
         if adopted:
             reap_training_descendants()
         with (directory / "output.log").open("ab") as log:
             log.write(b"\nPair Notebook runner failed. Check the configured Python environment and local agent storage.\n")
-        atomic_json(directory / "result.json", {"status": "failed", "exitCode": -1})
+        result = {"status": "failed", "exitCode": -1}
+        if isinstance(error, PreparationError):
+            result["reason"] = str(error)
+            with (directory / "output.log").open("ab") as log:
+                log.write((str(error) + "\n").encode("utf-8"))
+        atomic_json(directory / "result.json", result)
     finally:
         if process is not None and process.stdin is not None:
             process.stdin.close()
@@ -571,6 +795,12 @@ class Agent:
         # Preserve a venv's interpreter symlink; resolving it loses the environment.
         self.args.python = os.path.abspath(interpreter)
         self.args.workspace = str(Path(args.workspace).expanduser().resolve())
+        self.dataset = None
+        if getattr(args, "data_manifest", None):
+            manifest_file = Path(args.data_manifest).expanduser()
+            if manifest_file.stat().st_size > 32 * 1024 * 1024:
+                raise PreparationError("Prepared data manifest is too large.")
+            self.dataset = data_manifest(read_json(manifest_file))
         self.state = Path(args.state).expanduser().resolve()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = lock_file(self.state / "agent.lock")
@@ -601,7 +831,10 @@ class Agent:
                 gpus.append({"index": int(index), "uuid": gpu_uuid, "name": name, "memoryMb": float(memory)})
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
-        return {"cpuCount": os.cpu_count() or 1, "python": self.args.python, "gpus": gpus}
+        resources = {"cpuCount": os.cpu_count() or 1, "python": self.args.python, "gpus": gpus}
+        if getattr(self, "dataset", None) is not None:
+            resources["dataset"] = dataset_identity(self.dataset)
+        return resources
 
     def request(self, action, body):
         request = urllib.request.Request(self.endpoint + "/v1/agents/" + self.args.id + "/" + action,
@@ -624,7 +857,7 @@ class Agent:
         manifest = directory / "manifest.json"
         if manifest.exists():
             retained = read_json(manifest)["job"]
-            for field in ("id", "agentId", "entrypoint", "device", "gpuUuid", "files", "args"):
+            for field in ("id", "agentId", "createdAt", "entrypoint", "device", "gpuUuid", "files", "args", "dataset"):
                 if field in job and job[field] != retained.get(field):
                     raise ValueError("The broker input disagrees with the retained execution receipt")
         if job.get("cancelRequested") and not (directory / "cancel").exists():
@@ -636,6 +869,7 @@ class Agent:
                         (gpu["uuid"].lower() == job["gpuUuid"].lower() if job.get("gpuUuid") else "gpu:" + str(gpu["index"]) == job["device"])), None)
             atomic_json(manifest, {"job": job, "python": self.args.python,
                                    "workspace": self.args.workspace, "launchedAt": time.time(),
+                                   "dataManifest": self.dataset,
                                    "cudaDevice": "" if job["device"] == "cpu" else (gpu["uuid"] if gpu else None)})
             # Persist intent before spawning. On ambiguous crash recovery we never rerun Python.
             try:
@@ -669,6 +903,7 @@ class Agent:
         job = response["job"]
         if job is None:
             self.active_id = None
+            self.recovery_started.clear()
             return
         directory = self.ensure_job(job)
         self.active_id = job["id"]
@@ -694,6 +929,7 @@ class Agent:
             (directory / "cancel").touch()
         if "result" in report:
             self.active_id = None
+            self.recovery_started.pop(job["id"], None)
 
 
 def main():
@@ -703,7 +939,9 @@ def main():
     parser.add_argument("--name", default="")
     parser.add_argument("--token-file")
     parser.add_argument("--state", default=str(Path.home() / ".pair-notebook-agent"))
-    parser.add_argument("--workspace", default=os.getcwd(), help="Existing datasets/project directory; exposed as PAIR_NOTEBOOK_WORKSPACE")
+    parser.add_argument("--workspace", default=os.getcwd(), help="Owner-selected prepared-data source directory (training uses an isolated snapshot)")
+    parser.add_argument("--data-manifest", help="Owner-local JSON version/files(path,size,sha256) manifest; data is streamed and verified into each run")
+    parser.add_argument("--stage-data", help="Explicitly stage/resume verified owner data into this directory before submission; does not launch training")
     parser.add_argument("--python", default=sys.executable, help="Owner-selected training environment (never supplied by a job)")
     parser.add_argument("--poll-seconds", type=float, default=2)
     parser.add_argument("--run-job", help=argparse.SUPPRESS)
@@ -718,6 +956,29 @@ def main():
         return
     if args.run_job:
         run_job(Path(args.run_job).resolve())
+        return
+    if args.stage_data:
+        if not args.data_manifest:
+            parser.error("--stage-data requires --data-manifest and an owner-selected --workspace")
+        try:
+            manifest_path = Path(args.data_manifest).expanduser()
+            if manifest_path.stat().st_size > 32 * 1024 * 1024:
+                raise PreparationError("Prepared data manifest is too large.")
+            prepared = data_manifest(read_json(manifest_path))
+            if any(item["path"].casefold() == "owner-data-manifest.json" for item in prepared["files"]):
+                raise PreparationError("The data manifest publication path conflicts with a declared data file.")
+            destination = Path(args.stage_data).expanduser().resolve()
+            source = Path(args.workspace).expanduser().resolve()
+            if source == destination or destination.is_relative_to(source):
+                raise PreparationError("Choose a separate staging destination outside the source workspace.")
+            destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+            copy_verified_data(source, destination, prepared, lambda: False)
+            atomic_json(destination / "owner-data-manifest.json", prepared)
+            print(json.dumps(dataset_identity(prepared)), flush=True)
+        except Exception as error:
+            message = str(error) if isinstance(error, PreparationError) else "Data staging failed; retained partial files can be retried with the same manifest."
+            print(message, file=sys.stderr)
+            sys.exit(1)
         return
     if not args.url or not args.id or not math.isfinite(args.poll_seconds) or args.poll_seconds < 0.1:
         parser.error("--url, --id and a positive polling interval are required")

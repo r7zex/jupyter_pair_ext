@@ -6,6 +6,7 @@
 - [Architecture](architecture.md) — current components, data flow, storage ownership, compatibility boundary, and execution recovery.
 - [Protocol](protocol.md) — current admission, delivery, synchronization, execution, host-authority, and session-end contracts.
 - [VPS and persistent compute](VPS_COMPUTE.md) — private relay, agent deployment, repository snapshots and durable jobs.
+- [Persistent research and CONFIRM](PERSISTENT_RESEARCH.md) — ownership, immutable owner data, recovery and scoped emergency stops in 0.5.38.
 
 ## Release records
 
@@ -21,6 +22,8 @@ These documents preserve version-specific evidence and incident context. Their v
 - [0.5.35 shared-terminal training environment verification](HOST_TRAINING_AUDIT_0.5.35_2026-10-09.md)
 - [0.5.36 critical training lifecycle verification](HOST_TRAINING_AUDIT_0.5.36_2026-10-09.md)
 - [0.5.37 host repository, training and VPS critical audit](HOST_TRAINING_AUDIT_0.5.37_2026-10-09.md)
+- [0.5.38 persistent research and confirmed-stop audit](HOST_TRAINING_AUDIT_0.5.38_2026-10-10.md)
+- [0.5.38 completed four-hour Linux CPU soak](LONG_RUN_VALIDATION_0.5.38_2026-10-10.md)
 - [Changelog](../CHANGELOG.md)
 
 The exact two-computer Flowseal/zapret-to-Karing acceptance scenario remains recorded as **NOT RUN**. Deterministic and public-network checks must not be represented as that physical acceptance test.

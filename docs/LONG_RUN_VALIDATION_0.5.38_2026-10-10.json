@@ -1,0 +1,289 @@
+{
+  "boundaries": {
+    "acceleratedTimersProveElapsedHours": false,
+    "checkpointTrajectoryResume": "validated_by_separate_reference_pipeline_tests; soak_checks_model_optimizer_reload_equality",
+    "localNativeVscode": "not_available",
+    "localProductionBrokerAgent": "passed_real_four_hour_loopback_production_processes",
+    "loopbackIsExternalVps": false,
+    "persistenceAfterMachineDestruction": "not_proven; this workload completed before environment restart",
+    "physicalGpu": "not_available",
+    "realExternalVps": "not_tested_no_current_destination_or_credentials",
+    "remoteCiMatrix": "configured_result_must_be_reported_separately",
+    "syntheticInfrastructureFixtureProvesScientificAdvantage": false,
+    "twoPhysicalInternetPeers": "not_tested",
+    "windowsProcessContainment": "not_tested_in_linux_workspace"
+  },
+  "historicalStartReport": "docs/LONG_RUN_VALIDATION_0.5.38_2026-10-09.json",
+  "observedEnvironment": {
+    "codeExecutableAvailable": false,
+    "nvidiaSmiExecutableAvailable": false,
+    "os": "Linux",
+    "pythonVersion": "3.12.14"
+  },
+  "reportDate": "2026-10-10",
+  "reviewedAtUtc": "2026-10-10T09:56:36.891859+00:00",
+  "runnerWorkloadSmoke": {
+    "elapsedHoursClaim": false,
+    "latestCheckpointStep": 3,
+    "metrics": 3,
+    "modelAndOptimizerReloadChecked": true,
+    "previousCheckpointStep": 2,
+    "result": "passed",
+    "steps": 3
+  },
+  "soak": {
+    "acceptedJobAutomaticallyRerun": false,
+    "artifactChecks": {
+      "brokerLogMatchesAgentOutput": true,
+      "checkpointSha256": "09ed8db3b3ab1918d35b825d72487cd80915ea8e4d4554c3200fad3dc7c20ac5",
+      "exactlyOneTrainingLaunch": true,
+      "metricsCount": 14400,
+      "minimumMetricTimestampDeltaSeconds": 1.0008504390716553,
+      "observationsCount": 2886,
+      "previousCheckpointStep": 14340,
+      "publishedTemporaryFiles": 0,
+      "rssKiB": {
+        "broker": {
+          "first": 38692,
+          "last": 65900,
+          "maximum": 69080,
+          "medianByElapsedHour": {
+            "0": 57934.0,
+            "1": 63408,
+            "2": 65420.0,
+            "3": 65828,
+            "4": 65890.0
+          },
+          "minimum": 520
+        },
+        "monitor": {
+          "first": 17956,
+          "last": 18572,
+          "maximum": 19220,
+          "medianByElapsedHour": {
+            "0": 18436.0,
+            "1": 18456,
+            "2": 18808.0,
+            "3": 19220,
+            "4": 18572.0
+          },
+          "minimum": 17956
+        },
+        "pollingAgent": {
+          "first": 19748,
+          "last": 49092,
+          "maximum": 49100,
+          "medianByElapsedHour": {
+            "0": 48176.0,
+            "1": 49092,
+            "2": 49092.0,
+            "3": 49096,
+            "4": 49092.0
+          },
+          "minimum": 6388
+        },
+        "training": {
+          "first": 10140,
+          "last": 10920,
+          "maximum": 10920,
+          "medianByElapsedHour": {
+            "0": 10616,
+            "1": 10660,
+            "2": 10676.0,
+            "3": 10920,
+            "4": 10920.0
+          },
+          "minimum": 10140
+        }
+      },
+      "runId": "soak-8face0e4ab42d957",
+      "stdoutBytes": 9945,
+      "stdoutLines": 50,
+      "workloadElapsedSeconds": 14427.668353557587
+    },
+    "brokerObservedElapsedSeconds": 14431.31602525711,
+    "buildIdentity": "frozen_uncommitted_0.5.38_implementation_from_baseline_HEAD_identified_by_file_hashes",
+    "completed": {
+      "checkpoint": "/workspace/pair-notebook-soak-20261009-run1/agent/jobs/soak-8face0e4ab42d957/work/artifacts/soak-8face0e4ab42d957/resume.json",
+      "completionReason": "explicit_algorithmic_step_count",
+      "elapsedSeconds": 14427.668353557587,
+      "globalUpdate": 288000,
+      "loss": 0.008845409293862135,
+      "runId": "soak-8face0e4ab42d957",
+      "step": 14400,
+      "syntheticAccuracy": 0.99609375,
+      "timestamp": 1791591746.6823947
+    },
+    "completedElapsedHours": true,
+    "computationWallClockLimit": null,
+    "finalCodeScope": "compare_frozen_broker_protocol_and_agent_hashes_with_final_build; commit_HEAD_alone_is_not_the_tested_build_identity",
+    "finishedAtMoscow": "2026-10-10T03:22:26.682395+03:00",
+    "finishedBeforeEnvironmentRestart": true,
+    "frozenHashesMatchCurrentImplementationAtReview": {
+      "agent": true,
+      "broker": true,
+      "protocol": true
+    },
+    "globalUpdates": 288000,
+    "independentOfOpenChat": true,
+    "initialSandboxPreparationFailure": {
+      "computationAccepted": false,
+      "errno": 1,
+      "kind": "sandbox_local_socket_permission_error",
+      "retry": "authorized_network_permission_in_fresh_state_directory"
+    },
+    "naturalCompletionCondition": "explicit_algorithmic_step_count",
+    "plannedMinimumWorkloadSeconds": 14400.0,
+    "provesTensOfHours": false,
+    "result": "passed_actual_four_hour_elapsed_loopback_soak",
+    "runId": "soak-8face0e4ab42d957",
+    "runner": "scripts/persistent-soak.py",
+    "snapshot": {
+      "actualElapsedSeconds": 14431.31602525711,
+      "checkpoint": {
+        "format": "pair-soak-stdlib-v1",
+        "hasModelAndOptimizer": true,
+        "path": "/workspace/pair-notebook-soak-20261009-run1/agent/jobs/soak-8face0e4ab42d957/work/artifacts/soak-8face0e4ab42d957/resume.json",
+        "sha256": "09ed8db3b3ab1918d35b825d72487cd80915ea8e4d4554c3200fad3dc7c20ac5",
+        "step": 14400
+      },
+      "computationWallClockLimit": null,
+      "dataset": {
+        "declared": {
+          "sha256": "f4f1c744ad1515e0e3f53866141acc08a2a8d389e7291f00904a3c2891893ddf",
+          "version": "soak-fixture-v1"
+        },
+        "isolatedFileSha256": "bcd3dd2861af666ef3c007850b158d23e3071f60c11093ec0d1ea4480cd3eec4"
+      },
+      "error": null,
+      "faultEvents": [
+        {
+          "event": "broker_started",
+          "pid": 5595,
+          "timestamp": 1791577317.8076065
+        },
+        {
+          "event": "polling_agent_started",
+          "pid": 5596,
+          "timestamp": 1791577317.8080225
+        },
+        {
+          "event": "job_accepted",
+          "runId": "soak-8face0e4ab42d957",
+          "timestamp": 1791577318.8199327
+        },
+        {
+          "event": "broker_offline_started",
+          "timestamp": 1791577353.8560803
+        },
+        {
+          "event": "broker_started",
+          "pid": 6209,
+          "timestamp": 1791577373.8653073
+        },
+        {
+          "event": "broker_restarted_same_durable_state",
+          "timestamp": 1791577373.8654013
+        },
+        {
+          "event": "polling_agent_started",
+          "pid": 6408,
+          "timestamp": 1791577388.8856401
+        },
+        {
+          "event": "polling_agent_restarted_same_identity",
+          "timestamp": 1791577388.8857486
+        },
+        {
+          "event": "broker_observation_disconnected",
+          "timestamp": 1791577408.956457
+        },
+        {
+          "event": "broker_observation_reconnected",
+          "timestamp": 1791577438.9983296
+        },
+        {
+          "event": "job_terminal",
+          "status": "succeeded",
+          "timestamp": 1791591750.3297203
+        }
+      ],
+      "formatVersion": 1,
+      "implementation": {
+        "agentSha256": "96f48b29a10e4a523a987dc376fbb55053b80c0b222ac5f314d556561a25a08b",
+        "brokerSha256": "16240e87691aff13cdc170a8b448823b8a7f0834f069477a38c0adf8457b2a83",
+        "gitHeadBeforeRun": "97042cc8d46ca842f3dc0885e347316c3246b45a",
+        "nodeVersion": "v24.19.0",
+        "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+        "protocolSha256": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e",
+        "pythonVersion": "3.12.14",
+        "workloadSha256": "b461a80a6374bc9ad5bdb9de0a69bdf7b21786bfd246dcc8d1e1162c7ad9298b"
+      },
+      "job": {
+        "agentId": "soak-cpu",
+        "cancelRequested": false,
+        "createdAt": 1791577318812,
+        "dataset": {
+          "sha256": "f4f1c744ad1515e0e3f53866141acc08a2a8d389e7291f00904a3c2891893ddf",
+          "version": "soak-fixture-v1"
+        },
+        "device": "cpu",
+        "entrypoint": "soak-train.py",
+        "exitCode": 0,
+        "finishedAt": 1791591747480,
+        "id": "soak-8face0e4ab42d957",
+        "instanceId": "989d4f18d2304be1bc192fd77d2628fe",
+        "logEnd": 9945,
+        "logStart": 0,
+        "ownerIdentity": "team-operator",
+        "projectId": "synthetic-soak-project",
+        "sessionId": "synthetic-soak-session",
+        "startedAt": 1791577318885,
+        "status": "succeeded",
+        "title": "Synthetic infrastructure CPU soak"
+      },
+      "metricsPath": "/workspace/pair-notebook-soak-20261009-run1/agent/jobs/soak-8face0e4ab42d957/work/artifacts/soak-8face0e4ab42d957/metrics.jsonl",
+      "observedAt": 1791591750.3300605,
+      "pids": {
+        "broker": 6209,
+        "monitor": 5594,
+        "pollingAgent": 6408,
+        "training": 5650
+      },
+      "plannedMinimumWorkloadSeconds": 14400.0,
+      "progress": {
+        "elapsedSeconds": 14427.668353557587,
+        "globalUpdate": 288000,
+        "loss": 0.008845409293862135,
+        "runId": "soak-8face0e4ab42d957",
+        "step": 14400,
+        "syntheticAccuracy": 0.99609375,
+        "timestamp": 1791591746.6823947
+      },
+      "rssKiB": {
+        "broker": 65900,
+        "monitor": 18572,
+        "pollingAgent": 49092,
+        "training": null
+      },
+      "runId": "soak-8face0e4ab42d957",
+      "startedAt": 1791577319.0140355,
+      "state": "succeeded",
+      "uniqueTrainingLaunches": 1,
+      "validationBoundary": "production broker/agent and real Linux CPU/process/filesystem; loopback only"
+    },
+    "startedAtMoscow": "2026-10-09T23:21:59.014035+03:00",
+    "stateDirectory": "/workspace/pair-notebook-soak-20261009-run1",
+    "status": "succeeded",
+    "steps": 14400,
+    "uniqueTrainingLaunches": 1,
+    "workloadActualElapsedSeconds": 14427.668353557587
+  },
+  "terminalCancelOfflineCheck": {
+    "cancellationSent": false,
+    "networkRequired": false,
+    "result": "passed",
+    "sourceChange": "terminal_snapshot_short_circuit_only; monitoring_and_training_unchanged"
+  },
+  "version": "0.5.38"
+}

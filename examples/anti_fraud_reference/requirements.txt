@@ -1,0 +1,3 @@
+# Install into your own isolated training interpreter, not the extension.
+numpy==2.5.3
+torch==2.14.1

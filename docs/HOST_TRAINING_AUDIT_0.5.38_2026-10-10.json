@@ -1,0 +1,251 @@
+{
+  "formatVersion": 1,
+  "version": "0.5.38",
+  "reportDate": "2026-10-10",
+  "reviewedAtUtc": "2026-10-10T10:19:06.160657+00:00",
+  "repository": "https://github.com/r7zex/jupyter_pair_ext",
+  "branch": "codex/vps-persistent-compute",
+  "baselineCommit": "97042cc8d46ca842f3dc0885e347316c3246b45a",
+  "sourceIdentity": {
+    "scope": "changed and new executable, configuration and test files relative to baseline; audit documents excluded to avoid self-reference",
+    "sha256Manifest": {
+      ".github/workflows/training.yml": "c7c4ed6efe76d4e35179e002ccb512afea5417ffd3a73b1d1ceba9ea4d25bd42",
+      "examples/anti_fraud_reference/.gitignore": "416c368351d655294bc29cfb669584917dfdbdc1f6166378117900ce07135c08",
+      "examples/anti_fraud_reference/README.md": "0f00f94b46eb319ffad13dd8fe87601024e9682d5507bf61144e9d737ed39052",
+      "examples/anti_fraud_reference/__init__.py": "8813ac062d356e96d82c251e9481f8da3edb9d5782af2bef536effccab65d3f1",
+      "examples/anti_fraud_reference/__main__.py": "c625ab3e2039c932a0b73c1c2362ceced4df78f3509c6ed423cb8237d8c3b3d8",
+      "examples/anti_fraud_reference/checkpoints.py": "6b333b9dda833977964cd73d488e2a432b51306488ba814d0e79d4601b08508b",
+      "examples/anti_fraud_reference/configs/reference.json": "8f6a76b7b64c107ba4c3538eed3bf2237f10ab0987a7758c5f8918c93a8ebe1e",
+      "examples/anti_fraud_reference/data.py": "58d6b5b61787840124eff81bf8b538b9905efdc928b6d695d48ebf8f08f38165",
+      "examples/anti_fraud_reference/metrics.py": "855535b478e4193d1e7c4918c1679b47f318b1b92fb5b0311db7437e6996429f",
+      "examples/anti_fraud_reference/paper/outline.md": "de98d51768f0839584c2478fd1c324efa95a1a401e48938885ebe3ba07e9aa3b",
+      "examples/anti_fraud_reference/pipeline.py": "38b35f83de6de35162234e845c82ea95a6bf808d5f58bd43cfb84695fb6a2d72",
+      "examples/anti_fraud_reference/report.py": "e607d36a2d1ced2f2b7f5d71ae3f98edc9a2caa20e333fff797d8d2ca16eddf5",
+      "examples/anti_fraud_reference/requirements.txt": "a61a83eed29c88cf40225418c19080b1c2014e4b6e7816fb04495af05f1189d8",
+      "examples/anti_fraud_reference/run_reference.py": "af0fa11e43a8e130a0917089eed2e1d46fb48807fface145026ffa518c4e97f3",
+      "media/jupyter_kernel_bridge.py": "7d71c5f1d5276e77fb8c03072f1c4a0449a7f3e9bceb97f6d1723633e6e1d734",
+      "package-lock.json": "72578cda447de456140a0ad366108f10581e35364f56d7254901f5a066bbfb4a",
+      "package.json": "5044faadeba55e8c6a65bb26e156e064b94fb103059396accb5c03893d58b058",
+      "scripts/pair-notebook-agent.py": "96f48b29a10e4a523a987dc376fbb55053b80c0b222ac5f314d556561a25a08b",
+      "scripts/persistent-soak.py": "016de3915f699d5d4c125158060256c784ddea88a0702858cd8ebf41b1e05d28",
+      "src/core/pythonKernel.ts": "904ee4a81dd33f6f8dda12b645b80210b041f8d58b7f8268651f261f905b29c2",
+      "src/core/sharedTerminal.ts": "55a53a5adcca280699f73524f9116537fdc57d8bb76433b7795d6e8f0992613d",
+      "src/extension.ts": "ca74c2e7b46e927c9688514c7d8075cfa542ce57f26e820a27a824a8982517da",
+      "src/runtime/session.ts": "fa424935b84095bc18365df4e732b13b0eba0d88e5cdee8b0f78490ae983b224",
+      "src/vps/cli.ts": "b794f8a41aacbe166b60d85d8929a57b67685bd20ab6d1b29a2009275d9c89fb",
+      "src/vps/client.ts": "79798415ce0eeb5fa11732e45f7996d4d581de5fa2ad0d4f8ea307110edf00e6",
+      "src/vps/pendingSubmission.ts": "c693ec74778dda339247b5f6231c79dfe5f23cd7c6ca8aea21c204573c3e5608",
+      "src/vps/protocol.ts": "e23f479cbe27505ea486aa117dbcafa7ac665e604e18ff6f04fc3420afae86fc",
+      "src/vps/server.ts": "dfde6a6c8b766e8f9aa5f9cfaad30fee262fc3b08c9ec4d69949e549dd98b2a4",
+      "src/vscode/jupyterController.ts": "0f8100ed38bba345fd9bfc19930ded55f44396b47b8e411dbd64a590e899d933",
+      "src/vscode/sharedTerminal.ts": "38325e2dfab127fcdf7bcf2404319bcc59f346cceedba3c31346bac966902517",
+      "src/vscode/vpsCompute.ts": "743d31def987daeed448788ae18a167e1ab954b65243c49eba26eab3430ec4ca",
+      "test/anti_fraud_reference_test.py": "43b7d8833573a8732c1216c071bd038f63c501c80d822113522cae78fca4c987",
+      "test/interactiveStopProtection.test.ts": "41840cd61500b7358c96991090e27f2b780662c6917487b525569151d8019305",
+      "test/persistent_reference_integration_test.py": "704a6df61fb2da65ee503f20f793a3470ab311dff033ff011c9683213e935b8e",
+      "test/runtime.integration.test.ts": "ecd51d340c45f4efcaf7a0d5db6b29634473df4743014126c43b5c5fb7bac39c",
+      "test/sharedTerminalLifecycle.test.ts": "3b7d7b1f810b767ca911038aff00c3c0884bbef4865224f1ba61641d68ea2171",
+      "test/sharedTerminalUi.test.ts": "51535f0bd14baae5c7447a173e4ea81014a902932039ff2fb2597b484fb678fd",
+      "test/vpsAuditRound2.test.ts": "51a489d4e1a85abd07f93b412f411e8e8c8e5471ae71aea434edc367570853a5",
+      "test/vpsCancellationConfirmation.test.ts": "d801b8719d96159bab19fbf22746e215eb59c654ad442834d9f638ac805456f9",
+      "test/vpsCompute.test.ts": "09a8cbe5777c85b775643c24d8949861746812914551567697d0859aacf8af03",
+      "test/vpsComputeUi.test.ts": "55f088a9afa86de098be37ac98c41f77c43ada41c3a680719cd8eb01dada5831",
+      "test/vps_agent_audit.py": "377d2283a697fccb9d71904941fa7f35e579a6179298da25303933bbdb9f7dfb"
+    },
+    "manifestSha256": "0679bdd5ea09fe8ff8aab7c2bd4b3ca4f82fd357341415a512ca0fe57f25f14f"
+  },
+  "compiledSha256": {
+    "out/extension.js": "4ad5e14dbd72dd63d1d6e56c8999b8997221f6bdbf236ab3d2b95062e7da9737",
+    "out/src/vps/server.js": "16240e87691aff13cdc170a8b448823b8a7f0834f069477a38c0adf8457b2a83",
+    "out/src/vps/protocol.js": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e"
+  },
+  "checks": {
+    "typescript": {
+      "passed": 4750,
+      "failed": 0,
+      "pending": 0,
+      "reportedDuration": "4m",
+      "log": "/workspace/pair-suite-final.log",
+      "logSha256": "50a32a06601b00cf424ab7d48bda98e4c2622df279e9f57b725e907f1e60ced1"
+    },
+    "pythonBridge": {
+      "passed": 9,
+      "durationSeconds": 0.208,
+      "log": "/workspace/pair-bridge-final.log",
+      "logSha256": "b8c0134a737c4782aa7e87764fa2cb066b01c49a3872afe216f5b4bfbc70244a"
+    },
+    "pythonWorker": {
+      "passed": 102,
+      "durationSeconds": 80.545,
+      "log": "/workspace/pair-worker-final.log",
+      "logSha256": "6dbc5655be4393c6fb2b8275b4630064c6cb9ba84966fc91cfe1c80af14d3b79"
+    },
+    "pythonReference": {
+      "passed": 12,
+      "durationSeconds": 7.274,
+      "log": "/workspace/pair-notebook-final-reference-tests.log",
+      "logSha256": "3583a925da9d54f4c6c9268e8e2850c724d24a380ef78c578653b5d37676dbd5"
+    },
+    "pythonPersistentReferenceIntegration": {
+      "passed": 1,
+      "durationSeconds": 5.675,
+      "log": "/workspace/pair-reference-integration-final.log",
+      "logSha256": "dc7f5a6d680cb22d52047bd804c9b12f00ccbc04960b43fb1dc43caacc85ec84"
+    },
+    "uniqueTestCount": 4874,
+    "repeatRunsCounted": false,
+    "compile": {
+      "result": "passed",
+      "logSha256": "1a5a77057c9296df879f5dd29f50c8e28a791d55d10670829863e8df92ca9f58"
+    },
+    "lint": {
+      "result": "passed",
+      "logSha256": "5f5aa8dcb2d06906341a192d403b6789130214497a7588d049227f239ed63884"
+    },
+    "productionDependencyAudit": {
+      "vulnerabilities": {
+        "info": 0,
+        "low": 0,
+        "moderate": 0,
+        "high": 0,
+        "critical": 0,
+        "total": 0
+      },
+      "dependencies": {
+        "prod": 101,
+        "dev": 461,
+        "optional": 75,
+        "peer": 0,
+        "peerOptional": 0,
+        "total": 572
+      }
+    }
+  },
+  "environment": {
+    "os": "Linux x86_64",
+    "node": "24.19.0",
+    "python": "3.12.14",
+    "torch": "2.14.1+cpu",
+    "numpy": "2.5.3",
+    "jupyterClient": "8.10.0",
+    "ipykernel": "7.4.0"
+  },
+  "soak": {
+    "report": "LONG_RUN_VALIDATION_0.5.38_2026-10-10.json",
+    "status": "succeeded",
+    "workloadElapsedSeconds": 14427.668353557587,
+    "steps": 14400,
+    "launches": 1,
+    "frozenBackendMatchesFinal": true,
+    "loopback": true,
+    "externalVps": false
+  },
+  "reference": {
+    "synthetic": true,
+    "experimentCount": 9,
+    "seeds": [
+      7,
+      13,
+      29
+    ],
+    "epochsPerRun": 12,
+    "totalSteps": 2052,
+    "verifiedCheckpointSidecars": 182,
+    "verifiedRolePointers": 27,
+    "archive": "pair-notebook-synthetic-reference-evidence.zip",
+    "archiveSha256": "66f2e4163a6378e9cbc255329825fcfd159a5001c5b95bcfabaf224ddde983cb",
+    "integration": {
+      "agentSha256": "96f48b29a10e4a523a987dc376fbb55053b80c0b222ac5f314d556561a25a08b",
+      "brokerRestart": true,
+      "brokerSha256": {
+        "core/atomicFile.js": "bb6622f8a66495953945c9c8349f012cedfd02c516408d0c115f334a71041c88",
+        "vps/cli.js": "b0ac4fdec2d36a06a91e03bb3a8fa12f6f679710b4c8bda22f47be7029a15368",
+        "vps/protocol.js": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e",
+        "vps/server.js": "16240e87691aff13cdc170a8b448823b8a7f0834f069477a38c0adf8457b2a83"
+      },
+      "dataset": {
+        "sha256": "6986a20e306ecb6334c6bfa4f7fc3a152f70f43c4d5a7701d3f8f17ffd775948",
+        "version": "synthetic-v1-seed91-rows1600-delay16"
+      },
+      "datasetFileSha256": "e4737ef9c3d270062bec3f239b59f37cd5cb4ffc216451e2f51bcf682b96c428",
+      "epochs": 2,
+      "exportMetricsEqual": true,
+      "externalVps": "not-evaluated",
+      "globalStep": 18,
+      "immutableOwnerData": true,
+      "jobId": "real-reference-two-epochs",
+      "launches": 1,
+      "physicalGpu": "not-evaluated",
+      "runId": "8fddb72c5810421caca3d485fcca61b7",
+      "scope": "real-local-loopback-compiled-broker-and-agent",
+      "selectedPython": "/workspace/pair-notebook-validation-env/bin/python",
+      "sourceSha256": "67a5e2fc7acaf0e64989e2931bc238068fe6e119d0f9d4ff0e5d7befa579015c",
+      "status": "succeeded",
+      "testMetrics": {
+        "brier_score": 0.21925491613219042,
+        "fixed_fpr": {
+          "error_cost": 260.0,
+          "fn": 13,
+          "fp": 0,
+          "fpr": 0.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "reviews": 0,
+          "tn": 322,
+          "tp": 0,
+          "validation_fpr_target": 0.02
+        },
+        "fpr_note": "The FPR constraint is selected on validation; future-window FPR may drift.",
+        "minimum_cost": {
+          "error_cost": 225.0,
+          "fn": 10,
+          "fp": 25,
+          "fpr": 0.07763975155279502,
+          "precision": 0.10714285714285714,
+          "recall": 0.23076923076923078,
+          "reviews": 28,
+          "tn": 297,
+          "tp": 3
+        },
+        "positives": 13,
+        "pr_auc_average_precision": 0.09782943001971398,
+        "review_capacity": {
+          "capacity": 16,
+          "error_cost": 234.0,
+          "fn": 11,
+          "fp": 14,
+          "fpr": 0.043478260869565216,
+          "precision": 0.125,
+          "recall": 0.15384615384615385,
+          "reviews": 16,
+          "tn": 308,
+          "tp": 2
+        },
+        "rows": 335
+      },
+      "watcherSigkill": true
+    },
+    "archiveBytes": 3800356,
+    "archiveEntries": 545,
+    "verifiedSourceSnapshotFiles": 81,
+    "packageSourceSha256": "66c7ec78c0418f640f65b5787121aa192a083c8bd522712129474768fc70820a",
+    "finalSourceRegeneration": "All 9 experiments regenerated after trailing whitespace cleanup changed provenance; saved metrics and selected thresholds exactly equal original runs; repeated runs do not increase unique test count."
+  },
+  "distribution": {
+    "expectedVsix": "pair-notebook-0.5.38.vsix",
+    "expectedSourceArchive": "pair-notebook-complete-0.5.38.zip",
+    "verificationCommand": "node scripts/make-artifacts.mjs",
+    "verificationEvidence": "Final distribution manifest is created outside this source tree after packaging; archive hashes cannot be embedded inside themselves."
+  },
+  "limits": {
+    "externalVps": "not tested: current endpoint/credentials absent; empty TCP allowlist",
+    "physicalGpu": "not available",
+    "nativeWindows": "not tested",
+    "nativeLocalVscode": "not available: Could not find VS Code",
+    "twoPhysicalInternetPeers": "not tested; in-memory transport and mocked VS Code boundary are identified in tests",
+    "remoteCi": "configured; status must be read for pushed commit",
+    "pythonEnvironment": "owner-selected installed environment is not cloned; owner must freeze dependencies during an experiment",
+    "interactiveExtensionHost": "forced process death remains outside persistence guarantees; use independent compute agent",
+    "machineLoss": "no promise against executor shutdown, OOM, full disk or hardware loss"
+  }
+}

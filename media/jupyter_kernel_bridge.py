@@ -436,6 +436,7 @@ def main() -> int:
     try:
         manager.start_kernel(cwd=working_directory, env=dict(os.environ),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        emit({"type": "kernelProcess", "kernelPid": manager.provisioner.pid})
         client = manager.client()
         client.start_channels()
         client.wait_for_ready(timeout=30)
@@ -451,7 +452,7 @@ def main() -> int:
         return 3
 
     emit({"type": "ready", "pythonExecutable": sys.executable,
-          "kernelInfo": serializable(info.get("content", {}))})
+          "kernelInfo": serializable(info.get("content", {})), "kernelPid": manager.provisioner.pid})
     threading.Thread(target=iopub_loop, args=(client, manager), daemon=True).start()
     for target in (shell_loop, stdin_loop):
         threading.Thread(target=target, args=(client,), daemon=True).start()
@@ -520,7 +521,7 @@ def main() -> int:
                             wait_for_parent_message(client.get_shell_msg, info_id, 10, "kernel_info_reply")
                         finally:
                             PAUSE_CHANNELS.clear()
-                    emit({"type": "commandResult", "command": "restart", "requestId": request_id})
+                    emit({"type": "commandResult", "command": "restart", "requestId": request_id, "kernelPid": manager.provisioner.pid})
                 elif kind == "complete":
                     with STATE_LOCK:
                         if len(AUXILIARY) >= MAX_PENDING_AUXILIARY:

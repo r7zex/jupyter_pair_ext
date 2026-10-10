@@ -49,10 +49,9 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.controller.supportsExecutionOrder = true;
     this.controller.description = 'Real Jupyter kernel on the selected Pair Notebook compute target';
     this.controller.interruptHandler = async (notebook) => {
-      this.cancelQueuedExecution(notebook);
       const runtime = this.requireRuntime();
       const key = runtime.notebookKey(notebook.uri);
-      if (key) await runtime.interruptNotebook(key);
+      if (key && await runtime.confirmOperation('interrupt', key)) this.cancelQueuedExecution(notebook);
     };
     const claim = (notebook: vscode.NotebookDocument) => {
       if (this.runtime?.notebookKey(notebook.uri)) {
@@ -131,18 +130,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       this.activeExecutionHandles.delete(cell);
       this.activeExecutions.delete(cell);
     }
-    const runtime = this.runtime;
-    let key: string | undefined;
-    try {
-      key = runtime?.notebookKey(cell.notebook.uri);
-    } catch (error) {
-      this.log.appendLine(`[error] Could not locate removed executing cell: ${formatError(error)}`);
-    }
-    if (runtime && key) {
-      void runtime.interruptNotebook(key).catch((error) => {
-        this.log.appendLine(`[error] Could not interrupt execution for removed cell: ${formatError(error)}`);
-      });
-    }
+    // Removed cells retire only their execution handle. The runtime keeps
+    // accepted computation alive until natural completion or a CONFIRM stop.
   }
 
   public async restartActive(): Promise<void> {
@@ -151,8 +140,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     const runtime = this.requireRuntime();
     const key = runtime.notebookKey(editor.notebook.uri);
     if (!key) throw new Error('The active notebook is outside the Pair Notebook working copy.');
-    this.cancelQueuedExecution(editor.notebook);
-    await runtime.restartNotebook(key);
+    if (await runtime.confirmOperation('restart', key)) this.cancelQueuedExecution(editor.notebook);
   }
 
   public async executeActive(): Promise<void> {
@@ -366,10 +354,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
           const retainedBytes = estimateKernelEventBytes(event);
           if (pendingRenderEvents >= MAX_PENDING_RENDER_EVENTS
             || pendingRenderBytes + retainedBytes > MAX_PENDING_RENDER_BYTES) {
-            renderOverflow = new Error('Jupyter output arrived faster than VS Code could render it and was interrupted.');
-            void runtime.interruptNotebook(notebookKey).catch((error) => {
-              this.log.appendLine(`[error] Jupyter overflow interrupt: ${formatError(error)}`);
-            });
+            renderOverflow = new Error('Jupyter display output was truncated because VS Code could not render it fast enough. Computation continues.');
+            this.log.appendLine(`[warning] ${renderOverflow.message}`);
             return;
           }
           pendingRenderEvents += 1;
@@ -410,7 +396,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       } catch (error) {
         renderFailure = error;
       }
-      if (renderOverflow) throw renderOverflow;
+      if (renderOverflow) this.log.appendLine(`[warning] Completed execution with truncated display: ${renderOverflow.message}`);
       if (executionFailure) throw executionFailure;
       if (renderFailure) throw renderFailure;
       if (!result) throw new Error('Jupyter execution ended without a result.');

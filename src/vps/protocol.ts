@@ -6,14 +6,46 @@ export const MAX_JOB_FILES = 256;
 export const MAX_LOG_CHUNK = 64 * 1024;
 export const LOG_RETENTION_BYTES = 1024 * 1024;
 export const AGENT_ONLINE_MS = 30_000;
+export const CANCELLATION_CONFIRMATION_MS = 120_000;
 export const GPU_UUID = /^GPU-[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$/;
 
-export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export type JobStatus = 'queued' | 'running' | 'cancel_pending' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 export type VpsDevice = 'cpu' | `gpu:${number}`;
+export interface ComputeScope { projectId: string; sessionId: string }
+export interface DatasetIdentity { version: string; sha256: string }
+export type CancellationAction = 'cancel_job' | 'stop_session';
+export interface CancellationRequest {
+  action: CancellationAction;
+  /** Legacy jobs without scope can only be cancelled individually. */
+  scope?: ComputeScope;
+  targetIds?: string[];
+}
+export interface CancellationChallenge {
+  id: string;
+  action: CancellationAction;
+  scope?: ComputeScope;
+  targetIds: string[];
+  /** Frozen metadata presented before confirmation, never refreshed to a new run. */
+  targets: JobSummary[];
+  identity: string;
+  requiredPermission: 'cancel_own' | 'cancel_any' | 'stop_session';
+  authorityGeneration: string;
+  createdAt: number;
+  expiresAt: number;
+}
+export interface CancellationResult {
+  confirmationId: string;
+  action: CancellationAction;
+  scope?: ComputeScope;
+  targetIds: string[];
+  jobs: JobSummary[];
+  appliedAt: number;
+}
 export interface AgentResources {
   cpuCount: number;
   python: string;
   gpus: Array<{ index: number; name: string; memoryMb: number; uuid?: string }>;
+  dataset?: DatasetIdentity & { files: number };
 }
 export interface VpsAgent {
   id: string;
@@ -30,6 +62,9 @@ export interface JobSubmission {
   device: VpsDevice;
   /** Stable owner-reported GPU identity; older agents/jobs can use index alone. */
   gpuUuid?: string;
+  projectId?: string;
+  sessionId?: string;
+  dataset?: DatasetIdentity;
   entrypoint: string;
   files: Record<string, string>;
   args: string[];
@@ -41,6 +76,9 @@ export interface VpsJob extends JobSubmission {
   finishedAt?: number;
   instanceId?: string;
   exitCode?: number;
+  failureReason?: string;
+  /** Assigned from the authenticated broker credential, never submission input. */
+  ownerIdentity?: string;
   cancelRequested: boolean;
   logStart: number;
   logEnd: number;
@@ -50,7 +88,20 @@ export interface VpsJob extends JobSubmission {
 export type JobSummary = Omit<VpsJob, 'files' | 'args' | 'log'>;
 
 export function terminalJob(status: JobStatus): boolean {
-  return !['queued', 'running'].includes(status);
+  return !['queued', 'running', 'cancel_pending'].includes(status);
+}
+
+export function validComputeScope(raw: unknown): raw is ComputeScope {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const scope = raw as ComputeScope;
+  return typeof scope.projectId === 'string' && VPS_ID.test(scope.projectId)
+    && typeof scope.sessionId === 'string' && VPS_ID.test(scope.sessionId);
+}
+
+export function validDatasetIdentity(raw: unknown): raw is DatasetIdentity {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const dataset = raw as DatasetIdentity;
+  return visibleVpsText(dataset.version, 200) && typeof dataset.sha256 === 'string' && /^[a-f0-9]{64}$/.test(dataset.sha256);
 }
 
 /** Credentials belong to this exact endpoint; HTTP is only allowed on loopback. */
@@ -85,6 +136,8 @@ export function validateSubmission(raw: unknown): JobSubmission {
   const job = raw as JobSubmission;
   if (typeof job.id !== 'string' || !VPS_ID.test(job.id) || typeof job.agentId !== 'string' || !VPS_ID.test(job.agentId)
     || !visibleVpsText(job.title, 200)
+    || ((job.projectId !== undefined || job.sessionId !== undefined) && !validComputeScope(job))
+    || (job.dataset !== undefined && !validDatasetIdentity(job.dataset))
     || typeof job.device !== 'string' || !/^(cpu|gpu:(?:0|[1-9]\d{0,2}))$/.test(job.device) || !safeJobPath(job.entrypoint)
     || (job.gpuUuid !== undefined && (job.device === 'cpu' || typeof job.gpuUuid !== 'string'
       || !GPU_UUID.test(job.gpuUuid)))
@@ -101,6 +154,8 @@ export function validateSubmission(raw: unknown): JobSubmission {
   }
   const input = { id: job.id, agentId: job.agentId, title: job.title.trim(), device: job.device,
     ...(job.gpuUuid ? { gpuUuid: job.gpuUuid } : {}),
+    ...(job.projectId !== undefined ? { projectId: job.projectId, sessionId: job.sessionId! } : {}),
+    ...(job.dataset ? { dataset: { version: job.dataset.version, sha256: job.dataset.sha256 } } : {}),
     entrypoint: job.entrypoint, files: { ...job.files }, args: [...job.args] };
   if (Buffer.byteLength(JSON.stringify(input)) > MAX_JOB_BYTES) throw new Error('Invalid or oversized source snapshot.');
   return input;

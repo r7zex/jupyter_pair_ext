@@ -421,9 +421,29 @@ interface PendingBinaryAck {
   timer: NodeJS.Timeout;
 }
 
+export type ExecutionStopAction = 'interrupt' | 'restart' | 'terminal-interrupt' | 'stop-session'
+  | 'leave' | 'end-session' | 'transfer-host' | 'change-compute' | 'replace-repository';
+
+export interface ExecutionStopChallenge {
+  id: string;
+  action: ExecutionStopAction;
+  notebookKey?: string | undefined;
+  initiatorId: string;
+  executorId: string;
+  authority: HostClock;
+  targets: { runId: string; notebookKey: string; startedAt: number; computeEpoch: number }[];
+  terminalGeneration?: string | undefined;
+  expiresAt: number;
+}
+
+interface StoredExecutionStop {
+  challenge: ExecutionStopChallenge;
+  result?: Promise<void> | undefined;
+}
+
 interface PendingKernelCommand {
   executorId: string;
-  resolve: () => void;
+  resolve: (value?: ExecutionStopChallenge) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
@@ -631,6 +651,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private readonly completedTextIntents = new Map<string, true>();
   private pendingTextIntentBytes = 0;
 
+  private readonly executionStopChallenges = new Map<string, StoredExecutionStop>();
+  private readonly cancelledExecutionIds = new Set<string>();
+  private readonly stoppedNotebookGates = new Set<string>();
+  private stopAllExecutions = false;
   private readonly kernels = new Map<string, JupyterKernel>();
   private readonly kernelLastUsed = new Map<string, number>();
   private readonly executionOwners = new Map<string, ExecutionOwner>();
@@ -1149,6 +1173,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can transfer the host role.');
     if (this.endingSession) throw new Error('The session is already being ended.');
     if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait before transferring the host role.');
+    this.assertNoLocalManagedWork('transfer-host');
     const target = this.transport.peerRuntime().find((peer) => peer.peerId === targetPeerId && peer.online);
     if (!target) throw new Error('The selected participant is offline.');
     const next: HostClock = {
@@ -1219,6 +1244,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!key || (key !== '*' && this.project.kindOf(key) !== 'notebook')) {
       throw new Error('The compute target must reference a collaborative notebook.');
     }
+    this.assertNoLocalManagedWork('change-compute', key === '*' ? undefined : key);
     const currentEpoch = this.computeForNotebook(key).epoch ?? 0;
     const nextEpoch = currentEpoch + 1;
     if (!isSafeRevision(nextEpoch)) throw new Error('Compute selection epoch reached its supported limit.');
@@ -1261,7 +1287,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.hostTerminal) this.hostTerminal = new SharedTerminal({
       isHost: () => this.coordinator.isCurrentHost(),
       hostId: () => this.coordinator.clock.hostId,
-      available: () => !this.closed && !this.waitingForHostFolder && !this.endingSession && !this.changingBackingFolder,
+      available: () => !this.closed && !this.stopAllExecutions && !this.waitingForHostFolder && !this.endingSession && !this.changingBackingFolder,
       directory: () => this.descriptor.backingFolder || this.descriptor.workingFolder,
       prepare: async () => {
         this.assertExecutionAvailable();
@@ -1313,6 +1339,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onRequestId?: (requestId: string) => void,
   ): Promise<JupyterExecutionResult> {
     this.assertExecutionAvailable();
+    if (this.stoppedNotebookGates.has(notebookKey)) throw new Error('Confirmed notebook stop is in progress.');
     const requestId = newId();
     onRequestId?.(requestId);
     const target = this.computeForNotebook(notebookKey);
@@ -1664,32 +1691,177 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  /** UI assurance: the field starts empty; the executor independently verifies the typed value and scope. */
+  public async confirmOperation(action: ExecutionStopAction, notebookKey?: string): Promise<boolean> {
+    const challenge = await this.requestExecutionStop(action, notebookKey);
+    if (!challenge.targets.length && !challenge.terminalGeneration) {
+      if (action === 'restart' && notebookKey) await this.restartNotebook(notebookKey);
+      return true;
+    }
+    const runs = challenge.targets.map((target) =>
+      `${target.notebookKey}: run ${target.runId}, executor ${challenge.executorId}, elapsed ${Math.max(0, Math.round((Date.now() - target.startedAt) / 1000))}s`);
+    if (challenge.terminalGeneration) runs.push(`host shell ${challenge.terminalGeneration}, executor ${challenge.executorId}`);
+    const value = await vscode.window.showInputBox({
+      title: `Confirm ${action} — ${this.descriptor.projectName}`,
+      prompt: `${runs.join('; ')}. Stops kernels/shell and their child processes. Last checkpoint: not tracked for interactive execution; unsaved progress may be lost. Type exactly CONFIRM.`,
+      value: '', ignoreFocusOut: true,
+      validateInput: (input) => input === 'CONFIRM' ? undefined : 'Type exactly CONFIRM (case sensitive, no spaces).',
+    });
+    if (value !== 'CONFIRM') return false;
+    await this.applyExecutionStop(challenge, value);
+    return true;
+  }
+
+  public async requestExecutionStop(action: ExecutionStopAction, notebookKey?: string): Promise<ExecutionStopChallenge> {
+    if (notebookKey && (action === 'interrupt' || action === 'restart')) {
+      const target = this.computeForNotebook(notebookKey);
+      if (target.executorId !== this.descriptor.localPeer.peerId) {
+        return this.sendStopChallengeRequest(target.executorId, notebookKey, target, action);
+      }
+    }
+    return this.issueExecutionStop(action, notebookKey, this.descriptor.localPeer.peerId);
+  }
+
+  private managedStopTargets(notebookKey?: string): ExecutionStopChallenge['targets'] {
+    return [...this.executionOwners].filter(([, owner]) => !notebookKey || owner.notebookKey === notebookKey)
+      .map(([runId, owner]) => ({ runId, notebookKey: owner.notebookKey, startedAt: owner.startedAt ?? Date.now(),
+        computeEpoch: this.computeForNotebook(owner.notebookKey).epoch }))
+      .sort((left, right) => left.runId.localeCompare(right.runId));
+  }
+
+  private issueExecutionStop(action: ExecutionStopAction, notebookKey: string | undefined, initiatorId: string): ExecutionStopChallenge {
+    if (!['interrupt', 'restart', 'terminal-interrupt', 'stop-session', 'leave', 'end-session', 'transfer-host', 'change-compute', 'replace-repository'].includes(action)) {
+      throw new Error('Unknown stop action.');
+    }
+    if ((action === 'interrupt' || action === 'restart') && !notebookKey) throw new Error('Notebook stop requires an exact notebook scope.');
+    const targets = action === 'terminal-interrupt' ? [] : this.managedStopTargets(notebookKey);
+    const host = this.coordinator.clock.hostId;
+    if (['stop-session', 'end-session', 'transfer-host', 'replace-repository', 'change-compute', 'terminal-interrupt'].includes(action) && initiatorId !== host) {
+      throw new Error('Only the current host can perform this stop operation.');
+    }
+    if (initiatorId !== host && (action !== 'interrupt' && action !== 'restart') && initiatorId !== this.descriptor.localPeer.peerId) {
+      throw new Error('Only the current host can stop session computations.');
+    }
+    if (initiatorId !== host && targets.some((target) => this.executionOwners.get(target.runId)?.peerId !== initiatorId)) {
+      throw new Error('A participant may stop only a notebook whose affected runs all belong to that participant.');
+    }
+    const includesTerminal = !notebookKey && action !== 'interrupt' && action !== 'restart';
+    const terminalGeneration = includesTerminal && this.hostTerminal?.isRunning() ? this.hostTerminal.executionGeneration() : undefined;
+    if (terminalGeneration && initiatorId !== host) throw new Error('Only the current host can stop the shared terminal.');
+    for (const [id, record] of this.executionStopChallenges) {
+      if (record.challenge.expiresAt < Date.now()) this.executionStopChallenges.delete(id);
+    }
+    if (this.executionStopChallenges.size >= 128) throw new Error('Too many pending stop confirmations.');
+    const challenge: ExecutionStopChallenge = {
+      id: newId(), action, notebookKey, initiatorId, executorId: this.descriptor.localPeer.peerId,
+      authority: { ...this.coordinator.clock }, targets, terminalGeneration, expiresAt: Date.now() + 120_000,
+    };
+    this.executionStopChallenges.set(challenge.id, { challenge: structuredClone(challenge) });
+    return challenge;
+  }
+
+  public async applyExecutionStop(challenge: ExecutionStopChallenge, value: unknown): Promise<void> {
+    if (value !== 'CONFIRM') throw new Error('Exact typed CONFIRM is required.');
+    if (challenge.executorId !== this.descriptor.localPeer.peerId) {
+      if (!challenge.notebookKey || (challenge.action !== 'interrupt' && challenge.action !== 'restart')) throw new Error('Invalid remote stop scope.');
+      await this.sendKernelCommand(challenge.executorId, challenge.notebookKey, this.computeForNotebook(challenge.notebookKey), challenge.action,
+        { challengeId: challenge.id, value });
+      return;
+    }
+    await this.applyIssuedExecutionStop(challenge.id, value, this.descriptor.localPeer.peerId, challenge.action, challenge.notebookKey);
+  }
+
+  private async applyIssuedExecutionStop(id: string, value: unknown, initiatorId: string, action: ExecutionStopAction, notebookKey?: string): Promise<void> {
+    if (value !== 'CONFIRM') throw new Error('Exact typed CONFIRM is required.');
+    const record = this.executionStopChallenges.get(id);
+    const challenge = record?.challenge;
+    if (!record || !challenge || challenge.initiatorId !== initiatorId || challenge.action !== action
+      || challenge.notebookKey !== notebookKey) throw new Error('Stop confirmation identity, action or scope does not match.');
+    if (record.result) return record.result; // Retry of an applied operation has no second effect.
+    if (challenge.expiresAt < Date.now() || !sameClock(challenge.authority, this.coordinator.clock)) {
+      throw new Error('Stop confirmation expired or host authority changed.');
+    }
+    const current = action === 'terminal-interrupt' ? [] : this.managedStopTargets(notebookKey);
+    const ids = new Set(challenge.targets.map((target) => target.runId));
+    if (current.some((target) => !ids.has(target.runId)) || challenge.targets.some((target) => {
+      const activeOwner = this.executionOwners.get(target.runId);
+      // A renamed run still exists even when filtering by the old notebook
+      // scope returns no current targets. Its old confirmation is stale.
+      return (activeOwner && activeOwner.notebookKey !== target.notebookKey)
+        || this.computeForNotebook(target.notebookKey).epoch !== target.computeEpoch;
+    })) {
+      throw new Error('Affected executions changed; obtain a new confirmation.');
+    }
+    const includesTerminal = !notebookKey && action !== 'interrupt' && action !== 'restart';
+    const currentTerminal = includesTerminal && this.hostTerminal?.isRunning() ? this.hostTerminal.executionGeneration() : undefined;
+    if (currentTerminal && challenge.terminalGeneration !== currentTerminal) {
+      throw new Error('Terminal execution changed; obtain a new confirmation.');
+    }
+    if (initiatorId !== this.coordinator.clock.hostId && current.some((target) => this.executionOwners.get(target.runId)?.peerId !== initiatorId)) {
+      throw new Error('Stop permission no longer applies.');
+    }
+    // Install admission fences synchronously with validation: queued preparing
+    // continuations cannot register a new run before the stop's first await.
+    if (notebookKey) this.stoppedNotebookGates.add(notebookKey);
+    else this.stopAllExecutions = true;
+    const operation = async () => {
+      const kernels = new Set(current.map((target) => target.notebookKey));
+      for (const target of current) this.cancelledExecutionIds.add(target.runId);
+      this.emit('executionStop', [...ids]);
+      this.log.appendLine(`[stop] actor=${initiatorId} action=${action} scope=${notebookKey ?? 'session'} targets=${[...ids].join(',')} confirmation=${id} at=${new Date().toISOString()}`);
+      try {
+        if (challenge.terminalGeneration) await this.hostTerminal?.stopConfirmed(challenge.terminalGeneration, value);
+        await Promise.all([...kernels].map(async (key) => {
+          const kernel = this.kernels.get(key);
+          if (!kernel) return;
+          await kernel.stopConfirmed();
+          if (this.kernels.get(key) === kernel) this.kernels.delete(key);
+          this.setKernelStatus(key, 'Offline');
+        }));
+        const deadline = Date.now() + 5000;
+        while (current.some((target) => this.executionOwners.has(target.runId))) {
+          if (Date.now() >= deadline) throw new Error('Confirmed stop is waiting for preparing execution cleanup; no new execution was admitted.');
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+        if (action === 'restart' && notebookKey && !current.length) await this.kernels.get(notebookKey)?.restart();
+        this.log.appendLine(`[stop] confirmation=${id} result=stopped`);
+        if (action === 'stop-session') {
+          await vscode.commands.executeCommand('setContext', 'pairNotebook.executionAvailable', false);
+          this.transition('ready', 'Managed interactive computation is stopped; start a new session to admit new runs.');
+        }
+      } finally {
+        if (notebookKey) this.stoppedNotebookGates.delete(notebookKey);
+        else if (action !== 'stop-session') this.stopAllExecutions = false;
+      }
+    };
+    // Store before any awaits to make duplicate delivery one operation.
+    record.result = Promise.resolve().then(operation);
+    return record.result;
+  }
+
+  private assertNoLocalManagedWork(action: ExecutionStopAction, notebookKey?: string): void {
+    if (this.managedStopTargets(notebookKey).length || (!notebookKey && this.hostTerminal?.isRunning())) {
+      throw new Error(`${action} would destroy active interactive computation. Use the separate typed CONFIRM operation first, or keep this session open and use durable VPS jobs for work that must survive editor exit.`);
+    }
+  }
+
   public async cancelInput(requestId: string): Promise<void> {
-    const pending = this.pendingExecutions.get(requestId);
-    const owner = this.executionOwners.get(requestId);
-    const notebookKey = pending?.notebookKey ?? owner?.notebookKey;
-    if (!notebookKey) return;
-    await this.interruptNotebook(notebookKey);
-    this.transition('executing', `Input was cancelled; interrupt sent for ${notebookKey}.`);
+    const notebookKey = this.pendingExecutions.get(requestId)?.notebookKey ?? this.executionOwners.get(requestId)?.notebookKey;
+    if (notebookKey) await this.confirmOperation('interrupt', notebookKey);
   }
 
   public async interruptNotebook(notebookKey: string): Promise<void> {
+    this.assertNoLocalManagedWork('interrupt', notebookKey);
     const target = this.computeForNotebook(notebookKey);
-    if (target.executorId === this.descriptor.localPeer.peerId) {
-      await this.kernels.get(notebookKey)?.interrupt();
-    } else {
-      await this.sendKernelCommand(target.executorId, notebookKey, target, 'interrupt');
-    }
+    if (target.executorId === this.descriptor.localPeer.peerId) await this.kernels.get(notebookKey)?.interrupt();
+    else await this.sendKernelCommand(target.executorId, notebookKey, target, 'interrupt');
   }
 
   public async restartNotebook(notebookKey: string): Promise<void> {
+    this.assertNoLocalManagedWork('restart', notebookKey);
     const target = this.computeForNotebook(notebookKey);
-    if (target.executorId === this.descriptor.localPeer.peerId) {
-      const kernel = this.kernels.get(notebookKey);
-      if (kernel) await kernel.restart();
-    } else {
-      await this.sendKernelCommand(target.executorId, notebookKey, target, 'restart');
-    }
+    if (target.executorId === this.descriptor.localPeer.peerId) await this.kernels.get(notebookKey)?.restart();
+    else await this.sendKernelCommand(target.executorId, notebookKey, target, 'restart');
   }
 
   public notebookKey(uri: vscode.Uri): string | undefined {
@@ -2130,6 +2302,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   public async leave(): Promise<void> {
     if (this.closed) return;
+    this.assertNoLocalManagedWork('leave');
     await this.disposeAsync('explicit-leave');
   }
 
@@ -2140,6 +2313,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       throw new Error('Only the current Session Host can end the session for everyone.');
     }
     if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait before ending the session.');
+    this.assertNoLocalManagedWork('end-session');
     this.endingSession = true;
     try {
       await this.awaitSessionEndFence();
@@ -2200,7 +2374,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public dispose(): void {
-    this.runBackground('Session shutdown', () => this.disposeAsync('explicit-leave'));
+    this.runBackground('Session shutdown', () => this.leave());
   }
 
   private async disposeAsync(reason: SessionCloseReason = this.closeReason): Promise<void> {
@@ -2762,21 +2936,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.completedExecutionBarriers.delete(key);
       }
       this.clearPeerAwareness(peer.peerId);
-      for (const [requestId, owner] of [...this.executionOwners]) {
-        if (owner.peerId !== peer.peerId) continue;
-        void this.kernels.get(owner.notebookKey)?.interrupt().catch(() => undefined);
-        if (owner.replayTimer) clearTimeout(owner.replayTimer);
-        owner.outputTask?.dispose();
-        this.executionOwners.delete(requestId);
-      }
-      for (const [requestId, completed] of [...this.completedRemoteExecutions]) {
-        if (completed.sourceId === peer.peerId) this.dropCompletedRemoteExecution(requestId);
-      }
-      for (const [requestId, receipt] of [...this.completedExecutionReceipts]) {
-        if (receipt.executorId !== peer.peerId) continue;
-        clearTimeout(receipt.timer);
-        this.completedExecutionReceipts.delete(requestId);
-      }
+      // Observer route loss must not cancel accepted host computation. Its
+      // exactly-once owner and bounded replay remain available on reconnect.
+      // Keep bounded completion/receipt dedupe through reconnect as well:
+      // disconnecting after completion must never erase exactly-once replay.
       const affected = Object.entries(this.descriptor.notebookCompute ?? {})
         .filter(([, target]) => target.executorId === peer.peerId)
         .map(([key]) => key);
@@ -3334,6 +3497,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             break;
           }
           const effectiveFrom = conflict.source;
+          this.assertNotebookRenameSafe(effectiveFrom, to);
           const acceptFrom = await this.acceptFileState(from, fromState, sourceId, false, false);
           const acceptTo = await this.acceptFileState(to, toState, sourceId, false, false);
           if (acceptFrom && acceptTo) {
@@ -3616,7 +3780,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           if (pending && pending.executorId === sourceId) {
             clearTimeout(pending.timer);
             this.pendingKernelCommands.delete(requestId);
-            if (frame.meta.success === true) pending.resolve();
+            if (frame.meta.success === true) pending.resolve(frame.meta.challenge as ExecutionStopChallenge | undefined);
             else pending.reject(new Error(String(frame.meta.message ?? 'Remote kernel command failed.')));
           }
           break;
@@ -4289,7 +4453,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
+  private assertNotebookRenameSafe(from: string, to: string): void {
+    for (const key of this.kernels.keys()) {
+      const next = key === from ? to : key.startsWith(`${from}/`) ? `${to}${key.slice(from.length)}` : key;
+      if (next === key || !this.kernels.has(next)) continue;
+      if ([...this.executionOwners.values()].some((owner) => owner.notebookKey === next)) {
+        throw new Error('Replacing an executing notebook requires a separate typed CONFIRM stop for its exact runs first.');
+      }
+    }
+  }
+
   private renameNotebookRuntimeState(from: string, to: string): void {
+    this.assertNotebookRenameSafe(from, to);
     const moved = (key: string) => key === from ? to : key.startsWith(`${from}/`) ? `${to}${key.slice(from.length)}` : key;
     const move = <T>(map: Map<string, T>, replace?: (value: T) => void) => {
       for (const [key, value] of [...map]) {
@@ -4344,6 +4519,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const fromState = this.nextFileState(kind, true);
     const toState = this.nextFileState(kind, false);
 
+    this.assertNotebookRenameSafe(rawFrom, rawTo);
     this.renameFileStates(rawFrom, rawTo, fromState, toState);
     this.project.renameDocument(rawFrom, rawTo);
     this.renameNotebookRuntimeState(rawFrom, rawTo);
@@ -4735,11 +4911,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       ...Object.keys(this.descriptor.notebookPythonPaths ?? {}),
     ].filter(matches));
     for (const key of keys) {
+      // Deleting a document retires its UI, not accepted computation. Keep
+      // the kernel/owner until it finishes or an explicit CONFIRM stop arrives.
+      const executing = [...this.executionOwners.values()].some((owner) => owner.notebookKey === key);
+      if (executing) continue;
       this.kernels.get(key)?.stop();
       this.kernels.delete(key);
       this.kernelLastUsed.delete(key);
       this.notebookActiveExecutions.delete(key);
-      this.cancelNotebookExecutions(key, 'The notebook was deleted or replaced; its execution was cancelled.');
       if (this.descriptor.notebookCompute) delete this.descriptor.notebookCompute[key];
       if (this.descriptor.notebookPythonPaths) delete this.descriptor.notebookPythonPaths[key];
       this.setKernelStatus(key, 'Offline');
@@ -5654,7 +5833,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       pending.reject(new Error(reason));
     }
     for (const [requestId, pending] of this.pendingExecutions) {
-      if (pending.executorId !== executorId) continue;
+      if (pending.executorId !== executorId || pending.accepted) continue;
       clearTimeout(pending.timer);
       this.pendingExecutions.delete(requestId);
       pending.reject(new Error(reason));
@@ -5934,6 +6113,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         clearTimeout(timer);
         this.project.off('update', onUpdate);
         this.off('closed', onClosed);
+        this.off('executionStop', onStop);
       };
       const finishResolve = (state: { source: string; revision: string; digest: string }): void => {
         if (settled) return;
@@ -5971,6 +6151,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         check();
       };
       const onClosed = (): void => finishReject(this.sessionClosedError());
+      const onStop = (ids: string[]): void => {
+        if (ids.includes(requestId)) finishReject(new CellStateUnavailableError('Execution cancelled by a confirmed stop during cell convergence.'));
+      };
       const timer = setTimeout(() => {
         finishReject(new CellStateUnavailableError(
           'Timed out waiting for the requested target-cell CRDT state on the Session Host.',
@@ -5978,6 +6161,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }, Math.max(1, this.targetCellConvergenceTimeoutMs));
       this.project.on('update', onUpdate);
       this.once('closed', onClosed);
+      this.on('executionStop', onStop);
       // Re-check after subscribing so an update racing the initial inspection
       // cannot be missed.
       check();
@@ -6075,6 +6259,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       return;
     }
 
+    if (this.stopAllExecutions || this.stoppedNotebookGates.has(notebookKey)) {
+      rejectRequest('ExecutionCancelled', 'Confirmed stop is in progress.');
+      return;
+    }
     const expectedTarget = this.computeForNotebook(notebookKey);
     let target: NotebookComputeTarget;
     let code: string;
@@ -6115,7 +6303,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (this.executionOwners.get(requestId) === executionOwner) {
           this.executionOwners.delete(requestId);
         }
-        if (error instanceof StaleCellRevisionError) {
+        if (this.cancelledExecutionIds.has(requestId)) {
+          this.cancelledExecutionIds.delete(requestId);
+          this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, {
+            requestId, success: false, content: { status: 'error', ename: 'ExecutionCancelled', evalue: 'Cancelled by a confirmed stop during preparation.' },
+          }, [], new Map());
+        } else if (error instanceof StaleCellRevisionError) {
           rejectRequest('StaleCellRevision', error.message);
         } else if (error instanceof CellStateUnavailableError) {
           rejectRequest('CellStateUnavailable', error.message);
@@ -6229,6 +6422,14 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     }
 
+    if (this.cancelledExecutionIds.has(requestId)) {
+      this.executionOwners.delete(requestId);
+      this.cancelledExecutionIds.delete(requestId);
+      const cancelled = { requestId, success: false, content: { status: 'error', ename: 'ExecutionCancelled', evalue: 'Cancelled by a confirmed stop during preparation.' } };
+      this.rememberCompletedRemoteExecution(sourceId, requestId, requestDigest, cancelled, [], new Map());
+      return;
+    }
+
     // A new request reaches this point only after authority checks and, for
     // lightweight framing, exact host-canonical target-cell convergence.
     if (fastPath && executionOwner.cellId) {
@@ -6270,7 +6471,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             payload = encodeRemoteExecutionEvent(event);
           } catch (error) {
             executionOwner.eventOverflow = error instanceof Error ? error : new Error(String(error));
-            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const events = executionOwner.events ?? [];
@@ -6280,7 +6480,6 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             executionOwner.eventOverflow = new Error(
               'Remote Jupyter output exceeded the bounded reconnect replay queue.',
             );
-            void this.kernels.get(executionOwner.notebookKey)?.interrupt().catch(() => undefined);
             return;
           }
           const record = { sequence: events.length, payload } satisfies RemoteExecutionEventRecord;
@@ -6325,15 +6524,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.executionOwners.delete(requestId);
     }
     if (executionOwner.eventOverflow) {
-      result = {
-        requestId,
-        success: false,
-        content: {
-          status: 'error',
-          ename: 'OutputReplayLimit',
-          evalue: executionOwner.eventOverflow.message,
-        },
-      };
+      this.log.appendLine(`[warning] Execution ${requestId} finished with truncated observer output: ${executionOwner.eventOverflow.message}`);
     }
     if (executionOwner.outputState && executionOwner.cellId) {
       try {
@@ -6401,7 +6592,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.transport.sendTo(sourceId, 'kernelCommandResult', { requestId, success: false, message });
     };
     if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target
-      || (frame.meta.command !== 'interrupt' && frame.meta.command !== 'restart')) {
+      || (frame.meta.command !== 'interrupt' && frame.meta.command !== 'restart' && frame.meta.command !== 'prepare-stop')) {
       rejectCommand('The remote kernel command is malformed.');
       return;
     }
@@ -6410,25 +6601,48 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       rejectCommand(targetError);
       return;
     }
-    const kernel = this.kernels.get(notebookKey);
-    if (!kernel) {
-      this.transport.sendTo(sourceId, 'kernelCommandResult', {
-        requestId, success: false, message: `No running kernel exists for ${notebookKey}.`,
-      });
-      return;
-    }
     try {
-      if (frame.meta.command === 'interrupt') await kernel.interrupt();
-      else if (frame.meta.command === 'restart') await kernel.restart();
-      else throw new Error(`Unknown kernel command: ${String(frame.meta.command)}`);
-      this.transport.sendTo(sourceId, 'kernelCommandResult', {
-        requestId, notebookKey, command: frame.meta.command, success: true,
-      });
+      if (frame.meta.command === 'prepare-stop') {
+        if (frame.meta.action !== 'interrupt' && frame.meta.action !== 'restart') throw new Error('Invalid confirmation action.');
+        const challenge = this.issueExecutionStop(frame.meta.action, notebookKey, sourceId);
+        this.transport.sendTo(sourceId, 'kernelCommandResult', { requestId, success: true, challenge });
+        return;
+      }
+      const proof = frame.meta.proof as { challengeId?: unknown; value?: unknown } | undefined;
+      if (proof && typeof proof.challengeId === 'string') {
+        await this.applyIssuedExecutionStop(proof.challengeId, proof.value, sourceId, frame.meta.command, notebookKey);
+      } else {
+        this.assertNoLocalManagedWork(frame.meta.command, notebookKey);
+        const kernel = this.kernels.get(notebookKey);
+        if (!kernel) throw new Error(`No running kernel exists for ${notebookKey}.`);
+        if (frame.meta.command === 'interrupt') await kernel.interrupt();
+        else await kernel.restart();
+      }
+      this.transport.sendTo(sourceId, 'kernelCommandResult', { requestId, notebookKey, command: frame.meta.command, success: true });
     } catch (error) {
-      this.transport.sendTo(sourceId, 'kernelCommandResult', {
-        requestId, success: false, message: formatError(error),
-      });
+      this.transport.sendTo(sourceId, 'kernelCommandResult', { requestId, success: false, message: formatError(error) });
     }
+  }
+
+  private sendStopChallengeRequest(executorId: string, notebookKey: string, target: NotebookComputeTarget,
+    action: 'interrupt' | 'restart'): Promise<ExecutionStopChallenge> {
+    const requestId = newId();
+    return new Promise<ExecutionStopChallenge>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingKernelCommands.delete(requestId);
+        reject(new Error('Stop confirmation request timed out; computation was left running.'));
+      }, 15_000);
+      this.pendingKernelCommands.set(requestId, { executorId, timer, reject, resolve: (challenge) => {
+        if (!challenge || challenge.executorId !== executorId || challenge.initiatorId !== this.descriptor.localPeer.peerId
+          || challenge.action !== action || challenge.notebookKey !== notebookKey || !Array.isArray(challenge.targets)
+          || challenge.targets.length > 128) reject(new Error('Invalid executor stop confirmation.'));
+        else resolve(challenge);
+      } });
+      void this.sendToWithRouteRecovery(executorId, 'kernelCommand', { requestId, notebookKey, target, command: 'prepare-stop', action },
+        new Uint8Array(), 10_000).catch((error) => {
+        clearTimeout(timer); this.pendingKernelCommands.delete(requestId); reject(error);
+      });
+    });
   }
 
   private waitForHostTransfer(
@@ -6469,6 +6683,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     notebookKey: string,
     target: NotebookComputeTarget,
     command: 'interrupt' | 'restart',
+    proof?: { challengeId: string; value: unknown },
   ): Promise<void> {
     const requestId = newId();
     return new Promise<void>((resolve, reject) => {
@@ -6478,11 +6693,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.pendingKernelCommands.delete(requestId);
         reject(new Error(`Remote kernel ${command} could not be delivered after route recovery.`));
       }, routeTimeoutMs + commandTimeoutMs);
-      this.pendingKernelCommands.set(requestId, { executorId, resolve, reject, timer });
+      this.pendingKernelCommands.set(requestId, { executorId, resolve: () => resolve(), reject, timer });
       void this.sendToWithRouteRecovery(
         executorId,
         'kernelCommand',
-        { requestId, notebookKey, target, command },
+        { requestId, notebookKey, target, command, ...(proof ? { proof } : {}) },
         new Uint8Array(),
         routeTimeoutMs,
       ).then(() => {
@@ -6513,10 +6728,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     materializeWorkspace = true,
   ): Promise<JupyterExecutionResult> {
     const clock = this.coordinator.clock;
-    let notebookDeleted = false;
     const assertAuthority = () => {
       this.assertExecutionAvailable();
-      if (notebookDeleted) throw new Error('The notebook was deleted or replaced before execution could start.');
+      if (this.cancelledExecutionIds.has(requestId) || this.stopAllExecutions || this.stoppedNotebookGates.has(notebookKey)) {
+        throw new Error('Execution was cancelled by a confirmed stop before it could start.');
+      }
       if (!this.coordinator.isCurrentHost() || !sameClock(clock, this.coordinator.clock)
         || target.executorId !== this.descriptor.localPeer.peerId
         || !sameComputeTarget(target, this.computeForNotebook(notebookKey))) {
@@ -6524,11 +6740,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     };
     assertAuthority();
+    this.executionOwners.set(requestId, this.executionOwners.get(requestId) ?? {
+      peerId: this.descriptor.localPeer.peerId, notebookKey, accepted: false, startedAt: Date.now(),
+    });
     this.repositoryOperations++;
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
-    const onDelete = (key: string) => { if (key === notebookKey) notebookDeleted = true; };
     this.project.on('documentRenamed', onRename);
-    this.project.on('documentDeleted', onDelete);
     try {
     // Flush canonical edits first, then execute in the host repository so
     // private/unshared datasets and local project resources stay available.
@@ -6622,13 +6839,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     } finally {
       this.project.off('documentRenamed', onRename);
-      this.project.off('documentDeleted', onDelete);
       this.repositoryOperations--;
+      if (this.executionOwners.get(requestId)?.peerId === this.descriptor.localPeer.peerId) this.executionOwners.delete(requestId);
+      this.cancelledExecutionIds.delete(requestId);
     }
   }
 
   private assertExecutionAvailable(): void {
     if (this.closed) throw this.sessionClosedError();
+    if (this.stopAllExecutions) throw new Error('Confirmed session stop is in progress.');
     if (this.endingSession) throw new Error('The host is finalizing the session.');
     if (this.waitingForHostFolder) throw new Error('The session is paused until the new host chooses a folder.');
     if (this.changingBackingFolder) throw new Error('The host repository is changing. Try again after the folder is ready.');
@@ -6693,6 +6912,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   public async setBackingFolder(folder: string, mode: BackingFolderMode = 'replace'): Promise<void> {
     if (!this.coordinator.isCurrentHost()) throw new Error('Only the current Session Host can choose the shared backing folder.');
     if (this.closed) throw this.sessionClosedError();
+    if (this.stopAllExecutions) throw new Error('Confirmed session stop is in progress.');
     if (this.endingSession) throw new Error('The host is finalizing the session.');
     if (this.changingBackingFolder) throw new Error('The host repository is changing. Wait for the current folder change to finish.');
     if (this.repositoryOperations > 0 || this.activeExecutions > 0) throw new Error('Finish or stop notebook execution and terminal preparation before changing the host repository.');

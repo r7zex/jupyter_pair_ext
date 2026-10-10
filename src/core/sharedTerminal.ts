@@ -13,6 +13,9 @@ function retainedText(text: string): string {
   const first = tail.charCodeAt(0);
   return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
 }
+export interface TerminalStopChallenge {
+  id: string; action: 'terminal-interrupt'; hostId: string; generation: string; expiresAt: number;
+}
 export interface TerminalView { text: string; reset: boolean }
 interface TerminalAuthority {
   isHost(): boolean;
@@ -40,6 +43,8 @@ export class SharedTerminal extends EventEmitter {
   private queue = Promise.resolve();
   private queued = 0;
   private commandGeneration = 0;
+  private admissionRevision = 0;
+  private readonly stopChallenges = new Map<string, { challenge: TerminalStopChallenge; result?: Promise<void> }>();
   private closed = false;
   private snapshotRequested = false;
   private snapshotTimer: NodeJS.Timeout | undefined;
@@ -138,12 +143,23 @@ export class SharedTerminal extends EventEmitter {
     return true;
   }
   public isRunning(): boolean { return Boolean(this.child) || this.queued > 0; }
+  public executionGeneration(): string { return `${this.streamId}:${this.generation}:${this.commandGeneration}:${this.admissionRevision}`; }
+  public requestInterrupt(): TerminalStopChallenge {
+    if (!this.authority.isHost() || this.closed) throw new Error('Only the session host can interrupt the terminal.');
+    for (const [id, record] of this.stopChallenges) if (record.challenge.expiresAt < Date.now()) this.stopChallenges.delete(id);
+    if (this.stopChallenges.size >= 128) throw new Error('Too many terminal stop confirmations.');
+    const challenge: TerminalStopChallenge = { id: randomUUID(), action: 'terminal-interrupt', hostId: this.authority.hostId(),
+      generation: this.executionGeneration(), expiresAt: Date.now() + 120_000 };
+    this.stopChallenges.set(challenge.id, { challenge: { ...challenge } });
+    return challenge;
+  }
 
   public async execute(command: string): Promise<void> {
     if (this.closed || !this.authority.isHost() || !this.authority.available()) throw new Error('Only the active session host can enter terminal commands.');
     if (!command || command.length > 8192 || /[\uD800-\uDFFF]/u.test(command)
       || [...command].some((character) => { const code = character.charCodeAt(0); return (code < 32 && code !== 9 && code !== 10) || code === 127; })) throw new Error('Enter a command of at most 8192 characters.');
     if (this.queued >= 16) throw new Error('Terminal input queue is full.');
+    this.admissionRevision++;
     this.queued++;
     const generation = this.generation;
     const commandGeneration = this.commandGeneration;
@@ -246,11 +262,45 @@ export class SharedTerminal extends EventEmitter {
     this.emit('view', this.view());
     if (!this.closed && this.authority.isHost()) this.send(undefined, 'shellSnapshot', { streamId: this.streamId, generation: this.generation, generationIndex: this.generationIndex, sequence: 0 }, Buffer.alloc(0));
   }
-  public interrupt(): void {
+  public async interrupt(proof?: { challengeId: string; value: unknown }): Promise<void> {
     if (!this.authority.isHost() || this.closed) throw new Error('Only the session host can interrupt the terminal.');
-    this.commandGeneration++;
-    this.stopShell();
-    this.publish('\n[Host stopped the shell and its commands; the next command starts a new shell.]\n');
+    if (proof?.value !== 'CONFIRM') throw new Error('Exact typed CONFIRM is required to stop the shared terminal.');
+    const record = this.stopChallenges.get(proof.challengeId);
+    if (!record || record.challenge.action !== 'terminal-interrupt' || record.challenge.hostId !== this.authority.hostId()) {
+      throw new Error('Unknown terminal stop confirmation or changed host.');
+    }
+    if (record.result) return record.result;
+    if (record.challenge.expiresAt < Date.now()) throw new Error('Terminal stop confirmation expired.');
+    record.result = this.stopConfirmed(record.challenge.generation, proof.value);
+    return record.result;
+  }
+
+  /** Runtime has already checked its authority-issued operation and exact run scope. */
+  public async stopConfirmed(generation: string, value: unknown): Promise<void> {
+    if (!this.authority.isHost() || this.closed || value !== 'CONFIRM') throw new Error('Exact typed CONFIRM and current host authority are required.');
+    if (generation !== this.executionGeneration()) throw new Error('Terminal execution changed; obtain a new confirmation.');
+    this.commandGeneration++; // Includes commands still preparing, before any OS signal.
+    const child = this.child;
+    this.child = undefined;
+    if (child?.pid) {
+      child.stdin.destroy();
+      if (process.platform === 'win32') {
+        await new Promise<void>((resolve, reject) => {
+          const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+          killer.once('error', reject);
+          killer.once('close', (code) => code === 0 || child.exitCode !== null ? resolve() : reject(new Error(`Terminal process tree stop failed (${code}).`)));
+        });
+      } else {
+        const signalGroup = (signal: NodeJS.Signals) => {
+          try { process.kill(-child.pid!, signal); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        };
+        signalGroup('SIGTERM');
+        await new Promise<void>((resolve) => setTimeout(resolve, 750));
+        signalGroup('SIGKILL');
+      }
+    }
+    this.publish('\n[Confirmed stop of the host shell and its commands; the next command starts a new shell.]\n');
   }
   private stopShell(): void {
     const child = this.child;

@@ -155,7 +155,10 @@ describe('Round 2 Stage 16 — stable GPU selection, replay and durable cancella
         await client.submit(job);
         if (mask & 2) await client.submit({ ...job, files: Object.fromEntries(Object.entries(job.files).reverse()) });
         assert.equal((await poll()).data.job.id, job.id);
-        if (mask & 4) await client.cancel(job.id);
+        if (mask & 4) {
+          const confirmation = await client.requestCancellation({ action: 'cancel_job', targetIds: [job.id] });
+          await client.applyCancellation(confirmation.id, 'CONFIRM');
+        }
         if (mask & 8) {
           await server.stop(); server = new VpsServer(options); port = await server.start(); client = new VpsClient(`http://127.0.0.1:${port}`, team);
           const restored = (await poll()).data.job; assert.equal(restored.id, job.id); assert.equal(restored.cancelRequested, !!(mask & 4));
@@ -206,7 +209,8 @@ describe('Round 2 Stage 1 — synchronized CPU training checkpoints survive both
       while (Date.now() < end) { if (await check()) return; await new Promise((resolve) => setTimeout(resolve, 25)); }
       assert.fail('Acceptance condition did not become true');
     };
-    const contents = async (name: string): Promise<string> => { try { return await fsPromises.readFile(path.join(root, name), 'utf8'); } catch { return ''; } };
+    const work = path.join(root, 'agent', 'jobs', 'checkpoint-training', 'work');
+    const contents = async (name: string): Promise<string> => { try { return await fsPromises.readFile(path.join(work, name), 'utf8'); } catch { return ''; } };
     const source = 'import json,os,time\nfrom pathlib import Path\nfrom helper import TARGET\np=Path(os.environ["PAIR_NOTEBOOK_WORKSPACE"])\nwith (p/"runs").open("a") as f: f.write("once\\n")\nw=0.0\nfor step in range(30):\n w -= 0.2*(w-TARGET)\n (p/"checkpoint.json").write_text(json.dumps({"step":step,"weight":w}))\n print(step,w,flush=True)\n time.sleep(0.03)\n(p/"done").write_text(str(w))\n';
     try {
       host.getMap<string>('source').set('train.py', source);

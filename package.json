@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, WebRTC, Iroh QUIC and redundant relay fallback.",
-  "version": "0.5.37",
+  "version": "0.5.38",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -167,6 +167,14 @@
         "icon": "$(debug-stop)"
       },
       {
+        "command": "pairNotebook.stopVpsSession",
+        "title": "Pair Notebook: Emergency Stop Background Jobs in Current Session"
+      },
+      {
+        "command": "pairNotebook.stopInteractiveSession",
+        "title": "Pair Notebook: Emergency Stop Interactive Computations in Current Session"
+      },
+      {
         "command": "pairNotebook.refreshVpsJobs",
         "title": "Pair Notebook: Refresh VPS Compute",
         "icon": "$(refresh)"
@@ -175,6 +183,10 @@
         "command": "pairNotebook.openSharedTerminal",
         "title": "Pair Notebook: Open Shared Host Terminal",
         "enablement": "pairNotebook.inSession"
+      },
+      {
+        "command": "pairNotebook.startComputeSession",
+        "title": "Pair Notebook: Start New Standalone Compute Session"
       }
     ],
     "viewsContainers": {
@@ -330,7 +342,8 @@
     "artifacts": "npm run package && node scripts/make-artifacts.mjs",
     "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs",
     "vps:server": "node out/src/vps/cli.js",
-    "vps:agent": "python3 scripts/pair-notebook-agent.py"
+    "vps:agent": "python3 scripts/pair-notebook-agent.py",
+    "test:reference": "python3 -W error::ResourceWarning test/anti_fraud_reference_test.py -q"
   },
   "dependencies": {
     "@noble/secp256k1": "^3.1.0",

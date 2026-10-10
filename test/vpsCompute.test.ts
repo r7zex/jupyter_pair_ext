@@ -21,6 +21,11 @@ async function until(check: () => Promise<boolean> | boolean, timeout = 5000): P
   assert.fail('Condition did not become true before timeout');
 }
 
+async function confirmedCancel(client: VpsClient, id: string): Promise<void> {
+  const challenge = await client.requestCancellation({ action: 'cancel_job', targetIds: [id] });
+  await client.applyCancellation(challenge.id, 'CONFIRM');
+}
+
 function request(endpoint: string, token: string, route: string, body?: unknown): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
     const bytes = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
@@ -191,14 +196,14 @@ describe('VPS durable background compute', function () {
     it(`Stage 4 case ${mask}: cancellation survives claim timing and broker restart`, async () => {
       const input = job(`cancel-${mask}`); await client.submit(input);
       if (mask & 1) await request(endpoint, agentToken, '/v1/agents/compute-pc/poll', inventory);
-      await client.cancel(input.id);
+      await confirmedCancel(client, input.id);
       if (mask & 2) {
         await server.stop(); server = new VpsServer(options);
         endpoint = `http://127.0.0.1:${await server.start()}`; client = new VpsClient(endpoint, clientToken);
       }
       const saved = await client.job(input.id);
       assert.equal(saved.cancelRequested, true);
-      assert.equal(saved.status, mask & 1 ? 'running' : 'cancelled');
+      assert.equal(saved.status, mask & 1 ? 'cancel_pending' : 'cancelled');
       const polled = await request(endpoint, agentToken, '/v1/agents/compute-pc/poll', inventory);
       if (mask & 1) assert.equal(polled.data.job.cancelRequested, true); else assert.equal(polled.data.job, null);
     });
@@ -255,14 +260,14 @@ describe('VPS durable background compute', function () {
     assert.equal(Buffer.from(detail.log, 'base64').length, LOG_RETENTION_BYTES);
     assert.equal(detail.logStart, offset - LOG_RETENTION_BYTES);
     assert.equal((await request(endpoint, otherToken, '/v1/agents/other-pc/report', { ...body, offset })).status, 403);
-    await client.cancel('logs');
+    await confirmedCancel(client, 'logs');
     assert.equal((await request(endpoint, agentToken, '/v1/agents/compute-pc/poll', inventory)).data.job.cancelRequested, true);
     assert.equal((await request(endpoint, agentToken, '/v1/agents/compute-pc/report', {
       ...body, offset, log: '', result: { status: 'cancelled', exitCode: -1 },
     })).status, 200);
     assert.equal((await client.job('logs')).status, 'cancelled');
     await client.submit(job('never-start'));
-    await client.cancel('never-start');
+    await confirmedCancel(client, 'never-start');
     assert.equal((await request(endpoint, agentToken, '/v1/agents/compute-pc/poll', inventory)).data.job, null);
   });
 
@@ -334,6 +339,7 @@ describe('VPS durable background compute', function () {
       if (process.platform === 'win32') this.skip();
       const port = Number(new URL(endpoint).port);
       const state = path.join(directory, 'agent');
+      const work = path.join(state, 'jobs', 'offline-training', 'work');
       const launch = (): ChildProcess => {
         const child = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'compute-pc',
           '--state', state, '--workspace', directory, '--poll-seconds', '0.1'], {
@@ -347,18 +353,18 @@ describe('VPS durable background compute', function () {
         'helper.py': 'VALUE = "completed once"',
         'train.py': 'import os, time\nfrom pathlib import Path\nfrom helper import VALUE\nroot = Path(os.environ["PAIR_NOTEBOOK_WORKSPACE"])\nwith (root / "runs").open("a") as f: f.write("run\\n")\nprint("training started", flush=True)\ntime.sleep(1.2)\n(root / "finished").write_text(VALUE)\nprint(VALUE, flush=True)\n',
       } });
-      await until(async () => { try { return (await readFile(path.join(directory, 'runs'), 'utf8')) === 'run\n'; } catch { return false; } });
+      await until(async () => { try { return (await readFile(path.join(work, 'runs'), 'utf8')) === 'run\n'; } catch { return false; } });
       const stopped = new Promise<void>((resolve) => originalAgent.once('exit', () => resolve()));
       originalAgent.kill(signal); await stopped;
       await server.stop();
-      await until(async () => { try { return (await readFile(path.join(directory, 'finished'), 'utf8')) === 'completed once'; } catch { return false; } });
+      await until(async () => { try { return (await readFile(path.join(work, 'finished'), 'utf8')) === 'completed once'; } catch { return false; } });
       server = new VpsServer(options); await server.start(port);
       assert.equal((await client.job('offline-training')).status, 'running');
       launch();
       await until(async () => (await client.job('offline-training')).status === 'succeeded');
       const completed = await client.job('offline-training');
       assert.match(Buffer.from(completed.log, 'base64').toString(), /completed once/);
-      assert.equal(await readFile(path.join(directory, 'runs'), 'utf8'), 'run\n');
+      assert.equal(await readFile(path.join(work, 'runs'), 'utf8'), 'run\n');
       // Repeated heartbeat/recovery never executes an already completed job again.
       assert.equal((await client.jobs()).length, 1);
     });
@@ -378,6 +384,7 @@ describe('VPS durable background compute', function () {
     hostRelay.send(Buffer.from(Y.encodeStateAsUpdate(hostDocument)), 'guest-editor');
     await until(() => guestDocument.getMap('sources').get('train.py') === source);
     const state = path.join(directory, 'acceptance-agent');
+    const work = path.join(state, 'jobs', 'guest-acceptance', 'work');
     const launch = (): ChildProcess => {
       const child = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'compute-pc',
         '--state', state, '--workspace', directory, '--poll-seconds', '0.1'], {
@@ -387,14 +394,14 @@ describe('VPS durable background compute', function () {
     const daemon = launch(); await until(async () => (await client.agents()).length === 1);
     const guestClient = new VpsClient(endpoint, clientToken);
     await guestClient.submit({ ...job('guest-acceptance'), files: guestDocument.getMap<string>('sources').toJSON() });
-    await until(async () => { try { return (await readFile(path.join(directory, 'acceptance-runs'), 'utf8')) === 'once\n'; } catch { return false; } });
+    await until(async () => { try { return (await readFile(path.join(work, 'acceptance-runs'), 'utf8')) === 'once\n'; } catch { return false; } });
     hostRelay.stop(); guestRelay.stop(); hostDocument.destroy(); guestDocument.destroy();
     const exited = new Promise<void>((resolve) => daemon.once('exit', () => resolve())); daemon.kill('SIGKILL'); await exited;
     const port = Number(new URL(endpoint).port); await server.stop();
-    await until(async () => { try { return (await readFile(path.join(directory, 'acceptance-done'), 'utf8')) === 'complete'; } catch { return false; } });
+    await until(async () => { try { return (await readFile(path.join(work, 'acceptance-done'), 'utf8')) === 'complete'; } catch { return false; } });
     server = new VpsServer(options); await server.start(port); launch();
     await until(async () => (await guestClient.job('guest-acceptance')).status === 'succeeded');
-    assert.equal(await readFile(path.join(directory, 'acceptance-runs'), 'utf8'), 'once\n');
+    assert.equal(await readFile(path.join(work, 'acceptance-runs'), 'utf8'), 'once\n');
     assert.match(Buffer.from((await guestClient.job('guest-acceptance')).log, 'base64').toString(), /guest training/);
   });
 
@@ -409,7 +416,7 @@ describe('VPS durable background compute', function () {
     await until(async () => (await client.agents()).length === 1);
     await client.submit({ ...job('cancel-real'), files: { 'train.py': 'import time\nprint("started", flush=True)\ntime.sleep(5)\nprint("must not finish")' } });
     await until(async () => Buffer.from((await client.job('cancel-real')).log, 'base64').toString().includes('started'));
-    await client.cancel('cancel-real');
+    await confirmedCancel(client, 'cancel-real');
     await until(async () => (await client.job('cancel-real')).status === 'cancelled');
     const detail = await client.job('cancel-real');
     assert.doesNotMatch(Buffer.from(detail.log, 'base64').toString(), /must not finish/);
@@ -419,6 +426,7 @@ describe('VPS durable background compute', function () {
   it('cancels training descendants in the same Linux process group', async function () {
     if (process.platform !== 'linux') this.skip();
     const state = path.join(directory, 'descendant-agent');
+    const work = path.join(state, 'jobs', 'cancel-descendants', 'work');
     const daemon = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'compute-pc',
       '--state', state, '--workspace', directory, '--poll-seconds', '0.1'], {
       env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore',
@@ -429,14 +437,14 @@ describe('VPS durable background compute', function () {
       'child.py': 'import os,time\nfrom pathlib import Path\np=Path(os.environ["PAIR_NOTEBOOK_WORKSPACE"])\n(p/"child-pid").write_text(str(os.getpid()))\ntime.sleep(20)\n(p/"child-finished").write_text("should not finish")\n',
     } });
     let pid = '';
-    await until(async () => { try { pid = await readFile(path.join(directory, 'child-pid'), 'utf8'); return /^\d+$/.test(pid); } catch { return false; } });
-    await client.cancel('cancel-descendants');
+    await until(async () => { try { pid = await readFile(path.join(work, 'child-pid'), 'utf8'); return /^\d+$/.test(pid); } catch { return false; } });
+    await confirmedCancel(client, 'cancel-descendants');
     await until(async () => (await client.job('cancel-descendants')).status === 'cancelled');
     await until(async () => {
       try { return (await readFile(`/proc/${pid}/stat`, 'utf8')).split(')')[1]!.trim().startsWith('Z '); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true; throw error; }
     });
-    await assert.rejects(readFile(path.join(directory, 'child-finished')));
+    await assert.rejects(readFile(path.join(work, 'child-finished')));
   });
 });
 

@@ -11,6 +11,7 @@ export class SharedTerminalController implements vscode.Disposable {
   private outputEndedWithCarriageReturn = false;
   private lastRuntimeState: string | undefined;
   private connectionRecovering = false;
+  private confirmingStop = false;
   private binding = 0;
   private readonly write = new vscode.EventEmitter<string>();
   private readonly closeEvent = new vscode.EventEmitter<number>();
@@ -75,8 +76,17 @@ export class SharedTerminalController implements vscode.Disposable {
       close: () => { if (this.bound === runtime && this.binding === binding) this.unbind(); },
       handleInput: (data) => {
         if (this.bound !== runtime || this.binding !== binding || this.currentRuntime() !== runtime || !runtime.coordinator.isCurrentHost() || data.includes('\x1b')) return;
+        if (this.confirmingStop) return;
         for (const character of data) {
-          if (character === '\x03') { this.clearInput(); shared.interrupt(); }
+          if (this.confirmingStop) break;
+          if (character === '\x03') {
+            this.clearInput();
+            if (this.confirmingStop) continue;
+            this.confirmingStop = true;
+            void runtime.confirmOperation('terminal-interrupt').catch((error: unknown) => {
+              if (this.bound === runtime && this.binding === binding) this.write.fire(`\r\n${String(error)}\r\n`);
+            }).finally(() => { this.confirmingStop = false; });
+          }
           else if (character === '\r' || character === '\n') {
             const command = this.input;
             const overflow = this.inputOverflow;
@@ -107,7 +117,7 @@ export class SharedTerminalController implements vscode.Disposable {
   }
   private writeRoleNotice(): void {
     this.write.fire(this.bound?.coordinator.isCurrentHost()
-      ? '\r\n[Терминал хоста: вводите команды; Ctrl+C останавливает оболочку и её процессы.]\r\n'
+      ? '\r\n[Терминал хоста: вводите команды; Ctrl+C запрашивает CONFIRM перед остановкой оболочки и её процессов.]\r\n'
       : '\r\n[Терминал хоста: только просмотр. Команды вводит текущий хост.]\r\n');
   }
   private clearInput(): void { this.input = ''; this.inputOverflow = false; }

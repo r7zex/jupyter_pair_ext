@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { VpsServer } from './server';
+import { VpsServer, type VpsClientPrincipal } from './server';
 
 async function main(): Promise<void> {
   let agentTokens: Record<string, string>;
@@ -8,10 +8,19 @@ async function main(): Promise<void> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error();
     agentTokens = raw as Record<string, string>;
   } catch { throw new Error('PAIR_VPS_AGENT_TOKENS must be a JSON object mapping agent IDs to their tokens.'); }
+  let clientPrincipals: Record<string, VpsClientPrincipal> | undefined;
+  if (process.env.PAIR_VPS_CLIENT_PRINCIPALS !== undefined) {
+    try {
+      const raw: unknown = JSON.parse(process.env.PAIR_VPS_CLIENT_PRINCIPALS);
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error();
+      clientPrincipals = raw as Record<string, VpsClientPrincipal>;
+    } catch { throw new Error('PAIR_VPS_CLIENT_PRINCIPALS must map principal IDs to token, role and optional projectIds.'); }
+  }
   const port = Number(process.env.PAIR_VPS_PORT ?? '8787');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PAIR_VPS_PORT.');
   const server = new VpsServer({
     clientToken: process.env.PAIR_VPS_CLIENT_TOKEN ?? '', agentTokens,
+    ...(clientPrincipals ? { clientPrincipals } : {}),
     dataDirectory: path.resolve(process.env.PAIR_VPS_DATA ?? './.pair-vps'),
   });
   await server.start(port, process.env.PAIR_VPS_BIND ?? '127.0.0.1');

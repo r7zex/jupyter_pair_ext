@@ -25,7 +25,7 @@ PAIR_VPS_BIND=127.0.0.1
 PAIR_VPS_PORT=8787
 ```
 
-Each agent has its own ID and token. The team token can submit, read and cancel jobs and access the P2P relay. An agent token can only claim and report jobs assigned to its machine. This service instance is one trusted team's workspace; use separate service instances and credentials for separate teams.
+Each agent has its own ID and token. The team token is an assigned team-operator credential: it can submit, read and confirm scoped cancellation of jobs and access the P2P relay. An agent token can only claim and report jobs assigned to its machine. This service instance is one trusted team's workspace; use separate service instances and credentials for separate teams.
 
 Run `npm run vps:server` with those environment variables, or install a systemd service (adjust user and checkout path):
 
@@ -76,18 +76,9 @@ python3 /opt/pair-notebook-agent.py \
 
 `--python` is selected by the PC's owner. A submitted job cannot replace it. Relative interpreter paths are made absolute without resolving a virtual environment's symlink. NVIDIA GPUs are discovered through `nvidia-smi`; a selected GPU is pinned by UUID across queueing and CUDA enumeration changes. The runner sets `CUDA_VISIBLE_DEVICES` to that UUID; CPU hides CUDA devices. Your selected environment must contain the CUDA-capable framework and drivers needed by your code.
 
-`--workspace` points at existing datasets or other files on the compute PC. Source snapshots execute in a separate directory for each job. Refer to existing datasets without uploading them from your laptop:
+`--workspace` identifies owner-provisioned files on the compute PC. In 0.5.38, prepare a versioned `--data-manifest` with relative paths, sizes and SHA-256 hashes. The agent copies verified data into each immutable job work directory. `PAIR_NOTEBOOK_WORKSPACE`, cwd and project `PYTHONPATH` then refer to that private directory; editing the owner directory does not change accepted source/config/data. A selected dataset identity is pinned at submission. A changed or missing dataset fails preparation.
 
-```python
-import os
-from pathlib import Path
-
-data_directory = Path(os.environ['PAIR_NOTEBOOK_WORKSPACE'])
-dataset = data_directory / 'datasets' / 'my-training-data'
-# Save checkpoints to this directory to reuse them from future jobs:
-checkpoints = data_directory / 'checkpoints'
-checkpoints.mkdir(parents=True, exist_ok=True)
-```
+See [persistent research and CONFIRM](PERSISTENT_RESEARCH.md) for the manifest schema, immutable preparation, explicit resume, cancellation and permission model. The source snapshot does not automatically transport binary data from the editor host to a separate compute machine. Checkpoints live in `<agent-state>/jobs/<job-id>/work/`; retrieve or explicitly stage them for a new continuation using authorized owner filesystem access.
 
 For unattended operation, install an agent service:
 
@@ -138,7 +129,7 @@ Click a machine to select its compute device; click a job to follow its output. 
 
 For collaborative projects, the extension snapshots tracked text files from shared document state after all selection dialogs finish: Python modules, configuration, requirements, and small CSV/text datasets. Unsaved imported modules and other open text resources are included. A standalone trusted workspace snapshots these resources from its repository and overlays dirty editors, while a file opened without a workspace sends only the active file. Private credential paths and binary files are excluded. Nested scripts and notebook programs can import Python modules from the snapshot root.
 
-A notebook can submit its active cell or all Python code cells as a fresh Python program. IPython magics, interactive input and existing Jupyter kernel variables are unavailable in background jobs. Regular live notebook execution runs in the Session Host's backing repository; background execution is selected explicitly with **Run Python on VPS Compute** and uses the compute PC's immutable job directory. Files present only on the Session Host do not automatically exist on another compute PC: keep large/binary datasets in the agent's `--workspace` and address them through `PAIR_NOTEBOOK_WORKSPACE`, or use your existing file-transfer method to populate that workspace first.
+A notebook can submit its active cell or all Python code cells in a fresh process with a shared namespace between submitted cells. Existing Jupyter kernel variables and interactive input are unavailable; IPython magics and shell syntax work when the selected interpreter has IPython installed. Regular live notebook execution runs in the Session Host's backing repository; background execution is selected explicitly with **Run Python on VPS Compute** and uses the compute PC's immutable job directory. Files present only on the Session Host do not automatically exist on another compute PC: transfer large/binary datasets into the agent's owner `--workspace`, declare their relative paths, sizes and SHA-256 in `--data-manifest`, then submit. The agent copies only declared owner data into the immutable job directory; `PAIR_NOTEBOOK_WORKSPACE` points to that verified copy. See [owner data preparation](PERSISTENT_RESEARCH.md#owner-data-and-immutable-preparation).
 
 The submitted snapshot is immutable for that job: later collaborative edits do not alter running training. At most 256 text files and 4 MiB of JSON input can be sent. Install dependencies on the agent in advance; scripts are launched without a shell or automatic package installation. Large datasets stay on the PC.
 
@@ -153,7 +144,7 @@ The submitted snapshot is immutable for that job: later collaborative edits do n
 - An agent restart with its original state directory resumes reporting from the same runner and its stored output. An ambiguous launch, runner crash or PC reboot is reported as interrupted only after recovery can acquire both `run.lock` and `execution.lock`. Recovery waits for descendant cleanup and never automatically executes that accepted job again. Resume from a checkpoint in a new job if needed.
 - A different agent installation cannot take over an already running claim. Restore the original state directory to reconcile it; do not delete agent state as a recovery shortcut.
 - Cancellation of an offline agent is delivered when it reconnects. Cancellation is a request until that agent confirms it; it cannot power off a remote process while the network is unavailable.
-- Each job retains its source, files and checkpoints in `<agent-state>/jobs/<job-id>/work/`. Retrieve artifacts through your existing SSH/file access to that PC, or save them into `PAIR_NOTEBOOK_WORKSPACE` for future jobs. The VPS UI displays status and logs; it does not stream model weights or datasets.
+- Each job retains its source, files and checkpoints in `<agent-state>/jobs/<job-id>/work/`. Retrieve artifacts through your existing SSH/file access to that PC, and explicitly stage a verified checkpoint for a new continuation. The VPS UI displays status and logs; it does not stream model weights or datasets.
 - The broker retains the last 1 MiB of each job's output. The PC stores up to 32 MiB of output and continues draining further output so verbose training cannot block on a full pipe. Job files remain until the owner archives them.
 - The broker supports up to 1000 stored jobs. Archive completed job JSON files while the broker is stopped, and retain any active claims. Use one broker process per store.
 - The broker keeps job metadata in memory and reads one payload from disk at a time, so archived source/output do not all occupy VPS memory.
@@ -161,7 +152,7 @@ The submitted snapshot is immutable for that job: later collaborative edits do n
 
 The P2P editor session retains its existing host availability rules. A persistent compute agent does not become the editor Session Host. Background jobs and their VPS view remain available independently of that editor session.
 
-Notebook jobs preserve cell boundaries, a shared Python namespace and future-import state. The selected environment can run IPython magics and shell syntax when IPython is installed; ordinary Python cells also work without it. The first failed cell stops the job. Source snapshots remain bounded text inputs; binary datasets stay in the owner-provisioned compute workspace.
+Notebook jobs preserve cell boundaries, a shared Python namespace and future-import state. The selected environment can run IPython magics and shell syntax when IPython is installed; ordinary Python cells also work without it. The first failed cell stops the job. Source snapshots remain bounded text inputs; binary datasets are owner-provisioned and copied through a pinned, hash-verified manifest.
 
 ## Verification in this branch
 

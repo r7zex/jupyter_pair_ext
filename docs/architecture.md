@@ -1,5 +1,7 @@
 # Pair Notebook architecture
 
+In 0.5.38 editor sessions, transport routes and durable compute jobs have separate lifetimes. For unattended research, an independent agent owns a detached supervisor/runner and immutable source/data receipts; the broker persists scoped cancellation intents. Interactive kernels and the shared host shell still belong to Extension Host. [Persistent research](PERSISTENT_RESEARCH.md) documents these limits and the exact typed `CONFIRM` contract.
+
 ## Responsibilities
 
 Version 0.5.13 adds shared source-only editor replicas with version-aware merges, stable-ID structural deltas, and native execution ownership guards. Incremental notebook mutations account for the aggregate source/output budget, including retained cells. File lifecycle transitions remove obsolete CRDT/binary representations before materialization.
