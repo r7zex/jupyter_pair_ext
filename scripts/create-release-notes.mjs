@@ -60,6 +60,7 @@ ${changes}
 ## Download
 
 - \`${vsixName}\` — the only release asset users need. GitHub displays its SHA-256 digest next to the file.
+- \`pair-notebook-complete-${version}.zip\` — full source and matching compute agent for compute owners. Update editors, broker and agent together.
 
 GitHub also adds automatic **Source code** archives. They are for reading the source and cannot be installed as a VS Code extension.
 

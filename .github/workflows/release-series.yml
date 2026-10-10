@@ -1,0 +1,214 @@
+name: Publish releases 0.5.31 through 0.5.38
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-series.yml
+      - scripts/publish-release-series.mjs
+      - scripts/release-series.test.mjs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-series-0.5.31-0.5.38
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 0.5.31
+            commit: fdd982f4f46ac2e174166f8b89439ba8974b41f5
+          - version: 0.5.32
+            commit: a27427b8a7e6ba74ac68190e75fa5adce70f77f4
+          - version: 0.5.33
+            commit: de1605f8b64cec5f7a91e05fa3d08b6e4f3f86d9
+          - version: 0.5.34
+            commit: 672d4b0903273a679439712c787be28f7a3a4699
+          - version: 0.5.35
+            commit: 3ad515a881ae70412d168ea0142365e254f20a2e
+          - version: 0.5.36
+            commit: a95f9198fc91ff31496d22ede0ac9a1c7e762c03
+          - version: 0.5.37
+            commit: 97042cc8d46ca842f3dc0885e347316c3246b45a
+          - version: 0.5.38
+            commit: ${{ github.sha }}
+    env:
+      PAIR_RELEASE_VERSION: ${{ matrix.version }}
+      PAIR_RELEASE_COMMIT: ${{ matrix.commit }}
+      PAIR_RELEASE_DIR: ${{ runner.temp }}/release-series-${{ matrix.version }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Check out exact historical source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+      - name: Verify source identity
+        run: |
+          test "$(git rev-parse HEAD)" = "$PAIR_RELEASE_COMMIT"
+          test "$(node -p "require('./package.json').version")" = "$PAIR_RELEASE_VERSION"
+          mkdir -p "$PAIR_RELEASE_DIR"
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install locked dependencies and CPU kernel environment
+        run: |
+          npm ci
+          python -m pip install jupyter_client==8.10.0 ipykernel==7.4.0 numpy==2.5.3
+          python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+      - name: Capture production audit without rewriting historical lockfiles
+        run: |
+          set +e
+          npm audit --omit=dev --json > "$PAIR_RELEASE_DIR/production-audit.json"
+          PAIR_AUDIT_EXIT=$?
+          set -e
+          test "$PAIR_AUDIT_EXIT" -le 1
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads((Path(os.environ["PAIR_RELEASE_DIR"]) / "production-audit.json").read_text())
+          count = report["metadata"]["vulnerabilities"]["total"]
+          if os.environ["PAIR_RELEASE_VERSION"] == "0.5.38" and count:
+              raise SystemExit("Latest release has production vulnerabilities")
+          print("Historical production audit findings:", count)
+          PY
+      - name: Verify lint, build and complete integration suite without skips
+        run: |
+          npm run lint > "$PAIR_RELEASE_DIR/lint.log" 2>&1
+          npm run compile > "$PAIR_RELEASE_DIR/compile.log" 2>&1
+          node node_modules/mocha/bin/mocha.js --timeout 20000 --forbid-pending --exit 'out/test/**/*.test.js' > "$PAIR_RELEASE_DIR/mocha.log" 2>&1
+          tail -n 4 "$PAIR_RELEASE_DIR/mocha.log"
+      - name: Verify Python lifecycle and reference where present
+        run: |
+          python test/jupyter_bridge_unit.py -q > "$PAIR_RELEASE_DIR/bridge.log" 2>&1
+          if test -f test/vps_agent_audit.py; then
+            python test/vps_agent_audit.py -q > "$PAIR_RELEASE_DIR/worker.log" 2>&1
+          fi
+          if test -f test/anti_fraud_reference_test.py; then
+            python -W error::ResourceWarning test/anti_fraud_reference_test.py -q > "$PAIR_RELEASE_DIR/reference.log" 2>&1
+            python -W error::ResourceWarning test/persistent_reference_integration_test.py -q > "$PAIR_RELEASE_DIR/reference-integration.log" 2>&1
+          fi
+          if test -f scripts/release-series.test.mjs; then
+            node scripts/release-series.test.mjs > "$PAIR_RELEASE_DIR/publisher.log" 2>&1
+          fi
+      - name: Generate saved synthetic experiments for the current release
+        if: matrix.version == '0.5.38'
+        run: |
+          python -m examples.anti_fraud_reference generate-data --output "$PAIR_RELEASE_DIR/synthetic-reference/data" > "$PAIR_RELEASE_DIR/synthetic-data.log" 2>&1
+          python -m examples.anti_fraud_reference suite --config examples/anti_fraud_reference/configs/reference.json --data "$PAIR_RELEASE_DIR/synthetic-reference/data/transactions.csv" --manifest "$PAIR_RELEASE_DIR/synthetic-reference/data/dataset-manifest.json" --output "$PAIR_RELEASE_DIR/synthetic-reference/comparison" --seeds 7 13 29 > "$PAIR_RELEASE_DIR/synthetic-experiments.log" 2>&1
+          python - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+          folder = Path(os.environ["PAIR_RELEASE_DIR"])
+          results = folder / "synthetic-reference"
+          if len(list(results.rglob("results.json"))) != 9:
+              raise SystemExit("Expected nine completed synthetic experiments")
+          with zipfile.ZipFile(folder / "synthetic-reference-results.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for file in sorted(results.rglob("*")):
+                  if file.is_file():
+                      archive.write(file, "synthetic-reference/" + file.relative_to(results).as_posix())
+          PY
+      - name: Package and verify runtime assets
+        run: |
+          node scripts/make-artifacts.mjs --preflight-only
+          node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository > "$PAIR_RELEASE_DIR/vsix.log" 2>&1
+          node scripts/make-artifacts.mjs > "$PAIR_RELEASE_DIR/artifacts.log" 2>&1
+          cp "pair-notebook-$PAIR_RELEASE_VERSION.vsix" "pair-notebook-complete-$PAIR_RELEASE_VERSION.zip" "$PAIR_RELEASE_DIR/"
+          node scripts/create-release-notes.mjs "$PAIR_RELEASE_VERSION" "$PAIR_RELEASE_DIR/release-notes.md"
+      - name: Save checksums, provenance and public verification evidence
+        run: |
+          python - <<'PY'
+          import datetime, hashlib, json, os, zipfile
+          from pathlib import Path
+          folder = Path(os.environ["PAIR_RELEASE_DIR"])
+          version = os.environ["PAIR_RELEASE_VERSION"]
+          audit = json.loads((folder / "production-audit.json").read_text())
+          count = audit["metadata"]["vulnerabilities"]["total"]
+          with zipfile.ZipFile(folder / "validation-evidence.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for file in sorted(folder.glob("*.log")):
+                  archive.write(file, file.name)
+              archive.write(folder / "production-audit.json", "production-audit.json")
+          names = ["pair-notebook-" + version + ".vsix", "pair-notebook-complete-" + version + ".zip",
+                   "production-audit.json", "validation-evidence.zip"]
+          if version == "0.5.38":
+              names.append("synthetic-reference-results.zip")
+          manifest = {"version": version, "tag": "v" + version, "commit": os.environ["PAIR_RELEASE_COMMIT"],
+                      "verifiedAtUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                      "productionVulnerabilities": count, "verification": {"passed": True,
+                      "integrationSuite": "complete_no_skips", "pythonLifecycle": "passed",
+                      "packageIntegrity": "passed"}, "assets": []}
+          for name in names:
+              file = folder / name
+              manifest["assets"].append({"name": name, "bytes": file.stat().st_size,
+                                        "sha256": hashlib.sha256(file.read_bytes()).hexdigest()})
+          provenance = folder / "release-provenance.json"
+          provenance.write_text(json.dumps(manifest, indent=2) + "\n")
+          checksums = [asset["sha256"] + "  " + asset["name"] for asset in manifest["assets"]]
+          checksums.append(hashlib.sha256(provenance.read_bytes()).hexdigest() + "  release-provenance.json")
+          (folder / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n")
+          notes = folder / "release-notes.md"
+          text = notes.read_text().split("## Verification", 1)[0]
+          text += ("## Verification\n\nBuilt from immutable commit " + manifest["commit"] +
+                   ". The complete integration suite, Python lifecycle and artifact integrity checks passed. " +
+                   "Checksums and logs are attached in release-provenance.json, SHA256SUMS.txt and validation-evidence.zip.\n")
+          if version != "0.5.38":
+              text += "\nThis is a historical snapshot. Use [0.5.38](https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tag/v0.5.38) for the current training and confirmed-stop implementation.\n"
+          text += "\nProduction dependency audit findings: " + str(count) + ". See production-audit.json; historical lockfiles are preserved.\n"
+          text += "\nThe complete source ZIP includes the matching compute agent. Update editors, broker and agent together.\n"
+          if version == "0.5.38":
+              text += "\nsynthetic-reference-results.zip contains nine completed baseline/MLP/ablation experiments, checkpoints, saved metrics and generated paper tables. The data are synthetic; these are infrastructure checks, not results for a real fraud model.\n"
+          notes.write_text(text)
+          PY
+      - name: Retain verified files for publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-series-${{ matrix.version }}
+          path: ${{ env.PAIR_RELEASE_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish all eight verified releases
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out publishing code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Test publisher safety properties
+        run: node scripts/release-series.test.mjs
+      - name: Download verified version artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-series-*
+          path: ${{ runner.temp }}/verified-releases
+      - name: Publish immutable tags and assets in version order
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node scripts/publish-release-series.mjs "${{ runner.temp }}/verified-releases"

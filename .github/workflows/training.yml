@@ -3,6 +3,7 @@ name: Host and VPS training
 on:
   push:
     branches:
+      - main
       - codex/vps-persistent-compute
   pull_request:
     branches:
