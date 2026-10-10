@@ -181,6 +181,24 @@ jobs:
           path: ${{ env.PAIR_RELEASE_DIR }}/
           if-no-files-found: error
           retention-days: 30
+      - name: Show failed verification logs
+        if: failure() && env.PAIR_RELEASE_DIR != ''
+        run: |
+          shopt -s nullglob
+          PAIR_LOG_FILES=("$PAIR_RELEASE_DIR"/*.log)
+          if test "${#PAIR_LOG_FILES[@]}" -gt 0; then
+            tail -n 120 "${PAIR_LOG_FILES[@]}"
+          fi
+      - name: Retain failure diagnostics
+        if: failure() && env.PAIR_RELEASE_DIR != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-diagnostics-${{ matrix.version }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PAIR_RELEASE_DIR }}/*.log
+            ${{ env.PAIR_RELEASE_DIR }}/production-audit.json
+          if-no-files-found: warn
+          retention-days: 14
 
   publish:
     name: Publish all eight verified releases

@@ -318,7 +318,24 @@ export class JupyterKernel extends EventEmitter {
           child.kill();
           return;
         }
-        if (this.process === child) this.handleEvent(message);
+        if (this.process === child) {
+          if (message.type === 'complete' && message.success !== true && message.content?.ename === 'KernelDied') {
+            // Completion can arrive before the fatal message in another stdout
+            // chunk. Retire this bridge before resolving the cell so the next
+            // execute cannot reuse a dead kernel or inherit its delayed exit.
+            const error = new Error(typeof message.content.evalue === 'string'
+              ? message.content.evalue : 'Jupyter kernel exited unexpectedly.');
+            this.process = undefined;
+            this.ready = undefined;
+            this.kernelPid = undefined;
+            this.handleEvent(message);
+            this.rejectAll(error);
+            child.kill();
+            this.emit('fatal', error);
+            return;
+          }
+          this.handleEvent(message);
+        }
       };
       child.stdout.on('data', (chunk: Buffer) => {
         if (protocolFailed) return;

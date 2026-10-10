@@ -9,6 +9,7 @@
 - Restores job observation across editor restarts with bounded output and explicitly stale cached state. Adds a deliberate new standalone compute-session action after a scoped stop.
 - Adds an explicitly synthetic chronological anti-fraud baseline/MLP reference with full-state retained atomic checkpoints, deterministic CPU resume checks, validation-selected operating thresholds, saved provenance and generated multi-seed paper tables.
 - Adds an independently supervised soak runner and version-specific evidence. The real Linux CPU loopback run completed 4 hours 27.668 seconds with one launch and recovered broker/observer outages; external VPS and native Windows/GPU require separate verification.
+- Retires a crashed Jupyter bridge before settling the failed cell, allowing immediate replacement execution even when its fatal message and process exit arrive later.
 
 See [persistent research operations](docs/PERSISTENT_RESEARCH.md) and the 0.5.38 audit. Upgrade all editors and agents together; this branch push does not publish a Release or deploy production services.
 

@@ -100,7 +100,8 @@ describe('audit regressions', () => {
       assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}" "pair-notebook-complete-\$\{RELEASE_VERSION\}\.zip"\)/);
       assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
       assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
-      assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix|pair-notebook-complete|SHA256SUMS/);
+      assert.match(releaseNotesScript, /pair-notebook-complete-\$\{version\}\.zip/);
+      assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix|SHA256SUMS/);
       assert.doesNotMatch(workflow, /--clobber/);
       const compareIndex = publishJob.indexOf('cmp --silent');
       const editIndex = publishJob.indexOf('gh release edit');
