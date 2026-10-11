@@ -63,6 +63,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private visibleOutputBytes = 0;
   private readonly settingsSubscription: vscode.Disposable;
   private readonly pending: PendingSubmissionStore;
+  private readonly clientConnections = new WeakMap<VpsClient, VpsRelayConnection>();
 
   public constructor(private readonly context: vscode.ExtensionContext, private readonly currentRuntime: () => SessionRuntime | undefined) {
     this.view = vscode.window.createTreeView('pairNotebook.vpsCompute', { treeDataProvider: this });
@@ -141,7 +142,9 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private async client(): Promise<VpsClient> {
     const connection = await readVpsConnection(this.context);
     if (!connection) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS first.');
-    return new VpsClient(connection.url, connection.token);
+    const client = new VpsClient(connection.url, connection.token);
+    this.clientConnections.set(client, connection);
+    return client;
   }
 
   public async connect(): Promise<void> {
@@ -401,7 +404,9 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       validateInput: (value) => value === 'CONFIRM' ? undefined : 'Type the exact uppercase word CONFIRM with no spaces.' });
     if (text !== 'CONFIRM') return;
     const connection = await readVpsConnection(this.context);
-    if (this.disposed || !connection || connection.url !== client.endpoint || (stillCurrent && !await stillCurrent())) {
+    const original = this.clientConnections.get(client);
+    if (this.disposed || !connection || !original || connection.url !== original.url || connection.token !== original.token
+      || (stillCurrent && !await stillCurrent())) {
       throw new Error('The VPS, session or project changed while confirmation was open. Nothing was cancelled; start the action again.');
     }
     const result = await client.applyCancellation(challenge.id, text);

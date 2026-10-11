@@ -35,6 +35,40 @@ describe('Jupyter execution failures', () => {
     }
   });
 
+  it('replaces a dead kernel before its delayed fatal message or exit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-delayed-kernel-fatal-'));
+    const bridge = path.join(root, 'bridge.js');
+    await writeFile(bridge, [
+      "const fs = require('node:fs');",
+      "const readline = require('node:readline');",
+      "const marker = require('node:path').join(process.cwd(), 'started');",
+      "const first = !fs.existsSync(marker);",
+      "fs.writeFileSync(marker, 'started');",
+      "if (first) process.on('SIGTERM', () => {});",
+      "const emit = value => process.stdout.write(JSON.stringify(value) + '\\n');",
+      "emit({type:'ready',pythonExecutable:process.execPath,kernelInfo:{}});",
+      "readline.createInterface({input:process.stdin}).on('line', line => {",
+      " const command = JSON.parse(line);",
+      " if (command.command === 'shutdown') process.exit(0);",
+      " if (command.command !== 'execute') return;",
+      " if (first) {",
+      "  emit({type:'complete',requestId:command.requestId,success:false,content:{ename:'KernelDied',evalue:'Kernel exited unexpectedly'}});",
+      "  setTimeout(() => { emit({type:'fatal',message:'Old kernel exited unexpectedly'}); process.exit(0); }, 100);",
+      " } else emit({type:'complete',requestId:command.requestId,success:true,content:{status:'ok'}});",
+      "});",
+    ].join('\n'));
+    const kernel = new JupyterKernel(process.execPath, bridge, root);
+    try {
+      assert.equal((await kernel.execute('crashed-cell', 'crash')).success, false);
+      assert.equal((await kernel.execute('replacement-cell', 'continue')).success, true);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal((await kernel.execute('later-cell', 'continue')).success, true);
+    } finally {
+      await kernel.stopConfirmed();
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
   it('finishes a cell after actual kernel death and starts a usable replacement', async function () {
     this.timeout(60_000);
     const python = process.env.PAIR_NOTEBOOK_TEST_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');

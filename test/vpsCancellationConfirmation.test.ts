@@ -7,7 +7,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'mocha';
 import { VpsServer, type VpsServerOptions } from '../src/vps/server';
 import { VpsClient, VpsHttpError } from '../src/vps/client';
-import { CANCELLATION_CONFIRMATION_MS, type CancellationChallenge, type ComputeScope, type JobSubmission, terminalJob } from '../src/vps/protocol';
+import { CANCELLATION_CONFIRMATION_MS, type CancellationChallenge, type ComputeScope, type JobSubmission, type VpsJob, terminalJob } from '../src/vps/protocol';
 
 function post(endpoint: string, token: string, route: string, body: unknown): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
@@ -171,6 +171,18 @@ describe('VPS scoped cancellation confirmation and durable intent', function () 
     assert.deepEqual(await client.applyCancellation(confirmation.id, 'CONFIRM'), result);
   });
 
+  it('preserves natural completion reported after an accepted cancellation intent', async () => {
+    await client.submit(input('completion-race')); await poll();
+    const confirmation = await challenge('completion-race');
+    const receipt = await client.applyCancellation(confirmation.id, 'CONFIRM');
+    assert.equal(receipt.jobs[0]!.status, 'cancel_pending');
+    assert.equal((await complete('completion-race')).status, 200);
+    await restart();
+    const completed = await client.job('completion-race');
+    assert.equal(completed.status, 'succeeded'); assert.equal(completed.exitCode, 0);
+    assert.deepEqual(await client.applyCancellation(confirmation.id, 'CONFIRM'), receipt);
+  });
+
   it('applies consent once and replays its durable receipt without touching newer jobs', async () => {
     await client.submit(input('queued')); const confirmation = await challenge('queued');
     const result = await client.applyCancellation(confirmation.id, 'CONFIRM');
@@ -215,6 +227,84 @@ describe('VPS scoped cancellation confirmation and durable intent', function () 
     await assert.rejects(client.submit(input('late-recovery')), (error: unknown) => error instanceof VpsHttpError && error.status === 409);
   });
 
+  it('persists the authorized intent again after a failed write before cancelling any job', async () => {
+    await client.submit(input('intent-write-failure'));
+    const confirmation = await client.requestCancellation({ action: 'stop_session', scope });
+    const storage = server as unknown as { persistConfirmations(): Promise<void>; save(job: VpsJob): Promise<void> };
+    const persist = storage.persistConfirmations.bind(server);
+    const save = storage.save.bind(server);
+    let writes = 0;
+    storage.persistConfirmations = async () => {
+      if (++writes === 1) throw new Error('Injected intent write failure');
+      await persist();
+    };
+    assert.equal((await post(endpoint, team, `/v1/confirmations/${confirmation.id}/apply`, { text: 'CONFIRM' })).status, 500);
+    const ledger = path.join(directory, '.confirmations', 'operations.json');
+    assert.equal(JSON.parse(await readFile(ledger, 'utf8'))[0].state, 'pending');
+    assert.equal(JSON.parse(await readFile(path.join(directory, 'intent-write-failure.json'), 'utf8')).cancelRequested, false);
+    storage.save = async (job) => {
+      assert.equal(JSON.parse(await readFile(ledger, 'utf8'))[0].state, 'applying', 'job writes require a durable authorized intent');
+      await save(job);
+    };
+    assert.equal((await client.applyCancellation(confirmation.id, 'CONFIRM')).jobs[0]!.status, 'cancelled');
+    await restart();
+    await assert.rejects(client.submit(input('blocked-after-write-retry')), (error: unknown) => error instanceof VpsHttpError && error.status === 409);
+  });
+
+  it('reconciles a partial session stop before an agent can claim the remaining queued target', async () => {
+    await client.submit(input('first-target')); await client.submit(input('second-target'));
+    const confirmation = await client.requestCancellation({ action: 'stop_session', scope });
+    const storage = server as unknown as { save(job: VpsJob): Promise<void> };
+    const save = storage.save.bind(server);
+    let failed = false;
+    storage.save = async (job) => {
+      if (job.id === 'second-target' && !failed) { failed = true; throw new Error('Injected job write failure'); }
+      await save(job);
+    };
+    assert.equal((await post(endpoint, team, `/v1/confirmations/${confirmation.id}/apply`, { text: 'CONFIRM' })).status, 500);
+    assert.equal(JSON.parse(await readFile(path.join(directory, 'second-target.json'), 'utf8')).status, 'queued');
+    const response = await poll();
+    assert.equal(response.status, 200); assert.equal(response.data.job, null);
+    assert.deepEqual((await client.jobs()).map((job) => job.status), ['cancelled', 'cancelled']);
+    await restart();
+    assert.deepEqual((await client.applyCancellation(confirmation.id, 'CONFIRM')).jobs.map((job) => job.status), ['cancelled', 'cancelled']);
+  });
+
+  it('refuses claims and launches while a confirmed cancellation cannot be persisted', async () => {
+    await client.submit(input('unavailable-store'));
+    const confirmation = await client.requestCancellation({ action: 'stop_session', scope });
+    const storage = server as unknown as { persistConfirmations(): Promise<void> };
+    const persist = storage.persistConfirmations.bind(server);
+    storage.persistConfirmations = async () => { throw new Error('Injected unavailable cancellation store'); };
+    assert.equal((await post(endpoint, team, `/v1/confirmations/${confirmation.id}/apply`, { text: 'CONFIRM' })).status, 500);
+    assert.equal((await poll()).status, 500);
+    assert.equal((await post(endpoint, team, '/v1/jobs', input('must-not-be-admitted'))).status, 500);
+    await assert.rejects(readFile(path.join(directory, 'must-not-be-admitted.json')), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT');
+    assert.equal(JSON.parse(await readFile(path.join(directory, 'unavailable-store.json'), 'utf8')).status, 'queued');
+    storage.persistConfirmations = persist;
+    assert.equal((await poll()).data.job, null);
+    await assert.rejects(client.submit(input('still-not-admitted')), (error: unknown) => error instanceof VpsHttpError && error.status === 409);
+  });
+
+  it('does not acknowledge an in-memory receipt until its failed final ledger write is retried', async () => {
+    await client.submit(input('receipt-write-failure'));
+    const confirmation = await challenge('receipt-write-failure');
+    const storage = server as unknown as { persistConfirmations(): Promise<void> };
+    const persist = storage.persistConfirmations.bind(server);
+    let writes = 0;
+    storage.persistConfirmations = async () => {
+      if (++writes === 2) throw new Error('Injected receipt write failure');
+      await persist();
+    };
+    assert.equal((await post(endpoint, team, `/v1/confirmations/${confirmation.id}/apply`, { text: 'CONFIRM' })).status, 500);
+    const ledger = path.join(directory, '.confirmations', 'operations.json');
+    assert.equal(JSON.parse(await readFile(ledger, 'utf8'))[0].state, 'applying');
+    const result = await client.applyCancellation(confirmation.id, 'CONFIRM');
+    assert.equal(JSON.parse(await readFile(ledger, 'utf8'))[0].state, 'applied', 'successful replay requires a durable receipt');
+    await restart();
+    assert.deepEqual(await client.applyCancellation(confirmation.id, 'CONFIRM'), result);
+  });
+
   it('revokes replay permission after operator credential rotation while preserving confirmed session admission', async () => {
     await client.submit(input('rotated-operator'));
     const confirmation = await client.requestCancellation({ action: 'stop_session', scope });
@@ -240,6 +330,46 @@ describe('VPS scoped cancellation confirmation and durable intent', function () 
     server = new VpsServer(options);
     await assert.rejects(server.start(), /Confirmed run identity changed/);
     assert.equal(JSON.parse(await readFile(jobFile, 'utf8')).cancelRequested, false);
+  });
+
+  it('rejects persisted receipts with substituted actions, scopes or run identities', async () => {
+    await client.submit(input('receipt-integrity'));
+    const confirmation = await challenge('receipt-integrity');
+    await client.applyCancellation(confirmation.id, 'CONFIRM'); await server.stop();
+    const ledger = path.join(directory, '.confirmations', 'operations.json');
+    const original = await readFile(ledger, 'utf8');
+    const corruptions = [
+      (record: any) => { record.result.action = 'stop_session'; },
+      (record: any) => { record.result.targetIds[0] = 'another-target'; },
+      (record: any) => { record.result.jobs[0].createdAt += 1; },
+      (record: any) => { record.result.scope.sessionId = 'another-session'; },
+      (record: any) => { record.targets[0].projectId = 'another-project'; },
+      (record: any) => { record.scope.sessionId = 'another-session'; },
+      (record: any) => { record.requiredPermission = 'stop_session'; },
+    ];
+    for (const corrupt of corruptions) {
+      const records = JSON.parse(original); corrupt(records[0]);
+      await writeFile(ledger, JSON.stringify(records));
+      const invalid = new VpsServer(options);
+      try { await assert.rejects(invalid.start(), /cancellation ledger is inconsistent/); }
+      finally { await invalid.stop(); }
+    }
+    await writeFile(ledger, original); await restart();
+    assert.equal((await client.job('receipt-integrity')).status, 'cancelled');
+  });
+
+  it('refuses recovery when the persisted scope no longer matches its frozen targets', async () => {
+    await client.submit(input('scope-integrity'));
+    await client.requestCancellation({ action: 'stop_session', scope }); await server.stop();
+    const ledger = path.join(directory, '.confirmations', 'operations.json');
+    const records = JSON.parse(await readFile(ledger, 'utf8'));
+    records[0].state = 'applying'; records[0].appliedAt = Date.now();
+    records[0].scope.sessionId = 'another-session';
+    await writeFile(ledger, JSON.stringify(records));
+    const invalid = new VpsServer(options);
+    try { await assert.rejects(invalid.start(), /cancellation ledger is inconsistent/); }
+    finally { await invalid.stop(); }
+    assert.equal(JSON.parse(await readFile(path.join(directory, 'scope-integrity.json'), 'utf8')).cancelRequested, false);
   });
 
   it('requires the selected owner dataset identity before claiming a job', async () => {

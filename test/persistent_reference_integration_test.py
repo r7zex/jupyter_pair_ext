@@ -7,8 +7,10 @@ directory. This test does not establish an external VPS or physical GPU result.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -225,6 +228,9 @@ class PersistentReferenceIntegrationTest(unittest.TestCase):
         self.assertEqual(execution["workspace"], str(self.work))
         self.assertNotEqual(execution["workspace"], str(self.owner))
         self.assertEqual(execution["datasetSha256"], identity["sha256"])
+        self.wait_for(lambda: epoch_one["run_id"] in base64.b64decode(
+            self.request(f"/v1/jobs/{self.job_id}")["log"]).decode(),
+            "training metric upload through repeated compact known-job polls")
         self.watcher.kill(); self.watcher.wait(timeout=10)
         self.broker.terminate(); self.broker.wait(timeout=10)
         os.kill(execution["pid"], 0)  # Detached training remains alive without either observer.
@@ -274,6 +280,94 @@ class PersistentReferenceIntegrationTest(unittest.TestCase):
             "agentSha256": digest(self.agent_script), "testMetrics": result["test"]}
         (self.root / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True))
         print(f"Persistent reference integration evidence: {self.root}", flush=True)
+
+    def test_compact_poll_reports_output_and_delivers_bound_cancellation(self):
+        # Keep the real runner alive at a committed epoch while subsequent
+        # agent ticks receive the broker's compact knownJobId responses.
+        subprocess.run([self.python, "-m", "examples.anti_fraud_reference", "generate-data",
+            "--output", str(self.owner), "--rows", "1600", "--seed", "91", "--label-delay", "16"],
+            cwd=REPO, check=True, capture_output=True, text=True, timeout=30)
+        config = json.loads((REPO / "examples/anti_fraud_reference/configs/reference.json").read_text())
+        config.update(epochs=2, batch_size=96, device="cpu", model="logistic")
+        config["split"] = {"train_end": 850, "validation_start": 900, "validation_end": 1200,
+                           "test_start": 1250, "test_end": 1600, "gap": 50}
+        files = {f"examples/anti_fraud_reference/{name}":
+                 (REPO / "examples/anti_fraud_reference" / name).read_text() for name in SOURCE_FILES}
+        files.update({"config.json": json.dumps(config), "integration_entry.py": ENTRYPOINT})
+        self.launch_broker()
+        spec = importlib.util.spec_from_file_location("pair_reference_compact_agent", self.agent_script)
+        agent_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agent_module)
+        args = argparse.Namespace(url=self.endpoint, id="reference-pc", name="Reference CPU owner",
+            state=str(self.state), workspace=str(self.owner), data_manifest=str(self.owner / "owner-data-manifest.json"),
+            python=self.python, token_file=None)
+        with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": self.agent_token}):
+            observer = agent_module.Agent(args)
+        observed_polls = []
+        request = observer.request
+        def record_response(action, body):
+            response = request(action, body)
+            if action == "poll" and response["job"] is not None:
+                observed_polls.append(response["job"])
+            return response
+        observer.request = record_response
+        try:
+            observer.tick()
+            resources = self.request("/v1/agents")[0]["resources"]
+            identity = {key: resources["dataset"][key] for key in ["version", "sha256"]}
+            scope = {"projectId": "reference-project", "sessionId": "reference-session"}
+            job = {"id": self.job_id, "agentId": "reference-pc", **scope,
+                   "title": "compact poll and cancellation", "device": "cpu",
+                   "entrypoint": "integration_entry.py", "files": files, "args": [], "dataset": identity}
+            submitted = self.request("/v1/jobs", job)
+            observer.tick()
+            self.assertIn("files", observed_polls[-1])
+            self.wait_for(lambda: (self.work / "epoch-one.json").is_file(), "committed epoch before compact poll", timeout=45)
+            observer.tick()
+            compact = observed_polls[-1]
+            self.assertNotIn("files", compact)
+            self.assertNotIn("args", compact)
+            for key in ["id", "createdAt", "projectId", "sessionId", "ownerIdentity", "entrypoint", "dataset"]:
+                self.assertEqual(compact[key], submitted[key], key)
+            observed = self.request(f"/v1/jobs/{self.job_id}")
+            self.assertEqual(observed["status"], "running")
+            self.assertIn('"epoch": 1', base64.b64decode(observed["log"]).decode())
+            challenge = self.request("/v1/confirmations", {"action": "cancel_job", "scope": scope, "targetIds": [self.job_id]})
+            applied = self.request(f"/v1/confirmations/{challenge['id']}/apply", {"text": "CONFIRM"})
+            self.assertEqual(applied["targetIds"], [self.job_id])
+            self.assertEqual(applied["jobs"][0]["status"], "cancel_pending")
+            observer.tick()
+            self.assertNotIn("files", observed_polls[-1])
+            self.assertTrue(observed_polls[-1]["cancelRequested"])
+            self.assertTrue((self.job_directory / "cancel").exists())
+            self.wait_for(lambda: (self.job_directory / "result.json").is_file(), "confirmed stop of gated training", timeout=15)
+            observer.tick()
+            final = self.request(f"/v1/jobs/{self.job_id}")
+            self.assertEqual(final["status"], "cancelled")
+            self.assertEqual((self.work / "launch-count.txt").read_text(), "started\n")
+            self.assertFalse((self.work / "artifacts/results.json").exists())
+            execution = json.loads((self.work / "execution.json").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(execution["pid"], 0)
+            evidence = {"scope": "real-local-loopback-broker-agent-compact-poll", "jobId": self.job_id,
+                "status": final["status"], "launches": 1, "fullInitialPoll": True, "compactFollowupPoll": True,
+                "scopeOwnerMetadataUnchanged": True, "runningMetricsReported": True,
+                "confirmedCancellationDeliveredByCompactPoll": True, "trainingProcessGone": True,
+                "brokerSha256": {name: digest(self.frozen / name) for name in
+                    ["vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js"]},
+                "agentSha256": digest(self.agent_script), "externalVps": "not-evaluated"}
+            (self.root / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True))
+            print(f"Compact poll cancellation integration evidence: {self.root}", flush=True)
+        finally:
+            if self.job_directory.exists():
+                (self.job_directory / "cancel").touch()
+            for child in observer.children:
+                try:
+                    child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
+            observer.lock.close()
 
     def launch_broker_after_restart(self):
         log = (self.root / "broker.log").open("ab")
