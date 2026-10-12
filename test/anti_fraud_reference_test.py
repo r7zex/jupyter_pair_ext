@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -94,6 +95,94 @@ class ReferencePipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(CheckpointError, "config_sha256 changed"):
             self.run_train(output, resume=True)
         self.assertFalse((output / "results.json").exists())
+
+    def test_competing_resume_is_rejected_and_process_exit_releases_writer_lock(self):
+        output = self.root / "run"
+        self.run_train(output, stop_after_epoch=2)
+        config_path = self.root / "config.json"
+        atomic_json(config_path, self.config)
+        ready = self.root / "writer-ready"
+        script = """
+import json, os, sys
+from pathlib import Path
+from examples.anti_fraud_reference.checkpoints import CheckpointStore
+from examples.anti_fraud_reference.pipeline import train
+original = CheckpointStore.load
+def blocked_load(self, *args, **kwargs):
+    value = original(self, *args, **kwargs)
+    Path(sys.argv[5]).write_text('ready')
+    sys.stdin.readline()
+    os._exit(73)
+CheckpointStore.load = blocked_load
+train(json.loads(Path(sys.argv[1]).read_text()), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), resume=True)
+"""
+        child = subprocess.Popen([sys.executable, "-c", script, str(config_path), str(self.dataset),
+                                  str(self.manifest), str(output), str(ready)], cwd=REPO,
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 30
+            while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(ready.exists(), "child did not acquire the real run lock")
+            pointer = (output / "checkpoints/latest_resume.json").read_bytes()
+            with self.assertRaisesRegex(CheckpointError, "active writer"):
+                self.run_train(output, resume=True)
+            with self.assertRaisesRegex(CheckpointError, "active writer"):
+                self.run_train(output)
+            self.assertEqual((output / "checkpoints/latest_resume.json").read_bytes(), pointer)
+            self.assertFalse(list(output.glob("continuation-*.json")))
+            _, errors = child.communicate(b"exit\n", timeout=30)
+            self.assertEqual(child.returncode, 73, errors.decode())
+            finished = self.run_train(output, resume=True)
+            self.assertEqual(finished["status"], "completed")
+            self.assertEqual(len(list(output.glob("continuation-*.json"))), 1)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=30)
+
+    def test_fallback_cannot_import_another_experiment_with_identical_inputs(self):
+        output = self.root / "run"
+        foreign_output = self.root / "foreign-run"
+        original = self.run_train(output, stop_after_epoch=2)
+        self.run_train(foreign_output, stop_after_epoch=4)
+        foreign, _, _ = CheckpointStore(foreign_output / "checkpoints").load()
+        store = CheckpointStore(output / "checkpoints")
+        store.save("resume", foreign)
+        with self.assertRaisesRegex(CheckpointError, "different experiment"):
+            self.run_train(output, resume=True)
+        finished = self.run_train(output, resume=True, allow_fallback=True)
+        self.assertEqual(finished["run_id"], original["run_id"])
+        receipt = json.loads(next(output.glob("continuation-*.json")).read_text())
+        self.assertEqual(receipt["start_epoch"], 2)
+        self.assertTrue(receipt["retained_fallback"])
+
+    def test_export_rejects_changed_manifest_even_when_dataset_bytes_match(self):
+        output = self.root / "run"
+        self.run_train(output)
+        manifest = json.loads(self.manifest.read_text())
+        manifest["dataset_id"] = "changed-owner-version"
+        atomic_json(self.manifest, manifest)
+        with self.assertRaisesRegex(ValueError, "manifest identity differs"):
+            export_predictions(output / "checkpoints", self.dataset, self.manifest, self.root / "export-evaluation.json")
+        self.assertFalse((self.root / "export-evaluation.json").exists())
+
+    def test_checkpoint_epoch_step_must_match_committed_metadata(self):
+        output = self.root / "run"
+        self.run_train(output, stop_after_epoch=2)
+        store = CheckpointStore(output / "checkpoints")
+        state, path, _ = store.load()
+        state["epoch"] += 1
+        torch.save(state, path)
+        metadata = json.loads(path.with_suffix(".pt.json").read_text())
+        metadata.update(size=path.stat().st_size, sha256=digest_file(path))
+        atomic_json(path.with_suffix(".pt.json"), metadata)
+        atomic_json(store.root / "latest_resume.json", metadata)
+        with self.assertRaisesRegex(CheckpointError, "epoch/step metadata mismatch"):
+            store.load()
+        previous, _, fallback = store.load(allow_fallback=True)
+        self.assertTrue(fallback)
+        self.assertEqual(previous["epoch"], 1)
 
     def test_data_change_missing_data_and_frozen_snapshot_corruption_are_rejected(self):
         output = self.root / "run"

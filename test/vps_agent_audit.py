@@ -254,9 +254,13 @@ class AgentRegressions(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         try:
             request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/poll", data=b"{}")
-            with self.assertRaises(TimeoutError):
+            started = time.monotonic()
+            # Deadline shutdown may surface EOF or a TCP reset, depending on
+            # the kernel. Neither may turn a partial response into success.
+            with self.assertRaises((TimeoutError, ConnectionError)):
                 with agent_module.DeadlineOpener(urllib.request.ProxyHandler({})).open(request, timeout=0.12) as response:
                     self.assertEqual(json.loads(response.read()), {"job": None})
+            self.assertLess(time.monotonic() - started, 0.45)
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=2)
 
@@ -373,6 +377,92 @@ class AgentRegressions(unittest.TestCase):
             output = json.loads((directory / "output.log").read_text())
             self.assertEqual(output, {"cwd": str(directory / "work"), "workspace": str(directory / "work"),
                                       "pythonpath": str(directory / "work"), "config": "retained config"})
+
+    def test_detached_runner_does_not_execute_observer_pythonpath_startup(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-startup-isolation-") as temporary:
+            root = Path(temporary)
+            owner_path = root / "mutable-owner-modules"
+            owner_path.mkdir()
+            marker = root / "owner-startup-executed"
+            (owner_path / "sitecustomize.py").write_text(
+                "from pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('mutable observer code')\n")
+            with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), \
+                    patch.object(agent_module.Agent, "inventory", return_value={"gpus": []}):
+                observer = agent_module.Agent(self.args(root))
+            try:
+                with patch.dict(os.environ, {"PYTHONPATH": str(owner_path)}):
+                    directory = observer.ensure_job({"id": "startup-isolation", "device": "cpu", "entrypoint": "train.py",
+                                                      "args": [], "files": {"train.py": "print('retained source')"},
+                                                      "cancelRequested": False})
+                observer.children[0].wait(timeout=8)
+                self.assertEqual(agent_module.read_json(directory / "result.json"), {"status": "succeeded", "exitCode": 0})
+                self.assertEqual((directory / "output.log").read_text().strip(), "retained source")
+                self.assertFalse(marker.exists(), "Mutable observer modules must not run before reading the retained receipt")
+            finally:
+                for child in observer.children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=8)
+                observer.lock.close()
+
+    def test_inherited_python_home_cannot_replace_the_owner_selected_environment(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-python-home-") as temporary:
+            root = Path(temporary)
+            with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), \
+                    patch.object(agent_module.Agent, "inventory", return_value={"gpus": []}):
+                observer = agent_module.Agent(self.args(root))
+            try:
+                source = "import os\nprint(os.environ.get('PYTHONHOME', 'owner-selected-environment'))\n"
+                with patch.dict(os.environ, {"PYTHONHOME": str(root / "missing-home")}):
+                    directory = observer.ensure_job({"id": "python-home-isolation", "device": "cpu", "entrypoint": "train.py",
+                                                      "args": [], "files": {"train.py": source}, "cancelRequested": False})
+                observer.children[0].wait(timeout=8)
+                self.assertEqual(agent_module.read_json(directory / "result.json"), {"status": "succeeded", "exitCode": 0})
+                self.assertEqual((directory / "output.log").read_text().strip(), "owner-selected-environment")
+            finally:
+                for child in observer.children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=8)
+                observer.lock.close()
+
+    def test_replayed_receipt_cannot_change_project_session_or_authenticated_owner(self):
+        with tempfile.TemporaryDirectory(prefix="pair-agent-receipt-scope-") as temporary:
+            root = Path(temporary)
+            with patch.dict(os.environ, {"PAIR_AGENT_TOKEN": "a" * 32}), \
+                    patch.object(agent_module.Agent, "inventory", return_value={"gpus": []}):
+                observer = agent_module.Agent(self.args(root))
+            try:
+                job = {"id": "scoped-receipt", "agentId": "pc", "createdAt": 123,
+                       "projectId": "owner-project", "sessionId": "owner-session", "ownerIdentity": "owner-credential",
+                       "device": "cpu", "entrypoint": "train.py", "args": [],
+                       "files": {"train.py": "print('accepted once')"}, "cancelRequested": False}
+                directory = observer.ensure_job(job)
+                observer.children[0].wait(timeout=8)
+                for field in ("projectId", "sessionId", "ownerIdentity"):
+                    for change in ("replace", "omit"):
+                        changed = {**job, "cancelRequested": True}
+                        if change == "replace":
+                            changed[field] = "different-scope"
+                        else:
+                            changed.pop(field)
+                        with self.subTest(field=field, change=change), self.assertRaisesRegex(ValueError, "retained execution receipt"):
+                            observer.ensure_job(changed)
+                self.assertFalse((directory / "cancel").exists(), "A changed owner scope must not deliver cancellation")
+                compact = {key: value for key, value in job.items() if key not in ("files", "args")}
+                self.assertEqual(observer.ensure_job(compact), directory, "Compact polls retain the already accepted payload")
+                for field in ("files", "args"):
+                    with self.subTest(field=field), self.assertRaisesRegex(ValueError, "retained execution receipt"):
+                        observer.ensure_job({**compact, field: {} if field == "files" else ["changed argument"]})
+                self.assertEqual(observer.ensure_job(job), directory)
+                self.assertEqual(len(observer.children), 1, "The accepted receipt must retain its original execution")
+                self.assertEqual((directory / "output.log").read_text().strip(), "accepted once")
+            finally:
+                for child in observer.children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=8)
+                observer.lock.close()
 
     def test_natural_completion_is_not_relabelled_by_a_late_cancel(self):
         with tempfile.TemporaryDirectory(prefix="pair-agent-finish-race-") as temporary:
@@ -812,6 +902,55 @@ class PreparedDataRegressions(unittest.TestCase):
             with self.assertRaises(agent_module.PreparationError):
                 agent_module.copy_verified_data(root / "owner", work, data, lambda: False)
             self.assertFalse((outside / "sample.bin").exists())
+
+    def test_staging_rejects_hardlinked_partials_and_completed_snapshots_without_changing_owner_data(self):
+        for retained in ("partial", "completed"):
+            with self.subTest(retained=retained), tempfile.TemporaryDirectory(prefix="pair-data-hardlink-") as temporary:
+                root = Path(temporary)
+                data = self.manifest(root / "owner", payload=b"ownerX", name="data.bin")
+                private = root / "owner" / "private.bin"
+                original = b"owner" if retained == "partial" else b"ownerX"
+                private.write_bytes(original)
+                work = root / "run" / "work"
+                work.mkdir(parents=True)
+                if retained == "partial":
+                    staging = work.parent / ("data-staging-" + hashlib.sha256(str(work).encode("utf-8")).hexdigest()[:16])
+                    staging.mkdir()
+                    linked = staging / hashlib.sha256(b"data.bin").hexdigest()
+                else:
+                    linked = work / "data.bin"
+                try:
+                    os.link(private, linked)
+                except (OSError, NotImplementedError) as error:
+                    self.skipTest("Filesystem does not support hardlinks: " + str(error))
+                with self.assertRaisesRegex(agent_module.PreparationError, "hardlinks"):
+                    agent_module.copy_verified_data(root / "owner", work, data, lambda: False)
+                self.assertEqual(private.read_bytes(), original)
+                self.assertEqual(linked.read_bytes(), original)
+                if retained == "partial":
+                    self.assertFalse((work / "data.bin").exists())
+
+    def test_staging_rejects_a_fifo_partial_without_blocking_preparation(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO regression requires POSIX filesystem support")
+        with tempfile.TemporaryDirectory(prefix="pair-data-fifo-") as temporary:
+            root = Path(temporary)
+            data = self.manifest(root / "owner", payload=b"regular dataset", name="data.bin")
+            manifest = root / "manifest.json"
+            agent_module.atomic_json(manifest, data)
+            work = root / "staged"
+            work.mkdir()
+            staging = work.parent / ("data-staging-" + hashlib.sha256(str(work).encode("utf-8")).hexdigest()[:16])
+            staging.mkdir()
+            partial = staging / hashlib.sha256(b"data.bin").hexdigest()
+            os.mkfifo(partial)
+            result = subprocess.run([sys.executable, agent_module.__file__, "--workspace", str(root / "owner"),
+                                     "--data-manifest", str(manifest), "--stage-data", str(work)],
+                                    capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("regular files", result.stderr)
+            self.assertFalse((work / "data.bin").exists())
+            self.assertEqual((root / "owner" / "data.bin").read_bytes(), b"regular dataset")
 
 
 if __name__ == "__main__":

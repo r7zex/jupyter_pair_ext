@@ -16,7 +16,9 @@ from pathlib import Path
 import platform
 import random
 import secrets
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -105,6 +107,12 @@ def atomic_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    if os.name == 'posix':
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def read_json(path, fallback=None):
@@ -134,6 +142,49 @@ def rss_kib(pid):
     return None
 
 
+def process_identity(pid):
+    """Anchor service recovery to a boot and start time, never a reusable PID."""
+    try:
+        fields = Path('/proc', str(pid), 'stat').read_text().rsplit(')', 1)[1].split()
+        if fields[0] == 'Z':
+            return None
+        return {'pid': pid, 'startTicks': fields[19],
+            'bootId': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+    except (OSError, IndexError):
+        return None
+
+
+class RecoveredService:
+    """Handle to a previously detached observer service, pinned by Linux pidfd."""
+    def __init__(self, identity):
+        self.pid = identity['pid']
+        self.identity = identity
+        self.handle = os.pidfd_open(self.pid)
+        if process_identity(self.pid) != identity:
+            os.close(self.handle)
+            raise ProcessLookupError('Recorded service identity is no longer alive')
+
+    def poll(self):
+        return None if process_identity(self.pid) == self.identity else 0
+
+    def terminate(self):
+        signal.pidfd_send_signal(self.handle, signal.SIGTERM)
+
+    def kill(self):
+        signal.pidfd_send_signal(self.handle, signal.SIGKILL)
+
+    def wait(self, timeout):
+        until = time.monotonic() + timeout
+        while self.poll() is None:
+            if time.monotonic() >= until:
+                raise subprocess.TimeoutExpired('recovered observer service', timeout)
+            time.sleep(0.05)
+        return 0
+
+    def close(self):
+        os.close(self.handle)
+
+
 class Monitor:
     def __init__(self, state):
         self.state = state
@@ -142,13 +193,21 @@ class Monitor:
         self.credentials = read_json(state / 'credentials.json')
         self.broker = None
         self.agent = None
-        self.events = read_json(state / 'snapshot.json', {}).get('faultEvents', [])
+        self.events = []
+        if (state / 'events.jsonl').exists():
+            for line in (state / 'events.jsonl').read_text(encoding='utf-8').splitlines():
+                try:
+                    self.events.append(json.loads(line))
+                except ValueError:
+                    pass  # A partial final event cannot override committed observations.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def event(self, event, **detail):
         item = {'event': event, 'timestamp': time.time(), **detail}
         with (self.state / 'events.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(item, sort_keys=True) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         self.events.append(item)
 
     def request(self, method, route, body=None):
@@ -162,19 +221,37 @@ class Monitor:
                 raise ValueError('Oversized broker response')
             return json.loads(payload)
 
-    def spawn(self, command, logfile, env=None):
+    def spawn(self, command, logfile, env=None, service=None):
         with (self.state / logfile).open('ab', buffering=0) as output:
             child = subprocess.Popen(command, cwd=self.repo, env=env, stdin=subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, **detached_options())
+        if service:
+            identity = process_identity(child.pid)
+            if identity is None:
+                raise RuntimeError('Observer service exited before its identity was recorded')
+            services = read_json(self.state / 'service-processes.json', {})
+            atomic_json(self.state / 'service-processes.json', {**services, service: identity})
         return child
+
+    def recover_service(self, name):
+        identity = read_json(self.state / 'service-processes.json', {}).get(name)
+        if identity and process_identity(identity['pid']) == identity:
+            try:
+                child = RecoveredService(identity)
+            except ProcessLookupError:
+                return None
+            self.event('observer_service_adopted', service=name, pid=child.pid)
+            return child
+        return None
 
     def start_broker(self):
         env = dict(os.environ)
+        env.pop('PAIR_VPS_CLIENT_PRINCIPALS', None)
         env.update({'PAIR_VPS_CLIENT_TOKEN': self.credentials['client'],
             'PAIR_VPS_AGENT_TOKENS': json.dumps({'soak-cpu': self.credentials['agent']}),
             'PAIR_VPS_PORT': str(self.plan['port']), 'PAIR_VPS_BIND': '127.0.0.1',
             'PAIR_VPS_DATA': str(self.state / 'broker'), 'NO_PROXY': '127.0.0.1,localhost'})
-        self.broker = self.spawn([self.plan['node'], str(self.state / 'implementation' / 'src' / 'vps' / 'cli.js')], 'broker.log', env)
+        self.broker = self.spawn([self.plan['node'], str(self.state / 'implementation' / 'src' / 'vps' / 'cli.js')], 'broker.log', env, 'broker')
         self.event('broker_started', pid=self.broker.pid)
 
     def start_agent(self):
@@ -185,18 +262,49 @@ class Monitor:
             '--state', str(self.state / 'agent'), '--workspace', str(self.state / 'owner-workspace'),
             '--data-manifest', str(self.state / 'data-manifest.json'),
             '--token-file', str(self.state / 'agent-token'), '--python', self.plan['python'],
-            '--poll-seconds', '1'], 'agent.log', env)
+            '--poll-seconds', '1'], 'agent.log', env, 'agent')
         self.event('polling_agent_started', pid=self.agent.pid)
 
     @staticmethod
     def stop_poller(child):
-        if child and child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=5)
+        try:
+            if child and child.poll() is None:
+                try:
+                    child.terminate()
+                except ProcessLookupError:
+                    return
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
+        finally:
+            if isinstance(child, RecoveredService):
+                child.close()
+
+    def verify_completion(self, snapshot):
+        artifacts = self.state / 'agent' / 'jobs' / self.plan['runId'] / 'work' / 'artifacts' / self.plan['runId']
+        completed = read_json(artifacts / 'completed.json', {})
+        checkpoint = read_json(artifacts / 'resume.json', {})
+        event_names = {item['event'] for item in self.events}
+        required = {'broker_offline_started', 'broker_restarted_same_durable_state',
+            'polling_agent_restarted_same_identity', 'broker_observation_disconnected', 'broker_observation_reconnected'}
+        checks = {'uniqueTrainingLaunch': snapshot['uniqueTrainingLaunches'] == 1,
+            'explicitStepCountCompleted': completed.get('step') == self.plan['config']['steps'],
+            'minimumWorkloadElapsed': completed.get('elapsedSeconds', 0) >= snapshot['plannedMinimumWorkloadSeconds'],
+            'finalCheckpointCommitted': checkpoint.get('step') == self.plan['config']['steps'],
+            'checkpointDatasetMatches': checkpoint.get('datasetSha256') == self.plan['config']['datasetSha256'],
+            'isolatedDatasetMatches': snapshot['dataset']['isolatedFileSha256'] == self.plan['config']['datasetSha256'],
+            'scheduledFaultsObserved': required <= event_names,
+            'frozenImplementationMatches': all((self.state / 'implementation' / name).is_file()
+                and sha256(self.state / 'implementation' / name) == digest
+                for name, digest in self.plan['implementation']['filesSha256'].items())}
+        atomic_json(self.state / 'verification.json', {'runId': self.plan['runId'], 'verifiedAt': time.time(),
+            'actualWorkloadElapsedSeconds': completed.get('elapsedSeconds'), 'checks': checks,
+            'passed': all(checks.values()), 'externalVps': 'not_evaluated', 'physicalGpu': 'not_evaluated',
+            'realVsCodeLifecycle': 'not_evaluated'})
+        if not all(checks.values()):
+            raise RuntimeError('Soak completion verification failed: ' + ', '.join(name for name, passed in checks.items() if not passed))
 
     def snapshot(self, status, job=None, error=None):
         run_id = self.plan['runId']
@@ -225,7 +333,12 @@ class Monitor:
             'rssKiB': {'monitor': rss_kib(os.getpid()), 'broker': rss_kib(self.broker.pid) if self.broker else None,
                 'pollingAgent': rss_kib(self.agent.pid) if self.agent else None,
                 'training': rss_kib(process['pid']) if process else None},
-            'faultEvents': self.events, 'implementation': self.plan['implementation'],
+            'faultEvents': self.events,
+            'implementation': {**{key: item for key, item in self.plan['implementation'].items() if key != 'filesSha256'},
+                'filesManifestPath': str(self.state / 'plan.json'),
+                'copiedFileCount': len(self.plan['implementation'].get('filesSha256', {}))},
+            'testKind': self.plan.get('testKind', 'multi_hour_cpu_soak'),
+            'verification': read_json(self.state / 'verification.json'),
             'validationBoundary': 'production broker/agent and real Linux CPU/process/filesystem; loopback only',
             'dataset': {'declared': self.plan['dataset'],
                 'isolatedFileSha256': sha256(workspace / 'owner-synthetic-data.json') if (workspace / 'owner-synthetic-data.json').exists() else None},
@@ -238,22 +351,36 @@ class Monitor:
 
     def run(self):
         # Prevent two observers from managing the same broker/agent deployment.
-        if os.name != 'posix':
-            raise RuntimeError('This soak monitor currently requires POSIX process/lock semantics')
+        if not sys.platform.startswith('linux') or not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise RuntimeError('This soak monitor requires Linux process identity, pidfd and lock semantics')
         import fcntl
         with (self.state / 'monitor.lock').open('a') as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.start_broker()
-            self.start_agent()
+            atomic_json(self.state / 'monitor-process.json', process_identity(os.getpid()))
+            saved = read_json(self.state / 'snapshot.json', {})
+            if saved.get('runId') == self.plan['runId'] and saved.get('state') in ('succeeded', 'failed', 'cancelled', 'interrupted'):
+                return
+            names = {item['event'] for item in self.events}
+            broker_down = 'broker_offline_started' in names
+            broker_restarted = 'broker_restarted_same_durable_state' in names
+            agent_restarted = 'polling_agent_restarted_same_identity' in names
+            observation_lost = 'broker_observation_disconnected' in names
+            observation_returned = 'broker_observation_reconnected' in names
+            self.broker = self.recover_service('broker')
+            self.agent = self.recover_service('agent')
+            if self.broker is None and (not broker_down or broker_restarted):
+                self.start_broker()
+            if self.agent is None:
+                self.start_agent()
             submission = {'id': self.plan['runId'], 'agentId': 'soak-cpu', 'title': 'Synthetic infrastructure CPU soak',
                 'device': 'cpu', 'entrypoint': 'soak-train.py', 'args': [],
                 'projectId': self.plan['projectId'], 'sessionId': self.plan['sessionId'],
                 'dataset': self.plan['dataset'],
                 'files': {'soak-train.py': TRAINING, 'soak-config.json': json.dumps(self.plan['config'], sort_keys=True)}}
-            accepted = False
+            accepted = 'job_accepted' in names
             start = time.monotonic()
             # This is a readiness/admission deadline, never a training deadline.
-            while time.monotonic() - start < 60:
+            while not accepted and time.monotonic() - start < 60:
                 try:
                     if self.request('GET', '/v1/agents'):
                         self.request('POST', '/v1/jobs', submission)
@@ -266,8 +393,6 @@ class Monitor:
             if not accepted:
                 raise RuntimeError('Broker/agent admission not confirmed; accepted jobs are never automatically retried with another ID')
             faults = self.plan['faultSchedule']
-            broker_down, broker_restarted, agent_restarted = False, False, False
-            observation_lost, observation_returned = False, False
             while True:
                 current = read_json(self.state / 'agent' / 'jobs' / self.plan['runId'] / 'work' / 'artifacts' / self.plan['runId'] / 'process.json')
                 elapsed = time.time() - current['startedAt'] if current else 0
@@ -299,6 +424,8 @@ class Monitor:
                         raise RuntimeError('More than one training launch detected')
                     if job and status in ('succeeded', 'failed', 'cancelled', 'interrupted'):
                         self.event('job_terminal', status=status)
+                        if status == 'succeeded':
+                            self.verify_completion(snapshot)
                         self.snapshot(status, job)
                         # Terminal compute is already acknowledged before service cleanup.
                         self.stop_poller(self.agent)
@@ -306,10 +433,14 @@ class Monitor:
                         return
                 except (OSError, urllib.error.URLError) as error:
                     self.snapshot('waiting_for_broker', error=type(error).__name__)
-                time.sleep(5)
+                time.sleep(self.plan.get('observationSeconds', 5))
 
 
 def prepare(args):
+    if not sys.platform.startswith('linux') or not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+        raise RuntimeError('This soak runner requires Linux process identity, pidfd and lock semantics')
+    if shutil.which('node') is None:
+        raise RuntimeError('Node.js is required; compile the repository before starting this run')
     state = args.state.resolve()
     state.mkdir(parents=True, exist_ok=False, mode=0o700)
     workspace = state / 'owner-workspace'
@@ -319,6 +450,7 @@ def prepare(args):
     # Freeze the tested implementation: later compilation/editing cannot alter this run.
     shutil.copytree(args.repo.resolve() / 'out' / 'src', implementation / 'src')
     shutil.copy(args.repo.resolve() / 'scripts' / 'pair-notebook-agent.py', implementation)
+    shutil.copy(Path(__file__).resolve(), implementation / 'persistent-soak.py')
     shutil.copytree(args.repo.resolve() / 'node_modules' / 'ws', implementation / 'node_modules' / 'ws')
     randomizer = random.Random(41)
     dataset = []
@@ -345,31 +477,45 @@ def prepare(args):
     (state / 'agent-token').write_text(credentials['agent'], encoding='utf-8')
     (state / 'agent-token').chmod(0o600)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.repo, text=True).strip()
+    implementation_hashes = {str(path.relative_to(implementation)): sha256(path)
+        for path in sorted(implementation.rglob('*')) if path.is_file()}
     plan = {'runId': 'soak-' + secrets.token_hex(8), 'projectId': 'synthetic-soak-project',
         'sessionId': 'synthetic-soak-session', 'repository': str(args.repo.resolve()),
         'createdAt': time.time(), 'port': port, 'endpoint': 'http://127.0.0.1:' + str(port),
         'node': shutil.which('node'), 'python': sys.executable, 'config': config, 'dataset': dataset_identity,
-        'faultSchedule': {'brokerOfflineAtSeconds': 30, 'brokerOnlineAtSeconds': 50,
-            'pollingAgentRestartAtSeconds': 65, 'observerOfflineAtSeconds': 85, 'observerOnlineAtSeconds': 115},
+        'observationSeconds': args.observation_seconds,
+        'testKind': 'multi_hour_cpu_soak' if args.steps * args.step_seconds >= 14400 and args.fault_scale == 1 else 'short_cpu_regression',
+        'faultSchedule': {key: value * args.fault_scale for key, value in
+            {'brokerOfflineAtSeconds': 30, 'brokerOnlineAtSeconds': 50,
+             'pollingAgentRestartAtSeconds': 65, 'observerOfflineAtSeconds': 85, 'observerOnlineAtSeconds': 115}.items()},
         'implementation': {'gitHeadBeforeRun': commit, 'agentSha256': sha256(implementation / 'pair-notebook-agent.py'),
             'brokerSha256': sha256(implementation / 'src' / 'vps' / 'server.js'),
             'protocolSha256': sha256(implementation / 'src' / 'vps' / 'protocol.js'),
             'workloadSha256': hashlib.sha256(TRAINING.encode()).hexdigest(),
+            'filesSha256': implementation_hashes,
+            'filesManifestSha256': hashlib.sha256(json.dumps(implementation_hashes, sort_keys=True).encode()).hexdigest(),
+            'workingTreeModifiedBeforeRun': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=args.repo, text=True)),
             'platform': platform.platform(), 'pythonVersion': platform.python_version(),
             'nodeVersion': subprocess.check_output(['node', '--version'], text=True).strip()}}
     atomic_json(state / 'plan.json', plan)
-    with (state / 'monitor.log').open('ab', buffering=0) as output:
-        child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'monitor', '--state', str(state)],
-            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, **detached_options())
-    atomic_json(state / 'monitor-process.json', {'pid': child.pid})
+    child = start_monitor(state)
     print(json.dumps({'stateDirectory': str(state), 'monitorPid': child.pid, 'runId': plan['runId'],
+        'testKind': plan['testKind'],
         'plannedMinimumWorkloadSeconds': config['steps'] * config['minimumStepSeconds'],
-        'statusCommand': 'python3 scripts/persistent-soak.py status --state ' + str(state)}, indent=2))
+        'statusCommand': shlex.join([sys.executable, str(state / 'implementation' / 'persistent-soak.py'), 'status', '--state', str(state)]),
+        'resumeObserverCommand': shlex.join([sys.executable, str(state / 'implementation' / 'persistent-soak.py'), 'observe', '--state', str(state)])}, indent=2))
+
+
+def start_monitor(state):
+    with (state / 'monitor.log').open('ab', buffering=0) as output:
+        child = subprocess.Popen([sys.executable, str(state / 'implementation' / 'persistent-soak.py'), 'monitor', '--state', str(state)],
+            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, **detached_options())
+    return child
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'monitor', 'status', 'cancel'])
+    parser.add_argument('action', choices=['start', 'monitor', 'observe', 'status', 'cancel'])
     parser.add_argument('--state', type=Path, required=True, help='Persistent run directory; start requires a new path')
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--steps', type=int, default=14400, help='Explicit algorithmic step count (default 14400)')
@@ -377,11 +523,25 @@ def main():
     parser.add_argument('--checkpoint-steps', type=int, default=60)
     parser.add_argument('--stdout-steps', type=int, default=300, help='Default silence between output events is five minutes')
     parser.add_argument('--updates-per-step', type=int, default=20)
+    parser.add_argument('--observation-seconds', type=float, default=5)
+    parser.add_argument('--fault-scale', type=float, default=1, help='Use values below 1 only for explicitly short regression runs')
     args = parser.parse_args()
     if args.action == 'start':
         if min(args.steps, args.checkpoint_steps, args.stdout_steps, args.updates_per_step) <= 0 or not math.isfinite(args.step_seconds) or args.step_seconds < 0:
             parser.error('Step counts must be positive and step cadence finite/nonnegative')
+        if any(not math.isfinite(value) or value <= 0 for value in (args.observation_seconds, args.fault_scale)):
+            parser.error('Observation cadence and fault scale must be finite and positive')
         prepare(args)
+    elif args.action == 'observe':
+        identity = read_json(args.state / 'monitor-process.json')
+        saved = read_json(args.state / 'snapshot.json', {})
+        if saved.get('state') in ('succeeded', 'failed', 'cancelled', 'interrupted'):
+            print(json.dumps({'state': saved['state'], 'message': 'The run is terminal; no observer was started.'}))
+        elif identity and process_identity(identity['pid']) == identity:
+            print(json.dumps({'state': 'already_observing', 'monitorPid': identity['pid']}))
+        else:
+            child = start_monitor(args.state.resolve())
+            print(json.dumps({'state': 'observer_started', 'monitorPid': child.pid}))
     elif args.action == 'status':
         snapshot = read_json(args.state / 'snapshot.json')
         if snapshot:
@@ -425,6 +585,9 @@ def main():
         monitor = Monitor(args.state.resolve())
         try:
             monitor.run()
+        except BlockingIOError:
+            # A second observer never corrupts the active observer's snapshot.
+            raise RuntimeError('Another observer already owns this state directory') from None
         except Exception as error:
             # Observer failure preserves accepted compute; no implicit cancellation.
             monitor.event('monitor_failed', errorType=type(error).__name__)

@@ -1,5 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 const MAX_BRIDGE_LINE_BYTES = 32 * 1024 * 1024;
@@ -105,6 +106,7 @@ export class JupyterKernel extends EventEmitter {
   private stopping = false;
   private kernelPid: number | undefined;
   private confirmedStop: Promise<void> | undefined;
+  private failedProcessCleanup: Promise<void> | undefined;
 
   public constructor(
     private readonly pythonPath: string,
@@ -116,6 +118,7 @@ export class JupyterKernel extends EventEmitter {
   }
 
   public async start(): Promise<ReadyMessage> {
+    if (this.failedProcessCleanup) await this.failedProcessCleanup;
     if (this.ready && this.process && !this.process.killed) return this.ready;
     if (this.starting) return this.starting;
     this.confirmedStop = undefined;
@@ -181,6 +184,7 @@ export class JupyterKernel extends EventEmitter {
 
   /** A confirmed stop covers the kernel process group, including redirected workers. */
   public async stopConfirmed(): Promise<void> {
+    if (this.failedProcessCleanup) await this.failedProcessCleanup;
     if (this.confirmedStop) return this.confirmedStop;
     const child = this.process;
     const kernelPid = this.kernelPid;
@@ -224,6 +228,48 @@ export class JupyterKernel extends EventEmitter {
     // Internal lifecycle cleanup cannot show UI; explicit user commands are
     // fenced by SessionRuntime before they reach this process owner.
     void this.stopConfirmed().catch((error) => this.emit('protocolError', asError(error)));
+  }
+
+  /** Failure cleanup is bound to the retired group, never a replacement kernel. */
+  private retireFailedProcess(child: ChildProcessWithoutNullStreams, kernelPid: number | undefined): void {
+    const members: { pid: number; started: string }[] = [];
+    const identity = (pid: number): { group: number; started: string; state: string } | undefined => {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        return { group: Number(fields[2]), started: fields[19] ?? '', state: fields[0] ?? '' };
+      } catch { return undefined; } // A process may exit during enumeration.
+    };
+    const ownedGroupExists = () => members.some(({ pid, started }) => {
+      const current = identity(pid);
+      return current !== undefined && current.group === kernelPid && current.started === started && !/[ZX]/.test(current.state);
+    });
+    const signalGroup = (signal: NodeJS.Signals) => {
+      if (!kernelPid || !ownedGroupExists()) return;
+      try { process.kill(-kernelPid, signal); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    };
+    const cleanup = async () => {
+      if (kernelPid && process.platform === 'linux') {
+        for (const name of readdirSync('/proc')) {
+          if (!/^\d+$/.test(name)) continue;
+          const pid = Number(name);
+          const record = identity(pid);
+          if (record?.group === kernelPid && record.started && !/[ZX]/.test(record.state)) {
+            members.push({ pid, started: record.started });
+          }
+        }
+      }
+      signalGroup('SIGTERM');
+      child.kill();
+      await new Promise<void>((resolve) => setTimeout(resolve, 750));
+      // Retain PID birth identities across escalation. If the old group has
+      // emptied and its PGID was reused, no original live member authorizes it.
+      signalGroup('SIGKILL');
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    };
+    this.failedProcessCleanup = cleanup();
+    void this.failedProcessCleanup.catch((error) => this.emit('protocolError', asError(error)));
   }
 
   private spawnBridge(): Promise<ReadyMessage> {
@@ -325,12 +371,12 @@ export class JupyterKernel extends EventEmitter {
             // execute cannot reuse a dead kernel or inherit its delayed exit.
             const error = new Error(typeof message.content.evalue === 'string'
               ? message.content.evalue : 'Jupyter kernel exited unexpectedly.');
+            this.retireFailedProcess(child, this.kernelPid);
             this.process = undefined;
             this.ready = undefined;
             this.kernelPid = undefined;
             this.handleEvent(message);
             this.rejectAll(error);
-            child.kill();
             this.emit('fatal', error);
             return;
           }
@@ -388,8 +434,10 @@ export class JupyterKernel extends EventEmitter {
         // already started a replacement. Never let the stale child's handlers
         // clear or reject the replacement's state.
         if (this.process !== child) return;
+        if (!this.stopping) this.retireFailedProcess(child, this.kernelPid);
         this.process = undefined;
         this.ready = undefined;
+        this.kernelPid = undefined;
         this.rejectAll(error);
         if (!this.stopping) this.emit('exit', code, signal);
       });

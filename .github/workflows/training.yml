@@ -54,7 +54,8 @@ jobs:
           python -W error::ResourceWarning test/jupyter_bridge_unit.py -q
           python -W error::ResourceWarning test/vps_agent_audit.py -q
           python -W error::ResourceWarning test/anti_fraud_reference_test.py -q
-          python -W error::ResourceWarning test/persistent_reference_integration_test.py -q
+          python -W error::ResourceWarning test/persistent_soak_test.py -q
+          PAIR_REFERENCE_PYTHON="$(command -v python)" python -W error::ResourceWarning test/persistent_reference_integration_test.py -q
       - name: Package the verified extension and agent sources
         run: |
           node scripts/make-artifacts.mjs --preflight-only

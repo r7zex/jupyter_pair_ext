@@ -1,4 +1,4 @@
-# Persistent research runs — 0.5.38
+# Persistent research runs — 0.5.39
 
 The editor session, each network connection, and each accepted compute job have separate lifetimes. Use **Pair Notebook: Run Python on VPS Compute** for unattended training. Interactive notebook kernels and the shared host shell still belong to the VS Code Extension Host. They have no training-duration deadline, but cannot survive termination of that process or its machine.
 
@@ -52,11 +52,15 @@ The broker issues a random challenge bound to the authenticated principal, exact
 
 `cancel_pending` means the stop intent is retained and awaits executor acknowledgement. An offline agent is not reported as Cancelled. The agent first requests cooperative process termination, then escalates within a bounded interval against that run's supervised descendants. It does not kill every Python process or every process owned by the account. A queued run with no started process can be cancelled immediately.
 
+If durable cancellation storage fails, the broker refuses further claims/submissions until it can reconcile the frozen intent. It persists that intent again before changing targets on a retry and acknowledges completion only after publishing the receipt. Retain the state directory and restore writable storage; do not clear pending operations to unblock a session.
+
 The shared host terminal runs under the host account; participants see output, but only the current host enters commands. Remote shell-input RPC is rejected. Notebook execution is separately authorized and trusted Python can use OS APIs.
 
 The existing `PAIR_VPS_CLIENT_TOKEN` represents a trusted **team operator**. Holders have broad team job rights; it does not identify individual collaborators. To distinguish users, configure `PAIR_VPS_CLIENT_PRINCIPALS` as a JSON object mapping principal IDs to `{ "token": "...", "role": "operator|member|viewer", "projectIds": ["..."] }`. Keep all tokens in private service configuration. Operators may stop scoped session work; members submit and cancel their own jobs; viewers observe. Project restrictions apply to the compute API. Relay rooms carry opaque hashes and require the encrypted session invite; the broker cannot infer their project from the current relay envelope. Agent credentials can report only assigned work. The broker derives owner identity from credentials, never a submitted boolean or user name. Audit records contain identity, action, IDs, timestamps and outcome, without credentials.
 
 Interactive stop challenges are issued and validated by the authoritative executor and bind requester identity, host/compute epochs and the exact pending executions. Update **all participants and agents together**; legacy bare interrupt/cancel messages cannot provide this contract.
+
+Each interactive execution has its own opaque generation, including the preparing phase. Replacing a run under the same request ID invalidates previous consent. Changing the VPS credential while its dialog is open also invalidates that dialog; start the action again with the current identity.
 
 The UI guarantees an empty input and exact text validation. The authenticated API proves scoped authority and challenge use; it cannot prove that an arbitrary modified client physically typed the letters. It is not protection against the OS owner or trusted Python deliberately terminating a process.
 
@@ -65,3 +69,16 @@ The UI guarantees an empty input and exact text validation. The authenticated AP
 [The synthetic anti-fraud reference](../examples/anti_fraud_reference/README.md) contains dataset preparation, chronological evaluation, training, resume, retained atomic checkpoints, saved metrics, model export and generated paper tables. Its measurements validate infrastructure with synthetic data. They are not results for the researchers' real fraud model.
 
 Use the commands and evidence in the version-specific audit. Loopback broker/agent tests, substituted VS Code boundaries, real Extension Host CI, external VPS, Windows, physical GPU and an actually elapsed multi-hour run are separate results. A running soak is not a completed multi-hour test.
+
+The reference pipeline permits one train/resume writer per experiment directory. A second writer fails without modifying checkpoints; the OS releases the lock when its process exits, including a crash. Resume checks the original run provenance, and retained fallback cannot silently select a different experiment's checkpoint.
+
+For an independently observed Linux CPU soak after compiling the broker:
+
+```bash
+python3 scripts/persistent-soak.py start --state /srv/pair-validation/soak-0.5.39
+python3 scripts/persistent-soak.py status --state /srv/pair-validation/soak-0.5.39
+python3 scripts/persistent-soak.py observe --state /srv/pair-validation/soak-0.5.39
+python3 scripts/persistent-soak.py cancel --state /srv/pair-validation/soak-0.5.39
+```
+
+Use a new state directory for `start`; `observe` reattaches a crashed observer to the same accepted run. The default explicitly configured workload is 14,400 steps with at least one second per step, without a computation deadline. The observer, agent, compiled broker and required transport dependency are copied and hashed before launch. Observer recovery adopts services by Linux boot/process-start identity and pidfd; it does not relaunch training. Status marks stale observation and reports actual elapsed time. Completion writes `verification.json` for one launch, steps, checkpoint integrity, source hashes and recorded outages. `cancel` obtains a fresh scoped challenge and asks for exact `CONFIRM`; it never accepts a command-line boolean as consent. This harness requires Linux pidfd/lock support and storage/machine lifetime independent of the editor; it cannot keep a terminated cloud environment alive.

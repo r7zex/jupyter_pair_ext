@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from .checkpoints import (CheckpointError, CheckpointStore, atomic_json, capture_random_state,
-                          digest_file, digest_json, restore_random_state)
+                          digest_file, digest_json, experiment_lock, restore_random_state)
 from .data import chronological_split, fit_preprocessor, load_dataset, transform
 from .metrics import average_precision, evaluate, select_thresholds
 
@@ -93,6 +93,14 @@ def _stream_snapshot(source: Path, destination: Path, expected_sha: str) -> None
 
 def train(config: dict, dataset: Path, manifest: Path, output: Path, *, resume: bool = False,
           allow_fallback: bool = False, stop_after_epoch: int | None = None) -> dict:
+    """Train/resume with exclusive ownership of this experiment directory."""
+    with experiment_lock(Path(output)):
+        return _train(config, dataset, manifest, output, resume=resume,
+                      allow_fallback=allow_fallback, stop_after_epoch=stop_after_epoch)
+
+
+def _train(config: dict, dataset: Path, manifest: Path, output: Path, *, resume: bool = False,
+           allow_fallback: bool = False, stop_after_epoch: int | None = None) -> dict:
     """Resume only from epoch boundaries, with the original full config.
 
     stop_after_epoch is an explicit test/controlled-pause boundary, not a hidden
@@ -127,13 +135,22 @@ def train(config: dict, dataset: Path, manifest: Path, output: Path, *, resume: 
         "compute_agent": {key: os.environ.get(key) for key in ["PAIR_NOTEBOOK_JOB_ID", "PAIR_NOTEBOOK_SOURCE_SHA256", "PAIR_NOTEBOOK_DATA_SHA256", "PAIR_NOTEBOOK_DATA_VERSION"]},
     }
     output = Path(output)
-    if not resume and output.exists() and any(output.iterdir()):
+    if not resume and output.exists() and any(path.name != ".experiment.lock" for path in output.iterdir()):
         raise ValueError("output already contains an experiment; use an empty directory or explicit resume")
     output.mkdir(parents=True, exist_ok=True)
     store = CheckpointStore(output / "checkpoints")
     if resume:
-        saved, checkpoint_path, fell_back = store.load("resume", allow_fallback)
+        try:
+            recorded = json.loads((output / "provenance.json").read_text())
+            expected_run_id = recorded.pop("run_id")
+            if not isinstance(expected_run_id, str) or not expected_run_id:
+                raise ValueError("invalid run ID")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise CheckpointError(f"experiment provenance missing or invalid: {error}") from error
+        saved, checkpoint_path, fell_back = store.load("resume", allow_fallback, expected_run_id=expected_run_id)
         previous = saved["provenance"]
+        if previous != recorded:
+            raise CheckpointError("resume rejected: recorded experiment provenance changed")
         for key in ["config_sha256", "dataset_id", "dataset_sha256", "manifest_sha256", "environment"]:
             if previous[key] != identities[key]:
                 raise CheckpointError(f"resume rejected: {key} changed")
@@ -261,7 +278,7 @@ def train(config: dict, dataset: Path, manifest: Path, output: Path, *, resume: 
     if not best_checkpoint:
         raise CheckpointError("best validation checkpoint missing")
     best_metadata = json.loads((store.root / (best_checkpoint + ".json")).read_text())
-    best, best_path = store._read(best_metadata, "best")
+    best, best_path = store._read(best_metadata, "best", run_id)
     model.load_state_dict(best["model"])
     validation_scores, test_scores = scores_for("validation"), scores_for("test")
     validation_labels = tensors["validation"][1].cpu().numpy().astype(np.int64)
@@ -300,6 +317,9 @@ def export_predictions(export_directory: Path, dataset: Path, manifest: Path, ou
     rows, data_manifest = load_dataset(dataset, manifest)
     if exported["provenance"]["dataset_sha256"] != data_manifest["sha256"]:
         raise ValueError("export evaluation dataset identity differs")
+    if (exported["provenance"]["dataset_id"] != data_manifest["dataset_id"] or
+            exported["provenance"]["manifest_sha256"] != digest_json(data_manifest)):
+        raise ValueError("export evaluation dataset manifest identity differs")
     config = exported["config"]
     selected = chronological_split(rows, config["split"])["test"]
     model = make_model(config, len(exported["preprocessor"]["feature_indices"]))
@@ -308,7 +328,7 @@ def export_predictions(export_directory: Path, dataset: Path, manifest: Path, ou
     with torch.no_grad():
         scores = torch.sigmoid(model(torch.from_numpy(transform(selected, exported["preprocessor"]))).flatten()).numpy().astype(np.float64)
     labels = np.asarray([row["label"] for row in selected])
-    result = {"run_id": exported["run_id"], "export": path.name,
+    result = {"run_id": exported["run_id"], "export": path.name, "provenance": exported["provenance"],
               "test": evaluate(labels, scores, exported["thresholds"], config["operating_point"])}
     atomic_json(output, result)
     return result

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.39 - 2026-10-11 (durable recovery and experiment ownership)
+
+- Persists confirmed cancellation intent before changing jobs on every retry. Incomplete stop operations close admission and are reconciled before further claims; failed receipt writes cannot produce a successful replay. Retained cancellation metadata is checked before recovery.
+- Binds interactive stop challenges to an opaque execution generation and preserves preparation start times. VPS stop dialogs reject a changed credential. Immediately retires a dead Jupyter bridge before the next cell starts.
+- Isolates detached worker bootstrap from inherited Python startup/search settings, rejects hardlinked or nonregular data staging files, and verifies retained project/session/owner metadata before replay or cancellation.
+- Gives each reference experiment one process-owned writer lock, rejects checkpoints from another run and inconsistent epoch/step metadata, and verifies the data manifest during export evaluation.
+- Freezes the detached soak observer and dependencies, adopts only verified service process identities after observer restart, preserves fault history and writes explicit completion verification. Fresh 0.5.39 evidence is separate from historical 0.5.38 results.
+
+See [the current audit](docs/HOST_TRAINING_AUDIT_0.5.39_2026-10-11.md). External VPS, native Windows, physical GPU and a completed multi-hour run on this version require separate evidence. No Release or production deployment is part of this branch update.
+
 ## 0.5.38 - 2026-10-10 (persistent research and confirmed stops)
 
 - Requires fresh exact typed `CONFIRM` for managed notebook/terminal stops and destructive editor-session operations. Executor challenges bind identity, authority and exact runs; unconfirmed remote interrupts fail closed. Observer disconnect and notebook UI deletion no longer interrupt accepted running work.

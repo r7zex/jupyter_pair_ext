@@ -405,6 +405,50 @@ describe('VPS durable background compute', function () {
     assert.match(Buffer.from((await guestClient.job('guest-acceptance')).log, 'base64').toString(), /guest training/);
   });
 
+  it('finishes scoped training once after repeated compact known-job HTTP polls', async function () {
+    if (process.platform === 'win32') this.skip();
+    const state = path.join(directory, 'compact-agent');
+    const work = path.join(state, 'jobs', 'compact-training', 'work');
+    let compactPolls = 0;
+    const api = (server as unknown as { server: http.Server }).server;
+    const observe = (incoming: http.IncomingMessage): void => {
+      if (incoming.url !== '/v1/agents/compute-pc/poll') return;
+      const chunks: Buffer[] = [];
+      incoming.on('data', (bytes: Buffer) => chunks.push(bytes));
+      incoming.once('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (body.knownJobId === 'compact-training') compactPolls++;
+      });
+    };
+    api.on('request', observe);
+    const child = spawn('python3', [path.resolve('scripts/pair-notebook-agent.py'), '--url', endpoint, '--id', 'compute-pc',
+      '--state', state, '--workspace', directory, '--poll-seconds', '0.1'], {
+      env: { ...process.env, PAIR_AGENT_TOKEN: agentToken, NO_PROXY: '127.0.0.1,localhost' }, stdio: 'ignore',
+    });
+    children.push(child);
+    try {
+      await until(async () => (await client.agents()).length === 1);
+      const submitted = await client.submit({ ...job('compact-training'), projectId: 'compact-project', sessionId: 'compact-session', files: {
+        'train.py': 'import time\nfrom pathlib import Path\nwith Path("launches").open("a") as f: f.write("once\\n")\nwhile not Path("release").exists(): time.sleep(0.02)\nprint("compact complete", flush=True)\n',
+      } });
+      await until(() => compactPolls >= 2);
+      const compute = (await client.agents())[0]!;
+      const compact = await request(endpoint, agentToken, '/v1/agents/compute-pc/poll', {
+        instanceId: compute.instanceId, name: compute.name, resources: compute.resources, knownJobId: submitted.id,
+      });
+      assert.equal(compact.data.job.files, undefined); assert.equal(compact.data.job.args, undefined);
+      assert.equal(compact.data.job.createdAt, submitted.createdAt); assert.equal(compact.data.job.ownerIdentity, submitted.ownerIdentity);
+      assert.equal(compact.data.job.projectId, 'compact-project'); assert.equal(compact.data.job.sessionId, 'compact-session');
+      await writeFile(path.join(work, 'release'), 'release');
+      await until(async () => (await client.job(submitted.id)).status === 'succeeded');
+      assert.equal(await readFile(path.join(work, 'launches'), 'utf8'), 'once\n');
+      assert.match(Buffer.from((await client.job(submitted.id)).log, 'base64').toString(), /compact complete/);
+    } finally {
+      api.off('request', observe);
+      await writeFile(path.join(work, 'release'), 'release').catch(() => undefined);
+    }
+  });
+
   it('cancels an actual detached training process without making a participant the host', async function () {
     if (process.platform === 'win32') this.skip();
     const state = path.join(directory, 'cancel-agent');

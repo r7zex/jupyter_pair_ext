@@ -13,6 +13,7 @@ import re
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -62,6 +63,30 @@ def dataset_identity(manifest):
     return {"version": manifest["version"], "sha256": hashlib.sha256(encoded).hexdigest(), "files": len(manifest["files"])}
 
 
+def snapshot_stream(path, mode):
+    """A retained snapshot must never alias owner data or block on a FIFO."""
+    def isolated_file(metadata):
+        return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+
+    try:
+        if path.exists() or path.is_symlink():
+            if not isolated_file(path.lstat()):
+                raise PreparationError("Prepared data snapshots must be regular files without symlinks or hardlinks.")
+
+        def opener(filename, flags):
+            # Anchor the final component at open time. O_NONBLOCK avoids a
+            # replaced FIFO blocking before fstat can reject its file type.
+            return os.open(filename, flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
+
+        stream = open(path, mode, opener=opener)
+        if not isolated_file(os.fstat(stream.fileno())):
+            stream.close()
+            raise PreparationError("Prepared data snapshots must be regular files without symlinks or hardlinks.")
+        return stream
+    except OSError as error:
+        raise PreparationError("Prepared data snapshot storage is unavailable or unsafe. Prepare a separate staging directory.") from error
+
+
 def copy_verified_data(source_root, work, manifest, cancelled):
     """Bounded, resumable local staging. Publish only complete hash-verified files."""
     try:
@@ -97,7 +122,7 @@ def copy_verified_data(source_root, work, manifest, cancelled):
         retained = target if target.exists() else partial
         offset = 0
         if retained.exists():
-            with retained.open("rb") as stream:
+            with snapshot_stream(retained, "rb") as stream:
                 while True:
                     block = stream.read(CHUNK)
                     if not block:
@@ -110,7 +135,7 @@ def copy_verified_data(source_root, work, manifest, cancelled):
             raise PreparationError("Prepared data snapshot failed its integrity check. Prepare a fresh run.")
         if target.exists():
             continue
-        with source.open("rb") as original, partial.open("ab") as destination:
+        with source.open("rb") as original, snapshot_stream(partial, "ab") as destination:
             original.seek(offset)
             while True:
                 if cancelled():
@@ -185,8 +210,13 @@ def safe_path(value):
 
 
 def clean_environment():
+    # Interpreter startup must not load code from the observer's mutable
+    # workspace or select a different Python home/user site. The owner's
+    # explicit interpreter and the retained run snapshot choose imports.
+    excluded = {"PAIR_AGENT_TOKEN", "PAIR_VPS_CLIENT_TOKEN", "PAIR_VPS_AGENT_TOKENS",
+                "PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP", "PYTHONINSPECT"}
     return {key: value for key, value in os.environ.items()
-            if key not in ("PAIR_AGENT_TOKEN", "PAIR_VPS_CLIENT_TOKEN", "PAIR_VPS_AGENT_TOKENS")}
+            if key not in excluded}
 
 
 def stop_process(process):
@@ -857,8 +887,14 @@ class Agent:
         manifest = directory / "manifest.json"
         if manifest.exists():
             retained = read_json(manifest)["job"]
-            for field in ("id", "agentId", "createdAt", "entrypoint", "device", "gpuUuid", "files", "args", "dataset"):
-                if field in job and job[field] != retained.get(field):
+            for field in ("id", "agentId", "createdAt", "projectId", "sessionId", "ownerIdentity",
+                          "entrypoint", "device", "gpuUuid", "files", "args", "dataset"):
+                # knownJobId polls intentionally send a compact JobSummary.
+                # Only source/argv payloads may be omitted; execution ownership
+                # and all other immutable metadata must remain present.
+                if field in ("files", "args") and field not in job:
+                    continue
+                if job.get(field) != retained.get(field):
                     raise ValueError("The broker input disagrees with the retained execution receipt")
         if job.get("cancelRequested") and not (directory / "cancel").exists():
             (directory / "cancel").touch(mode=0o600)
@@ -874,7 +910,7 @@ class Agent:
             # Persist intent before spawning. On ambiguous crash recovery we never rerun Python.
             try:
                 options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-                self.children.append(subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--run-job", str(directory)],
+                self.children.append(subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "--run-job", str(directory)],
                                                        env=clean_environment(), stdin=subprocess.DEVNULL,
                                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options))
             except OSError:
