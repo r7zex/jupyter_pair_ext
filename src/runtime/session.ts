@@ -344,6 +344,7 @@ interface ExecutionOwner {
   outputState?: JupyterRenderState | undefined;
   outputTask?: CadencedTask | undefined;
   startedAt?: number | undefined;
+  generation?: string | undefined;
   events?: RemoteExecutionEventRecord[] | undefined;
   eventBytes?: number | undefined;
   eventOverflow?: Error | undefined;
@@ -431,7 +432,7 @@ export interface ExecutionStopChallenge {
   initiatorId: string;
   executorId: string;
   authority: HostClock;
-  targets: { runId: string; notebookKey: string; startedAt: number; computeEpoch: number }[];
+  targets: { runId: string; notebookKey: string; startedAt: number; generation: string; computeEpoch: number }[];
   terminalGeneration?: string | undefined;
   expiresAt: number;
 }
@@ -1724,7 +1725,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private managedStopTargets(notebookKey?: string): ExecutionStopChallenge['targets'] {
     return [...this.executionOwners].filter(([, owner]) => !notebookKey || owner.notebookKey === notebookKey)
-      .map(([runId, owner]) => ({ runId, notebookKey: owner.notebookKey, startedAt: owner.startedAt ?? Date.now(),
+      .map(([runId, owner]) => ({ runId, notebookKey: owner.notebookKey, startedAt: owner.startedAt ??= Date.now(),
+        generation: owner.generation ??= newId(),
         computeEpoch: this.computeForNotebook(owner.notebookKey).epoch }))
       .sort((left, right) => left.runId.localeCompare(right.runId));
   }
@@ -1787,7 +1789,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const activeOwner = this.executionOwners.get(target.runId);
       // A renamed run still exists even when filtering by the old notebook
       // scope returns no current targets. Its old confirmation is stale.
-      return (activeOwner && activeOwner.notebookKey !== target.notebookKey)
+      return (activeOwner && (activeOwner.notebookKey !== target.notebookKey || activeOwner.generation !== target.generation))
         || this.computeForNotebook(target.notebookKey).epoch !== target.computeEpoch;
     })) {
       throw new Error('Affected executions changed; obtain a new confirmation.');
@@ -5864,6 +5866,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       notebookKey,
       requestDigest,
       accepted: false,
+      startedAt: Date.now(),
+      generation: newId(),
       cellId,
       events: [],
       eventBytes: 0,
@@ -6434,7 +6438,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // lightweight framing, exact host-canonical target-cell convergence.
     if (fastPath && executionOwner.cellId) {
       executionOwner.outputState = createJupyterRenderState();
-      executionOwner.startedAt = Date.now();
+      executionOwner.startedAt ??= Date.now();
       this.project.setCellExecution(notebookKey, executionOwner.cellId, { requestId });
       this.project.setCellOutputs(notebookKey, executionOwner.cellId, []);
       const owner = executionOwner;
@@ -6741,7 +6745,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     };
     assertAuthority();
     this.executionOwners.set(requestId, this.executionOwners.get(requestId) ?? {
-      peerId: this.descriptor.localPeer.peerId, notebookKey, accepted: false, startedAt: Date.now(),
+      peerId: this.descriptor.localPeer.peerId, notebookKey, accepted: false, startedAt: Date.now(), generation: newId(),
     });
     this.repositoryOperations++;
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
@@ -6806,6 +6810,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       peerId: this.descriptor.localPeer.peerId,
       notebookKey,
       accepted: true,
+      startedAt: Date.now(),
+      generation: newId(),
     });
     this.activeExecutions += 1;
     this.notebookActiveExecutions.set(notebookKey, (this.notebookActiveExecutions.get(notebookKey) ?? 0) + 1);

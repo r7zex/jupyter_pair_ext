@@ -1,0 +1,397 @@
+{
+  "reportVersion": 1,
+  "packageVersion": "0.5.39",
+  "date": "2026-10-11",
+  "timezone": "Europe/Moscow",
+  "generatedAt": "2026-10-11T21:33:08.604348+03:00",
+  "repository": {
+    "url": "https://github.com/r7zex/jupyter_pair_ext",
+    "targetBranch": "codex/vps-persistent-compute",
+    "initialLocalHead": "56cfd15",
+    "initialVersion": "0.5.38",
+    "initialTreeClean": true,
+    "initialLocalStatePreserved": true,
+    "actualFetchedTargetHead": "7e75dec3702b72f619ea9032fca310db9e53a393",
+    "fetchedTargetVersion": "0.5.38",
+    "implementationIdentity": "final checked source and compiled content SHA-256; commit and remote ref in separate push receipt",
+    "sourceSha256": {
+      "scripts/pair-notebook-agent.py": "ef4d2107e4b839a995ecbe2a15747f98426ad6533a26fe3fec87cb7128f05906",
+      "scripts/persistent-soak.py": "29bf8d0b44f934e7fee2dd8c129b20b82467b26918a027bf75c3fec4569eb32d",
+      "src/vps/server.ts": "d2c8e05a10ca622d752f0c87c813fb814d5243096e77341888dfff37994f12c9",
+      "src/vps/protocol.ts": "e23f479cbe27505ea486aa117dbcafa7ac665e604e18ff6f04fc3420afae86fc",
+      "src/vps/client.ts": "79798415ce0eeb5fa11732e45f7996d4d581de5fa2ad0d4f8ea307110edf00e6",
+      "src/core/pythonKernel.ts": "c54f044a8b8206549c076d4df51d1c8b1b6db6030f8b1f8dd77e9d7f251a40e4",
+      "src/runtime/session.ts": "fff216431fa7b4f8d093ef0b67aa1aedffcda306ecb7d14bd2cc0a4e3aeeab3f",
+      "src/vscode/vpsCompute.ts": "0cfa20d3bfd76943614ca7ac532a74206c339114338022b6fde9bc26366aa94f",
+      "examples/anti_fraud_reference/checkpoints.py": "0a426abd6176b01fbb52e55f6e90e99bca8f64d7da2d22365885a254deb14b58",
+      "examples/anti_fraud_reference/pipeline.py": "cd83eae4caf47fa9d33d7224eddb4452438ba8c25d749fb1fcb83852de9d82d5",
+      "test/vps_agent_audit.py": "e48489ebe567f3c4e83260205b72b2ee418e7e8a1d39723c38f82be1ba740ce2",
+      "test/anti_fraud_reference_test.py": "bb157f1ca9087e9eedc8beae5f0a4c4fe6261b87f9f964f1a881e15fdca7bc54",
+      "test/persistent_reference_integration_test.py": "95777c6abb60d3b56800e34e53069492fd653e7e49a48607c93c9232f1a4e0f0",
+      "test/persistent_soak_test.py": "b0560aac219804df281d66e9cbe53abe4dbe573ebd88f77b6cf71da92cf1b8db",
+      "package.json": "aa0aeddc6a2e61e6bb1a873d1fb25e07b7a3c57511ccdd83edb857884e95d360",
+      "package-lock.json": "cfb30216ed64ba46ac3e33669753a9cc0b921cb36d33fbf9bc1b365e5bd18b29",
+      "test/pythonKernel.test.ts": "1aaa293cb8148461b934c150cb93c64942efa60ba2c12375bda0e71dd199eeae",
+      "test/interactiveStopProtection.test.ts": "9a09a5fb515ad57145db20db904d24dc38a3e4622a16a70f42055f5baf79dd3a",
+      "test/vpsCancellationConfirmation.test.ts": "145082a982cc17193277aee64f809e4427ce39998d2caa91346f5b059e73aa7d",
+      "test/vpsCompute.test.ts": "61a649033b9edb386f05798ed26fb788614885822abf984a9f89b9783b7b1afd",
+      "test/vpsComputeUi.test.ts": "89039bd231e5802535e5709c635bff607d3eac5a345421be2262e7d3bf35a3a4",
+      ".github/workflows/training.yml": "7b3364d5dcca8a856732bc7d21e71e0d63a66a84e9175009344909425860c86b"
+    },
+    "pushStatus": "recorded_separately_in_push_receipt",
+    "mainSwitch": false,
+    "reset": false,
+    "forcePush": false,
+    "releasePublished": false,
+    "productionDeploymentChanged": false,
+    "commitAndRemoteVerification": "/workspace/pair-validation-2026-10-11/push-receipt.json"
+  },
+  "scope": {
+    "compute": "local Linux CPU loopback broker/agent",
+    "externalVps": "out_of_scope_by_user",
+    "realFraudDatasetSupplied": false,
+    "syntheticMetricsAreResearchEvidence": false
+  },
+  "architecture": {
+    "durableMode": "broker filesystem ledger + independent polling agent + detached runner/supervisor",
+    "acceptedComputeWallClockDeadline": null,
+    "automaticAmbiguousReplay": false,
+    "projectSourceConfigDeclaredData": "retained per-run snapshots with hashes",
+    "pythonDependencies": "owner-selected environment, not automatically cloned or protected from owner modifications",
+    "interactiveKernelAndSharedShell": "Extension Host lifetime, native shutdown/reload survival not guaranteed"
+  },
+  "fixes": [
+    {
+      "area": "workerBootstrap",
+      "before": "mutable sitecustomize startup and inherited PYTHONHOME could execute owner startup or fail without result",
+      "after": "isolated internal helpers with -I -S; cleaned Python bootstrap overrides",
+      "evidence": "WORKER_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "ownerDataStaging",
+      "before": "retained hardlink modified private inode; nonregular partial could block",
+      "after": "regular single-link opened-fd validation with POSIX nofollow/nonblock",
+      "evidence": "WORKER_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "executionReceipt",
+      "before": "changed or removed immutable owner/scope could deliver cancellation",
+      "after": "strict immutable metadata before cancel; legitimate compact omission allowed only for files/args",
+      "evidence": "WORKER_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "cancellationLedger",
+      "before": "write failure could claim unresolved target, publish premature success or restore substituted receipt/scope",
+      "after": "persist authorized intent before reconciliation and target writes; persist success receipt; validate restored action/scope/targets/generations",
+      "evidence": "BROKER_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "interactiveConsent",
+      "before": "same run ID replacement inherited old consent and remote preparation elapsed was unstable",
+      "after": "opaque per-owner generation and stable admission timestamp",
+      "evidence": "INTERACTIVE_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "kernelFailure",
+      "before": "dead bridge reused on next cell and redirected descendant remained live",
+      "after": "bridge retired before failed completion; Linux PID/starttime group cleanup before replacement",
+      "evidence": "INTERACTIVE_AUDIT_0.5.39_2026-10-11.md"
+    },
+    {
+      "area": "referenceCheckpoint",
+      "before": "competing resume writers, foreign run fallback and incomplete export manifest identity checks",
+      "after": "OS-owned experiment writer lock, run/provenance/envelope validation and full export dataset identity",
+      "evidence": "synthetic-reference-0.5.39.zip/reference-suite/validation-notes.json"
+    },
+    {
+      "area": "soakObserver",
+      "before": "mutable observer code, lock contender overwrote snapshot, restart duplicated observer services",
+      "after": "frozen observer/dependency hashes, fsynced event ledger, Linux boot/start identity plus pidfd adoption, detached observe and completion verification",
+      "evidence": "validation-plan-2026-10-11.md"
+    }
+  ],
+  "confirm": {
+    "exactText": "CONFIRM",
+    "freshInputRequired": true,
+    "dialogOpenStopsCompute": false,
+    "scope": "exact action/project/session/targets/generation",
+    "authority": "authenticated host/operator or authorized per-job principal",
+    "singleUse": true,
+    "offlineState": "cancel_pending until acknowledged",
+    "naturalCompletionRace": "preserve actual succeeded result",
+    "boundary": "managed UI/API only; arbitrary trusted shell/Python and OS-owner actions outside guarantee",
+    "manualHumanTypingProvableAgainstModifiedClient": false
+  },
+  "validation": {
+    "evidenceDirectory": "/workspace/pair-validation-2026-10-11",
+    "python": {
+      "uniqueTests": 140,
+      "passed": 140,
+      "failed": 0,
+      "skipped": 0,
+      "suites": [
+        {
+          "suite": "worker",
+          "uniqueTests": 107,
+          "status": "passed",
+          "skipped": 0,
+          "durationSeconds": 131.615,
+          "log": "worker-tests.log"
+        },
+        {
+          "suite": "jupyterBridge",
+          "uniqueTests": 9,
+          "status": "passed",
+          "skipped": 0,
+          "log": "jupyter-bridge-tests.log"
+        },
+        {
+          "suite": "referencePipeline",
+          "uniqueTests": 16,
+          "status": "passed",
+          "skipped": 0,
+          "durationSeconds": 16.546,
+          "log": "synthetic-reference-0.5.39.zip/reference-suite/regression-tests.log"
+        },
+        {
+          "suite": "persistentReferenceIntegration",
+          "uniqueTests": 2,
+          "status": "passed",
+          "skipped": 0,
+          "durationSeconds": 45.395,
+          "log": "reference-integration-final.log"
+        },
+        {
+          "suite": "soakObserver",
+          "uniqueTests": 6,
+          "status": "passed",
+          "skipped": 0,
+          "log": "soak-runner-tests.log"
+        }
+      ]
+    },
+    "typescript": {
+      "finalSuiteStatus": "passed",
+      "finalUniqueTests": 4763,
+      "finalPassed": 4763,
+      "finalFailed": 0,
+      "finalSkipped": 0,
+      "subsetChecks": [
+        {
+          "suite": "interactive",
+          "uniqueTests": 42,
+          "passed": 42,
+          "failed": 0,
+          "skipped": 0,
+          "durationSeconds": 22
+        },
+        {
+          "suite": "broker",
+          "uniqueTests": 46,
+          "passed": 46,
+          "failed": 0,
+          "skipped": 0
+        }
+      ],
+      "counting": "subsets and reruns are not added to full suite count",
+      "durationSeconds": 382.444,
+      "start": "2026-10-11T18:24:35.451Z",
+      "end": "2026-10-11T18:30:57.895Z",
+      "log": "typescript-tests.json"
+    },
+    "compile": "passed",
+    "syntax": "passed",
+    "eslint": "passed",
+    "npmAuditVulnerabilities": 0,
+    "nativeVsCode": {
+      "status": "unavailable",
+      "reason": "Could not find VS Code",
+      "log": "vscode-e2e.log"
+    },
+    "physicalGpu": {
+      "status": "not_evaluated",
+      "torchCudaAvailable": false
+    },
+    "windows": "not_evaluated",
+    "macos": "not_evaluated",
+    "mocks": "VS Code API in runtime/UI tests; selected inventory/transport fixtures. Local process/filesystem/Jupyter/Torch integration uses real execution.",
+    "compiledSha256": {
+      "out/extension.js": "ecb78c567c19f538dd76896ac8b371ca1819a00bdc41bf7623a8f206ed9b194c",
+      "out/src/vps/cli.js": "b0ac4fdec2d36a06a91e03bb3a8fa12f6f679710b4c8bda22f47be7029a15368",
+      "out/src/vps/server.js": "77d68a020cc33e55ccb70439924b36628f685c1b5bfa709e7b4fc6f82ce1a6da",
+      "out/src/vps/protocol.js": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e",
+      "out/src/core/atomicFile.js": "bb6622f8a66495953945c9c8349f012cedfd02c516408d0c115f334a71041c88",
+      "out/src/core/pythonKernel.js": "83fb57d19f64f2c3c4bf2d699319141b9e4d6168b1904f65ec6a72d7df8ac7f6",
+      "out/src/runtime/session.js": "ba1bb8fddbd9d46a86182d669adb6fa5d7023737f0a3909e52af375f656193b4"
+    }
+  },
+  "reference": {
+    "environment": {
+      "python": "3.12.14",
+      "torch": "2.14.1+cpu",
+      "numpy": "2.5.3",
+      "device": "cpu"
+    },
+    "completedSyntheticRuns": 9,
+    "seeds": [
+      7,
+      13,
+      29
+    ],
+    "variants": [
+      "logistic full history",
+      "MLP full history",
+      "MLP history removed"
+    ],
+    "datasetId": "synthetic-v1-seed91-rows4000-delay24",
+    "datasetSha256": "79cce50634c5e676a4018269cb25321aa166c3be3b534b8d492912266800b176",
+    "artifact": "/workspace/pair-validation-2026-10-11/synthetic-reference-0.5.39.zip",
+    "artifactSha256": "20c76885ddcf39e3fdb9a711a744fc1bea28249d351786819ae8889c850c54ff",
+    "resumeBoundary": "completed epochs; partial epoch may replay from committed checkpoint",
+    "trustedResumeArtifactsOnly": true,
+    "sha256IsAuthentication": false,
+    "realFraudModelSuperiorityClaimed": false
+  },
+  "soak": {
+    "pilot": {
+      "passed": true,
+      "actualWorkloadElapsedSeconds": 14.278937578201294,
+      "completedSteps": 100,
+      "uniqueTrainingLaunches": 1,
+      "observerSigkillSurvived": true,
+      "allEightChecksPassed": true,
+      "acceleratedFaultTimes": true,
+      "multiHourDurationClaimed": false,
+      "evidence": "/workspace/pair-validation-2026-10-11/soak-pilot-fixed/pilot-evidence.json"
+    },
+    "initialFailure": {
+      "passed": false,
+      "reason": "Frozen polling worker rejects compact known-job receipt; durable result replay did not complete",
+      "computeNaturallySucceeded": true,
+      "evidence": "/workspace/pair-validation-2026-10-11/soak-pilot/pilot-evidence.json"
+    },
+    "long": {
+      "runId": "soak-70596cccb0ea953b",
+      "state": "running",
+      "observedAtEpochSeconds": 1791743585.9251127,
+      "actualElapsedSeconds": 854.2898652553558,
+      "progress": {
+        "elapsedSeconds": 854.121725320816,
+        "globalUpdate": 16820,
+        "loss": 0.026628114135204592,
+        "runId": "soak-70596cccb0ea953b",
+        "step": 841,
+        "syntheticAccuracy": 0.99609375,
+        "timestamp": 1791743585.7569818
+      },
+      "checkpoint": {
+        "format": "pair-soak-stdlib-v1",
+        "hasModelAndOptimizer": true,
+        "path": "/workspace/pair-validation-2026-10-11/soak-long/agent/jobs/soak-70596cccb0ea953b/work/artifacts/soak-70596cccb0ea953b/resume.json",
+        "sha256": "131611e5ace79128f9fd93bf14f510d5ee40fa371f1c73722051c12b1e4b84f9",
+        "step": 840
+      },
+      "uniqueTrainingLaunches": 1,
+      "plannedMinimumWorkloadSeconds": 14400,
+      "computationWallClockLimit": null,
+      "allScheduledFaultsObserved": true,
+      "fourHoursCompleted": false,
+      "terminalVerification": null,
+      "stateDirectory": "/workspace/pair-validation-2026-10-11/soak-long",
+      "launchingCommandFinishedAndIndependentProgressObserved": true,
+      "implementation": {
+        "agentSha256": "ef4d2107e4b839a995ecbe2a15747f98426ad6533a26fe3fec87cb7128f05906",
+        "brokerSha256": "77d68a020cc33e55ccb70439924b36628f685c1b5bfa709e7b4fc6f82ce1a6da",
+        "copiedFileCount": 163,
+        "filesManifestPath": "/workspace/pair-validation-2026-10-11/soak-long/plan.json",
+        "filesManifestSha256": "e35aad7ad5bfbe2d21e88a80cba4c1ca7880b854d691373d793ca85bbb835c42",
+        "gitHeadBeforeRun": "7e75dec3702b72f619ea9032fca310db9e53a393",
+        "nodeVersion": "v24.19.0",
+        "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+        "protocolSha256": "626a35e897d86fcbabe0d2721e2c81a136c5396522a55a59bc2ef1019f52ed0e",
+        "pythonVersion": "3.12.14",
+        "workingTreeModifiedBeforeRun": true,
+        "workloadSha256": "b461a80a6374bc9ad5bdb9de0a69bdf7b21786bfd246dcc8d1e1162c7ad9298b"
+      },
+      "rssKiB": {
+        "broker": 57504,
+        "monitor": 19008,
+        "pollingAgent": 40948,
+        "training": 10400
+      },
+      "faultEvents": [
+        {
+          "event": "broker_started",
+          "pid": 6536,
+          "timestamp": 1791742726.7355058
+        },
+        {
+          "event": "polling_agent_started",
+          "pid": 6537,
+          "timestamp": 1791742726.7544203
+        },
+        {
+          "event": "job_accepted",
+          "runId": "soak-70596cccb0ea953b",
+          "timestamp": 1791742729.9008827
+        },
+        {
+          "event": "broker_offline_started",
+          "timestamp": 1791742766.016224
+        },
+        {
+          "event": "broker_started",
+          "pid": 7021,
+          "timestamp": 1791742781.7207587
+        },
+        {
+          "event": "broker_restarted_same_durable_state",
+          "timestamp": 1791742781.7213888
+        },
+        {
+          "event": "polling_agent_started",
+          "pid": 7189,
+          "timestamp": 1791742797.109061
+        },
+        {
+          "event": "polling_agent_restarted_same_identity",
+          "timestamp": 1791742797.1117506
+        },
+        {
+          "event": "broker_observation_disconnected",
+          "timestamp": 1791742817.6187754
+        },
+        {
+          "event": "broker_observation_reconnected",
+          "timestamp": 1791742847.9167821
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "No completed four-hour soak at report observation",
+    "Native VS Code execution unavailable",
+    "Physical GPU and Windows/macOS execution unverified",
+    "External VPS explicitly outside chosen scope",
+    "Interactive kernels/shell remain Extension Host scoped",
+    "Python environment remains owner controlled, not cloned",
+    "Arbitrary trusted shell/Python/OS-owner actions outside managed CONFIRM guarantees",
+    "Linux failed-kernel process-group cleanup does not prove containment of deliberately escaped groups",
+    "Single-writer durable store and advisory experiment lock need retained functioning filesystem",
+    "Machine/provider shutdown, OOM, full or lost disk and hardware failure are not overcome",
+    "Synthetic infrastructure metrics do not establish real fraud quality or scientific superiority"
+  ],
+  "relatedAudits": [
+    "WORKER_AUDIT_0.5.39_2026-10-11.md",
+    "BROKER_AUDIT_0.5.39_2026-10-11.md",
+    "INTERACTIVE_AUDIT_0.5.39_2026-10-11.md",
+    "validation-plan-2026-10-11.md"
+  ],
+  "distribution": {
+    "vsixPath": "/workspace/jupyter_pair_ext/pair-notebook-0.5.39.vsix",
+    "completeSourcePath": "/workspace/jupyter_pair_ext/pair-notebook-complete-0.5.39.zip",
+    "artifactVerification": "/workspace/pair-validation-2026-10-11/build-artifacts.json",
+    "gitPushReceipt": "/workspace/pair-validation-2026-10-11/push-receipt.json",
+    "selfReferentialCommitAndArchiveHashes": "recorded outside the hashed source/archive"
+  }
+}

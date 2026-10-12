@@ -146,6 +146,27 @@ describe('interactive executor-issued CONFIRM protection', () => {
     });
   }
 
+  it('rejects consent when a new execution owner reuses the previous run ID', async () => {
+    const host = runtime('/tmp/interactive-confirm-generation'); reserve(host);
+    try {
+      const challenge = await host.requestExecutionStop('interrupt', 'train.ipynb');
+      const replacement = reserve(host, 'run-a');
+      await assert.rejects(host.applyExecutionStop(challenge, 'CONFIRM'), /Affected executions changed/);
+      assert.equal(replacement.stops(), 0);
+      assert.equal(host.executionOwners.has('run-a'), true);
+    } finally { host.executionOwners.clear(); await host.disposeAsync(); }
+  });
+
+  it('records a stable admission time for remote runs during preparation', async () => {
+    const host = runtime('/tmp/interactive-confirm-remote-admission');
+    try {
+      const owner = host.reserveRemoteExecutionOwner('run-a', 'guest', 'train.ipynb', 'digest');
+      assert.equal(typeof owner.startedAt, 'number');
+      const challenge = await host.requestExecutionStop('interrupt', 'train.ipynb');
+      assert.equal(challenge.targets[0].startedAt, owner.startedAt);
+    } finally { host.executionOwners.clear(); await host.disposeAsync(); }
+  });
+
   it('blocks direct interrupt/restart/leave/transfer calls while managed work exists', async () => {
     const host = runtime('/tmp/interactive-confirm-bypass'); const operation = reserve(host);
     try {
@@ -302,5 +323,31 @@ describe('confirmed interactive process tree stop with real filesystem/processes
       await completed;
       await until(() => !running(workerPid));
     } finally { await kernel.stopConfirmed(); if (workerPid && running(workerPid)) process.kill(workerPid, 'SIGKILL'); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('cleans a dead kernel\'s redirected worker before replacement while preserving unrelated processes', async function () {
+    this.timeout(25_000);
+    if (process.platform !== 'linux') this.skip();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-kernel-failure-child-'));
+    const python = process.env.PAIR_NOTEBOOK_TEST_PYTHON || 'python3';
+    const kernel = new JupyterKernel(python, path.resolve('media/jupyter_kernel_bridge.py'), root);
+    const unrelated = spawn('sleep', ['30'], { stdio: 'ignore' });
+    let workerPid = 0;
+    try {
+      const result = await kernel.execute('dies-with-worker', [
+        'import os, subprocess, sys, time', 'from pathlib import Path',
+        'worker_code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(\'worker.ready\', \'w\').write(\'ready\'); time.sleep(30)"',
+        'worker = subprocess.Popen([sys.executable, "-c", worker_code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+        'Path("worker.pid").write_text(str(worker.pid))',
+        'while not Path("worker.ready").exists(): time.sleep(0.01)', 'os._exit(23)',
+      ].join('\n'));
+      workerPid = Number(await readFile(path.join(root, 'worker.pid'), 'utf8'));
+      assert.equal(result.success, false);
+      assert.equal(result.content.ename, 'KernelDied');
+      const replacement = await kernel.execute('replacement-after-worker-failure', 'assert 2 + 2 == 4');
+      assert.equal(replacement.success, true);
+      await until(() => !running(workerPid));
+      assert.equal(running(unrelated.pid!), true);
+    } finally { await kernel.stopConfirmed(); unrelated.kill('SIGKILL'); if (workerPid && running(workerPid)) process.kill(workerPid, 'SIGKILL'); await rm(root, { recursive: true, force: true }); }
   });
 });

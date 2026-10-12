@@ -398,6 +398,19 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     assert.deepEqual(inputOptions.map((options) => options.value), ['', '']);
   });
 
+  it('rejects a credential change while a cancellation confirmation is open', async () => {
+    await client.submit({ id: 'old-identity-run', agentId: 'pc', title: 'baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+    const originalInput = boundary.window.showInputBox;
+    boundary.window.showInputBox = async () => {
+      secrets.set(vpsSecretKey(endpoint), randomBytes(32).toString('hex'));
+      return 'CONFIRM';
+    };
+    try { await assert.rejects(controller.cancel('old-identity-run'), /VPS, session or project changed/); }
+    finally { boundary.window.showInputBox = originalInput; }
+    assert.equal((await client.job('old-identity-run')).status, 'queued');
+    assert.equal((await client.job('old-identity-run')).cancelRequested, false);
+  });
+
   it('shows cancel_pending until a disconnected executor acknowledges process cleanup', async () => {
     await client.submit({ id: 'offline-stop', agentId: 'pc', title: 'long baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
     await register(); // The real broker claims this job; there is no worker to acknowledge cancellation.

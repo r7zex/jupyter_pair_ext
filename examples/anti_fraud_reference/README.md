@@ -39,6 +39,14 @@ sets `PAIR_NOTEBOOK_JOB_ID`, `PAIR_NOTEBOOK_SOURCE_SHA256`,
 job identities are also retained. Do not edit or share private run datasets
 with every participant automatically.
 
+Each run directory has an exclusive OS advisory writer lock throughout
+preparation, training/resume and artifact publication. A simultaneous
+`train`/`resume` targeting the same run fails before loading or changing its
+checkpoints. The OS releases the lock on process exit; the persistent
+`.experiment.lock` file is deliberately retained and does not block a later
+resume. This guard relies on the filesystem supporting the OS lock and does
+not replace the compute agent's request deduplication or observer attachment.
+
 ## Resume and artifacts
 
 `resume` uses the same arguments and original full configuration as `train`:
@@ -79,6 +87,10 @@ complete epoch; an interrupted epoch is replayed from the last saved boundary.
 A damaged latest checkpoint fails by default. Add
 `--allow-retained-fallback` to `resume` to explicitly permit rollback to an older
 usable retained checkpoint. The continuation receipt records that rollback.
+The recorded experiment run ID binds both the latest checkpoint and retained
+fallback selection: artifacts from another run are rejected even when their
+data/configuration/source are identical. Envelope epoch/step must match the
+committed sidecar. The original `provenance.json` is required for resume.
 Changing configuration, source version, dataset bytes/version, train
 preprocessing, device or tested environment rejects exact resume. Missing or
 altered frozen data also rejects it. Power-loss durability depends on the
@@ -94,6 +106,10 @@ python -m examples.anti_fraud_reference evaluate-export \
   --manifest examples/anti_fraud_reference/.runs/data/dataset-manifest.json \
   --output examples/anti_fraud_reference/.runs/logistic-seed7/export-evaluation.json
 ```
+
+Export evaluation also verifies the original dataset manifest/version, not
+only matching CSV bytes, and preserves the original run provenance in its
+saved evaluation record.
 
 ## Data and evaluation protocol
 
@@ -177,11 +193,13 @@ identify it. Nothing automatically relaunches an accepted training job.
 python -W error::ResourceWarning -m unittest test/anti_fraud_reference_test.py -v
 ```
 
-The targeted suite contains 12 unique tests. They exercise real CPU Torch
+The targeted suite contains 16 unique tests. They exercise real CPU Torch
 training, owner files, checkpoint publication,
 actual subprocess exit during serialization, corruption/format rejection,
 dataset/config/source changes, deterministic model/optimizer/scheduler/scaler/
-RNG/history equivalence, independent export evaluation, causal preprocessing and
+RNG/history equivalence, competing-process writer rejection/crash recovery,
+foreign-run fallback rejection, envelope epoch/step consistency, changed export
+manifest rejection, independent export evaluation, causal preprocessing and
 generated-table provenance. The serialization fault is injected at the
 `torch.save` boundary in a real child process. Native VS Code, broker networking,
 external VPS, physical CUDA, Windows and multi-hour execution are separate

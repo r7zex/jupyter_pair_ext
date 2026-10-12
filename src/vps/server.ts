@@ -42,6 +42,47 @@ function equalToken(actual: string, expected: string): boolean {
   return timingSafeEqual(createHash('sha256').update(actual).digest(), createHash('sha256').update(expected).digest());
 }
 
+function validCancellationSummary(raw: unknown): raw is JobSummary {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const job = raw as JobSummary;
+  try {
+    // Ledger snapshots contain metadata only. Validate their immutable launch
+    // fields with the same schema without reading or retaining source payloads.
+    validateSubmission({ ...job, files: { [job.entrypoint]: '' }, args: [] });
+  } catch { return false; }
+  return Number.isSafeInteger(job.createdAt) && job.createdAt >= 0
+    && typeof job.cancelRequested === 'boolean'
+    && ['queued', 'running', 'cancel_pending', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(job.status)
+    && (job.ownerIdentity === undefined || (typeof job.ownerIdentity === 'string' && VPS_ID.test(job.ownerIdentity)))
+    && (job.status !== 'cancel_pending' || (job.cancelRequested && job.finishedAt === undefined))
+    && (job.status !== 'cancelled' || job.cancelRequested)
+    && (!terminalJob(job.status) || (Number.isSafeInteger(job.finishedAt) && job.finishedAt! >= 0));
+}
+
+function sameCancellationRun(left: JobSummary, right: JobSummary): boolean {
+  const fields: Array<keyof JobSummary> = ['id', 'createdAt', 'agentId', 'title', 'device', 'gpuUuid',
+    'projectId', 'sessionId', 'entrypoint', 'ownerIdentity'];
+  return fields.every((field) => left[field] === right[field])
+    && (left.dataset === undefined) === (right.dataset === undefined)
+    && left.dataset?.version === right.dataset?.version && left.dataset?.sha256 === right.dataset?.sha256;
+}
+
+function sameCancellationScope(left: ComputeScope | undefined, right: ComputeScope | undefined): boolean {
+  return (left === undefined) === (right === undefined)
+    && left?.projectId === right?.projectId && left?.sessionId === right?.sessionId;
+}
+
+function validCancellationReceipt(operation: CancellationOperation): boolean {
+  const result = operation.result;
+  return !!result && result.confirmationId === operation.id && result.action === operation.action
+    && sameCancellationScope(result.scope, operation.scope) && result.appliedAt === operation.appliedAt
+    && Array.isArray(result.targetIds) && Array.isArray(result.jobs)
+    && result.targetIds.length === operation.targetIds.length && result.jobs.length === operation.targets.length
+    && result.targetIds.every((id, index) => id === operation.targetIds[index])
+    && result.jobs.every((job, index) => validCancellationSummary(job) && job.status !== 'queued'
+      && job.status !== 'running' && sameCancellationRun(job, operation.targets[index]!));
+}
+
 function resources(raw: any): AgentResources {
   if (!raw || !Number.isInteger(raw.cpuCount) || raw.cpuCount < 1 || raw.cpuCount > 65536
     || !visibleVpsText(raw.python, 512) || !Array.isArray(raw.gpus) || raw.gpus.length > 64
@@ -319,27 +360,36 @@ export class VpsServer {
     try { records = JSON.parse(await readFile(path.join(this.options.dataDirectory, '.confirmations', 'operations.json'), 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
     if (!Array.isArray(records) || records.length > 1000) throw new Error('VPS cancellation ledger is inconsistent.');
+    const seen = new Set<string>();
+    let targets = 0;
     for (const value of records) {
       const operation = value as CancellationOperation;
-      if (!operation || !VPS_ID.test(operation.id) || this.confirmations.has(operation.id)
+      if (!operation || typeof operation.id !== 'string' || !VPS_ID.test(operation.id) || seen.has(operation.id)
         || !['cancel_job', 'stop_session'].includes(operation.action) || !['pending', 'applying', 'applied'].includes(operation.state)
-        || !VPS_ID.test(operation.identity) || typeof operation.principalGeneration !== 'string'
-        || !/^[a-f0-9]{64}$/.test(operation.principalGeneration) || !VPS_ID.test(operation.authorityGeneration)
+        || typeof operation.identity !== 'string' || !VPS_ID.test(operation.identity) || typeof operation.principalGeneration !== 'string'
+        || !/^[a-f0-9]{64}$/.test(operation.principalGeneration) || typeof operation.authorityGeneration !== 'string' || !VPS_ID.test(operation.authorityGeneration)
         || !['cancel_own', 'cancel_any', 'stop_session'].includes(operation.requiredPermission)
-        || !Number.isSafeInteger(operation.createdAt) || !Number.isSafeInteger(operation.expiresAt)
+        || (operation.action === 'stop_session') !== (operation.requiredPermission === 'stop_session')
+        || !Number.isSafeInteger(operation.createdAt) || operation.createdAt < 0 || !Number.isSafeInteger(operation.expiresAt)
         || operation.expiresAt !== operation.createdAt + CANCELLATION_CONFIRMATION_MS
         || !Array.isArray(operation.targets) || !Array.isArray(operation.targetIds) || !Array.isArray(operation.targetRuns)
         || operation.targets.length !== operation.targetIds.length || operation.targetRuns.length !== operation.targetIds.length
         || new Set(operation.targetIds).size !== operation.targetIds.length
-        || operation.targetRuns.some((run, index) => !run || !VPS_ID.test(run.id) || run.id !== operation.targetIds[index]
+        || operation.targetRuns.some((run, index) => !run || typeof run.id !== 'string' || !VPS_ID.test(run.id) || run.id !== operation.targetIds[index]
           || !Number.isSafeInteger(run.createdAt) || operation.targets[index]?.id !== run.id || operation.targets[index]?.createdAt !== run.createdAt)
         || (operation.scope !== undefined && !validComputeScope(operation.scope))
         || (operation.action === 'stop_session' && !operation.scope)
         || (operation.action === 'cancel_job' && operation.targetIds.length !== 1)
-        || (operation.state !== 'pending' && !Number.isSafeInteger(operation.appliedAt))
-        || (operation.state === 'applied' && (!operation.result || operation.result.confirmationId !== operation.id))) {
+        || operation.targets.some((target) => !validCancellationSummary(target) || terminalJob(target.status)
+          || (operation.scope ? !this.inScope(target, operation.scope) : validComputeScope(target)))
+        || (operation.state !== 'pending' && (!Number.isSafeInteger(operation.appliedAt) || operation.appliedAt! < 0))
+        || (operation.state !== 'applied' && operation.result !== undefined)
+        || (operation.state === 'applied' && !validCancellationReceipt(operation))) {
         throw new Error('VPS cancellation ledger is inconsistent.');
       }
+      seen.add(operation.id);
+      targets += operation.targetIds.length;
+      if (targets > 20_000) throw new Error('VPS cancellation ledger is inconsistent.');
       // Unapplied dialogs belong to the old broker authority epoch. Confirmed
       // intents and replay receipts survive a restart and are recovered below.
       if (operation.state !== 'pending') this.confirmations.set(operation.id, operation);
@@ -382,7 +432,8 @@ export class VpsServer {
       createdAt: now, expiresAt: now + CANCELLATION_CONFIRMATION_MS,
       targetRuns: targets.map((job) => ({ id: job.id, createdAt: job.createdAt })), state: 'pending' };
     this.confirmations.set(operation.id, operation);
-    await this.persistConfirmations();
+    try { await this.persistConfirmations(); }
+    catch (error) { this.confirmations.delete(operation.id); throw error; }
     return { id: operation.id, action: operation.action,
       ...(operation.scope ? { scope: operation.scope } : {}), targetIds: [...operation.targetIds],
       targets: operation.targets.map(jobSummary), identity: operation.identity, requiredPermission: operation.requiredPermission,
@@ -416,20 +467,23 @@ export class VpsServer {
       }
       operation.state = 'applying';
       operation.appliedAt = Date.now();
-      // Persist the authorized intent before changing any jobs. A crash can be
-      // recovered without expanding the frozen target list or losing consent.
-      await this.persistConfirmations();
     }
     return this.finishCancellation(operation);
   }
 
   private async finishCancellation(operation: CancellationOperation): Promise<CancellationResult> {
     if (operation.action === 'stop_session') this.stoppedScopes.add(this.scopeKey(operation.scope!));
+    // A previous intent write may have failed before publication. Every retry
+    // must durably authorize the frozen targets before touching their records.
+    await this.persistConfirmations();
     const jobs: JobSummary[] = [];
-    for (const target of operation.targetRuns) {
+    for (const [index, target] of operation.targetRuns.entries()) {
       const current = this.jobs.get(target.id);
-      if (!current || current.createdAt !== target.createdAt) throw new Error('Confirmed run identity changed during cancellation recovery.');
+      if (!current || current.createdAt !== target.createdAt || !sameCancellationRun(current, operation.targets[index]!)) {
+        throw new Error('Confirmed run identity changed during cancellation recovery.');
+      }
       const job = await this.load(target.id);
+      if (!sameCancellationRun(job, operation.targets[index]!)) throw new Error('Confirmed run identity changed during cancellation recovery.');
       if (!terminalJob(job.status)) {
         const cancelled: VpsJob = { ...job, cancelRequested: true,
           ...(job.status === 'queued' ? { status: 'cancelled', finishedAt: Date.now() } : { status: 'cancel_pending' }) };
@@ -441,11 +495,23 @@ export class VpsServer {
       ...(operation.scope ? { scope: operation.scope } : {}), targetIds: [...operation.targetIds], jobs, appliedAt: operation.appliedAt! };
     operation.result = result;
     operation.state = 'applied';
-    await this.persistConfirmations();
+    try { await this.persistConfirmations(); }
+    catch (error) {
+      // An in-memory receipt is not an acknowledgement of durable completion.
+      // Keep recovery active until the receipt itself has been published.
+      operation.state = 'applying';
+      delete operation.result;
+      throw error;
+    }
     return result;
   }
 
   private async dispatch(method: string, route: string, body: any, agentRoute: RegExpExecArray | null, logOffset: string | null, principal?: Principal): Promise<unknown> {
+    // Reconcile an interrupted write before an agent can claim a queued target
+    // or a client can receive a success receipt. A failing store stays closed.
+    for (const operation of this.confirmations.values()) {
+      if (operation.state === 'applying') await this.finishCancellation(operation);
+    }
     if (agentRoute && method === 'POST') {
       const agentId = agentRoute[1]!;
       if (typeof body.instanceId !== 'string' || !VPS_ID.test(body.instanceId)) throw new HttpError(400, 'Invalid agent instance.');

@@ -5,6 +5,8 @@ resume files deserialize Python state: load only artifacts from a trusted owner.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -21,6 +23,46 @@ FORMAT_VERSION = 1
 
 class CheckpointError(ValueError):
     pass
+
+
+@contextmanager
+def experiment_lock(directory: Path):
+    """One writer per run, with a kernel-owned lock released on process exit.
+
+    Keep the lock inode permanently: unlinking it would let a new process lock
+    another inode while an existing writer still owns the original one.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / ".experiment.lock"
+    if path.is_symlink():
+        raise CheckpointError("unsafe experiment lock path")
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    acquired = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise CheckpointError("experiment already has an active writer; observe it instead of starting another train/resume") from error
+            raise
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def digest_file(path: Path) -> str:
@@ -126,7 +168,7 @@ class CheckpointStore:
         finally:
             Path(temporary).unlink(missing_ok=True)
 
-    def _read(self, metadata: dict, expected_role: str) -> tuple[dict, Path]:
+    def _read(self, metadata: dict, expected_role: str, expected_run_id: str | None = None) -> tuple[dict, Path]:
         try:
             filename = metadata["file"]
             if not isinstance(filename, str) or Path(filename).name != filename or not filename.endswith(".pt"):
@@ -144,9 +186,16 @@ class CheckpointStore:
             payload = torch.load(path, map_location="cpu", weights_only=expected_role == "export")
             if payload["format_version"] != FORMAT_VERSION or payload["role"] != expected_role or payload["run_id"] != metadata["run_id"]:
                 raise CheckpointError("checkpoint envelope mismatch")
+            if expected_run_id is not None and payload["run_id"] != expected_run_id:
+                raise CheckpointError("checkpoint belongs to a different experiment")
+            if any(type(payload.get(key)) is not int or payload[key] < 0 or payload[key] != metadata[key]
+                   for key in ["epoch", "global_step"]):
+                raise CheckpointError("checkpoint epoch/step metadata mismatch")
             required = {"model", "config", "provenance", "preprocessor"}
             if expected_role in {"resume", "best"}:
                 required |= {"optimizer", "scheduler", "scaler", "rng", "epoch", "global_step", "history", "best_validation_pr_auc"}
+            else:
+                required.add("thresholds")
             if not required.issubset(payload):
                 raise CheckpointError("checkpoint state incomplete")
             return payload, path
@@ -155,10 +204,10 @@ class CheckpointStore:
         except Exception as error:
             raise CheckpointError(f"invalid/incomplete checkpoint: {error}") from error
 
-    def load(self, role: str = "resume", allow_fallback: bool = False) -> tuple[dict, Path, bool]:
+    def load(self, role: str = "resume", allow_fallback: bool = False, *, expected_run_id: str | None = None) -> tuple[dict, Path, bool]:
         pointer = self.root / f"latest_{role}.json"
         try:
-            payload, path = self._read(json.loads(pointer.read_text()), role)
+            payload, path = self._read(json.loads(pointer.read_text()), role, expected_run_id)
             return payload, path, False
         except (CheckpointError, OSError, ValueError) as error:
             if not allow_fallback:
@@ -167,7 +216,7 @@ class CheckpointStore:
         for sidecar in self.root.glob(f"{role}-*.pt.json"):
             try:
                 metadata = json.loads(sidecar.read_text())
-                payload, path = self._read(metadata, role)
+                payload, path = self._read(metadata, role, expected_run_id)
                 valid.append((payload["epoch"], payload["global_step"], path.name, payload, path))
             except (CheckpointError, OSError, ValueError):
                 continue
