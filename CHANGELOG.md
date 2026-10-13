@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2
+
+- Record result publication in the atomic workspace manifest, so report retries preserve later artifact renames/deletions, including after restart.
+- Resync reused blobs after write failures, repair only unreferenced partial blobs, and propagate Linux metadata directory-sync failures without entering rename fallback.
+- Normalize and bound live kernel-control payloads; retire stdin controls with the durable terminal report.
+- Align the interactive agent response bound with admitted commands and recovery controls, preventing oversized accepted claims from wedging the shared VPS worker.
+- Allow personal execution consent on the owner-selected device while member switching stays disabled; fence compute-selection dialogs and late responses to their original connection.
+- Freeze the complete broker dependency closure in real reference integration tests; require a non-root bubblewrap CPU/privacy smoke in Linux CI and show sandbox skip reasons locally.
+- Bind VSIX and standalone-server manifests to the checked source commit and verify packaged runtime hashes.
+- Show fresh-kernel reset notices, retire stale notebook namespaces after rename, and fence session actions/uploads/recovery and attachment handoffs to their original connection.
+
 ## 0.6.1 - 2026-10-13 (persistent session review)
 
 - Checks file paths, ACLs and revision conflicts before retiring public kernels. Rejected deletion, rename or visibility requests cannot reset an accepted computation.

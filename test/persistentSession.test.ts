@@ -211,6 +211,26 @@ describe('Persistent VPS Session Host', () => {
     assert.match((await call('execution', { executionId: command.executionId })).data.error, /conflicts/);
   });
 
+  for (const recovery of ['report retry', 'server restart']) it(`preserves a user rename after partial artifact publication during ${recovery}`, async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'rename-artifact' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    host.saveResults = async function (...args: unknown[]) { await original.apply(this, args); throw new Error('Crash after publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('published once'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.saveResults = original;
+    const current = (await call('snapshot')).data;
+    assert.equal((await call('rename', { path: 'result.txt', newPath: 'renamed.txt', expectedRevision: current.revision })).status, 200);
+    if (recovery === 'server restart') { await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`; }
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'result.txt' })).status, 404);
+    assert.equal((await call('read', { path: 'renamed.txt' })).data.content, encoded('published once'));
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+  });
+
   it('runs canonical public notebook cells with idempotent reports and conflict-safe saved output', async () => {
     await registerVps(); let snap = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
     snap = (await call('mkdir', { path: 'secret', visibility: 'private', expectedRevision: snap.revision })).data;
@@ -380,6 +400,54 @@ describe('Persistent VPS Session Host', () => {
     assert.equal((await call('execution', { executionId: queued.data.id })).data.state, 'interrupted');
     assert.equal((await call('report', { deviceId: 'vps', executionId: command.executionId, commandId: command.id, generation: command.generation, offset: 0, events: [], state: 'completed' }, agent)).status, 200);
     assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+  });
+
+  it('allows member consent on the locked owner target and rechecks its revocation at claim', async () => {
+    await registerVps(); const joined = await guest();
+    assert.equal((await call('registerDevice', { device: { id: 'owner-pc', name: 'Owner machine', python: '/selected/python', cpu: 'CPU', gpus: [], isolation: 'test policy inventory' } })).status, 200);
+    await call('share', { deviceId: 'owner-pc', enabled: true });
+    const target = { deviceId: 'owner-pc' };
+    const selected = (await call('select', { target })).data;
+    const requested = await call('select', { target }, joined.token);
+    assert.equal(requested.status, 200); assert.equal(requested.data.allowMemberSwitch, false);
+    const consent = requested.data.consent;
+    await call('consent', { consentId: consent.id, approved: true });
+    const view = (await call('view')).data;
+    assert.equal(view.generation, selected.generation);
+    const saved = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.deepEqual(saved.policy.ownerBaseline, target);
+    assert.equal((await call('select', { target: { deviceId: 'vps' } }, joined.token)).status, 403);
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    const run = await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'locked-target-run' }, joined.token);
+    assert.equal(run.status, 200); assert.equal(run.data.deviceId, 'owner-pc');
+    await call('revokeConsent', { consentId: consent.id });
+    assert.equal((await call('claim', { deviceId: 'owner-pc' })).data.command, null);
+    assert.equal((await call('execution', { executionId: run.data.id }, joined.token)).data.state, 'failed');
+  });
+
+  it('normalizes live kernel controls instead of retaining arbitrary RPC fields', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'normalized-controls' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'interrupt', unrelatedPayload: 'x'.repeat(1024 * 1024) } })).status, 200);
+    const controls = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.controls;
+    assert.deepEqual(Object.keys(controls[0].command).sort(), ['command', 'requestId']);
+  });
+
+  it('bounds aggregate stdin bytes and retires delivered input after terminal reporting', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'bounded-controls' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    for (let i = 0; i < 3; i++) assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'inputReply', value: 'x'.repeat(65536) } })).status, 200);
+    assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'inputReply', value: 'x'.repeat(65536) } })).status, 409);
+    assert.equal((await rpc({ operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [] }, agent)).status, 200);
+    const saved = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.deepEqual(saved.executions[0].controls, []);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('execution', { executionId: command.executionId })).data.state, 'completed');
   });
 
   it('requires device owner consent and invalidates a queued solo exception when another human joins', async () => {

@@ -31,6 +31,35 @@ function setup(online: string[] = ['owner', 'alice', 'bob']): {
 }
 
 describe('persistent session compute authorization', () => {
+  it('grants execution on the owner-selected machine without granting member switching', () => {
+    const { policy } = setup();
+    const target = { deviceId: 'owner-pc', gpuUuid: GPU_ONE };
+    policy.select('owner', target);
+    const generation = policy.view().generation;
+    assert.throws(() => policy.executionTarget('alice'), /consent/);
+    const requested = policy.select('alice', target);
+    assert.equal(requested.consent?.status, 'pending');
+    assert.equal(policy.view().generation, generation);
+    assert.throws(() => policy.select('alice', { deviceId: 'owner-pc', gpuUuid: GPU_TWO }), /disabled member/);
+    policy.decideConsent('owner', requested.consent!.id, true);
+    assert.deepEqual(policy.executionTarget('alice').target, target);
+    assert.equal(policy.view().generation, generation);
+    assert.deepEqual(policy.view().ownerBaseline, target);
+    policy.revokeConsent('owner', requested.consent!.id);
+    assert.throws(() => policy.executionTarget('alice'), /consent/);
+    assert.deepEqual(policy.executionTarget('owner').target, target);
+  });
+
+  it('does not switch back when a current-device execution consent is approved after owner selection changes', () => {
+    const { policy } = setup();
+    policy.select('owner', { deviceId: 'owner-pc' });
+    const requested = policy.select('alice', { deviceId: 'owner-pc' });
+    policy.select('owner', { deviceId: 'vps' });
+    policy.decideConsent('owner', requested.consent!.id, true);
+    assert.deepEqual(policy.view().target, { deviceId: 'vps' });
+    assert.throws(() => policy.select('alice', { deviceId: 'owner-pc' }), /disabled member/);
+  });
+
   it('defaults to the VPS CPU and counts only connected human members', () => {
     const { policy, presence } = setup([]);
     assert.deepEqual(policy.view().target, { deviceId: 'vps' });

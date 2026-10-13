@@ -1,6 +1,6 @@
 # Pair Notebook
 
-The 0.6.1 development build adds [persistent VPS sessions](docs/PERSISTENT_VPS.md): the server owns session lifecycle and files, while an independent interactive agent owns the selected Python kernel. This first stage synchronizes on save with conflict checks; per-keystroke VPS CRDT collaboration and native Windows/macOS compute isolation remain follow-up work. See [the architecture](docs/PERSISTENT_VPS_ARCHITECTURE.md), [the 0.6.1 review](docs/PERSISTENT_VPS_REVIEW_0.6.1.md) and [original validation boundaries](docs/PERSISTENT_VPS_VALIDATION.md).
+The 0.6.2 development build adds [persistent VPS sessions](docs/PERSISTENT_VPS.md): the server owns session lifecycle and files, while an independent interactive agent owns the selected Python kernel. This first stage synchronizes on save with conflict checks; per-keystroke VPS CRDT collaboration and native Windows/macOS compute isolation remain follow-up work. See [the architecture](docs/PERSISTENT_VPS_ARCHITECTURE.md), [the 0.6.2 review](docs/PERSISTENT_VPS_REVIEW_0.6.2.md) and [original validation boundaries](docs/PERSISTENT_VPS_VALIDATION.md).
 
 For unattended background training, the existing independent compute agent remains available. See [persistent research runs](docs/PERSISTENT_RESEARCH.md) for that separate workflow.
 
@@ -23,7 +23,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 
 ## Install
 
-The **0.6.1 development build** is not a published GitHub release. Build its VSIX with `npm ci` and `npm run package`, and build the matching standalone server with `npm run package:persistent-server`. Install `pair-notebook-0.6.1.vsix` on every participant's computer. Successful [Host and VPS training runs](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/training.yml) retain the VSIX, source archive and matching standalone server with its SHA-256 checksum. [Deployment instructions](docs/PERSISTENT_VPS.md) include Ubuntu services, trusted HTTPS for the IP address, direct server session creation and agent setup. The latest published release verified at the start of this review was 0.5.39.
+The **0.6.2 development build** is not a published GitHub release. Build its VSIX with `npm ci` and `npm run package`, and build the matching standalone server with `npm run package:persistent-server`. Install `pair-notebook-0.6.2.vsix` on every participant's computer. Successful [Host and VPS training runs](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/training.yml) retain the VSIX, source archive and matching standalone server with its SHA-256 checksum. [Deployment instructions](docs/PERSISTENT_VPS.md) include Ubuntu services, trusted HTTPS for the IP address, direct server session creation and agent setup. The latest published release verified at the start of this review was 0.5.39.
 
 Open the [latest GitHub Release](https://github.com/r7zex/jupyter_pair_ext/releases/latest), download its single `pair-notebook-<version>.vsix` file, and install it on **both computers** from **Extensions: Install from VSIX...**, or run:
 

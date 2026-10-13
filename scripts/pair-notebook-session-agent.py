@@ -39,7 +39,9 @@ MAX_EVENT_BYTES = 256 * 1024
 # The server retains at most 1 MiB per execution. Reserve room for array
 # punctuation, a final completion and an explicit output-limit diagnostic.
 MAX_JOURNAL_BYTES = 1024 * 1024 - 32 * 1024
-MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+# The host admits a 16 MiB command; recovery adds bounded live controls.
+# A smaller response bound can strand an accepted global VPS claim forever.
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 MAX_BRIDGE_BYTES = 32 * 1024 * 1024
 MAX_KERNELS = 2
 MAX_ARTIFACT_ENTRIES = 2048

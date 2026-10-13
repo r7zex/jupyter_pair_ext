@@ -16,3 +16,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 media/native/
+
+# Generated source provenance bundled in the VSIX.
+PAIR_BUILD.json

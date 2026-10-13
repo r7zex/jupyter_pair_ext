@@ -18,6 +18,7 @@ const scrypt = (value: string, salt: string): Promise<Buffer> => new Promise((re
 const PRESENCE_MS = 20_000;
 const MAX_RPC_BYTES = 12 * 1024 * 1024;
 const MAX_EVENTS_BYTES = 1024 * 1024;
+const MAX_CONTROL_BYTES = 256 * 1024;
 const MAX_EXECUTIONS = 32;
 const MAX_SESSIONS = 16;
 const sha = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -78,6 +79,7 @@ export class PersistentSessionHost {
       this.retireRevokedReporting(session);
       this.sessions.set(record.id, session);
       for (const run of record.executions) if (run.mergePending) await this.finishResultMerge(session, run);
+      await workspace.retainPublications(record.executions.filter((run) => run.mergePending).map((run) => run.execution.id));
       await this.persist(session);
     }
     this.sweep = setInterval(() => {
@@ -317,7 +319,10 @@ export class PersistentSessionHost {
       const entries = session.workspace.snapshot(owner).entries;
       const hidesPublicFiles = owner && entries.some((entry) => entry.visibility === 'public' && (entry.path === source || entry.path.startsWith(`${source}/`)))
         && entries.some((entry) => entry.visibility === 'private' && entry.type === 'directory' && target.startsWith(`${entry.path}/`));
-      return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session) : undefined);
+      const movesNotebook = entries.some((entry) => entry.visibility === 'public' && entry.type === 'file' && entry.path.endsWith('.ipynb')
+        && (entry.path === source || entry.path.startsWith(`${source}/`)));
+      return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session)
+        : movesNotebook ? async () => { session.policy.invalidateKernels(); await this.persist(session); } : undefined);
     }
     if (body.operation === 'remove') {
       // Deletion retires kernels holding the old public snapshot.
@@ -462,7 +467,11 @@ export class PersistentSessionHost {
     if (!input || (input.command !== 'interrupt' && input.command !== 'inputReply')) throw new SessionError(400, 'Invalid active kernel control.');
     if (input.command === 'inputReply' && (typeof input.value !== 'string' || input.value.length > 65536)) throw new SessionError(400, 'Invalid kernel input.');
     if (run.controls.length >= 128) throw new SessionError(409, 'Kernel control limit reached.');
-    const id = randomUUID(); run.controls.push({ id, command: { ...input, requestId: id } }); await this.persist(session); return { ...run.execution, events: [] };
+    const id = randomUUID();
+    const control = { id, command: { command: input.command, requestId: id,
+      ...(input.command === 'inputReply' ? { value: input.value } : {}) } };
+    if (Buffer.byteLength(JSON.stringify([...run.controls, control])) > MAX_CONTROL_BYTES) throw new SessionError(409, 'Kernel control byte limit reached.');
+    run.controls.push(control); await this.persist(session); return { ...run.execution, events: [] };
   }
 
   private async claim(session: Session, deviceId: string): Promise<{ command: PersistentCommand | null; controls?: { id: string; command: Record<string, unknown> }[]; recoverOnly?: boolean }> {
@@ -513,6 +522,7 @@ export class PersistentSessionHost {
       ...(body.error !== undefined ? { error: body.error as string } : {}) };
     run.offset += events.length;
     run.mergePending = terminalMerge;
+    if (body.state !== 'running') run.controls = [];
     run.reports = [...run.reports, { offset: body.offset as number, digest, end: run.offset }];
     try { await this.persist(session); }
     catch (error) { Object.assign(run, before); throw error; }
@@ -531,6 +541,7 @@ export class PersistentSessionHost {
     run.mergePending = false;
     try { await this.persist(session); }
     catch (error) { run.mergePending = true; throw error; }
+    await session.workspace.retainPublications(session.record.executions.filter((item) => item.mergePending).map((item) => item.execution.id));
   }
 
   private async saveOutputs(session: Session, run: ExecutionRecord): Promise<void> {
@@ -550,28 +561,37 @@ export class PersistentSessionHost {
   }
   private async saveResults(session: Session, run: ExecutionRecord, value: unknown, removed: unknown): Promise<void> {
     if (value !== undefined && (!Array.isArray(value) || value.length > 256)) { run.execution.error = 'Returned files exceed result limits.'; return; }
-    for (const item of (value ?? []) as { path?: unknown; content?: unknown; version?: unknown }[]) {
+    for (const [index, item] of ((value ?? []) as { path?: unknown; content?: unknown; version?: unknown }[]).entries()) {
       if (!item || !safeJobPath(item.path) || typeof item.content !== 'string' || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
       const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      const publicationId = `${run.execution.id}:write:${index}`;
+      if (session.workspace.hasPublication(publicationId)) {
+        if (current?.type !== 'file' || (await session.workspace.read(item.path, false)).content !== item.content) {
+          run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.';
+        }
+        continue;
+      }
       if ((current?.version ?? 0) !== item.version) {
         // A previous merge may have published this exact content before a
         // crash. Acknowledge it without overwriting a subsequent different edit.
         if (current?.type === 'file' && (await session.workspace.read(item.path, false)).content === item.content) continue;
         run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.'; continue;
       }
-      try { await session.workspace.write(item.path, item.content, snapshot.revision, false); }
+      try { await session.workspace.write(item.path, item.content, snapshot.revision, false, publicationId); }
       catch (error) {
         if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
         run.execution.error = 'A returned file could not be merged safely; execution events remain available.';
       }
     }
     if (removed !== undefined && (!Array.isArray(removed) || removed.length > 256)) { run.execution.error = 'Returned deletions exceed result limits.'; return; }
-    for (const item of (removed ?? []) as { path?: unknown; version?: unknown }[]) {
+    for (const [index, item] of ((removed ?? []) as { path?: unknown; version?: unknown }[]).entries()) {
       if (!item || !safeJobPath(item.path) || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
       const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      const publicationId = `${run.execution.id}:remove:${index}`;
+      if (session.workspace.hasPublication(publicationId)) continue;
       if (!current) continue;
       if (current.type !== 'file' || current.version !== item.version) { run.execution.error = 'Returned deletion conflicts with a newer server version.'; continue; }
-      try { await session.workspace.remove(item.path, snapshot.revision, false); }
+      try { await session.workspace.remove(item.path, snapshot.revision, false, undefined, publicationId); }
       catch (error) {
         if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
         run.execution.error = 'Returned deletion could not be merged safely.';
