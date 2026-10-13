@@ -47,7 +47,7 @@ its SHA and checks completed after the last functional changes.
   describes a dirty development tree based on `97244d8`, before final packaging.
   It proves harness execution only. No short duration or simulated clock is
   presented as long-soak evidence.
-- TS full suite: 4900 passing with `--forbid-pending` after preparing the actual
+- TS full suite: 4901 passing with `--forbid-pending` after preparing the actual
   Python/Jupyter/CPU Torch environment. The initial unprepared run failed due to
   missing Jupyter and is not counted as a pass. The final full run includes late-generation/source output fencing and three
   replica-race/conflict regressions. Delivery manifests and remote CI are
@@ -86,7 +86,9 @@ automatically installed. CRDT retained state is bounded (6 MiB); compaction is a
 explicit notebook replacement that fences old replicas. Journals remain on the
 owning user's machine; conflict replicas are preserved before reset. Folder
 sync uses bounded polling/reconciliation rather than a scalable file-event log.
-Additional concurrent edit+rename, large folder and multi-editor scenarios are
+Private rename+edit with lost deletion ACK now preserves a durable Private
+lineage before deleting the old path; new copies/parents publish atomically
+as Private. Broader concurrent edit+rename, large folder and multi-editor scenarios are
 needed before declaring the complete synchronization requirement passed.
 
 A fixed OS quota for server data, worker state, images/dependencies and bounded
@@ -100,3 +102,13 @@ Resources still needed: configured SSH credential and TCP route to the target,
 trusted TLS/domain and allowed reboot window; physical NVIDIA/CUDA executors;
 Windows/WSL2 and macOS/Docker Desktop hosts; two actual VS Code profiles; durable
 24-hour execution environment. No annual availability claim is made.
+
+
+CI on initial implementation commit `2404d3c9fa06e9b374568c7776cf845f62d2e6b2`:
+[Host and VPS training](https://github.com/r7zex/jupyter_pair_ext/actions/runs/38442741532)
+passed the full suite, mandatory actual non-root bubblewrap, required real
+Linux-container test, Python lifecycle and standalone package checks; both
+installable/server artifacts were saved. [Extension Host E2E](https://github.com/r7zex/jupyter_pair_ext/actions/runs/38442741522)
+passed all four native editor jobs. This is not two-editor persistent acceptance.
+The Private-lineage/container-metrics followup has its own final head CI and
+clean delivery; never substitute the earlier artifact for its final SHA.

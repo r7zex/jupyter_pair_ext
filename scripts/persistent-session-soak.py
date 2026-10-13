@@ -120,7 +120,10 @@ def main():
             usage=__import__('psutil').Process(os.getpid())
             processes=[usage,*usage.children(recursive=True)]
             disk=sum(item.stat().st_size for item in state.rglob('*') if item.is_file())
-            record('sample',cycle=sequence,executions=len(executions),rssBytes=sum(item.memory_info().rss for item in processes if item.is_running()),diskBytes=disk,processes=len(processes),kernels=len(agent.kernels))
+            names=[*sandbox.containers.values(),*personal_sandbox.containers.values()]
+            statistics=subprocess.run([sandbox.docker,'stats','--no-stream','--format','{{json .}}',*names],env=sandbox.environment(None),check=True,capture_output=True,text=True,timeout=15) if names else None
+            container_metrics=[json.loads(line) for line in statistics.stdout.splitlines()] if statistics else []
+            record('sample',cycle=sequence,executions=len(executions),rssBytes=sum(item.memory_info().rss for item in processes if item.is_running()),diskBytes=disk,processes=len(processes),kernels=len(agent.kernels)+len(personal.kernels),containerStats=container_metrics)
             summary={'sourceCommit':commit,'elapsedSeconds':time.monotonic()-started,'executions':len(executions),'cycles':sequence,'status':'running','shortHarnessCheck':args.check,'acceptance24Hours':False}
             AGENT.atomic_json(evidence/'summary.json',summary)
             if not args.check:

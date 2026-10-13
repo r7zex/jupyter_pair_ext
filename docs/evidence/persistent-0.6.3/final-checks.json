@@ -2,7 +2,7 @@
   "baseCommit": "97244d853194380d31f2f79edf54444d00961a35",
   "treeBeforeCommit": true,
   "typescript": {
-    "passing": 4900,
+    "passing": 4901,
     "pending": 0,
     "forbidPending": true
   },
@@ -29,14 +29,14 @@
   "targetVps": false,
   "soak24HoursComplete": false,
   "functionalSourceSha256": {
-    "src/vps/persistentServer.ts": "f85d66d89093fb1543b537e71fb2617ecb6b1af295d26e3a0181f790a4a1b61c",
+    "src/vps/persistentServer.ts": "c35525e6d3eec2076d1b8aaf117ca0b0595aa2f5ab3356cae692735118cdb46c",
     "src/vps/persistentStorage.ts": "0edce4c13354e4c386228627f508fc1a9d2501bae8aa3f94f5414e82e25d8431",
     "src/vps/persistentNotebookCrdt.ts": "e29de9d39b6e341aa96beeac588a52597460f78e01ea1f7152e1d38810855336",
-    "src/vps/persistentFolderSync.ts": "0b07c3fb445ce4522e878bbb9fa282b0a92dd78ea303a33585185ea226f16c93",
+    "src/vps/persistentFolderSync.ts": "678ab68fb4baf87929116e3f4c5bbca889eedcc65db733a6ec017468d50ec803",
     "src/vscode/persistent.ts": "1d9740088f7b2b74ca0b3d3118f5189b026c117476d129382b3d34849603a8af",
     "src/vscode/persistentNotebookSync.ts": "c10a78e0aa4bcd4567550ef8cca1f672d92d9133d7e56e98e31ea67f0779484c",
     "scripts/pair-notebook-session-agent.py": "c6bcd07cfea4e9b8886b6e1f97135a4aa584d9aee9b7252495b65cd6e526130d",
     "scripts/pair-notebook-wsl-agent.ps1": "0fbcd99f7a96b036bf85744e94e3d864c7bec28e482614259b4ee4367058cf24",
-    "scripts/persistent-session-soak.py": "afb3ff53b24666c5a0c28e7a45f2821ef767755f734549d9de4733848306fdb1"
+    "scripts/persistent-session-soak.py": "7dc20ba049ef49ba7014f918374fb51eedc343db64d268fa5e1eb5e63a243e79"
   }
 }

@@ -387,7 +387,10 @@ export class PersistentSessionHost {
     }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);
     if (body.operation === 'read') return session.workspace.read(this.string(body, 'path'), owner);
-    if (body.operation === 'write') return session.workspace.write(this.string(body, 'path'), this.string(body, 'content'), this.revision(body), owner);
+    if (body.operation === 'write') {
+      if (body.visibility !== undefined && (!owner || body.visibility !== 'private')) throw new SessionError(403, 'Only the owner can create a Private file.');
+      return session.workspace.write(this.string(body, 'path'), this.string(body, 'content'), this.revision(body), owner, undefined, body.visibility === 'private');
+    }
     if (body.operation === 'mkdir') {
       if (body.visibility !== undefined && (!owner || (body.visibility !== 'public' && body.visibility !== 'private'))) throw new SessionError(403, 'Only the owner can create a directory with explicit visibility.');
       return session.workspace.mkdir(this.string(body, 'path'), this.revision(body), owner, body.visibility as 'public' | 'private' | undefined);
