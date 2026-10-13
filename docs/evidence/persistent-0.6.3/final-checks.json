@@ -37,6 +37,6 @@
     "src/vscode/persistentNotebookSync.ts": "c10a78e0aa4bcd4567550ef8cca1f672d92d9133d7e56e98e31ea67f0779484c",
     "scripts/pair-notebook-session-agent.py": "c6bcd07cfea4e9b8886b6e1f97135a4aa584d9aee9b7252495b65cd6e526130d",
     "scripts/pair-notebook-wsl-agent.ps1": "0fbcd99f7a96b036bf85744e94e3d864c7bec28e482614259b4ee4367058cf24",
-    "scripts/persistent-session-soak.py": "7dc20ba049ef49ba7014f918374fb51eedc343db64d268fa5e1eb5e63a243e79"
+    "scripts/persistent-session-soak.py": "669529d2777e7f2130dc1e8743559ec983a1a1ae52e23a40db5a3e605d9cbbf4"
   }
 }
