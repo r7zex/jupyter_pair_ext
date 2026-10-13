@@ -48,6 +48,20 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
     const after = await rpc<PersistentSnapshot>('snapshot'); await rpc('write', { path: 'secret.ipynb', expectedRevision: after.revision, content: encoded(JSON.stringify({ cells: [], metadata: {} })) });
     await assert.rejects(rpc('notebookSync', { path: 'secret.ipynb', epoch: start.epoch, update: start.update }), /Reload|HTTP 409|changed/);
   });
+  it('keeps ambiguous offline Private rename plus edits Private across lost ACK and journal reload', async () => {
+    const localRoot = path.join(root, 'lineage'); await mkdir(localRoot);
+    const snapshot = await rpc<PersistentSnapshot>('mkdir', { path: 'public-root', expectedRevision: 0 });
+    await rpc<PersistentSnapshot>('write', { path: 'public-root/private.txt', visibility: 'private', content: encoded('private original'), expectedRevision: snapshot.revision });
+    const options = { localRoot, remoteRoot: 'public-root', journal: path.join(root, 'lineage.json'), sessionId: owner.sessionId, client, current: () => true, conflict: async () => 'later' as const };
+    let sync = new PersistentFolderSync(options); await sync.cycle();
+    await rename(path.join(localRoot, 'private.txt'), path.join(localRoot, 'moved.txt')); await writeFile(path.join(localRoot, 'moved.txt'), 'private modified');
+    const original = client.call.bind(client); let lost = false;
+    client.call = async (operation, input) => { const result = await original(operation, input); if (operation === 'remove' && !lost) { lost = true; throw new Error('Deletion acknowledgement lost'); } return result as any; };
+    await assert.rejects(sync.cycle(), /acknowledgement/); client.call = original; sync = new PersistentFolderSync(options); await sync.cycle();
+    const result = await rpc<PersistentSnapshot>('snapshot'); assert.equal(result.entries.find((entry) => entry.path === 'public-root/moved.txt')?.visibility, 'private');
+    await assert.rejects(member.call('read', { sessionId: owner.sessionId, path: 'public-root/moved.txt' }), /unavailable/);
+  });
+
   it('reconciles folder changes, rename ACLs, lost acknowledgements, conflicts, deletes and offline recovery', async () => {
     const localRoot = path.join(root, 'local'); await mkdir(localRoot); await writeFile(path.join(localRoot, 'data.txt'), 'initial');
     await rpc('mkdir', { path: 'mirror', visibility: 'private', expectedRevision: 0 });

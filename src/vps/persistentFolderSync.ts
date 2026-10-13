@@ -7,7 +7,7 @@ import { safeJobPath } from './protocol';
 import type { PersistentClient } from './persistentClient';
 import type { PersistentSnapshot } from './persistentProtocol';
 interface Entry { hash: string; type: 'file' | 'directory'; visibility?: 'public' | 'private' }
-export interface FolderSyncState { format: 1; baseline: Record<string, Entry> }
+export interface FolderSyncState { format: 1; baseline: Record<string, Entry>; privateCandidates?: string[] }
 export interface FolderSyncConflict { path: string; local?: Entry; remote?: Entry }
 const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 const same = (left: Entry | undefined, right: Entry | undefined): boolean => left?.type === right?.type && left?.hash === right?.hash;
@@ -80,7 +80,7 @@ export class PersistentFolderSync {
   private async reconcile(): Promise<void> {
     this.current();
     if (!this.loaded) {
-      try { const value = JSON.parse(await readFile(this.options.journal, 'utf8')) as FolderSyncState; if (value.format !== 1 || !value.baseline || Object.keys(value.baseline).some((name) => !safeJobPath(name))) throw new Error('Invalid sync recovery journal.'); this.state = value; }
+      try { const value = JSON.parse(await readFile(this.options.journal, 'utf8')) as FolderSyncState; if (value.format !== 1 || !value.baseline || Object.keys(value.baseline).some((name) => !safeJobPath(name)) || (value.privateCandidates !== undefined && (!Array.isArray(value.privateCandidates) || value.privateCandidates.length > 4096 || value.privateCandidates.some((name) => !safeJobPath(name))))) throw new Error('Invalid sync recovery journal.'); this.state = value; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       this.loaded = true;
     }
@@ -110,11 +110,17 @@ export class PersistentFolderSync {
       remote = await this.remote();
       this.state.baseline[newName] = remote.entries[newName]!; delete this.state.baseline[oldName]; await this.save();
     }
-    const names = [...new Set([...Object.keys(local), ...Object.keys(remote.entries), ...Object.keys(this.state.baseline)])].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+    const names = [...new Set([...Object.keys(local), ...Object.keys(remote.entries), ...Object.keys(this.state.baseline), ...(this.state.privateCandidates ?? [])])].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+    // Rename+edit may defeat hash matching. Preserve Private lineage durably
+    // before any old-path deletion, including retries after a lost ACK.
+    if (Object.entries(this.state.baseline).some(([name, entry]) => entry.visibility === 'private' && !local[name])) {
+      this.state.privateCandidates = [...new Set([...(this.state.privateCandidates ?? []), ...Object.keys(local).filter((name) => !this.state.baseline[name] && !remote.entries[name])])];
+      await this.save();
+    }
     for (const name of names) {
       this.current(); local = await this.local(); remote = await this.remote();
       const left = local[name]; const right = remote.entries[name]; const base = this.state.baseline[name];
-      if (same(left, right)) { if (right) this.state.baseline[name] = right; else delete this.state.baseline[name]; await this.save(); continue; }
+      if (same(left, right)) { this.state.privateCandidates = this.state.privateCandidates?.filter((candidate) => candidate !== name) ?? []; if (right) this.state.baseline[name] = right; else delete this.state.baseline[name]; await this.save(); continue; }
       const localChanged = !same(left, base); const remoteChanged = !same(right, base);
       let direction: 'local' | 'remote' | 'later' = localChanged && remoteChanged ? 'later' : localChanged ? 'local' : 'remote';
       if (localChanged && remoteChanged) direction = await this.options.conflict({ path: name, ...(left ? { local: left } : {}), ...(right ? { remote: right } : {}) });
@@ -128,10 +134,10 @@ export class PersistentFolderSync {
           await this.options.client.call('remove', { sessionId: this.options.sessionId, path: this.remotePath(name), expectedRevision: remote.revision });
         } else if (left.type === 'directory') {
           if (right) continue;
-          await this.options.client.call('mkdir', { sessionId: this.options.sessionId, path: this.remotePath(name), expectedRevision: remote.revision });
+          await this.options.client.call('mkdir', { sessionId: this.options.sessionId, path: this.remotePath(name), expectedRevision: remote.revision, ...(this.state.privateCandidates?.includes(name) ? { visibility: 'private' } : {}) });
         } else {
           const bytes = await this.bytes(name); if (digest(bytes) !== left.hash) throw new Error('Local file changed before upload.');
-          await this.options.client.call('write', { sessionId: this.options.sessionId, path: this.remotePath(name), content: bytes.toString('base64'), expectedRevision: remote.revision });
+          await this.options.client.call('write', { sessionId: this.options.sessionId, path: this.remotePath(name), content: bytes.toString('base64'), expectedRevision: remote.revision, ...(this.state.privateCandidates?.includes(name) ? { visibility: 'private' } : {}) });
         }
       } else {
         const target = await this.safeLocal(name); const latest = (await this.local())[name]; if (!same(latest, left)) throw new Error('Local file changed before download.'); this.current();
@@ -143,5 +149,5 @@ export class PersistentFolderSync {
       if (same(afterLocal[name], afterRemote.entries[name])) { if (afterRemote.entries[name]) this.state.baseline[name] = afterRemote.entries[name]!; else delete this.state.baseline[name]; await this.save(); }
     }
   }
-  private async save(): Promise<void> { this.current(); await mkdir(path.dirname(this.options.journal), { recursive: true, mode: 0o700 }); await atomicWriteFile(this.options.journal, JSON.stringify(this.state)); }
+  private async save(): Promise<void> { this.current(); this.state.privateCandidates = this.state.privateCandidates?.filter((candidate) => !this.state.baseline[candidate]) ?? []; await mkdir(path.dirname(this.options.journal), { recursive: true, mode: 0o700 }); await atomicWriteFile(this.options.journal, JSON.stringify(this.state)); }
 }
