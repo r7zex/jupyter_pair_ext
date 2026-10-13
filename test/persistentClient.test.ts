@@ -236,6 +236,14 @@ describe('Persistent notebook execution connection ownership', () => {
     assert.ok(informationMessages.includes(message));
   });
 
+  for (const change of ['generation', 'source']) it(`keeps late outputs and errors in recovery after a ${change} change`, async () => {
+    const calls: string[] = []; const source = change === 'source' ? 'changed cell' : 'admitted cell';
+    const handle = { cell: { document: { getText: () => source, isClosed: false } }, replaceOutput: async () => { calls.push('outputs'); }, appendOutput: async () => { calls.push('errors'); } } as unknown as vscode.NotebookCellExecution;
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), { connection: { sessionId: 'session' }, disposed: false, view: { generation: change === 'generation' ? 2 : 1 } }) as { observe: (initial: PersistentExecution, handle: vscode.NotebookCellExecution) => Promise<PersistentExecution> };
+    const result: PersistentExecution = { id: 'late', notebook: 'work.ipynb', cellIndex: 0, requesterId: 'member', deviceId: 'old-device', generation: 1, state: 'completed', sourceHash: createHash('sha256').update('admitted cell').digest('hex'), events: [], error: 'late private error' };
+    assert.equal(await ui.observe(result, handle), result); assert.deepEqual(calls, []);
+  });
+
   type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
   for (const phase of ['queue', 'save']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
     let unblock!: () => void;

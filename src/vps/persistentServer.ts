@@ -8,6 +8,8 @@ import { portableRelativePath } from '../core/projectPath';
 import { PersistentWorkspace, PersistentStorageError } from './persistentStorage';
 import { PersistentComputePolicy, type PersistentComputeState, type PersistentDeviceInput } from './persistentCompute';
 import { PersistentHistory } from './persistentHistory';
+import * as Y from 'yjs';
+import { loadNotebookCrdt, saveNotebookCrdt, sharedNotebook } from './persistentNotebookCrdt';
 import { persistentNotebookOutputs } from './persistentNotebookOutputs';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
 import { safeJobPath, VPS_ID, visibleVpsText } from './protocol';
@@ -27,7 +29,8 @@ const token = (): string => randomBytes(32).toString('base64url');
 class SessionError extends Error {
   public constructor(public readonly status: number, message: string) { super(message); }
 }
-interface MemberRecord { id: string; name: string; role: PersistentMember['role']; tokenHash: string; revoked: boolean }
+interface MemberRecord { id: string; name: string; role: PersistentMember['role']; tokenHash: string; revoked: boolean; invitationId?: string; expiresAt?: number; readOnly?: boolean }
+interface Invitation { id: string; tokenHash: string; expiresAt: number; readOnly: boolean; revoked: boolean }
 interface ExecutionRecord {
   execution: PersistentExecution; requestId: string; commandId: string; cellIdentity: string;
   sourceHash: string; notebookVersion: number; offset: number; reports: { offset: number; digest: string; end: number }[];
@@ -40,6 +43,7 @@ interface SessionRecord {
   password: { salt: string; hash: string }; members: MemberRecord[]; policy: PersistentComputeState;
   executions: ExecutionRecord[];
   aclEpoch: number;
+  invitations?: Invitation[];
 }
 interface Session { record: SessionRecord; workspace: PersistentWorkspace; policy: PersistentComputePolicy; seen: Map<string, number>; history: PersistentHistory }
 interface NotebookCell { id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown[]; execution_count?: number | null }
@@ -86,8 +90,10 @@ export class PersistentSessionHost {
       void this.enqueue(async () => {
         for (const session of this.sessions.values()) {
           const before = JSON.stringify(session.policy.serialize());
+          const states = session.record.executions.map((run) => run.execution.state).join(',');
           session.policy.setMembers(this.members(session));
-          if (JSON.stringify(session.policy.serialize()) !== before) await this.persist(session);
+          this.retireRevokedReporting(session);
+          if (JSON.stringify(session.policy.serialize()) !== before || states !== session.record.executions.map((run) => run.execution.state).join(',')) await this.persist(session);
         }
         const now = Date.now();
         for (const [key, failure] of this.failures) if (failure.until < now) this.failures.delete(key);
@@ -175,6 +181,8 @@ export class PersistentSessionHost {
       || record.members.filter((member) => member.role === 'owner' && member.id === record.ownerId && !member.revoked).length !== 1
       || record.members.some((member) => member.role === 'owner' && member.id !== record.ownerId)
       || new Set(record.members.map((member) => member.id)).size !== record.members.length
+      || record.members.some((member) => (member.expiresAt !== undefined && !Number.isSafeInteger(member.expiresAt)) || (member.readOnly !== undefined && typeof member.readOnly !== 'boolean') || (member.invitationId !== undefined && !VPS_ID.test(member.invitationId)))
+      || (record.invitations !== undefined && (!Array.isArray(record.invitations) || record.invitations.length > 64 || record.invitations.some((invite) => !invite || !VPS_ID.test(invite.id) || !/^[a-f0-9]{64}$/.test(invite.tokenHash) || !Number.isSafeInteger(invite.expiresAt) || typeof invite.readOnly !== 'boolean' || typeof invite.revoked !== 'boolean')))
       || !Number.isSafeInteger(record.aclEpoch) || record.aclEpoch < 1
       || !Array.isArray(record.executions) || record.executions.length > MAX_EXECUTIONS) throw new Error('Invalid saved session authority.');
     for (const run of record.executions) {
@@ -183,6 +191,7 @@ export class PersistentSessionHost {
         || !Number.isSafeInteger(run.offset) || run.offset < 0 || !Array.isArray(run.execution.events)
         || Buffer.byteLength(JSON.stringify(run.execution.events)) > MAX_EVENTS_BYTES || !Array.isArray(run.reports) || run.reports.length > 4096
         || !Number.isSafeInteger(run.aclEpoch) || run.aclEpoch < 1 || !Array.isArray(run.controls) || run.controls.length > 128
+        || (run.execution.scope !== undefined && !['public', 'private'].includes(run.execution.scope))
         || (run.kernelCommand !== undefined && run.kernelCommand !== 'restart' && run.kernelCommand !== 'release')
         || (run.mergePending !== undefined && (typeof run.mergePending !== 'boolean' || (run.mergePending && !['completed', 'failed'].includes(run.execution.state))))
         || !['queued', 'running', 'completed', 'failed', 'interrupted'].includes(run.execution.state)) throw new Error('Invalid saved execution.');
@@ -192,15 +201,25 @@ export class PersistentSessionHost {
   private administrative(credential: string): boolean { return this.options.administrativeTokens.some((value) => this.matches(credential, sha(value))); }
   private agent(credential: string): boolean { return !!this.options.vpsAgentToken && this.matches(credential, sha(this.options.vpsAgentToken)); }
   private membership(session: Session, credential: string): MemberRecord {
-    const member = session.record.members.find((candidate) => !candidate.revoked && this.matches(credential, candidate.tokenHash));
+    const member = session.record.members.find((candidate) => this.validMember(session, candidate) && this.matches(credential, candidate.tokenHash));
     if (!member) throw new SessionError(401, 'Session membership is invalid or revoked.'); return member;
   }
   private members(session: Session): PersistentMember[] {
-    return session.record.members.filter((member) => !member.revoked).map((member) => ({ id: member.id, name: member.name, role: member.role,
+    return session.record.members.filter((member) => this.validMember(session, member)).map((member) => ({ id: member.id, name: member.name, role: member.role,
       online: (session.seen.get(member.id) ?? 0) > Date.now() - PRESENCE_MS }));
   }
+  private validMember(session: Session, member: MemberRecord): boolean {
+    return !member.revoked && (member.expiresAt === undefined || member.expiresAt > Date.now())
+      && (!member.invitationId || session.record.invitations?.some((invite) => invite.id === member.invitationId && !invite.revoked && invite.expiresAt > Date.now()) === true);
+  }
+  private limitAuthentication(address: string): void {
+    const key = `authentication:${address}`; const previous = this.failures.get(key);
+    if (previous && previous.until > Date.now() && previous.count >= 20) throw new SessionError(429, 'Too many authentication attempts. Try later.');
+    if (this.failures.size >= 1024 && !this.failures.has(key)) this.failures.delete(this.failures.keys().next().value!);
+    this.failures.set(key, { count: previous && previous.until > Date.now() ? previous.count + 1 : 1, until: previous && previous.until > Date.now() ? previous.until : Date.now() + 60_000 });
+  }
   private retireRevokedReporting(session: Session): void {
-    const members = new Set(session.record.members.filter((member) => !member.revoked).map((member) => member.id));
+    const members = new Set(session.record.members.filter((member) => this.validMember(session, member)).map((member) => member.id));
     const deviceOwners = new Map(session.policy.view().devices.map((device) => [device.id, device.ownerId]));
     for (const run of session.record.executions) {
       if (run.execution.state !== 'queued' && run.execution.state !== 'running') continue;
@@ -229,7 +248,7 @@ export class PersistentSessionHost {
   private view(session: Session, member: MemberRecord): PersistentSessionView {
     const policy = session.policy.view();
     const devices = policy.devices.map((device) => ({ ...device, usingMemberIds: [...new Set(session.record.executions
-      .filter((run) => run.execution.state === 'running' && run.execution.deviceId === device.id).map((run) => run.execution.requesterId))] }));
+      .filter((run) => (member.id === session.record.ownerId || run.execution.scope !== 'private') && run.execution.state === 'running' && run.execution.deviceId === device.id).map((run) => run.execution.requesterId))] }));
     return { id: session.record.id, name: session.record.name, state: session.record.state, ownerId: session.record.ownerId,
       memberId: member.id, members: this.members(session), revision: session.workspace.snapshot(member.id === session.record.ownerId).revision,
       allowMemberSwitch: policy.allowMemberSwitch, devices, target: policy.target, generation: policy.generation,
@@ -238,6 +257,24 @@ export class PersistentSessionHost {
 
   private async dispatch(body: PersistentRpcRequest, credential: string, address: string): Promise<unknown> {
     if (this.closing) throw new SessionError(503, 'Session service is stopping.');
+    if (['discover', 'join', 'acceptInvitation'].includes(body.operation)) this.limitAuthentication(address);
+    if (body.operation === 'discover') {
+      const value = typeof body.password === 'string' && body.password.length >= 12 && body.password.length <= 1024 ? body.password : '';
+      const matches: { id: string; name: string }[] = [];
+      for (const session of this.sessions.values()) {
+        const actual = await scrypt(value, session.record.password.salt);
+        if (timingSafeEqual(actual, Buffer.from(session.record.password.hash, 'hex')) && session.record.state === 'running') matches.push({ id: session.record.id, name: session.record.name });
+      }
+      if (!matches.length) throw new SessionError(401, 'Session access is unavailable.');
+      return { sessions: matches };
+    }
+    if (body.operation === 'acceptInvitation') {
+      const invitationToken = typeof body.invitationToken === 'string' ? body.invitationToken : '';
+      const session = this.sessions.get(String(body.sessionId));
+      const invite = session?.record.invitations?.find((entry) => this.matches(invitationToken, entry.tokenHash) && !entry.revoked && entry.expiresAt > Date.now());
+      if (!session || !invite || session.record.state !== 'running') throw new SessionError(401, 'Session access is unavailable.');
+      return this.addMember(session, body, invite);
+    }
     if (body.operation === 'create') {
       if (!this.administrative(credential)) throw new SessionError(401, 'An administrative credential is required to create sessions.');
       if (this.sessions.size >= MAX_SESSIONS) throw new SessionError(409, 'Session limit reached.');
@@ -285,11 +322,30 @@ export class PersistentSessionHost {
     if (!['leave', 'claim', 'report', 'registerDevice', 'share'].includes(body.operation)) session.seen.set(member.id, Date.now());
     session.policy.setMembers(this.members(session));
     const owner = member.id === session.record.ownerId;
+    if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'artifacts', 'notebookSync'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
+    if (body.operation === 'invitations') { this.owner(session, member); return { invitations: (session.record.invitations ?? []).map((invite) => ({ id: invite.id, expiresAt: invite.expiresAt, readOnly: invite.readOnly, revoked: invite.revoked })) }; }
+    if (body.operation === 'createInvitation') {
+      this.owner(session, member);
+      if (!Number.isSafeInteger(body.lifetimeSeconds) || (body.lifetimeSeconds as number) < 60 || (body.lifetimeSeconds as number) > 7 * 86400 || typeof body.readOnly !== 'boolean') throw new SessionError(400, 'Choose an invitation lifetime from 60 seconds to seven days and its permissions.');
+      const invitations = (session.record.invitations ?? []).filter((invite) => !invite.revoked && invite.expiresAt > Date.now());
+      if (invitations.length >= 64) throw new SessionError(409, 'Invitation limit reached.');
+      const secret = token(); const invite: Invitation = { id: randomUUID(), tokenHash: sha(secret), expiresAt: Date.now() + (body.lifetimeSeconds as number) * 1000, readOnly: body.readOnly as boolean, revoked: false };
+      session.record.invitations = [...invitations, invite]; await this.persist(session);
+      return { id: invite.id, invitationToken: secret, sessionId: session.record.id, expiresAt: invite.expiresAt, readOnly: invite.readOnly };
+    }
+    if (body.operation === 'revokeInvitation') {
+      this.owner(session, member); const invite = session.record.invitations?.find((entry) => entry.id === body.invitationId);
+      if (!invite) throw new SessionError(404, 'Invitation is unavailable.');
+      invite.revoked = true;
+      for (const guest of session.record.members) if (guest.invitationId === invite.id) { guest.revoked = true; session.seen.delete(guest.id); }
+      session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return { revoked: true };
+    }
     if (body.operation === 'view' || body.operation === 'heartbeat') { await this.persist(session); return this.view(session, member); }
     if (body.operation === 'leave') { session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
     if (body.operation === 'lifecycle') return this.lifecycle(session, member, this.string(body, 'action'));
     if (body.operation === 'password') {
       this.owner(session, member); session.record.password = await this.password(body.password);
+      session.record.invitations = [];
       for (const guest of session.record.members) if (guest.id !== member.id) { guest.revoked = true; session.seen.delete(guest.id); }
       session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return this.view(session, member);
     }
@@ -306,6 +362,29 @@ export class PersistentSessionHost {
       return this.report(session, body, deviceId);
     }
     this.active(session);
+    if (body.operation === 'notebookSync') {
+      const filename = this.string(body, 'path');
+      if (!filename.endsWith('.ipynb')) throw new SessionError(400, 'Select a notebook.');
+      const file = await session.workspace.read(filename, owner);
+      const { doc, epoch, template } = loadNotebookCrdt(file.content);
+      try {
+        if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced. Preserve offline edits and reopen it.');
+        const before = Buffer.from(Y.encodeStateAsUpdate(doc));
+        if (body.update !== undefined) {
+          const update = this.string(body, 'update');
+          if (update.length > 2 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(update)) throw new SessionError(413, 'CRDT update exceeds limits.');
+          try { Y.applyUpdate(doc, Buffer.from(update, 'base64')); } catch { throw new SessionError(400, 'Invalid CRDT update.'); }
+        }
+        if (member.readOnly && !Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw new SessionError(403, 'This invitation grants read access only.');
+        let content: string;
+        try { content = saveNotebookCrdt(doc, epoch, template); } catch { throw new SessionError(400, 'Invalid or oversized notebook CRDT.'); }
+        const revision = content === file.content ? file.revision : (await session.workspace.write(filename, content, file.revision, owner)).revision;
+        const vector = typeof body.stateVector === 'string' && body.stateVector.length <= 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
+        let update: string;
+        try { update = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); } catch { throw new SessionError(400, 'Invalid CRDT state vector.'); }
+        return { epoch, revision, update, ...sharedNotebook(doc) };
+      } finally { doc.destroy(); }
+    }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);
     if (body.operation === 'read') return session.workspace.read(this.string(body, 'path'), owner);
     if (body.operation === 'write') return session.workspace.write(this.string(body, 'path'), this.string(body, 'content'), this.revision(body), owner);
@@ -319,7 +398,7 @@ export class PersistentSessionHost {
       const entries = session.workspace.snapshot(owner).entries;
       const hidesPublicFiles = owner && entries.some((entry) => entry.visibility === 'public' && (entry.path === source || entry.path.startsWith(`${source}/`)))
         && entries.some((entry) => entry.visibility === 'private' && entry.type === 'directory' && target.startsWith(`${entry.path}/`));
-      const movesNotebook = entries.some((entry) => entry.visibility === 'public' && entry.type === 'file' && entry.path.endsWith('.ipynb')
+      const movesNotebook = entries.some((entry) => entry.type === 'file' && entry.path.endsWith('.ipynb')
         && (entry.path === source || entry.path.startsWith(`${source}/`)));
       return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session)
         : movesNotebook ? async () => { session.policy.invalidateKernels(); await this.persist(session); } : undefined);
@@ -350,13 +429,13 @@ export class PersistentSessionHost {
     else if (body.operation === 'execution') {
       const run = session.record.executions.find((candidate) => candidate.execution.id === body.executionId || (candidate.requestId === body.requestId && candidate.execution.requesterId === member.id))
         ?? (typeof body.executionId === 'string' ? await session.history.lookupExecution(body.executionId) : typeof body.requestId === 'string' ? await session.history.lookupRequest(body.requestId) : undefined);
-      if (!run) throw new SessionError(404, 'Execution does not exist.');
+      if (!run || (run.execution.scope === 'private' && !owner)) throw new SessionError(404, 'Execution does not exist.');
       if (run.aclEpoch !== session.record.aclEpoch && !owner) throw new SessionError(403, 'Execution results predate a workspace privacy change.');
       if (!owner) await session.workspace.read(run.execution.notebook, false); return run.execution;
     }
     else if (body.operation === 'artifacts') {
       const run = session.record.executions.find((candidate) => candidate.execution.id === body.executionId) ?? (typeof body.executionId === 'string' ? await session.history.lookupExecution(body.executionId) : undefined);
-      if (!run || (run.aclEpoch !== session.record.aclEpoch && !owner)) throw new SessionError(404, 'Execution artifacts are unavailable.');
+      if (!run || (run.execution.scope === 'private' && !owner) || (run.aclEpoch !== session.record.aclEpoch && !owner)) throw new SessionError(404, 'Execution artifacts are unavailable.');
       if (!owner) await session.workspace.read(run.execution.notebook, false);
       try { return JSON.parse(await this.readMetadata(path.join(this.directory(id), 'results', `${run.execution.id}.json`), 8 * 1024 * 1024)) as unknown; }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { files: [], removedFiles: [], expired: true }; throw error; }
@@ -379,11 +458,15 @@ export class PersistentSessionHost {
       this.failures.set(key, { count: (failure?.count ?? 0) + 1, until: Date.now() + 60_000 }); throw new SessionError(401, 'Password is incorrect.');
     }
     this.failures.delete(key);
+    return this.addMember(session, body);
+  }
+
+  private async addMember(session: Session, body: PersistentRpcRequest, invite?: Invitation): Promise<PersistentMembership> {
     const name = this.string(body, 'name'); if (!visibleVpsText(name, 120)) throw new SessionError(400, 'Invalid participant name.');
-    session.record.members = session.record.members.filter((member) => !member.revoked);
+    session.record.members = session.record.members.filter((member) => this.validMember(session, member));
     session.policy.setMembers(this.members(session)); session.policy.pruneRetiredDevices(session.record.executions.filter((run) => run.execution.state === 'queued' || run.execution.state === 'running').map((run) => run.execution.deviceId));
     if (session.record.members.length >= 128) throw new SessionError(409, 'Active membership limit reached.');
-    const memberId = randomUUID(); const secret = token(); session.record.members.push({ id: memberId, name, role: 'member', tokenHash: sha(secret), revoked: false });
+    const memberId = randomUUID(); const secret = token(); session.record.members.push({ id: memberId, name, role: 'member', tokenHash: sha(secret), revoked: false, ...(invite ? { invitationId: invite.id, expiresAt: invite.expiresAt, readOnly: invite.readOnly } : {}) });
     session.seen.set(memberId, Date.now()); session.policy.setMembers(this.members(session)); await this.persist(session);
     return { sessionId: session.record.id, memberId, token: secret, name: session.record.name };
   }
@@ -416,6 +499,8 @@ export class PersistentSessionHost {
     if (existing) {
       if (existing.execution.requesterId !== member.id || existing.execution.notebook !== body.notebook || existing.execution.cellIndex !== (body.operation === 'kernel' ? 0 : body.cellIndex)) throw new SessionError(409, 'Execution request ID has different input.');
       if (body.expectedSourceHash !== undefined && body.expectedSourceHash !== existing.sourceHash) throw new SessionError(409, 'Execution request ID has different source.');
+      if (existing.execution.scope === 'private' && member.id !== session.record.ownerId) throw new SessionError(404, 'Execution does not exist.');
+      if (body.expectedCellId !== undefined && body.expectedCellId !== existing.cellIdentity) throw new SessionError(409, 'Execution request ID has different cell identity.');
       if (existing.aclEpoch !== session.record.aclEpoch && member.id !== session.record.ownerId) throw new SessionError(403, 'Execution predates a privacy change.');
       await session.workspace.read(existing.execution.notebook, member.id === session.record.ownerId);
       return existing.execution;
@@ -423,7 +508,10 @@ export class PersistentSessionHost {
     await this.trimHistory(session, true);
     if (session.record.executions.filter((run) => run.execution.state === 'queued' || run.execution.state === 'running').length >= 4) throw new SessionError(409, 'Four executions are already pending in this session. Wait for one to finish.');
     const notebookPath = this.string(body, 'notebook'); if (!notebookPath.endsWith('.ipynb')) throw new SessionError(400, 'Select a notebook.');
-    const file = await session.workspace.read(notebookPath, false); const snapshot = session.workspace.snapshot(false);
+    const file = await session.workspace.read(notebookPath, member.id === session.record.ownerId);
+    const snapshot = session.workspace.snapshot(member.id === session.record.ownerId);
+    const privateExecution = snapshot.entries.find((entry) => entry.path === notebookPath)?.visibility === 'private';
+    const scope = privateExecution ? 'private' : 'public';
     if (body.operation === 'execute' && file.revision !== this.revision(body)) throw new SessionError(409, 'Notebook snapshot changed. Refresh before execution.');
     const notebook = this.notebook(file.content); const index = body.operation === 'kernel' ? 0 : body.cellIndex;
     let source = ''; let cellIdentity = 'kernel-control';
@@ -432,21 +520,25 @@ export class PersistentSessionHost {
       const cell = notebook.cells[index as number]!;
       if (cell.cell_type !== 'code') throw new SessionError(400, 'Only a code cell can execute.');
       source = this.source(cell); cellIdentity = cell.id ?? `index:${index}`;
+      if (body.expectedCellId !== undefined && body.expectedCellId !== cellIdentity) throw new SessionError(409, 'The displayed cell identity changed.');
       if (body.expectedSourceHash !== undefined && (typeof body.expectedSourceHash !== 'string'
         || !/^[a-f0-9]{64}$/.test(body.expectedSourceHash) || body.expectedSourceHash !== sha(source))) {
         throw new SessionError(409, 'The saved cell differs from the editor. Reload or save before execution.');
       }
     }
-    const { target, generation } = session.policy.executionTarget(member.id); const id = randomUUID(); const commandId = randomUUID();
+    const selected = session.policy.view();
+    const target = privateExecution && selected.devices.find((device) => device.id === selected.target.deviceId)?.ownerId !== member.id ? { deviceId: 'vps' } : selected.target;
+    session.policy.assertExecutionTarget(member.id, target);
+    const generation = selected.generation; const id = randomUUID(); const commandId = randomUUID();
     const raw: Record<string, unknown> = { command: 'execute', requestId: commandId, codeBase64: Buffer.from(source).toString('base64') };
     if (body.operation === 'kernel') {
       if (!['restart', 'release'].includes(String(body.command))) throw new SessionError(400, 'Invalid queued kernel control.');
       raw.command = body.command;
     }
     const execution: PersistentExecution = { id, notebook: notebookPath, cellIndex: index as number, requesterId: member.id, deviceId: target.deviceId,
-      ...(target.gpuUuid ? { gpuUuid: target.gpuUuid } : {}), generation, state: 'queued', events: [] };
-    const files = await session.workspace.publicSnapshot();
-    const command: PersistentCommand = { id: commandId, executionId: id, sessionId: session.record.id, kernelId: `${session.record.id}:${generation}:${notebookPath}`,
+      ...(target.gpuUuid ? { gpuUuid: target.gpuUuid } : {}), generation, state: 'queued', events: [], scope, cellId: cellIdentity, sourceHash: sha(source), admittedRevision: file.revision };
+    const files = await session.workspace.publicSnapshot(undefined, privateExecution);
+    const command: PersistentCommand = { id: commandId, executionId: id, sessionId: session.record.id, kernelId: `${session.record.id}:${scope}:${generation}:${notebookPath}`, scope,
       generation, deviceId: target.deviceId, ...(target.gpuUuid ? { gpuUuid: target.gpuUuid } : {}),
       files: files.map((item) => ({ ...item, version: snapshot.entries.find((entry) => entry.path === item.path)?.version ?? 0 })), command: raw };
     if (Buffer.byteLength(JSON.stringify(command)) > 16 * 1024 * 1024) throw new SessionError(413, 'Public compute snapshot exceeds the 16 MiB transport limit.');
@@ -459,7 +551,7 @@ export class PersistentSessionHost {
 
   private async kernelControl(session: Session, member: MemberRecord, body: PersistentRpcRequest): Promise<PersistentExecution> {
     const run = [...session.record.executions].reverse().find((candidate) => candidate.execution.state === 'running' && (candidate.execution.id === body.executionId || candidate.execution.notebook === body.notebook));
-    if (!run) throw new SessionError(409, 'No running kernel execution matches this control.');
+    if (!run || (run.execution.scope === 'private' && member.id !== session.record.ownerId)) throw new SessionError(409, 'No running kernel execution matches this control.');
     if (run.aclEpoch !== session.record.aclEpoch && member.id !== session.record.ownerId) throw new SessionError(403, 'Kernel execution predates a privacy change.');
     await session.workspace.read(run.execution.notebook, member.id === session.record.ownerId);
     if (run.execution.requesterId !== member.id && member.role === 'member') throw new SessionError(403, 'Only the execution requester or an administrator can control it.');
@@ -475,6 +567,7 @@ export class PersistentSessionHost {
   }
 
   private async claim(session: Session, deviceId: string): Promise<{ command: PersistentCommand | null; controls?: { id: string; command: Record<string, unknown> }[]; recoverOnly?: boolean }> {
+    session.policy.setMembers(this.members(session));
     session.policy.heartbeatDevice(deviceId);
     const running = session.record.executions.find((run) => run.execution.deviceId === deviceId && run.execution.state === 'running');
     if (running) {
@@ -488,8 +581,10 @@ export class PersistentSessionHost {
       if (run.execution.deviceId !== deviceId || run.execution.state !== 'queued') continue;
       try {
         const latest = session.policy.view();
-        if (latest.generation !== run.execution.generation || latest.target.deviceId !== deviceId || latest.target.gpuUuid !== run.execution.gpuUuid || run.aclEpoch !== session.record.aclEpoch) throw new SessionError(409, 'Queued execution selection changed.');
-        session.policy.assertExecutionTarget(run.execution.requesterId, { deviceId, ...(run.execution.gpuUuid ? { gpuUuid: run.execution.gpuUuid } : {}) }); await session.workspace.read(run.execution.notebook, false);
+        if (latest.generation !== run.execution.generation || (run.execution.scope !== 'private' && (latest.target.deviceId !== deviceId || latest.target.gpuUuid !== run.execution.gpuUuid)) || run.aclEpoch !== session.record.aclEpoch) throw new SessionError(409, 'Queued execution selection changed.');
+        if (run.execution.scope === 'private' && deviceId !== 'vps' && latest.devices.find((device) => device.id === deviceId)?.ownerId !== session.record.ownerId) throw new SessionError(403, 'Private execution requires the owner machine or VPS.');
+        session.policy.assertExecutionTarget(run.execution.requesterId, { deviceId, ...(run.execution.gpuUuid ? { gpuUuid: run.execution.gpuUuid } : {}) }); const file = await session.workspace.read(run.execution.notebook, run.execution.scope === 'private');
+        void file;
       }
       catch { run.execution.state = 'failed'; run.execution.error = 'Execution authority or public notebook access was revoked before launch.'; await this.persist(session); continue; }
       run.execution.state = 'running'; await this.persist(session);
@@ -547,26 +642,29 @@ export class PersistentSessionHost {
   private async saveOutputs(session: Session, run: ExecutionRecord): Promise<void> {
     if (run.kernelCommand) return;
     try {
-      const file = await session.workspace.read(run.execution.notebook, false); const notebook = this.notebook(file.content);
-      const version = session.workspace.snapshot(false).entries.find((entry) => entry.path === run.execution.notebook)?.version;
+      const privateExecution = run.execution.scope === 'private';
+      const file = await session.workspace.read(run.execution.notebook, privateExecution); const notebook = this.notebook(file.content);
+      const version = session.workspace.snapshot(privateExecution).entries.find((entry) => entry.path === run.execution.notebook)?.version;
       if (version !== run.notebookVersion) return;
       const cell = notebook.cells[run.execution.cellIndex]; if (!cell || cell.cell_type !== 'code' || (cell.id ?? `index:${run.execution.cellIndex}`) !== run.cellIdentity || sha(this.source(cell)) !== run.sourceHash) return;
       const rendered = persistentNotebookOutputs(run.execution.events);
       cell.outputs = rendered.outputs; cell.execution_count = rendered.executionCount;
-      await session.workspace.write(run.execution.notebook, Buffer.from(JSON.stringify(notebook, null, 2)).toString('base64'), file.revision, false);
+      await session.workspace.write(run.execution.notebook, Buffer.from(JSON.stringify(notebook, null, 2)).toString('base64'), file.revision, privateExecution, undefined, privateExecution);
     } catch (error) {
       if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
       run.execution.error = 'Notebook outputs could not be merged; the execution result remains available.';
     }
   }
   private async saveResults(session: Session, run: ExecutionRecord, value: unknown, removed: unknown): Promise<void> {
+    const privateExecution = run.execution.scope === 'private';
     if (value !== undefined && (!Array.isArray(value) || value.length > 256)) { run.execution.error = 'Returned files exceed result limits.'; return; }
     for (const [index, item] of ((value ?? []) as { path?: unknown; content?: unknown; version?: unknown }[]).entries()) {
       if (!item || !safeJobPath(item.path) || typeof item.content !== 'string' || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
-      const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      const snapshot = session.workspace.snapshot(privateExecution); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      if (privateExecution && current && current.visibility !== 'private') continue;
       const publicationId = `${run.execution.id}:write:${index}`;
       if (session.workspace.hasPublication(publicationId)) {
-        if (current?.type !== 'file' || (await session.workspace.read(item.path, false)).content !== item.content) {
+        if (current?.type !== 'file' || (await session.workspace.read(item.path, privateExecution)).content !== item.content) {
           run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.';
         }
         continue;
@@ -574,10 +672,10 @@ export class PersistentSessionHost {
       if ((current?.version ?? 0) !== item.version) {
         // A previous merge may have published this exact content before a
         // crash. Acknowledge it without overwriting a subsequent different edit.
-        if (current?.type === 'file' && (await session.workspace.read(item.path, false)).content === item.content) continue;
+        if (current?.type === 'file' && (await session.workspace.read(item.path, privateExecution)).content === item.content) continue;
         run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.'; continue;
       }
-      try { await session.workspace.write(item.path, item.content, snapshot.revision, false, publicationId); }
+      try { await session.workspace.write(item.path, item.content, snapshot.revision, privateExecution, publicationId, privateExecution); }
       catch (error) {
         if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
         run.execution.error = 'A returned file could not be merged safely; execution events remain available.';
@@ -586,12 +684,13 @@ export class PersistentSessionHost {
     if (removed !== undefined && (!Array.isArray(removed) || removed.length > 256)) { run.execution.error = 'Returned deletions exceed result limits.'; return; }
     for (const [index, item] of ((removed ?? []) as { path?: unknown; version?: unknown }[]).entries()) {
       if (!item || !safeJobPath(item.path) || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
-      const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      const snapshot = session.workspace.snapshot(privateExecution); const current = snapshot.entries.find((entry) => entry.path === item.path);
+      if (privateExecution && current && current.visibility !== 'private') continue;
       const publicationId = `${run.execution.id}:remove:${index}`;
       if (session.workspace.hasPublication(publicationId)) continue;
       if (!current) continue;
       if (current.type !== 'file' || current.version !== item.version) { run.execution.error = 'Returned deletion conflicts with a newer server version.'; continue; }
-      try { await session.workspace.remove(item.path, snapshot.revision, false, undefined, publicationId); }
+      try { await session.workspace.remove(item.path, snapshot.revision, privateExecution, undefined, publicationId); }
       catch (error) {
         if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
         run.execution.error = 'Returned deletion could not be merged safely.';

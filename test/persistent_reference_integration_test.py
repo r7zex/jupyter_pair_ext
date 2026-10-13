@@ -28,7 +28,7 @@ from unittest.mock import patch
 FROZEN_MODULES = [
     "vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js",
     "vps/persistentServer.js", "vps/persistentStorage.js", "vps/persistentCompute.js",
-    "vps/persistentHistory.js", "vps/persistentNotebookOutputs.js", "core/projectPath.js",
+    "vps/persistentHistory.js", "vps/persistentNotebookOutputs.js", "vps/persistentNotebookCrdt.js", "core/projectPath.js",
 ]
 import urllib.error
 import urllib.request

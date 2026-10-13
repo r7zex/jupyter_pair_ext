@@ -57,6 +57,13 @@ jobs:
           fi
       - name: Run complete host and VPS integration suite without skips
         run: node node_modules/mocha/bin/mocha.js --timeout 20000 --forbid-pending --exit 'out/test/**/*.test.js'
+      - name: Build the immutable isolated Linux-container runtime
+        run: docker build --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt -f deploy/persistent/Containerfile --iidfile "$RUNNER_TEMP/pair-runtime-image" deploy/persistent
+      - name: Require real container isolation and stateful kernel acceptance
+        env:
+          PAIR_NOTEBOOK_CONTAINER_IMAGE_FILE: ${{ runner.temp }}/pair-runtime-image
+          PAIR_CONTAINER_EVIDENCE: ${{ runner.temp }}/pair-container-evidence.json
+        run: python -W error::ResourceWarning test/persistent_container_integration_test.py -v
       - name: Check kernel and detached process lifecycle
         env:
           PAIR_NOTEBOOK_REQUIRE_SANDBOX: '1'
@@ -87,3 +94,4 @@ jobs:
             pair-notebook-complete-*.zip
             artifacts/pair-notebook-server-persistent.tar.gz
             artifacts/pair-notebook-server-persistent.tar.gz.sha256
+            ${{ runner.temp }}/pair-container-evidence.json

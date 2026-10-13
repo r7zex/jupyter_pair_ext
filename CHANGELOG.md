@@ -1,5 +1,15 @@
 # Changelog
 
+
+## 0.6.3 — persistent session completion work
+
+- Durable Yjs notebook updates with stable IDs, order/source/metadata, local replica journals, epoch fencing and acknowledged execution identity.
+- Continuous local-folder reconciliation with durable three-way baselines, CAS, ACL-preserving renames, conflict choices and reload/offline recovery.
+- Owner-only Private scopes, isolated snapshots/kernels/artifacts/results, owner/VPS target restriction and output cleanup on declassification.
+- Password-based session discovery and expiring/revocable read-only or Public edit invitations; separate hashed credentials and authentication throttling.
+- Actual isolated Linux-container backend with pinned image Python, readiness/resources/lifecycle; WSL2 Windows launcher and documented macOS Docker Desktop runtime.
+- Required real container CI acceptance, a measured 24-hour background soak harness and explicit full-disk production budget. Native Windows/macOS, physical CUDA, two real VS Code, target VPS and completed 24-hour soak remain acceptance blockers.
+
 ## 0.6.2
 
 - Record result publication in the atomic workspace manifest, so report retries preserve later artifact renames/deletions, including after restart.

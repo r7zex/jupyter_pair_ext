@@ -24,12 +24,20 @@ try {
     outfile: path.join(server, 'out/src/vps/cli.js'),
     define: { 'process.env.WS_NO_BUFFER_UTIL': "'1'", 'process.env.WS_NO_UTF_8_VALIDATE': "'1'" },
   });
+  // The detached soak harness uses an actual importable Host module. Bundle it
+  // independently so archive validation never resolves checkout node_modules.
+  await build({ absWorkingDir: root, entryPoints: ['src/vps/server.ts'], bundle: true,
+    platform: 'node', target: 'node20', format: 'cjs', outfile: path.join(server, 'out/src/vps/server.js'),
+    define: { 'process.env.WS_NO_BUFFER_UTIL': "'1'", 'process.env.WS_NO_UTF_8_VALIDATE': "'1'" } });
   const files = [
+    'scripts/pair-notebook-wsl-agent.ps1',
+    'scripts/persistent-session-soak.py',
     'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
     'docs/PERSISTENT_VPS_VALIDATION.md', 'LICENSE',
     'docs/PERSISTENT_VPS_REVIEW_0.6.1.md',
     'docs/PERSISTENT_VPS_REVIEW_0.6.2.md',
+    'docs/PERSISTENT_VPS_REVIEW_0.6.3.md',
   ];
   for (const relative of files) {
     const destination = path.join(server, relative);

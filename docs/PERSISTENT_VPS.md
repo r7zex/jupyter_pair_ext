@@ -1,10 +1,10 @@
 # Постоянные VPS-сессии: установка на Ubuntu
 
-Для сборки 0.6.2 см. [независимую повторную проверку](PERSISTENT_VPS_REVIEW_0.6.2.md). Выберите уже активное устройство через **Select Persistent Compute Device**, чтобы запросить персональное разрешение на выполнение: запрет переключения не запрещает такой запрос и не меняет kernel. SHA готового VSIX указан в `PAIR_BUILD.json`, сервера — в `BUILD.json`; для поставки из чистого commit оба признака local changes должны быть `false`.
+Для сборки 0.6.3 см. [реализацию и текущие границы приёмки](PERSISTENT_VPS_REVIEW_0.6.3.md). Выберите уже активное устройство через **Select Persistent Compute Device**, чтобы запросить персональное разрешение на выполнение: запрет переключения не запрещает такой запрос и не меняет kernel. SHA готового VSIX указан в `PAIR_BUILD.json`, сервера — в `BUILD.json`; для поставки из чистого commit оба признака local changes должны быть `false`.
 
 Переименование Public notebook или его папки меняет generation kernels сессии. Последующие запуски используют пустой namespace с явным уведомлением; уже принятые вычисления продолжаются. Сначала сохраните нужные Python objects в файлы, если хотите загрузить их после переименования или смены устройства.
 
-Используйте одинаковую версию сервера и VSIX, сейчас **0.6.1**. [Проверка 0.6.1](PERSISTENT_VPS_REVIEW_0.6.1.md) описывает исправления и оставшиеся критерии приёмки. При обновлении дождитесь завершения принятого исполнения и сохраните backup; незавершённый перенос durable results восстанавливается при запуске нового сервера, без повторного запуска ячейки.
+Используйте одинаковую версию сервера и VSIX, сейчас **0.6.3**. [Текущий отчёт](PERSISTENT_VPS_REVIEW_0.6.3.md) описывает реализацию и оставшиеся критерии приёмки. При обновлении дождитесь завершения принятого исполнения и сохраните backup; незавершённый перенос durable results восстанавливается при запуске нового сервера, без повторного запуска ячейки.
 
 Эта инструкция относится к новой реализации постоянного Session Host и соответствующей сборке расширения. Обычный P2P Session Host и существующий broker фоновых задач — другие режимы. Опубликованная базовая версия описана в [VPS_COMPUTE.md на исходном commit](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/docs/VPS_COMPUTE.md) и [PERSISTENT_RESEARCH.md на исходном commit](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/docs/PERSISTENT_RESEARCH.md). Новые файлы этой итерации пока следует читать в поставленной сборке/локальном checkout: ссылка на исходный commit не является подтверждением наличия новой функции на GitHub.
 
@@ -18,7 +18,7 @@
 
 Исходники новой реализации: [серверный entrypoint](../src/vps/cli.ts), [HTTP-сервер](../src/vps/server.ts), [RPC-контракт](../src/vps/persistentProtocol.ts), [интерактивный агент](../scripts/pair-notebook-session-agent.py), [Jupyter bridge](../media/jupyter_kernel_bridge.py). Старый entrypoint можно сверить с [базовым кодом GitHub](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/src/vps/cli.ts). После публикации используйте immutable commit ссылки именно на новую версию.
 
-В первом этапе синхронизация привязана к сохранённым файлам. Это ещё не полный режим общего редактирования текста/ячеек с CRDT, курсорами и всеми файловыми watcher-событиями. Серверные файлы, права и результаты сохраняются; Python-объекты в RAM не восстанавливаются после перезапуска worker/VPS и не мигрируют при смене устройства.
+В 0.6.3 notebook CRDT и двусторонний folder reconciliation работают непрерывно, с durable local journals и серверным CAS. Collaborative cursors не реализованы. Серверные файлы, права и результаты сохраняются; Python-объекты в RAM не восстанавливаются после перезапуска worker/VPS и не мигрируют при смене устройства.
 
 ## 2. Совпадающие артефакты и зависимости
 
@@ -246,7 +246,7 @@ chmod 0600 "$HOME/.pair-notebook-private/owner.json"
 
 Для начальной загрузки используйте действие загрузки файлов/папки в VPS-сессию: сначала выбирается **Private (owner only)** или **Public**, затем файлы и новый серверный каталог назначения. Private предлагается по умолчанию; Public каталог публикуется после завершения загрузки. До публикации проверьте, что каталог/файл имеет нужное правило. Вложенное Private правило ограничивает доступ даже внутри Public каталога. Права меняются через **Make VPS Folder Public** / **Make VPS Folder Private** и сохраняются сервером. Участник получает только разрешённый снимок; не копируйте токены и секреты в Public файл.
 
-В этой версии все kernels получают только Public файлы, включая запуски владельца. Private notebooks не исполняются; сервер отказывает до передачи кода агенту. Права владельца на просмотр Private файлов не предоставляют kernel доступ к ним.
+В 0.6.3 Public kernels получают только Public snapshot. Private notebooks исполняет только владелец, на VPS либо своей выбранной машине. Private scope имеет отдельный kernel ID, workspace, receipt, outputs и artifacts; содержимое Private не передаётся машине другого участника. Новые Private artifacts публикуются как Private; Public файлы из такого исполнения не перезаписываются. При переводе notebook в Public сервер атомарно удаляет старые outputs/CRDT replica и меняет generation. Python RAM не переносится между scopes.
 
 Проверьте полный цикл вручную:
 
@@ -279,7 +279,7 @@ python3 /opt/pair-notebook/server/scripts/pair-notebook-session-agent.py \
 
 Каталог state должен принадлежать выделенному непривилегированному worker account. Передача управления третьему человеку требует подтверждения владельца машины, которое проверяется сервером перед запуском. Отключение sharing запрещает новые работы; политика активных работ отображается явно.
 
-Первый защищённый agent поддерживает Linux/bubblewrap. Поддержка Windows/macOS с эквивалентной изоляцией, автоматическая установка сервисов на них и полный перенос больших datasets ещё требуют отдельной реализации и проверок. Не запускайте такой agent без изоляции в основном личном аккаунте с приватными данными.
+Защищённые runtimes: Linux/bubblewrap, macOS/Linux Docker containers и Windows/WSL2 launcher. Для контейнера требуется immutable installed image ID; Python выбирается внутри image. Нативная приёмка Windows/macOS ещё не проведена. Установка и readiness описаны ниже; agent всегда отказывает при недоступной изоляции.
 
 Для NVIDIA нужны работающий драйвер на реальной машине, доступ sandbox к нужным GPU devices и CUDA-совместимый PyTorch **в выбранном Python environment**. Имя GPU, результат `nvidia-smi` и mock объявления capabilities не заменяют реального kernel теста:
 
@@ -373,3 +373,44 @@ unset pair_restore
 5. Обновите расширения участников той же версией. При несовместимой миграции rollback требует прежнего server, прежнего VSIX **и данных из копии до миграции**. Не направляйте старый код на мигрированную базу без подтверждённой обратной совместимости.
 
 Проверка отсутствия приватных данных, работа двух реальных VS Code, реальный GPU, reboot данного VPS, испытание renewal и продолжительное наблюдение являются отдельными критериями готовности. Эта инструкция не выдаёт их за уже выполненные проверки.
+
+
+## 12. Синхронизация, discovery и приглашения 0.6.3
+
+Join требует адрес VPS и пароль. `discover` возвращает только подходящие running sessions; при нескольких сессиях расширение предлагает выбор. Пароль повторно проверяется при join. Общий rate limit ограничивает password/discovery/invitation attempts. Owner создаёт invitation в Manage: read-only либо Public edit/execute, lifetime до семи дней (UI — 24 часа). Ссылка содержит session ID и отдельный случайный invitation token в fragment; сервер хранит hash. Revoke invitation отзывает полученные через неё member credentials. Password rotation отзывает приглашения и участников. Invitation не является admin/member bearer.
+
+Открытые VPS notebooks синхронизируются через Yjs. Stable cell IDs, порядок, source и metadata сохраняются вместе с CRDT state в атомарном notebook blob; retry одного update не заменяет поздние edits. Локальный replica journal записывается до отправки. При смене privacy/замене notebook старый epoch отвергается: UI предлагает сохранить replica отдельно и загрузить серверную версию. Execution admission сверяет отображаемый source hash, ID и acknowledged revision; сохранённые request IDs предотвращают скрытый rerun после потерянного HTTP ACK.
+
+Manage → Synchronize a local folder continuously связывает выбранную локальную папку с server folder. Состояние связи восстанавливается после reload, reconciliation использует durable hash baseline, CAS, rename с сохранением ACL и ручной выбор конфликтующей версии. До выбора обе копии сохраняются. `.git` и `.pair-notebook-conflicts` исключены; links/special files отвергаются. Большие datasets не входят в этот протокол. Сочетание одновременного локального редактирования notebook через folder sync и виртуального notebook editor требует отдельной проверки двумя настоящими VS Code; целесообразно открывать shared notebook в VPS workspace.
+
+## 13. Защищённые VM/container agents
+
+Windows: установите WSL2 и выделенную Ubuntu distribution штатными средствами Microsoft. Launcher использует выбранное имя distribution; не завершает чужие службы и не удаляет distro. `-Action Install` устанавливает Linux venv, bubblewrap и копии только agent/bridge; `Check` выполняет настоящую readiness probe. Запуск от root запрещён. Используйте non-root default user и credentials в его Linux private directory.
+
+```powershell
+./scripts/pair-notebook-wsl-agent.ps1 -Distro PairNotebook -Action Install
+./scripts/pair-notebook-wsl-agent.ps1 -Distro PairNotebook -Action Check
+./scripts/pair-notebook-wsl-agent.ps1 -Distro PairNotebook -Action Run -AgentArguments @('--config','/home/pair/device.json','--state','/home/pair/agent-state','--share')
+```
+
+Python и runtime находятся в WSL2; это Linux compute, не выбранный Windows conda/venv. Bubblewrap разрешает только workspace, system/Python roots и bridge, не `/mnt/c`, Windows home или весь диск. Отзыв sharing/consent выполняется через server UI; foreground launcher завершается Ctrl-C с освобождением kernels. Для unattended startup настройте службу в выбранной distro и подтвердите её lifecycle на Windows; автоматическая установка Windows service пока не реализована.
+
+macOS/Linux: установите Docker Desktop/Engine, запустите Linux daemon. На macOS включите штатный локальный Docker socket в настройках Desktop; coordinator не меняет host HOME и использует только уже настроенные Docker selectors. Containerfile готовит реальный venv. CA для build — доверенный bundle вашей среды; не отключайте verification. В образе нет credentials, host home и Docker socket. Зафиксируйте immutable image ID после сборки:
+
+```bash
+docker build --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt -f deploy/persistent/Containerfile --iidfile /tmp/pair-runtime-image deploy/persistent
+python3 scripts/pair-notebook-session-agent.py --runtime-image "$(cat /tmp/pair-runtime-image)" --runtime-python /opt/pair-python/bin/python --check-isolation
+python3 scripts/pair-notebook-session-agent.py --config /PRIVATE/device.json --state /PRIVATE/agent-state --share --runtime-image "$(cat /tmp/pair-runtime-image)" --runtime-python /opt/pair-python/bin/python --runtime-cpus 1 --runtime-memory-mb 512
+```
+
+На macOS выберите существующий trusted CA bundle для build. Docker Desktop использует Linux VM: выбранный interpreter — `/opt/pair-python/bin/python` внутри image. Host Python только запускает coordinator. Каждый kernel: non-root UID/GID владельца coordinator (согласован с правами bind workspace), read-only image, network none, cap-drop ALL, no-new-privileges, pids 128, CPU/RAM/swap limits, bounded tmpfs и два mounts `/work`, `/bridge.py`. Остановка удаляет точный container; восстановление agent удаляет только orphan containers с его label после получения single-writer lock. Native Windows Python coordinator запрещён: Linux no-follow operations выполняет WSL2.
+
+## 14. Полный disk budget: обязательное production решение
+
+Workspace quota сама по себе недостаточна. Для VPS 25 GB выделите отдельные quota-limited файловые системы/volumes: server data **4 GiB** (workspace/blobs/commands/receipts/results/broker), worker state **4 GiB**, фиксированные dependencies/images **до 6 GiB**, journald **128 MiB**, reserve root **не менее 5 GiB**. Docker writable kernels используют тот же ограниченный worker volume; tmpfs не заменяет его disk quota. Backup храните вне этих volumes и вне VPS. Конкретное устройство/partition/quota ID устанавливается только после инвентаризации и проверенного backup; данный checkout не форматирует VPS.
+
+Provisioning считается незавершённым до реальной проверки kernel/worker write до границы quota, `ENOSPC`/`EDQUOT`, сохранения опубликованных manifests, retry после освобождения безопасного места и reboot с установленными mounts. Настройте alerts при 70/85%, запрет нового admission при 90%, bounded journald, fixed images и off-host backup retention. Никогда не удаляйте permanent receipts: их потеря допускает повторное исполнение старых request IDs. При исчерпании quota сохраняйте receipts/ACL и останавливайте новые записи; переносите session store целиком на больший проверенный volume или явно завершайте старую сессию. Outputs имеют существующую bounded history retention; blobs собираются на recovery; worker receipts/retained results сохраняются в пределах OS quota до ручного завершения сессии и проверенного archive. Без настроенной OS quota полная disk bound **не подтверждена**.
+
+## 15. Длительный soak
+
+`scripts/persistent-session-soak.py --evidence /PRIVATE/soak --image-file /PRIVATE/image-id` запускает реальные Host, два sessions, два isolated executor, Jupyter, reconnect, idempotent admission, consent/revoke, kernel restart и Host restart. Default duration — 24 часа реального monotonic time; меньшая acceptance duration запрещена. `--check` выполняет короткую проверку harness и явно записывает `acceptance24Hours=false`. JSONL содержит elapsed time, execution IDs, ledger counts, RSS/disk/process/kernel samples; summary становится true только после измеренных 86400 секунд. Состояние/credentials evidence directory — Private, не включайте его в публичные CI artifacts. Публичны только очищенные metrics/summary, runtime image ID и test logs. Ни короткий harness, ни запущенный процесс не являются завершённой 24-hour приёмкой; успешные 24 часа не доказывают год uptime.

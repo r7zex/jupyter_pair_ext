@@ -133,11 +133,11 @@ export class PersistentWorkspace {
   }
 
   /** Compute snapshots always use the member ACL, including when the requester is the owner. */
-  publicSnapshot(maxBytes = 10 * 1024 * 1024): Promise<{ path: string; content: string }[]> {
+  publicSnapshot(maxBytes = 10 * 1024 * 1024, privateExecution = false): Promise<{ path: string; content: string }[]> {
     return this.enqueue(async () => {
       const manifest = this.current();
       if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) quota();
-      const publicFiles = manifest.entries.filter((entry) => entry.type === 'file' && this.visibility(entry.path, manifest) === 'public');
+      const publicFiles = manifest.entries.filter((entry) => entry.type === 'file' && (privateExecution || this.visibility(entry.path, manifest) === 'public'));
       // Bound serialized command size before allocating content buffers on a small VPS.
       const serializedBytes = publicFiles.reduce((sum, entry) => sum + Math.ceil(entry.size / 3) * 4
         + Buffer.byteLength(JSON.stringify(entry.path), 'utf8') + 26, 2);
@@ -159,17 +159,22 @@ export class PersistentWorkspace {
     await this.mutate(this.current().revision, true, (next) => { next.publications = keep; });
   }
 
-  write(value: string, content: string, expectedRevision: number, owner: boolean, publicationId?: string): Promise<PersistentSnapshot> {
+  write(value: string, content: string, expectedRevision: number, owner: boolean, publicationId?: string, privateResult = false): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, async (next) => {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
       const bytes = decodeContent(content, this.limits.maxFileBytes);
       const existing = next.entries.find((entry) => entry.path === name);
+      if (privateResult && (!owner || (existing && this.visibility(name, next) !== 'private'))) {
+        throw new PersistentStorageError('FORBIDDEN', 'Private execution cannot publish into Public files.');
+      }
       if (existing?.type === 'directory') invalid('A directory cannot be overwritten by a file.');
+      const originalParents = privateResult ? new Set(next.entries.map((entry) => entry.path)) : undefined;
       this.ensureParents(name, next);
+      if (originalParents) for (const entry of next.entries) if (entry.type === 'directory' && !originalParents.has(entry.path)) entry.visibility = 'private';
       const blob = createHash('sha256').update(bytes).digest('hex');
       const entry: StoredEntry = { path: name, type: 'file', size: bytes.length, mtime: Date.now(),
-        version: next.revision, blob, ...(existing?.visibility ? { visibility: existing.visibility } : {}) };
+        version: next.revision, blob, ...(privateResult ? { visibility: 'private' as const } : existing?.visibility ? { visibility: existing.visibility } : {}) };
       next.entries = next.entries.filter((item) => item.path !== name);
       next.entries.push(entry);
       this.validateEntries(next);
@@ -227,14 +232,23 @@ export class PersistentWorkspace {
 
   /** This API is owner-only; the authenticated server must check the caller before calling it. */
   setVisibility(value: string, visibility: 'public' | 'private', expectedRevision: number, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
-    return this.mutate(expectedRevision, true, (next) => {
+    return this.mutate(expectedRevision, true, async (next) => {
       const name = normalizePath(value);
       if (visibility !== 'public' && visibility !== 'private') invalid('Invalid visibility.');
       const entry = next.entries.find((item) => item.path === name);
       if (!entry) missing();
+      const previouslyPrivate = next.entries.filter((item) => within(item.path, name) && item.type === 'file' && item.path.endsWith('.ipynb') && this.visibility(item.path, next) === 'private');
       entry.visibility = visibility;
       entry.version = next.revision;
       entry.mtime = Date.now();
+      if (visibility === 'public') for (const item of previouslyPrivate) {
+        const notebook = JSON.parse((await this.readBlob(item)).toString('utf8')) as { cells?: { outputs?: unknown[]; execution_count?: number | null }[]; metadata?: Record<string, unknown> };
+        if (!Array.isArray(notebook.cells)) invalid('Cannot publish an invalid Private notebook.');
+        for (const cell of notebook.cells) { if (cell.outputs) cell.outputs = []; if ('execution_count' in cell) cell.execution_count = null; }
+        if (notebook.metadata) { delete notebook.metadata.pair_crdt; delete notebook.metadata.widgets; }
+        const bytes = Buffer.from(JSON.stringify(notebook)); item.blob = createHash('sha256').update(bytes).digest('hex');
+        item.size = bytes.length; item.version = next.revision; item.mtime = Date.now(); await this.storeBlob(item.blob, bytes);
+      }
     }, beforePublish);
   }
 
