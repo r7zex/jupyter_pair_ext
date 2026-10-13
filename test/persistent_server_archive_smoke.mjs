@@ -30,7 +30,7 @@ async function port() {
 async function start() {
   const value = await port();
   const child = spawn(process.execPath, [path.join(root, 'server/out/src/vps/cli.js')], {
-    cwd: path.join(root, 'empty'), env: { ...process.env,
+    cwd: path.join(root, 'empty'), env: { ...process.env, NODE_PATH: '',
       PAIR_VPS_CLIENT_TOKEN: admin, PAIR_VPS_AGENT_TOKENS: JSON.stringify({ vps: 'B'.repeat(40) }),
       PAIR_VPS_DATA: path.join(root, 'data'), PAIR_VPS_BIND: '127.0.0.1', PAIR_VPS_PORT: String(value) },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -70,6 +70,8 @@ try {
   execFileSync('tar', ['-xzf', archive, '-C', root]); await mkdir(path.join(root, 'empty'));
   const manifest = JSON.parse(await readFile(path.join(root, 'server/BUILD.json')));
   assert.equal(manifest.version, version);
+  assert.equal(manifest.baseCommit, execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repository, encoding: 'utf8' }).trim());
+  assert.equal(manifest.localChangesIncluded, execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: repository, encoding: 'utf8' }).trim() !== '');
   for (const [name, digest] of Object.entries(manifest.files)) {
     assert.equal(createHash('sha256').update(await readFile(path.join(root, 'server', name))).digest('hex'), digest);
   }

@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sourceProvenance } from './build-provenance.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
@@ -28,6 +29,7 @@ try {
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
     'docs/PERSISTENT_VPS_VALIDATION.md', 'LICENSE',
     'docs/PERSISTENT_VPS_REVIEW_0.6.1.md',
+    'docs/PERSISTENT_VPS_REVIEW_0.6.2.md',
   ];
   for (const relative of files) {
     const destination = path.join(server, relative);
@@ -47,8 +49,9 @@ try {
     }
   }
   await hashFiles(server);
-  const manifest = { version: pkg.version, baseCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
-    localChangesIncluded: true, node: '>=20', files: hashes };
+  const source = sourceProvenance(root);
+  const manifest = { version: pkg.version, baseCommit: source.commit,
+    localChangesIncluded: source.dirty, node: '>=20', files: hashes };
   await fs.writeFile(path.join(server, 'BUILD.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   await fs.mkdir(artifacts, { recursive: true });
   execFileSync('tar', ['-czf', archive, '-C', staging, 'server'], { stdio: 'inherit' });

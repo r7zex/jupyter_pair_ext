@@ -68,6 +68,7 @@ describe('Persistent session transport and credential boundaries', () => {
 });
 
 let warningChoice: string | undefined;
+let quickPick: ((items: unknown[]) => Promise<unknown>) | undefined;
 const informationMessages: string[] = [];
 const boundary = {
   TreeItem: class {},
@@ -84,7 +85,18 @@ const boundary = {
   window: {
     activeNotebookEditor: undefined as { notebook: { uri: vscode.Uri } } | undefined,
     showWarningMessage: async () => warningChoice,
+    showQuickPick: async (items: unknown[]) => quickPick?.(items),
+    showOpenDialog: async () => [{ scheme: 'file', path: '/selected.txt' }],
+    showInputBox: async () => 'upload',
     showInformationMessage: async (message: string) => { informationMessages.push(message); },
+  },
+  commands: { executeCommand: async () => undefined },
+  workspace: {
+    isTrusted: true,
+    workspaceFolders: undefined as vscode.WorkspaceFolder[] | undefined,
+    notebookDocuments: [] as vscode.NotebookDocument[],
+    updateWorkspaceFolders: () => true,
+    fs: { stat: async () => ({ type: 1, size: 5 }), readFile: async () => Buffer.from('local private fixture') },
   },
 };
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
@@ -213,6 +225,17 @@ describe('Persistent server file save conflicts', () => {
 });
 
 describe('Persistent notebook execution connection ownership', () => {
+  it('shows fresh-kernel namespace reset events even when the server generation did not change', async () => {
+    informationMessages.length = 0;
+    const message = 'A fresh Python kernel was started; previous variables are unavailable.';
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { sessionId: 'session' }, disposed: false,
+    }) as { observe: (initial: PersistentExecution) => Promise<PersistentExecution> };
+    await ui.observe({ id: 'fresh-kernel', notebook: 'work.ipynb', cellIndex: 0, requesterId: 'member', deviceId: 'vps',
+      generation: 1, state: 'completed', events: [{ type: 'kernelState', message }] });
+    assert.ok(informationMessages.includes(message));
+  });
+
   type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
   for (const phase of ['queue', 'save']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
     let unblock!: () => void;
@@ -249,6 +272,100 @@ describe('Persistent notebook execution connection ownership', () => {
     await ui.execute([cell], notebook);
     assert.equal(calls[0]?.sessionId, 'original');
     assert.equal(calls[0]?.expectedSourceHash, createHash('sha256').update('print("displayed")').digest('hex'));
+  });
+});
+
+describe('Persistent compute selection UI', () => {
+  afterEach(() => { quickPick = undefined; warningChoice = undefined; });
+  for (const phase of ['dialog', 'response']) it(`keeps current-device consent attached to the original connection during ${phase}`, async () => {
+    let release!: () => void; let submitted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { submitted = resolve; });
+    const calls: unknown[] = [];
+    const view = { memberId: 'member', target: { deviceId: 'pc' }, members: [], consents: [], devices: [
+      { id: 'pc', ownerId: 'owner', name: 'Machine', python: '/python', cpu: 'CPU', isolation: 'bwrap', enabled: true, online: true, gpus: [] },
+    ] };
+    const connection = { sessionId: 'original', client: { call: async (_operation: string, input: unknown) => {
+      calls.push(input); submitted(); await gate; return view;
+    } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), { connection, view, poll: async () => undefined }) as {
+      selectCompute: () => Promise<void>; connection: unknown; view: unknown;
+    };
+    quickPick = async (items) => { if (phase === 'dialog') { submitted(); await gate; } return items[0]; };
+    warningChoice = 'Request access';
+    const pending = ui.selectCompute(); await started;
+    const replacement = { target: { deviceId: 'new-session-pc' } };
+    ui.connection = { sessionId: 'replacement' }; ui.view = replacement;
+    release(); await pending;
+    assert.equal(calls.length, phase === 'dialog' ? 0 : 1);
+    assert.equal(ui.view, replacement);
+  });
+});
+
+describe('Persistent session actions preserve their original connection', () => {
+  afterEach(() => { quickPick = undefined; warningChoice = undefined; });
+  for (const action of ['manage', 'shareComputer', 'upload', 'recoverExecution']) it(`rejects ${action} after a session changes during its dialog`, async () => {
+    let release!: () => void; let opened!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const dialog = new Promise<void>((resolve) => { opened = resolve; });
+    const calls: unknown[] = [];
+    const original = { sessionId: 'original', client: { call: async () => { calls.push('original'); return {}; } } };
+    const replacement = { sessionId: 'replacement', client: { call: async () => { calls.push('replacement'); return { id: 'run', notebook: 'old.ipynb', state: 'completed' }; } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: original, disposed: false, poll: async () => undefined,
+      view: { id: 'original', name: 'Original', ownerId: 'owner', memberId: 'owner', allowMemberSwitch: false,
+        members: [{ id: 'owner', role: 'owner' }], consents: [], devices: [{ id: 'pc', ownerId: 'owner', enabled: true }] },
+      context: { globalState: { get: () => [{ notebook: 'old.ipynb', requestId: 'old-request' }] } },
+      files: { refresh: async () => undefined, uri: () => ({}), createPrivateDirectory: async () => { calls.push('mkdir'); },
+        writeFile: async () => { calls.push('upload'); } },
+    }) as { connection: unknown; [key: string]: unknown };
+    quickPick = async (items) => {
+      opened(); await gate;
+      return action === 'manage' ? items.find((item) => (item as { action?: string }).action === 'settings')
+        : action === 'shareComputer' ? items.find((item) => (item as { action?: string }).action === 'toggle') : items[0];
+    };
+    const pending = (ui[action] as () => Promise<void>)(); await dialog;
+    ui.connection = replacement; release();
+    await assert.rejects(pending, /session changed/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('does not clear a replacement connection when an old leave acknowledgement arrives late', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const replacement = { sessionId: 'replacement' };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { sessionId: 'original', client: { call: async () => gate } },
+      files: { setConnection: () => undefined }, status: { hide: () => undefined }, changed: { fire: () => undefined },
+    }) as { connection: unknown; leave: () => Promise<void> };
+    const pending = ui.leave(); ui.connection = replacement; release(); await pending;
+    assert.equal(ui.connection, replacement);
+  });
+
+  it('keeps a newer attachment while retaining credentials from a delayed older heartbeat', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const originalCall = PersistentClient.prototype.call;
+    PersistentClient.prototype.call = async function <T>(): Promise<T> {
+      if (this.endpoint.includes('first.example')) await gate;
+      return { id: this.endpoint, memberId: 'member', ownerId: 'owner' } as T;
+    };
+    let saved: unknown[] = []; const credentials: string[] = [];
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      disposed: false, connectionAttempt: 0, credentialWrites: Promise.resolve(), updateUi: () => undefined,
+      context: { secrets: { store: async (key: string) => { credentials.push(key); } },
+        globalState: { get: () => saved, update: async (_key: string, value: unknown[]) => { saved = value; } } },
+      files: { setConnection: () => undefined, refresh: async () => undefined, uri: () => ({ toString: () => 'pair-vps://second/' }) },
+    }) as { attach: (saved: unknown, token: string) => Promise<void>; connection: { sessionId: string } };
+    const descriptor = (name: string) => ({ endpoint: `https://${name}.example`, sessionId: name, memberId: 'member', name });
+    const first = ui.attach(descriptor('first'), 'a'.repeat(40));
+    try {
+      await ui.attach(descriptor('second'), 'b'.repeat(40)); release();
+      await assert.rejects(first, /connection changed/);
+      assert.equal(ui.connection.sessionId, 'second');
+      assert.equal(credentials.length, 2);
+      assert.deepEqual(saved.map((item) => (item as { sessionId: string }).sessionId), ['second', 'first']);
+    } finally { release(); PersistentClient.prototype.call = originalCall; }
   });
 });
 

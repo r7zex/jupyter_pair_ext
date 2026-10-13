@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, WebRTC, Iroh QUIC and redundant relay fallback.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -428,7 +428,7 @@
   },
   "scripts": {
     "clean": "rimraf out",
-    "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap && node scripts/bundle-iroh-native.mjs",
+    "compile": "rimraf out && tsc -p tsconfig.json && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --define:process.env.WS_NO_BUFFER_UTIL=\"'1'\" --define:process.env.WS_NO_UTF_8_VALIDATE=\"'1'\" --outfile=out/extension.js --sourcemap && node scripts/bundle-iroh-native.mjs && node scripts/package-build-manifest.mjs",
     "lint": "eslint .",
     "test": "npm run compile && mocha --timeout 15000 --exit \"out/test/**/*.test.js\"",
     "test:e2e": "npm run compile && node scripts/run-vscode-e2e.mjs",

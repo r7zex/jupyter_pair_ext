@@ -8,6 +8,7 @@ import { builtinModules } from 'node:module';
 import yazl from 'yazl';
 import yauzl from 'yauzl';
 import sensitivePathPolicy from './sensitive-path-policy.cjs';
+import { sourceProvenance } from './build-provenance.mjs';
 
 const { isSensitiveArtifactPath } = sensitivePathPolicy;
 
@@ -141,6 +142,7 @@ async function main() {
   const vsixEntries = await listEntries(vsixPath);
   const required = [
     'extension/package.json',
+    'extension/PAIR_BUILD.json',
     'extension/out/extension.js',
     'extension/media/jupyter_kernel_bridge.py',
     'extension/media/pair-notebook.svg',
@@ -152,6 +154,33 @@ async function main() {
   const missing = required.filter((entry) => !vsixEntries.includes(entry));
   if (missing.length) throw new Error(`VSIX is missing required entries: ${missing.join(', ')}`);
   await verifyNativeAssets(vsixPath, vsixEntries);
+  const provenance = JSON.parse(fs.readFileSync(path.join(root, 'PAIR_BUILD.json'), 'utf8'));
+  const source = sourceProvenance(root);
+  if (provenance.version !== packageJson.version || provenance.commit !== source.commit || provenance.dirty !== source.dirty) {
+    throw new Error('Compile the current source before packaging: stale build provenance.');
+  }
+  await new Promise((resolve, reject) => {
+    yauzl.open(vsixPath, { lazyEntries: true }, (error, zip) => {
+      if (error) return reject(error);
+      const expected = { 'extension/PAIR_BUILD.json': createHash('sha256').update(fs.readFileSync(path.join(root, 'PAIR_BUILD.json'))).digest('hex'),
+        ...Object.fromEntries(Object.entries(provenance.files).map(([name, digest]) => [`extension/${name}`, digest])) };
+      zip.on('error', reject);
+      zip.on('entry', (entry) => {
+        if (!(entry.fileName in expected)) return zip.readEntry();
+        zip.openReadStream(entry, (error, stream) => {
+          if (error) return reject(error);
+          const hash = createHash('sha256'); stream.on('data', (data) => hash.update(data)); stream.on('error', reject);
+          stream.on('end', () => {
+            if (hash.digest('hex') !== expected[entry.fileName]) { zip.close(); reject(new Error(`Packaged runtime differs from compiled source: ${entry.fileName}`)); return; }
+            delete expected[entry.fileName]; zip.readEntry();
+          });
+        });
+      });
+      zip.on('end', () => Object.keys(expected).length ? reject(new Error('Packaged runtime files are missing.')) : resolve());
+      zip.readEntry();
+    });
+  });
+  console.log(`VSIX source provenance verified: ${provenance.commit}; dirty=${provenance.dirty}.`);
   const unsafePaths = vsixEntries.filter((entry) => entry.startsWith('/') || entry.includes('\\')
     || entry.split('/').includes('..'));
   if (unsafePaths.length) throw new Error(`VSIX contains an unsafe archive path: ${unsafePaths.join(', ')}`);
