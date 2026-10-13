@@ -1,0 +1,62 @@
+/** Independent server-hosted sessions. These credentials never authorize the legacy job broker. */
+export interface PersistentFileEntry {
+  path: string;
+  type: 'file' | 'directory';
+  size: number;
+  mtime: number;
+  version: number;
+  visibility: 'public' | 'private';
+}
+export interface PersistentSnapshot { revision: number; entries: PersistentFileEntry[] }
+export interface PersistentDevice {
+  id: string;
+  ownerId: string;
+  name: string;
+  python: string;
+  cpu: string;
+  gpus: { uuid: string; name: string; memoryMb: number }[];
+  enabled: boolean;
+  online: boolean;
+  isolation: string;
+  ready?: boolean;
+  cudaAvailable?: boolean;
+  cpuCount?: number;
+  diagnostics?: string[];
+  /** Computed by the Session Host from admitted work; never accepted as agent inventory. */
+  usingMemberIds?: string[];
+}
+export interface PersistentTarget { deviceId: string; gpuUuid?: string }
+export interface PersistentMember { id: string; name: string; role: 'owner' | 'admin' | 'member'; online: boolean }
+export interface PersistentConsent {
+  id: string; requesterId: string; deviceId: string; gpuUuid?: string;
+  status: 'pending' | 'approved' | 'denied' | 'revoked';
+}
+export interface PersistentSessionView {
+  id: string; name: string; state: 'running' | 'stopped'; ownerId: string;
+  memberId: string; allowMemberSwitch: boolean; members: PersistentMember[];
+  devices: PersistentDevice[]; target: PersistentTarget; generation: number;
+  consents: PersistentConsent[]; revision: number;
+}
+export interface PersistentMembership { sessionId: string; memberId: string; token: string; name: string }
+export interface PersistentExecution {
+  id: string; notebook: string; cellIndex: number; requesterId: string;
+  deviceId: string; gpuUuid?: string; generation: number;
+  state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+  events: Record<string, unknown>[]; error?: string;
+}
+export interface PersistentCommand {
+  id: string; executionId: string; sessionId: string; kernelId: string;
+  generation: number; deviceId: string; gpuUuid?: string;
+  files: { path: string; content: string }[];
+  command: Record<string, unknown>;
+}
+/** POST /v1/sessions/rpc, JSON {operation, sessionId?, ...}. Responses are JSON.
+ * Operations: create/list (admin bearer), join (password), view/heartbeat/leave,
+ * snapshot/read/write/mkdir/rename/remove/visibility, lifecycle/password/revoke/role,
+ * settings/registerDevice/share/select/consent/revokeConsent, execute/execution,
+ * claim/report (device owner bearer; configured VPS agent token for deviceId=vps).
+ * Files use base64 content; mutations require expectedRevision, rename also newPath.
+ * execute uses notebook, cellIndex, expectedRevision, requestId. report uses commandId,
+ * executionId, events (bridge envelopes), state, optional error/files.
+ */
+export interface PersistentRpcRequest { operation: string; sessionId?: string; [key: string]: unknown }

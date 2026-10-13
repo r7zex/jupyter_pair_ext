@@ -1,0 +1,6 @@
+# Replace YOUR_OWN_NAME with a name registered in your own DuckDNS account.
+# Its A record must resolve to 192.0.2.10. Remove any incorrect AAAA record.
+YOUR_OWN_NAME.duckdns.org {
+    header Cache-Control "no-store"
+    reverse_proxy 127.0.0.1:8787
+}

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { atomicWriteFile } from '../core/atomicFile';
+import { PersistentSessionHost } from './persistentServer';
 import { AGENT_ONLINE_MS, CANCELLATION_CONFIRMATION_MS, GPU_UUID, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
   type AgentResources, type CancellationChallenge, type CancellationResult, type ComputeScope, type JobStatus, type JobSummary,
   type VpsAgent, type VpsJob, jobSummary, submissionDigest, terminalJob, validComputeScope, validDatasetIdentity, validateSubmission, visibleVpsText } from './protocol';
@@ -32,6 +33,8 @@ export interface VpsServerOptions {
   agentTokens: Record<string, string>;
   /** The existing shared clientToken remains an explicitly trusted team operator. */
   clientPrincipals?: Record<string, VpsClientPrincipal>;
+  /** Agent credential used exclusively for interactive execution of persistent sessions. */
+  persistentVpsAgentId?: string;
 }
 
 class HttpError extends Error {
@@ -126,6 +129,7 @@ export class VpsServer {
   private stopPromise: Promise<void> | undefined;
   private closing = false;
   private lockOwner: string | undefined;
+  private readonly persistent: PersistentSessionHost;
 
   public constructor(private readonly options: VpsServerOptions) {
     const grants = Object.entries(options.clientPrincipals ?? {});
@@ -146,6 +150,10 @@ export class VpsServer {
         return { ...rights, id: id as string, generation: createHash('sha256')
           .update(JSON.stringify({ id, token: rights.token, role: rights.role, projectIds: rights.projectIds })).digest('hex') };
       });
+    const vpsAgentToken = options.agentTokens[options.persistentVpsAgentId ?? 'vps'];
+    this.persistent = new PersistentSessionHost({ directory: path.join(options.dataDirectory, 'sessions'),
+      administrativeTokens: this.principals.filter((principal) => principal.role === 'operator').map((principal) => principal.token),
+      ...(vpsAgentToken ? { vpsAgentToken } : {}) });
     this.server.requestTimeout = 10_000;
     this.server.headersTimeout = 10_000;
     this.server.on('upgrade', (request, socket, head) => {
@@ -166,7 +174,7 @@ export class VpsServer {
     await mkdir(this.options.dataDirectory, { recursive: true, mode: 0o700 });
     await this.acquireStoreLock();
     try { return await this.initialize(port, host); }
-    catch (error) { await this.releaseStoreLock(); throw error; }
+    catch (error) { await this.persistent.stop(); await this.releaseStoreLock(); throw error; }
   }
 
   private async initialize(port: number, host: string): Promise<number> {
@@ -181,6 +189,7 @@ export class VpsServer {
     this.jobs.clear();
     for (const job of ordered) this.jobs.set(job.id, job);
     await this.loadConfirmations();
+    await this.persistent.start();
     await new Promise<void>((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(port, host, () => { this.server.off('error', reject); resolve(); });
@@ -236,6 +245,7 @@ export class VpsServer {
     this.server.closeIdleConnections();
     await Promise.allSettled([...this.requests]);
     await this.serial;
+    await this.persistent.stop();
     await new Promise<void>((resolve) => this.sockets.close(() => resolve()));
     await closed;
     await this.releaseStoreLock();
@@ -289,6 +299,8 @@ export class VpsServer {
     try {
       if (this.closing) throw new HttpError(503, 'VPS broker is stopping.');
       const url = new URL(request.url ?? '/', 'http://localhost');
+      if (request.method === 'GET' && url.pathname === '/health') { response.end(JSON.stringify({ status: 'ok', persistentSessions: true })); return; }
+      if (url.pathname === '/v1/sessions/rpc') { clearTimeout(deadline); await this.persistent.handle(request, response); return; }
       const agentRoute = /^\/v1\/agents\/([A-Za-z0-9_-]{1,128})\/(poll|report)$/.exec(url.pathname);
       const token = agentRoute ? this.agentTokens.get(agentRoute[1]!) : undefined;
       const principal = agentRoute ? undefined : this.principals.find((candidate) => this.authorized(request, candidate.token));

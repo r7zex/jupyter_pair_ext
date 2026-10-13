@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - 2026-10-13 (persistent VPS sessions, development build)
+
+- Adds a server-owned session lifecycle, salted scrypt password joins, independent member credentials, administrative grants and revocation. Empty sessions survive disconnects and process restarts.
+- Stores projects as immutable file blobs and atomic revisioned manifests, enforcing inherited private-folder ACLs on snapshots, direct APIs, mutation and compute preparation. Stale saves preserve local edits; output-only notebook changes can merge safely.
+- Separates compute selection from session ownership, with exact machine-owner consent, server-checked sharing, the sole-participant exception and safe fallback for subsequent runs.
+- Adds an independent Linux interactive Jupyter agent using the selected interpreter and real CUDA UUID masks. Public workspace isolation fails closed; changing device creates a new Python namespace. Receipts prevent hidden replay, and bounded output archives preserve request identities.
+- Integrates persistent Explorer workspaces, notebook execution, device/consent controls and owner credential import into VS Code. Preserves the existing P2P runtime and background broker as separate modes.
+- Includes a standalone server package, direct VPS administration helper, systemd templates, IP certificate renewal and backup instructions. This stage provides save-based synchronization. Real NVIDIA hardware, production VPS/TLS, native Windows/macOS agent isolation, live VPS CRDT editing and a completed long soak remain separate work or validation.
+
 ## 0.5.39 - 2026-10-11 (durable recovery and experiment ownership)
 
 - Persists confirmed cancellation intent before changing jobs on every retry. Incomplete stop operations close admission and are reconciled before further claims; failed receipt writes cannot produce a successful replay. Retained cancellation metadata is checked before recovery.

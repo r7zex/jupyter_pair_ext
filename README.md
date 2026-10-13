@@ -1,6 +1,8 @@
 # Pair Notebook
 
-For unattended training, use the independent compute agent. Version 0.5.39 strengthens durable cancellation recovery, per-run confirmation and immutable worker preparation, with a synthetic reproducible research reference. See [persistent research runs](docs/PERSISTENT_RESEARCH.md) for operation and verification limits.
+The 0.6.0 development build adds [persistent VPS sessions](docs/PERSISTENT_VPS.md): the server owns session lifecycle and files, while an independent interactive agent owns the selected Python kernel. This first stage synchronizes on save with conflict checks; per-keystroke VPS CRDT collaboration and native Windows/macOS compute isolation remain follow-up work. See [the architecture](docs/PERSISTENT_VPS_ARCHITECTURE.md) and [validation boundaries](docs/PERSISTENT_VPS_VALIDATION.md).
+
+For unattended background training, the existing independent compute agent remains available. See [persistent research runs](docs/PERSISTENT_RESEARCH.md) for that separate workflow.
 
 [![Latest release](https://img.shields.io/github/v/release/r7zex/jupyter_pair_ext?display_name=tag&sort=semver)](https://github.com/r7zex/jupyter_pair_ext/releases/latest)
 [![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
@@ -16,11 +18,12 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 - Recoverable remote notebook execution with idempotent requests, route-aware file barriers, ordered output replay, and exactly-once stdin handling.
 - A shared host command terminal: everyone can view its output; the current host enters commands and confirms shell interruption with exact typed `CONFIRM`. Open **Host terminal** in the session sidebar or **Pair Notebook: Open Shared Host Terminal** from the Command Palette.
 - Optional [own VPS relay and persistent compute agents](docs/VPS_COMPUTE.md): encrypted collaboration through your server and CPU/GPU Python jobs on any registered PC, continuing while the submitting laptop is off.
+- [Server-hosted VPS sessions](docs/PERSISTENT_VPS.md): durable projects, password membership, public/private folder ACLs, device-owner consent, CPU/GPU selection, and stateful interactive Jupyter through a Linux compute agent. Use **Connect to VPS**; the earlier broker connection is **Connect to VPS Compute**.
 - A bundled runtime: collaborators install only the VSIX and do not need a Pair Notebook account, daemon, server, mesh client, or npm package.
 
 ## Install
 
-Version **0.5.39**, dated **11 October 2026**, is available from the `codex/vps-persistent-compute` branch. Build its VSIX with `npm ci` and `npm run package`, then install `pair-notebook-0.5.39.vsix` on every participant's computer. Successful [Host and VPS training workflow runs](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/training.yml) also retain the verified VSIX and complete source archive as downloadable artifacts. Update `scripts/pair-notebook-agent.py` on each compute owner's machine as well. Branch pushes do not publish a GitHub Release automatically; the latest published release can have an earlier version.
+The local **0.6.0 development build** is not a published GitHub release. Build its VSIX with `npm ci` and `npm run package`, and build the matching standalone server with `npm run package:persistent-server`. Install `pair-notebook-0.6.0.vsix` on every participant's computer. [Deployment instructions](docs/PERSISTENT_VPS.md) include Ubuntu services, trusted HTTPS for the IP address, direct server session creation and agent setup. The latest published release verified at the start of this work was 0.5.39.
 
 Open the [latest GitHub Release](https://github.com/r7zex/jupyter_pair_ext/releases/latest), download its single `pair-notebook-<version>.vsix` file, and install it on **both computers** from **Extensions: Install from VSIX...**, or run:
 

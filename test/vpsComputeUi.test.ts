@@ -87,6 +87,26 @@ async function teardown(): Promise<void> { controller.dispose(); await rm(root, 
 
 describe('VPS project input resources', () => {
   beforeEach(setup); afterEach(teardown);
+  for (const resource of ['notebook', 'text', 'workspace']) it(`refuses private persistent ${resource} input before credentials, dialogs or source capture`, async () => {
+    let sourceReads = 0; let credentialReads = 0; let apiCalls = 0; let selections = 0;
+    const privateSource = () => { sourceReads++; return 'print("PRIVATE_PAIR_VPS_CANARY")'; };
+    const privateUri = { scheme: 'pair-vps', authority: 'private-session', path: '/private/train.ipynb', fsPath: '/private/train.ipynb' };
+    if (resource === 'notebook') notebook = { notebook: { uri: privateUri, getCells: () => [{ kind: 2, document: { languageId: 'python', getText: privateSource } }] }, selection: { start: 0 } };
+    else if (resource === 'text') editor = { document: { uri: { ...privateUri, path: '/private/train.py', fsPath: '/private/train.py' }, getText: privateSource } };
+    else workspaceFolders = [{ uri: { scheme: 'pair-vps', authority: 'private-session', path: '/', fsPath: '/' } }];
+    endpoint = 'http://localhost:9999';
+    secrets.set(vpsSecretKey(endpoint), 'a'.repeat(32));
+    secretRead = async () => { credentialReads++; return 'a'.repeat(32); };
+    pick = async (items) => { selections++; return items[0]; };
+    const originalAgents = VpsClient.prototype.agents;
+    VpsClient.prototype.agents = async () => { apiCalls++; return []; };
+    try {
+      await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
+      await assert.rejects((controller as any).sourceSnapshot(), /Persistent VPS notebook kernel/);
+      assert.deepEqual({ sourceReads, credentialReads, apiCalls, selections, prompts: inputOptions.length },
+        { sourceReads: 0, credentialReads: 0, apiCalls: 0, selections: 0, prompts: 0 });
+    } finally { VpsClient.prototype.agents = originalAgents; }
+  });
   it('includes canonical project config and data while excluding credential files', async () => {
     const project = new Map([['helper.py', 'VALUE=1'], ['config.json', '{"epochs":40}'], ['data.csv', 'x,y\n1,3'], ['.env', 'PRIVATE=secret']]);
     runtime = { descriptor: { workingFolder: root }, project: { keys: () => project.keys(), kindOf: () => 'text', text: (key: string) => project.get(key) } };
@@ -206,6 +226,35 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       body: JSON.stringify({ instanceId: 'pc-installation', name: 'Compute PC', resources: { cpuCount: 4, python: 'python3', gpus: [] } }) });
     assert.equal(response.status, 200); await response.arrayBuffer();
   }
+  for (const dialog of ['Background compute', 'Run notebook in background']) it(`rejects a switch to private persistent input during the ${dialog} dialog`, async () => {
+    await register();
+    let sourceReads = 0;
+    const cells = [{ kind: 2, document: { languageId: 'python', getText: () => { sourceReads++; return 'print("LOCAL")'; } } }];
+    notebook = { notebook: { uri: { scheme: 'file', fsPath: path.join(root, 'train.ipynb') }, getCells: () => cells }, selection: { start: 0 } };
+    pick = async (items, options) => {
+      if (options.title === dialog) notebook = { notebook: {
+        uri: { scheme: 'pair-vps', authority: 'private-session', path: '/private/train.ipynb', fsPath: '/private/train.ipynb' },
+        getCells: () => [{ kind: 2, document: { languageId: 'python', getText: () => { sourceReads++; return 'print("PRIVATE_PAIR_VPS_CANARY")'; } } }],
+      }, selection: { start: 0 } };
+      return items[0];
+    };
+    await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
+    assert.equal(sourceReads, 0);
+    assert.equal((await client.jobs()).length, 0);
+    assert.equal(inputOptions.length, 0);
+  });
+  it('does not deliver a pending broker submission after switching to a persistent workspace while saving its receipt', async () => {
+    await register();
+    const save = PendingSubmissionStore.prototype.save;
+    PendingSubmissionStore.prototype.save = async function (url, job): Promise<void> {
+      await save.call(this, url, job);
+      workspaceFolders = [{ uri: { scheme: 'pair-vps', authority: 'private-session', path: '/', fsPath: '/' } }];
+    };
+    try {
+      await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
+      assert.equal((await client.jobs()).length, 0);
+    } finally { PendingSubmissionStore.prototype.save = save; }
+  });
   for (const mode of ['repository', 'torch', 'notebook']) it(`trains ${mode === 'torch' ? 'PyTorch with binary owner data' : mode === 'notebook' ? 'a collaborative notebook from host repository inputs' : 'from a real repository snapshot'}, reloads a model and recovers after the editor and VPS stop`, async function () {
     this.timeout(20_000);
     const useTorch = mode === 'torch';
@@ -334,7 +383,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
     assert.match(String((await controller.getChildren(groups[1]))[0]!.label), /No background jobs/);
     secrets.set(vpsSecretKey(endpoint), randomBytes(32).toString('hex'));
     const denied = (await controller.getChildren(groups[0]))[0]!;
-    assert.equal(denied.command!.command, 'pairNotebook.connectVps');
+    assert.equal(denied.command!.command, 'pairNotebook.connectVpsCompute');
   });
   it('prevents execution in an untrusted workspace', async () => {
     trusted = false; await assert.rejects(controller.submit(), /Trust this workspace/);

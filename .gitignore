@@ -9,6 +9,7 @@ out/*
 .vscode-test/
 .e2e-driver/
 *.vsix
+artifacts/
 *.zip
 __pycache__/
 *.py[cod]

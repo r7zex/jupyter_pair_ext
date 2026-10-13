@@ -295,11 +295,14 @@ export class JupyterKernel extends EventEmitter {
         child.kill();
         reject(new Error('Jupyter kernel startup timed out after 35 seconds.'));
       }, 35_000);
-      let stdoutBuffer = Buffer.alloc(0);
+      let stdoutChunks: Buffer[] = [];
+      let stdoutLineBytes = 0;
       let protocolFailed = false;
       const failProtocol = (error: Error): void => {
         if (protocolFailed) return;
         protocolFailed = true;
+        stdoutChunks = [];
+        stdoutLineBytes = 0;
         const current = this.process === child;
         if (current) this.emit('protocolError', error);
         if (!settled) {
@@ -384,26 +387,32 @@ export class JupyterKernel extends EventEmitter {
         }
       };
       child.stdout.on('data', (chunk: Buffer) => {
-        if (protocolFailed) return;
-        stdoutBuffer = stdoutBuffer.byteLength
-          ? Buffer.concat([stdoutBuffer, chunk], stdoutBuffer.byteLength + chunk.byteLength)
-          : Buffer.from(chunk);
-        let newline = stdoutBuffer.indexOf(0x0a);
-        while (newline >= 0) {
-          const lineBytes = stdoutBuffer.subarray(0, newline);
-          stdoutBuffer = stdoutBuffer.subarray(newline + 1);
-          if (lineBytes.byteLength > MAX_BRIDGE_LINE_BYTES) {
+        if (protocolFailed || this.process !== child) return;
+        let offset = 0;
+        while (offset < chunk.byteLength) {
+          const newline = chunk.indexOf(0x0a, offset);
+          const segment = chunk.subarray(offset, newline < 0 ? chunk.byteLength : newline);
+          stdoutLineBytes += segment.byteLength;
+          if (stdoutLineBytes > MAX_BRIDGE_LINE_BYTES) {
             failProtocol(new Error('Jupyter bridge message exceeds the 32 MiB safety limit.'));
             return;
           }
+          if (newline < 0) {
+            stdoutChunks.push(segment);
+            return;
+          }
+          // Keep bytes intact across UTF-8 boundaries and copy a fragmented
+          // line only once. Rejoining every stdout chunk grows quadratically.
+          const lineBytes = stdoutChunks.length
+            ? Buffer.concat([...stdoutChunks, segment], stdoutLineBytes)
+            : segment;
+          stdoutChunks = [];
+          stdoutLineBytes = 0;
           const line = lineBytes.subarray(0, lineBytes.at(-1) === 0x0d ? lineBytes.byteLength - 1 : lineBytes.byteLength)
             .toString('utf8');
           if (line) acceptLine(line);
-          if (protocolFailed) return;
-          newline = stdoutBuffer.indexOf(0x0a);
-        }
-        if (stdoutBuffer.byteLength > MAX_BRIDGE_LINE_BYTES) {
-          failProtocol(new Error('Jupyter bridge message exceeds the 32 MiB safety limit.'));
+          if (protocolFailed || this.process !== child) return;
+          offset = newline + 1;
         }
       });
       child.stderr.on('data', (chunk: Buffer) => this.emit('stderr', chunk.toString('utf8')));

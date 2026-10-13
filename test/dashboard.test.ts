@@ -74,6 +74,8 @@ describe('dashboard webview startup', () => {
     assert.match(assignedHtml, /Начать сессию/);
     assert.match(assignedHtml, /Подключиться/);
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
+    assert.match(assignedHtml, /command:pairNotebook\.connectVps">Постоянная VPS-сессия/);
+    assert.doesNotMatch(assignedHtml, /command:pairNotebook\.connectVpsCompute/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
     assert.match(assignedHtml, /Сессия:/);
@@ -92,7 +94,9 @@ describe('dashboard webview startup', () => {
     assert.doesNotMatch(assignedHtml, /action\('end'[^\n]+disabled:paused/);
     assert.doesNotMatch(assignedHtml, new RegExp(['Tail', 'scale'].join(''), 'i'));
     assert.deepEqual(webview.options.localResourceRoots, []);
-    assert.deepEqual(webview.options.enableCommandUris, ['pairNotebook.startSession', 'pairNotebook.joinSession']);
+    assert.deepEqual(webview.options.enableCommandUris, [
+      'pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.connectVps',
+    ]);
     assert.equal(posted.length, 1, 'a complete landing state is posted after HTML assignment');
     const landing = posted[0] as { patch?: { recent?: Array<Record<string, unknown>> } };
     assert.equal(landing.patch?.recent?.[0]?.hostName, 'Alice');
@@ -102,11 +106,15 @@ describe('dashboard webview startup', () => {
     receive?.({ command: 'webviewReady' });
     receive?.(null);
     receive?.({ command: '__proto__' });
+    receive?.({ command: 'constructor' });
+    receive?.({ command: 'toString' });
+    receive?.({ command: 'connectVpsCompute' });
     receive?.({ command: 'join' });
+    receive?.({ command: 'vps' });
     receive?.({ command: 'webviewError', detail: 'synthetic failure' });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(posted.length, 2, 'the ready handshake requests a fresh state in case the first post raced');
-    assert.deepEqual(executed, ['pairNotebook.joinSession']);
+    assert.deepEqual(executed, ['pairNotebook.joinSession', 'pairNotebook.connectVps']);
     assert.deepEqual(errors, ['Pair Notebook panel error: synthetic failure']);
     provider.dispose();
   });

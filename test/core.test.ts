@@ -2231,10 +2231,14 @@ describe('protocol and notebook compatibility', () => {
     );
   });
 
-  it('declares safe workspace defaults and no remote-compute deny switches', async () => {
+  it('declares trust-gated virtual workspace support and no remote-compute deny switches', async () => {
     const manifest = JSON.parse(await readFile(path.resolve(__dirname, '../../package.json'), 'utf8')) as any;
     assert.equal(manifest.capabilities.untrustedWorkspaces.supported, 'limited');
-    assert.equal(manifest.capabilities.virtualWorkspaces.supported, false);
+    assert.equal(manifest.capabilities.virtualWorkspaces.supported, true);
+    const connectionCommands = manifest.contributes.commands.filter((command: { command: string }) => ['pairNotebook.connectVps', 'pairNotebook.connectVpsCompute'].includes(command.command));
+    assert.equal(connectionCommands.length, 2, 'Persistent session and broker compute connections remain separate commands.');
+    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVps' && item.when === 'view == pairNotebook.persistentSessions'));
+    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVpsCompute' && item.when === 'view == pairNotebook.vpsCompute'));
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'], undefined);

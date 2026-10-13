@@ -94,7 +94,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       const connection = await readVpsConnection(this.context);
       if (!connection) {
         const connect = new ComputeItem('Connect to your VPS');
-        connect.command = { command: 'pairNotebook.connectVps', title: 'Connect to VPS' };
+        connect.command = { command: 'pairNotebook.connectVpsCompute', title: 'Connect to VPS Compute' };
         return [connect];
       }
       if (!item) return [new ComputeItem('Compute machines', 'agents'), new ComputeItem('Background jobs', 'jobs')];
@@ -118,7 +118,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     } catch (error) {
       const auth = error instanceof VpsHttpError && [401, 403].includes(error.status);
       const retry = new ComputeItem(auth ? 'VPS access denied — click to reconnect' : 'VPS unavailable — click to retry');
-      retry.command = { command: auth ? 'pairNotebook.connectVps' : 'pairNotebook.refreshVpsJobs', title: 'Retry VPS connection' };
+      retry.command = { command: auth ? 'pairNotebook.connectVpsCompute' : 'pairNotebook.refreshVpsJobs', title: 'Retry VPS connection' };
       const cached = this.context.globalState.get<{ endpoint: string; jobs: JobSummary[] }>(JOB_CACHE_KEY);
       const configured = vscode.workspace.getConfiguration('pairNotebook').get<string>('vpsUrl', '').trim();
       if (!auth && item?.group === 'jobs' && cached?.endpoint === configured.replace(/\/+$/, '')) {
@@ -141,7 +141,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
 
   private async client(): Promise<VpsClient> {
     const connection = await readVpsConnection(this.context);
-    if (!connection) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS first.');
+    if (!connection) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS Compute first.');
     const client = new VpsClient(connection.url, connection.token);
     this.clientConnections.set(client, connection);
     return client;
@@ -176,8 +176,10 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   }
 
   private async submitOnce(preferredAgent?: string): Promise<void> {
+    this.assertBrokerProject();
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before submitting Python for remote execution.');
     const initial = await readVpsConnection(this.context);
+    this.assertBrokerProject();
     if (!initial) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS first.');
     const client = new VpsClient(initial.url, initial.token);
     const legacy = this.context.globalState.get<{ endpoint: string; id: string }>('pairNotebook.pendingVpsJob');
@@ -190,6 +192,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       await this.showJob(existing.id); return;
     }
     const pending = await this.pending.load(client.endpoint);
+    this.assertBrokerProject();
     if (pending) { await this.deliver(client, pending); return; }
     const runtime = this.currentRuntime();
     const scope = await this.computeScope();
@@ -210,6 +213,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     if (runtime !== this.currentRuntime() || !this.sameScope(scope, await this.computeScope())) {
       throw new Error('The session or project changed during selection. Start the submission again.');
     }
+    this.assertBrokerProject();
     const gpuUuid = selected.agent.resources.gpus.find((gpu) => `gpu:${gpu.index}` === selected.device)?.uuid;
     const job = validateSubmission({ id: randomUUID(), agentId: selected.agent.id, device: selected.device,
       ...scope,
@@ -221,6 +225,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   }
 
   private async deliver(client: VpsClient, job: JobSubmission): Promise<void> {
+    this.assertBrokerProject();
     try { await client.submit(job); }
     catch { throw new Error(`Could not confirm job ${job.id}. Open VPS Jobs to check it; the next submission will reconcile this request first.`); }
     await this.pending.clear(job.id);
@@ -260,6 +265,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   }
 
   private async sourceSnapshot(): Promise<Pick<JobSubmission, 'entrypoint' | 'files'> | undefined> {
+    this.assertBrokerProject();
     const active = this.currentRuntime();
     const files: Record<string, string> = Object.create(null) as Record<string, string>;
     const notebook = vscode.window.activeNotebookEditor;
@@ -282,6 +288,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       if (!selectedScope) return undefined;
       scope = selectedScope.value as 'all' | 'cell';
     }
+    this.assertBrokerProject();
     if (this.disposed || active !== this.currentRuntime()) throw new Error('The collaborative session changed during source selection. Try again.');
     // Read standalone project resources before capturing dirty editors. Collaborative
     // state is captured synchronously so canonical dependencies form one snapshot.
@@ -312,6 +319,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       };
       await visit('');
     }
+    this.assertBrokerProject();
     if (this.disposed || active !== this.currentRuntime()) throw new Error('The collaborative session changed during source capture. Try again.');
     if (active) for (const key of active.project.keys()) {
       if (safeJobPath(key) && shouldTrackProjectPath(key) && active.project.kindOf(key) === 'text') {
@@ -346,6 +354,13 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     }
     if (Object.keys(files).length > MAX_JOB_FILES || Buffer.byteLength(JSON.stringify(files)) > MAX_JOB_BYTES) throw new Error('Python source snapshot is too large for a background job.');
     return { entrypoint, files };
+  }
+
+  private assertBrokerProject(): void {
+    const uri = vscode.window.activeNotebookEditor?.notebook.uri ?? vscode.window.activeTextEditor?.document.uri;
+    if (uri?.scheme === 'pair-vps' || vscode.workspace.workspaceFolders?.[0]?.uri.scheme === 'pair-vps') {
+      throw new Error('Run this project with the Pair Notebook • Persistent VPS notebook kernel. Background VPS Compute does not accept persistent VPS files.');
+    }
   }
 
   public async showJobs(): Promise<void> {
