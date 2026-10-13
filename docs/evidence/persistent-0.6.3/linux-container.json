@@ -1,0 +1,17 @@
+{
+  "platform": "linux",
+  "runtime": "Linux container (not native macOS/Windows acceptance)",
+  "image": "sha256:409955bc503dec9a5c84ec6f9a82a958200e2434130358e05478966f5fbc4b65",
+  "python": "/opt/pair-python/bin/python",
+  "uid": 1000,
+  "network": "none",
+  "memoryBytes": 536870912,
+  "nanoCpus": 1000000000,
+  "bindMounts": [
+    "/work",
+    "/bridge.py"
+  ],
+  "statefulCells": 2,
+  "gpu": false,
+  "agentSha256": "c6bcd07cfea4e9b8886b6e1f97135a4aa584d9aee9b7252495b65cd6e526130d"
+}

@@ -1,0 +1,8 @@
+FROM python:3.12-slim-bookworm
+RUN --mount=type=secret,id=proxy_ca,required=true \
+    python -m venv /opt/pair-python && \
+    PIP_CERT=/run/secrets/proxy_ca /opt/pair-python/bin/python -m pip install --no-cache-dir jupyter_client==8.10.0 ipykernel==7.4.0
+RUN groupadd --gid 1000 pair && useradd --uid 1000 --gid 1000 --create-home pair
+USER 1000:1000
+WORKDIR /work
+ENTRYPOINT ["/opt/pair-python/bin/python"]

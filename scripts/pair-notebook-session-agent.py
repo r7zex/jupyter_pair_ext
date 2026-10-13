@@ -3,7 +3,7 @@
 
 The membership credential authorizes one person's device; the separately
 configured VPS agent credential authorizes device ``vps``. Neither is exposed
-to Python. Linux bubblewrap and a non-root account are mandatory. Interactive
+to Python. Linux bubblewrap or an isolated Linux-container runtime is mandatory. Windows uses the WSL2 launcher; macOS uses Docker Desktop Linux containers. Interactive
 state survives cells and network outages, but not an executor process restart.
 Accepted commands are journalled before execution and are never replayed after
 an ambiguous crash. This agent deliberately does not alter the legacy broker.
@@ -404,6 +404,102 @@ class Sandbox:
             return False
 
 
+class ContainerSandbox:
+    """Linux containers; Docker Desktop's Linux VM is the runtime on macOS/Windows."""
+    def __init__(self, image, python, bridge, cpus=1.0, memory_mb=512, scope="default"):
+        self.python, self.bridge = python, Path(bridge).resolve()
+        self.docker = shutil.which("docker")
+        self.image, self.cpus, self.memory_mb = image, cpus, memory_mb
+        self.uid = os.getuid() if hasattr(os, "getuid") else 1000
+        self.gid = os.getgid() if hasattr(os, "getgid") else 1000
+        self.ready, self.cuda_available, self.gpus = False, False, []
+        self.containers = {}
+        self.label = hashlib.sha256(str(scope).encode()).hexdigest()
+        self.reason = "Container execution is disabled until the isolated runtime passes readiness."
+        try:
+            if self.uid == 0:
+                raise AgentError("Run the container agent with a dedicated non-root account.")
+            if not self.docker or not re.fullmatch(r"(?:sha256:[a-f0-9]{64}|[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64})", image or ""):
+                raise AgentError("Install/start Docker Desktop (Windows/macOS) or Docker Engine; supply the installed immutable image ID with --runtime-image.")
+            if not python.startswith("/") or ".." in python.split("/") or not self.bridge.is_file():
+                raise AgentError("--runtime-python must be the actual absolute Python path INSIDE the Linux image.")
+            if not 0.1 <= cpus <= 64 or not 128 <= memory_mb <= 65536:
+                raise AgentError("Container CPU/RAM limits are invalid.")
+            info = subprocess.run([self.docker, "info", "--format", "{{.OSType}}"], capture_output=True, text=True, timeout=15, check=True)
+            if info.stdout.strip() != "linux":
+                raise AgentError("Use the Linux-container runtime (Docker Desktop VM on Windows/macOS).")
+            self.image = subprocess.run([self.docker, "image", "inspect", image, "--format", "{{.Id}}"], capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+            with __import__("tempfile").TemporaryDirectory(prefix="pair-container-probe-") as temporary:
+                workspace = Path(temporary)
+                workspace.chmod(0o777)
+                probe = subprocess.run(self.command(workspace, None, ["-I", "-c", "import json,sys,jupyter_client,ipykernel;print(json.dumps({'python':sys.executable,'uid':__import__('os').getuid()}))"]), env=self.environment(None), capture_output=True, text=True, timeout=30, check=True)
+                actual = json.loads(probe.stdout)
+                if actual["python"] != python or actual["uid"] != self.uid:
+                    raise AgentError("Selected container Python or non-root UID disagrees with readiness.")
+                self.stop(workspace)
+            self.ready = True
+            self.reason = f"Linux container {self.image}; UID {self.uid}; Docker Desktop VM on Windows/macOS; Python {python}; workspace-only mounts; no network; {cpus} CPUs/{memory_mb} MiB."
+            self.gpus = Sandbox.inventory_gpus()
+            self.cuda_available = any(self.probe_cuda(gpu["uuid"]) for gpu in self.gpus)
+        except (OSError, ValueError, subprocess.SubprocessError, KeyError) as error:
+            self.reason = str(error) if isinstance(error, AgentError) else "Container readiness failed; check Docker, installed image and its Python/Jupyter environment."
+
+    def recover(self):
+        result = subprocess.run([self.docker, "ps", "-aq", "--filter", "label=pair.agent=" + self.label], capture_output=True, text=True, timeout=15, check=True)
+        identifiers = [value for value in result.stdout.split() if re.fullmatch(r"[a-f0-9]{12,64}", value)]
+        if identifiers:
+            subprocess.run([self.docker, "rm", "--force", *identifiers], capture_output=True, timeout=30, check=True)
+
+    def environment(self, gpu_uuid):
+        environment = clean_environment()
+        for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+            if key in os.environ:
+                environment[key] = os.environ[key]
+        return environment
+
+    def command(self, workspace, gpu_uuid, python_args=None):
+        if not self.docker:
+            raise AgentError("Container runtime is unavailable; no direct subprocess fallback.")
+        workspace = Path(workspace).resolve()
+        if "," in str(workspace) or "," in str(self.bridge):
+            raise AgentError("Container mount paths cannot contain commas.")
+        if gpu_uuid and (not GPU_ID.fullmatch(gpu_uuid) or not any(gpu["uuid"] == gpu_uuid for gpu in self.gpus)):
+            raise AgentError("Selected GPU is unavailable.")
+        name = "pair-kernel-" + uuid.uuid4().hex
+        self.containers[str(workspace)] = name
+        args = [self.docker, "run", "--rm", "--pull=never", "--interactive", "--name", name,
+                "--label=pair.agent=" + self.label, "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                f"--user={self.uid}:{self.gid}", "--pids-limit=128", f"--cpus={self.cpus}", f"--memory={self.memory_mb}m",
+                f"--memory-swap={self.memory_mb}m", "--ipc=private", "--ulimit=nofile=1024:1024",
+                "--tmpfs=/tmp:rw,nosuid,nodev,size=64m,mode=1777", f"--tmpfs=/home/pair:rw,nosuid,nodev,size=16m,uid={self.uid},gid={self.gid}",
+                "--mount", f"type=bind,src={workspace},dst=/work",
+                "--mount", f"type=bind,src={self.bridge},dst=/bridge.py,readonly",
+                "--workdir=/work", "--env=HOME=/home/pair", "--env=USER=pair", "--env=LOGNAME=pair", "--env=PAIR_NOTEBOOK_CWD=/work", "--env=PAIR_NOTEBOOK_WORKSPACE=/work",
+                "--env=PYTHONDONTWRITEBYTECODE=1", "--env=PYTHONNOUSERSITE=1", "--env=JUPYTER_PLATFORM_DIRS=1",
+                "--env=CUDA_VISIBLE_DEVICES=" + (gpu_uuid or ""), "--env=HTTP_PROXY=", "--env=HTTPS_PROXY=",
+                "--env=ALL_PROXY=", "--env=NO_PROXY=", "--env=http_proxy=", "--env=https_proxy=", "--env=all_proxy=", "--env=no_proxy="]
+        if gpu_uuid:
+            args += ["--gpus", "device=" + gpu_uuid]
+        return args + ["--entrypoint", self.python, self.image] + (python_args if python_args is not None else ["-I", "/bridge.py"])
+
+    def stop(self, workspace):
+        name = self.containers.pop(str(Path(workspace).resolve()), None)
+        if name:
+            subprocess.run([self.docker, "rm", "--force", name], capture_output=True, timeout=15, check=False)
+
+    def probe_cuda(self, gpu_uuid):
+        if not GPU_ID.fullmatch(gpu_uuid):
+            return False
+        try:
+            with __import__("tempfile").TemporaryDirectory(prefix="pair-container-cuda-") as temporary:
+                workspace = Path(temporary); workspace.chmod(0o777)
+                result = subprocess.run(self.command(workspace, gpu_uuid, ["-I", "-c", "import torch;assert torch.cuda.is_available();assert torch.cuda.device_count()==1;assert torch.tensor([1.,2.],device='cuda').sum().item()==3;print('cuda-ready')"]), env=self.environment(gpu_uuid), capture_output=True, text=True, timeout=30)
+                self.stop(workspace)
+                return result.returncode == 0 and result.stdout.strip() == "cuda-ready"
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+
 class Bridge:
     def __init__(self, sandbox, workspace, gpu_uuid):
         if not sandbox.ready:
@@ -412,6 +508,7 @@ class Bridge:
             raise AgentError("Selected GPU requires a compatible NVIDIA driver and CUDA-enabled PyTorch in this Python environment.")
         self.events = queue.Queue(maxsize=64)
         self.workspace = workspace
+        self.sandbox = sandbox
         self.baseline = {}
         self.last_used = time.monotonic()
         self.process = subprocess.Popen(sandbox.command(workspace, gpu_uuid), env=sandbox.environment(gpu_uuid),
@@ -478,10 +575,17 @@ class Bridge:
             self.process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(self.process.pid, signal.SIGKILL)
+                if hasattr(self.sandbox, "stop"):
+                    self.sandbox.stop(self.workspace)
+                if hasattr(os, "killpg"):
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                else:
+                    self.process.kill()
             except ProcessLookupError:
                 pass
             self.process.wait(timeout=5)
+        if hasattr(self.sandbox, "stop"):
+            self.sandbox.stop(self.workspace)
         for stream in (self.process.stdin, self.process.stdout):
             if stream:
                 stream.close()
@@ -495,7 +599,7 @@ class SessionAgent:
         if args.id != "vps" and not args.session:
             raise AgentError("Personal devices require --session and that session's membership credential.")
         self.transport = transport or Transport(args.url, args.token_file, getattr(args, "config_token", None))
-        self.sandbox = sandbox or Sandbox(args.python, args.bridge)
+        self.sandbox = sandbox or (ContainerSandbox(args.runtime_image, getattr(args, "runtime_python", "/opt/pair-python/bin/python"), args.bridge, getattr(args, "runtime_cpus", 1), getattr(args, "runtime_memory_mb", 512), str(Path(args.state).expanduser().resolve())) if getattr(args, "runtime_image", None) else Sandbox(args.python, args.bridge))
         self.bridge_factory = bridge_factory
         state_path = Path(args.state).expanduser()
         if state_path.is_symlink():
@@ -515,12 +619,21 @@ class SessionAgent:
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.state.is_symlink():
             raise AgentError("Device state directory must not be a symlink.")
-        if sys.platform != "linux":
-            raise AgentError("Interactive agents currently require Linux; no unsafe platform fallback is supported.")
-        import fcntl
+        if sys.platform not in ("linux", "darwin", "win32"):
+            raise AgentError("Unsupported interactive agent platform.")
+        if sys.platform == "win32":
+            raise AgentError("Use pair-notebook-wsl-agent.ps1: the protected Windows agent runs inside WSL2 with Linux no-follow filesystem operations. Native Windows filesystem synchronization is disabled.")
+        if sys.platform != "linux" and not isinstance(self.sandbox, ContainerSandbox):
+            raise AgentError("Windows/macOS agents require the isolated Linux container VM runtime.")
         self.lock = (self.state / "agent.lock").open("a+")
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform == "win32":
+                import msvcrt
+                self.lock.write(" "); self.lock.flush(); self.lock.seek(0)
+                msvcrt.locking(self.lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             self.lock.close()
             raise AgentError("Another interactive agent owns this state directory.") from error
@@ -532,6 +645,8 @@ class SessionAgent:
                 raise AgentError("Device state belongs to a different endpoint, session or device.")
         else:
             atomic_json(identity_file, identity)
+        if isinstance(self.sandbox, ContainerSandbox) and self.sandbox.ready:
+            self.sandbox.recover()
         self.kernels = {}
         self.active = None
         self.last_registration = 0
@@ -583,7 +698,7 @@ class SessionAgent:
     def _claim(self, command, recover_only=False):
         directory = self._directory(command)
         receipt_file = directory / "receipt.json"
-        identity = {key: command.get(key) for key in ("id", "sessionId", "kernelId", "executionId", "deviceId", "generation", "gpuUuid")}
+        identity = {key: command.get(key) for key in ("id", "sessionId", "kernelId", "executionId", "deviceId", "generation", "gpuUuid", "scope")}
         identity["digest"] = hashlib.sha256(json.dumps(command, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if receipt_file.exists():
             receipt = json.loads(receipt_file.read_text())
@@ -613,7 +728,7 @@ class SessionAgent:
             self._persist()
             return
         try:
-            key = (command["sessionId"], command["kernelId"], command["generation"], command.get("gpuUuid"))
+            key = (command["sessionId"], command["kernelId"], command["generation"], command.get("gpuUuid"), command.get("scope", "public"))
             self.active["requestId"] = command["command"].get("requestId", "")
             self.active["commandKind"] = command["command"].get("command")
             if self.active["commandKind"] == "release":
@@ -636,12 +751,12 @@ class SessionAgent:
                 # No command is running in another bridge on this serial device.
                 # Old generations cannot service future executions, so retire
                 # them after their accepted execution has completed.
-                obsolete = [entry for entry in self.kernels if entry[0] == key[0] and entry[2] != key[2]]
+                obsolete = [entry for entry in self.kernels if entry[0] == key[0] and (entry[2] != key[2] or entry[4] != key[4])]
                 for entry in obsolete:
                     self.kernels.pop(entry).close()
                 if len(self.kernels) >= getattr(self.args, "max_kernels", MAX_KERNELS):
                     raise AgentError("Live notebook kernel limit reached. Switch execution device or restart the interactive agent to release kernels; existing variables were retained.")
-                workspace = self.state / "kernels" / hashlib.sha256(json.dumps(key).encode()).hexdigest() / "public"
+                workspace = self.state / "kernels" / hashlib.sha256(json.dumps(key).encode()).hexdigest() / command.get("scope", "public")
                 workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
                 baseline = install_snapshot(workspace, command["files"])
                 bridge = self.bridge_factory(self.sandbox, workspace, command.get("gpuUuid"))
@@ -886,12 +1001,21 @@ def main():
     parser.add_argument("--name", default="")
     parser.add_argument("--token-file")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--runtime-image", help="Installed immutable Linux image ID; Docker Desktop VM on Windows/macOS")
+    parser.add_argument("--runtime-python", default="/opt/pair-python/bin/python", help="Python INSIDE the container, not a host environment")
+    parser.add_argument("--runtime-cpus", type=float, default=1)
+    parser.add_argument("--runtime-memory-mb", type=int, default=512)
     parser.add_argument("--bridge", default=str(Path(__file__).resolve().parents[1] / "media" / "jupyter_kernel_bridge.py"))
     parser.add_argument("--state", default=str(Path.home() / ".pair-notebook-session-agent"))
     parser.add_argument("--share", action="store_true", help="Explicitly allow this session's Python code to run in the isolated public workspace")
     parser.add_argument("--poll-seconds", type=float, default=0.5)
     parser.add_argument("--max-kernels", type=int, default=MAX_KERNELS, choices=(1, 2))
+    parser.add_argument("--check-isolation", action="store_true", help="Verify the actual selected isolated runtime and exit without credentials")
     args = parser.parse_args()
+    if args.check_isolation:
+        sandbox = ContainerSandbox(args.runtime_image, args.runtime_python, args.bridge, args.runtime_cpus, args.runtime_memory_mb) if args.runtime_image else Sandbox(args.python, args.bridge)
+        print(sandbox.reason, flush=True)
+        return 0 if sandbox.ready else 2
     if args.config:
         if args.url or args.session or args.token_file:
             parser.error("--config cannot be combined with --url, --session or --token-file")

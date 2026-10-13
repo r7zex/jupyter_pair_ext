@@ -30,7 +30,7 @@ export class PersistentClient {
     if (['create', 'list'].includes(operation) && this.credential.kind !== 'admin') {
       return Promise.reject(new Error('This action requires a VPS administrative credential.'));
     }
-    if (!['create', 'list', 'join'].includes(operation) && this.credential.kind !== 'membership') {
+    if (!['create', 'list', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
       return Promise.reject(new Error('Join a persistent session before using its API.'));
     }
     const url = new URL(`${this.endpoint}/v1/sessions/rpc`);

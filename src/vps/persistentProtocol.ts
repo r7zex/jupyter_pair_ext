@@ -43,12 +43,15 @@ export interface PersistentExecution {
   deviceId: string; gpuUuid?: string; generation: number;
   state: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
   events: Record<string, unknown>[]; error?: string;
+  scope?: 'public' | 'private';
+  cellId?: string; sourceHash?: string; admittedRevision?: number;
 }
 export interface PersistentCommand {
   id: string; executionId: string; sessionId: string; kernelId: string;
   generation: number; deviceId: string; gpuUuid?: string;
   files: { path: string; content: string }[];
   command: Record<string, unknown>;
+  scope?: 'public' | 'private';
 }
 /** POST /v1/sessions/rpc, JSON {operation, sessionId?, ...}. Responses are JSON.
  * Operations: create/list (admin bearer), join (password), view/heartbeat/leave,

@@ -173,6 +173,37 @@ server.start().then((port) => console.log(JSON.stringify({port}))).catch((error)
         self.assertEqual(result["state"], "completed", str(result))
         return result
 
+    def test_real_private_namespace_imports_outputs_and_declassification_reset(self):
+        self.owner = self.rpc("create", ADMIN_TOKEN, name="Private real kernel", password=PASSWORD)
+        self.agent = AGENT.SessionAgent(argparse.Namespace(
+            id="vps", session=None, url=self.endpoint, token_file=str(self.token_file), python=self.python,
+            bridge=str(ROOT / "media/jupyter_kernel_bridge.py"), state=str(self.directory / "agent"),
+            name="Actual Private/Public CPU", share=True, max_kernels=1),
+            sandbox=DirectSandbox(self.python, self.directory / "direct-test-home"))
+        self.agent.tick()
+        source = "from secretdep import secret\nprivate_value=secret\nprint(private_value)"
+        notebook = {"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": [{"id": "private", "cell_type": "code", "source": source, "metadata": {}, "outputs": [], "execution_count": None}]}
+        snap = self.owner_rpc("snapshot")
+        snap = self.owner_rpc("write", path="work.ipynb", content=base64.b64encode(json.dumps(notebook).encode()).decode(), expectedRevision=snap["revision"])
+        snap = self.owner_rpc("visibility", path="work.ipynb", visibility="private", expectedRevision=snap["revision"])
+        snap = self.owner_rpc("write", path="secretdep.py", content=base64.b64encode(b"secret='private-canary'").decode(), expectedRevision=snap["revision"])
+        self.owner_rpc("visibility", path="secretdep.py", visibility="private", expectedRevision=snap["revision"])
+        result = self.finish(0, "actual-private")
+        self.assertEqual(result["scope"], "private")
+        saved = json.loads(base64.b64decode(self.owner_rpc("read", path="work.ipynb")["content"]))
+        self.assertIn("private-canary", json.dumps(saved["cells"][0]["outputs"]))
+        snap = self.owner_rpc("snapshot")
+        self.owner_rpc("visibility", path="work.ipynb", visibility="public", expectedRevision=snap["revision"])
+        published = json.loads(base64.b64decode(self.owner_rpc("read", path="work.ipynb")["content"]))
+        self.assertEqual(published["cells"][0]["outputs"], [])
+        published["cells"][0]["source"] = "assert 'private_value' not in globals()\nimport pathlib\nassert not pathlib.Path('secretdep.py').exists()\nprint('public-reset')"
+        snap = self.owner_rpc("snapshot")
+        self.owner_rpc("write", path="work.ipynb", content=base64.b64encode(json.dumps(published).encode()).decode(), expectedRevision=snap["revision"])
+        public = self.finish(0, "actual-public-reset")
+        self.assertEqual(public["scope"], "public")
+        self.assertEqual(len(self.agent.kernels), 1)
+        self.assertTrue(any(event.get("type") == "kernelState" for event in public["events"]))
+
     def test_notebook_rename_retires_old_namespace_and_reuses_single_kernel_capacity(self):
         self.owner = self.rpc("create", ADMIN_TOKEN, name="Notebook rename", password=PASSWORD)
         self.agent = AGENT.SessionAgent(argparse.Namespace(

@@ -109,6 +109,20 @@ try {
   assert.equal((await call('snapshot', {}, guest.token)).status, 409);
   assert.equal((await call('lifecycle', { action: 'start' })).data.state, 'running');
   checks.push('owner stop/start gates participant workspace');
+  const discovery = await rpc('discover', { password }); assert.equal(discovery.status, 200); assert.equal(discovery.data.sessions[0].id, owner.sessionId);
+  const invite = await call('createInvitation', { lifetimeSeconds: 60, readOnly: true }); assert.equal(invite.status, 200);
+  const invited = await rpc('acceptInvitation', { sessionId: owner.sessionId, invitationToken: invite.data.invitationToken, name: 'Read only' }); assert.equal(invited.status, 200);
+  assert.equal((await call('write', { path: 'denied.txt', content: encoded('x'), expectedRevision: 3 }, invited.data.token)).status, 403);
+  await call('revokeInvitation', { invitationId: invite.data.id }); assert.equal((await call('view', {}, invited.data.token)).status, 401);
+  checks.push('standalone discovery/invitation scope and revocation');
+  const current = await call('snapshot');
+  await call('write', { path: 'shared.ipynb', content: encoded(JSON.stringify({ metadata: {}, cells: [{ id: 'stable-cell', cell_type: 'code', source: 'value=41', metadata: {}, outputs: [] }] })), expectedRevision: current.data.revision });
+  const crdt = await call('notebookSync', { path: 'shared.ipynb' }); assert.equal(crdt.status, 200); assert.equal(crdt.data.cells[0].id, 'stable-cell');
+  const repeated = await call('notebookSync', { path: 'shared.ipynb', epoch: crdt.data.epoch, update: crdt.data.update }); assert.equal(repeated.status, 200); assert.equal(repeated.data.revision, crdt.data.revision);
+  checks.push('bundled Yjs CRDT durable initialization and idempotent replay');
+  const imported = execFileSync(process.execPath, ['-e', `const {VpsServer}=require(${JSON.stringify(path.join(root,'server/out/src/vps/server.js'))});if(typeof VpsServer!=='function')process.exit(1)`], { cwd: path.join(root,'empty'), env: { ...process.env, NODE_PATH: '' } }); assert.equal(imported.length, 0);
+  checks.push('importable bundled Host for detached soak without checkout dependencies');
+
   await stop(service.child);
   console.log(JSON.stringify({ version: manifest.version, checks }, null, 2));
 } finally {

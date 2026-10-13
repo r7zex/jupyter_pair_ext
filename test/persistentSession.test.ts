@@ -471,4 +471,65 @@ describe('Persistent VPS Session Host', () => {
     assert.equal((await call('report',{deviceId:device.id,commandId:command.id,executionId:command.executionId,generation:command.generation,offset:0,events:[],state:'completed'})).status,403);
     assert.equal((await call('report',{deviceId:device.id,commandId:command.id,executionId:command.executionId,generation:command.generation,offset:0,events:[],state:'completed'},joined.token)).status,200);
   });
+  it('discovers only password-authorized sessions and separates expiring invitations from member/admin credentials', async () => {
+    const another = await rpc({ operation: 'create', name: 'Another project', password }, admin);
+    await rpc({ operation: 'create', name: 'Hidden name', password: 'another secret password' }, admin);
+    const discovered = await rpc({ operation: 'discover', password });
+    assert.equal(discovered.status, 200);
+    assert.deepEqual(discovered.data.sessions.map((item: any) => item.id).sort(), [owner.sessionId, another.data.sessionId].sort());
+    const invite = await call('createInvitation', { lifetimeSeconds: 60, readOnly: true });
+    assert.equal(invite.status, 200);
+    assert.equal((await call('view', {}, invite.data.invitationToken)).status, 401);
+    const input = { operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.data.invitationToken, name: 'Invited' };
+    assert.equal((await rpc({ ...input, sessionId: another.data.sessionId })).status, 401);
+    const joined = await rpc(input); assert.equal(joined.status, 200);
+    assert.equal((await call('write', { path: 'forbidden', content: encoded('x'), expectedRevision: 0 }, joined.data.token)).status, 403);
+    assert.equal((await rpc({ operation: 'create', name: 'forbidden', password }, joined.data.token)).status, 401);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('snapshot', {}, joined.data.token)).status, 200);
+    await call('revokeInvitation', { invitationId: invite.data.id });
+    assert.equal((await rpc(input)).status, 401);
+    assert.equal((await call('view', {}, joined.data.token)).status, 401);
+    const serialized = await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8');
+    assert.equal(serialized.includes(invite.data.invitationToken), false);
+  });
+
+  it('expires saved invitation/member authority without reviving it after process recovery', async () => {
+    const invite = (await call('createInvitation', { lifetimeSeconds: 60, readOnly: false })).data;
+    const joined = await rpc({ operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.invitationToken, name: 'Expiring' });
+    assert.equal(joined.status, 200); await server.stop();
+    const filename = path.join(directory, 'sessions', owner.sessionId, 'session.json'); const record = JSON.parse(await readFile(filename, 'utf8'));
+    record.invitations[0].expiresAt = Date.now() - 1; record.members.find((member: any) => member.id === joined.data.memberId).expiresAt = Date.now() - 1;
+    await import('node:fs/promises').then((fs) => fs.writeFile(filename, JSON.stringify(record)));
+    server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('view', {}, joined.data.token)).status, 401);
+    assert.equal((await rpc({ operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.invitationToken, name: 'Expired' })).status, 401);
+    assert.equal((await call('view')).status, 200);
+  });
+
+  it('isolates owner Private execution, artifacts and recovery from members even after declassification', async () => {
+    await registerVps(); const joined = await guest();
+    let snapshot = (await call('write', { path: 'secret.ipynb', content: notebook('private_value = "secret"'), expectedRevision: 0 })).data;
+    snapshot = (await call('visibility', { path: 'secret.ipynb', visibility: 'private', expectedRevision: snapshot.revision })).data;
+    const input = { notebook: 'secret.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, expectedCellId: 'stable-cell', requestId: 'private-run' };
+    assert.equal((await call('execute', input, joined.token)).status, 404);
+    const accepted = await call('execute', input); assert.equal(accepted.status, 200); assert.equal(accepted.data.scope, 'private');
+    const claim = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal(claim.scope, 'private'); assert.match(claim.kernelId, /:private:/);
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+    assert.equal((await call('kernelControl', { executionId: accepted.data.id, command: { command: 'inputReply', value: 'stolen' } }, joined.token)).status, 409);
+    const report = { deviceId: 'vps', executionId: accepted.data.id, commandId: claim.id, generation: claim.generation, offset: 0,
+      state: 'completed', events: [{ type: 'stream', name: 'stdout', text: 'private output', requestId: claim.id }], files: [{ path: 'artifact.txt', content: encoded('private artifact'), version: 0 }, { path: 'private-results/value.txt', content: encoded('private tree'), version: 0 }] };
+    assert.equal((await call('report', report, agent)).status, 200);
+    assert.equal((await call('snapshot', {}, joined.token)).data.entries.length, 0);
+    assert.equal((await call('read', { path: 'artifact.txt' }, joined.token)).status, 404);
+    const current = (await call('snapshot')).data;
+    await call('visibility', { path: 'secret.ipynb', visibility: 'public', expectedRevision: current.revision });
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+    assert.equal((await call('artifacts', { executionId: accepted.data.id }, joined.token)).status, 404);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('execution', { executionId: accepted.data.id })).data.events[0].text, 'private output');
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+  });
+
 });
