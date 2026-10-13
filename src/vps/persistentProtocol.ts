@@ -56,7 +56,8 @@ export interface PersistentCommand {
  * settings/registerDevice/share/select/consent/revokeConsent, execute/execution,
  * claim/report (device owner bearer; configured VPS agent token for deviceId=vps).
  * Files use base64 content; mutations require expectedRevision, rename also newPath.
- * execute uses notebook, cellIndex, expectedRevision, requestId. report uses commandId,
+ * execute uses notebook, cellIndex, expectedRevision, requestId and optional
+ * expectedSourceHash (SHA-256 of the displayed cell) to reject concurrent source changes. report uses commandId,
  * executionId, events (bridge envelopes), state, optional error/files.
  */
 export interface PersistentRpcRequest { operation: string; sessionId?: string; [key: string]: unknown }

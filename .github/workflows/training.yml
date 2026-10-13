@@ -52,12 +52,17 @@ jobs:
       - name: Check kernel and detached process lifecycle
         run: |
           python -W error::ResourceWarning test/jupyter_bridge_unit.py -q
+          python -W error::ResourceWarning test/persistent_session_agent_test.py -q
+          python -W error::ResourceWarning test/persistent_session_admin_test.py -q
+          python -W error::ResourceWarning test/persistent_session_cpu_integration_test.py -q
           python -W error::ResourceWarning test/vps_agent_audit.py -q
           python -W error::ResourceWarning test/anti_fraud_reference_test.py -q
           python -W error::ResourceWarning test/persistent_soak_test.py -q
           PAIR_REFERENCE_PYTHON="$(command -v python)" python -W error::ResourceWarning test/persistent_reference_integration_test.py -q
       - name: Package the verified extension and agent sources
         run: |
+          npm run package:persistent-server
+          npm run test:persistent:server
           node scripts/make-artifacts.mjs --preflight-only
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
@@ -70,3 +75,5 @@ jobs:
           path: |
             pair-notebook-*.vsix
             pair-notebook-complete-*.zip
+            artifacts/pair-notebook-server-persistent.tar.gz
+            artifacts/pair-notebook-server-persistent.tar.gz.sha256

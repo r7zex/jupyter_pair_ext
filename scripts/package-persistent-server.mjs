@@ -27,6 +27,7 @@ try {
     'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
     'docs/PERSISTENT_VPS_VALIDATION.md', 'LICENSE',
+    'docs/PERSISTENT_VPS_REVIEW_0.6.1.md',
   ];
   for (const relative of files) {
     const destination = path.join(server, relative);

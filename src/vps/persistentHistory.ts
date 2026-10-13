@@ -24,6 +24,7 @@ export interface PersistentHistoryRun {
   reports: { offset: number; digest: string; end: number }[];
   aclEpoch: number;
   controls: { id: string; command: Record<string, unknown> }[];
+  mergePending?: boolean;
 }
 interface Receipt {
   version: 1; requestId: string; executionId: string; identity: string;

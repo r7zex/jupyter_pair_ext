@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, WebRTC, Iroh QUIC and redundant relay fallback.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -34,6 +34,7 @@
   ],
   "activationEvents": [
     "onView:pairNotebook.dashboard",
+    "onFileSystem:pair-vps",
     "workspaceContains:.pair-notebook-session.json"
   ],
   "main": "./out/extension.js",
@@ -446,6 +447,7 @@
     "test:persistent:agent": "python3 test/persistent_session_agent_test.py -q",
     "test:persistent:cpu": "python3 test/persistent_session_cpu_integration_test.py -q",
     "test:persistent:admin": "python3 test/persistent_session_admin_test.py -q",
+    "test:persistent:server": "node test/persistent_server_archive_smoke.mjs",
     "test:reference": "python3 -W error::ResourceWarning test/anti_fraud_reference_test.py -q"
   },
   "dependencies": {
