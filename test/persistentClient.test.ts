@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import Module from 'node:module';
 import path from 'node:path';
@@ -77,6 +78,7 @@ const boundary = {
   },
   Uri: { from: (value: unknown) => value },
   FileType: { File: 1, Directory: 2 },
+  NotebookCellKind: { Code: 2 },
   FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
   FileSystemError: { Unavailable: (message: string) => new Error(message), NoPermissions: (message: string) => new Error(message) },
   window: {
@@ -107,6 +109,42 @@ function loadPersistentUi(): typeof import('../src/vscode/persistent') {
 const { PersistentFileSystem, PersistentSessionController } = loadPersistentUi();
 
 describe('Persistent server file save conflicts', () => {
+  it('rejects a delayed read from a disconnected session without poisoning the new editing baseline', async () => {
+    const provider = new PersistentFileSystem();
+    let resolveRead!: (value: { content: string; revision: number }) => void;
+    const oldRead = new Promise<{ content: string; revision: number }>((resolve) => { resolveRead = resolve; });
+    const connection = (client: unknown) => ({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Test', client }) as Parameters<typeof provider.setConnection>[0];
+    provider.setConnection(connection({ call: async () => oldRead }));
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/main.py' } as vscode.Uri;
+    const pending = provider.readFile(uri);
+    const writes: Record<string, unknown>[] = [];
+    provider.setConnection(connection({ call: async (operation: string, input: Record<string, unknown>) => {
+      if (operation === 'read') return { content: Buffer.from('new connection').toString('base64'), revision: 2 };
+      writes.push(input); return { revision: 3, entries: [] };
+    } }));
+    resolveRead({ content: Buffer.from('old private content').toString('base64'), revision: 99 });
+    await assert.rejects(pending, /session changed/);
+    assert.equal(Buffer.from(await provider.readFile(uri)).toString(), 'new connection');
+    await provider.writeFile(uri, Buffer.from('new edit'), { create: true, overwrite: true });
+    assert.equal(writes[0]?.expectedRevision, 2);
+    provider.dispose();
+  });
+
+  it('rejects a delayed save acknowledgement without replacing a new session snapshot', async () => {
+    const provider = new PersistentFileSystem();
+    let resolveWrite!: (value: { revision: number; entries: [] }) => void;
+    const pendingWrite = new Promise<{ revision: number; entries: [] }>((resolve) => { resolveWrite = resolve; });
+    const connection = (client: unknown) => ({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Test', client }) as Parameters<typeof provider.setConnection>[0];
+    provider.setConnection(connection({ call: async () => pendingWrite }));
+    const pending = provider.writeFile({ scheme: 'pair-vps', authority: 'session', path: '/main.py' } as vscode.Uri, Buffer.from('edit'), { create: true, overwrite: true });
+    await Promise.resolve();
+    provider.setConnection(connection({ call: async () => ({ revision: 2, entries: [] }) }));
+    provider.accept({ revision: 2, entries: [] });
+    resolveWrite({ revision: 99, entries: [] });
+    await assert.rejects(pending, /session changed/);
+    assert.equal(provider.revision, 2);
+    provider.dispose();
+  });
   it('rejects a nonrecursive delete of a nonempty folder without sending a server mutation', async () => {
     const provider = new PersistentFileSystem();
     const operations: string[] = [];
@@ -171,6 +209,46 @@ describe('Persistent server file save conflicts', () => {
     assert.equal(writes, 0);
     assert.match(content, /collaborator edit/);
     provider.dispose();
+  });
+});
+
+describe('Persistent notebook execution connection ownership', () => {
+  type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
+  for (const phase of ['queue', 'save']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
+    let unblock!: () => void;
+    const wait = new Promise<void>((resolve) => { unblock = resolve; });
+    let saves = 0;
+    const connection = { sessionId: 'original', client: { call: async () => { throw new Error('No RPC should be sent'); } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(phase === 'queue' ? [['work.ipynb', wait]] : []), disposed: false,
+    }) as ExecutionUi;
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => { saves++; await wait; return true; } } as unknown as vscode.NotebookDocument;
+    const pending = ui.execute([], notebook);
+    if (phase === 'save') { await Promise.resolve(); await Promise.resolve(); }
+    ui.connection = { sessionId: 'replacement' };
+    unblock();
+    await assert.rejects(pending, /session changed/);
+    assert.equal(saves, phase === 'queue' ? 0 : 1);
+  });
+
+  it('binds admission to the original session and the actual displayed cell source', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const connection = { sessionId: 'original', client: { call: async (_operation: string, input: Record<string, unknown>) => {
+      calls.push(input); return { id: 'accepted', state: 'completed', events: [] };
+    } } };
+    const handle = { start: () => undefined, clearOutput: async () => undefined, end: () => undefined };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(), executions: new Map(), disposed: false,
+      files: { revision: 9, refresh: async () => undefined },
+      context: { globalState: { update: async () => undefined } },
+      notebook: { createNotebookCellExecution: () => handle },
+      observe: async () => ({ state: 'completed' }),
+    }) as ExecutionUi;
+    const cell = { index: 0, kind: 2, document: { languageId: 'python', getText: () => 'print("displayed")' } } as unknown as vscode.NotebookCell;
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => true } as unknown as vscode.NotebookDocument;
+    await ui.execute([cell], notebook);
+    assert.equal(calls[0]?.sessionId, 'original');
+    assert.equal(calls[0]?.expectedSourceHash, createHash('sha256').update('print("displayed")').digest('hex'));
   });
 });
 

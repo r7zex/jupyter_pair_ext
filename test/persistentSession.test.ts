@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -65,6 +66,149 @@ describe('Persistent VPS Session Host', () => {
     const joined = await guest(); assert.equal((await call('password', { password: 'new protected password' })).status, 200);
     assert.equal((await call('view', {}, joined.token)).status, 401); assert.equal((await call('view')).status, 200);
     assert.equal((await rpc({ operation: 'join', sessionId: owner.sessionId, password, name: 'Old password' })).status, 401);
+  });
+
+  it('rejects a changed editor source before accepting work, even with the latest project revision', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook('print("collaborator")'), expectedRevision: 0 })).data;
+    const input = { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'displayed-source',
+      expectedSourceHash: createHash('sha256').update('print("my cell")').digest('hex') };
+    assert.equal((await call('execute', input)).status, 409);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+    const accepted = { ...input, expectedSourceHash: createHash('sha256').update('print("collaborator")').digest('hex') };
+    assert.equal((await call('execute', accepted)).status, 200);
+    assert.equal((await call('execute', input)).status, 409, 'A request ID cannot substitute another displayed source.');
+  });
+
+  it('keeps the VPS worker on accepted work across sessions and stopped-session recovery', async () => {
+    await registerVps();
+    const other = (await rpc({ operation: 'create', name: 'Second session', password }, admin)).data as PersistentMembership;
+    const inOther = (operation: string, fields: Record<string, unknown> = {}) => rpc({ operation, sessionId: other.sessionId, ...fields }, other.token);
+    const snapshot = (await inOther('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await inOther('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'second-session-first-run' });
+    const accepted = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal(accepted.sessionId, other.sessionId);
+    const firstSnapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    const queued = (await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: firstSnapshot.revision, requestId: 'first-session-queued-run' })).data;
+    // A scoped API request must not bypass the cross-session admission fence.
+    assert.equal((await call('claim', { deviceId: 'vps' }, agent)).data.command, null);
+    for (const stopped of [false, true]) {
+      if (stopped) assert.equal((await inOther('lifecycle', { action: 'stop' })).status, 200);
+      const recovery = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data;
+      assert.equal(recovery.command.executionId, accepted.executionId); assert.equal(recovery.recoverOnly, true);
+      assert.deepEqual(recovery.command.files, []); assert.deepEqual(recovery.command.command, {});
+      assert.equal((await call('execution', { executionId: queued.id })).data.state, 'queued');
+    }
+    assert.equal((await rpc({ operation: 'report', sessionId: other.sessionId, deviceId: 'vps', commandId: accepted.id,
+      executionId: accepted.executionId, generation: accepted.generation, offset: 0, state: 'completed', events: [] }, agent)).status, 200);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command.executionId, queued.id);
+  });
+
+  it('rolls back an unpersisted terminal report so the same offset can retry safely', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'report-storage-retry' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { persist: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.persist;
+    host.persist = async () => { throw new Error('Simulated terminal receipt write failure'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('retry result'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.persist = original;
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].execution.state, 'running');
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'result.txt' })).data.content, encoded('retry result'));
+  });
+
+  it('retries the final merge receipt instead of acknowledging an unpersisted completion', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'merge-receipt-retry' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { persist: (session: { record: { executions: { mergePending?: boolean }[] } }) => Promise<void> } }).persistent;
+    const original = host.persist;
+    let failed = false;
+    host.persist = async function (session) {
+      if (!failed && session.record.executions[0]?.mergePending === false) { failed = true; throw new Error('Final receipt write failed'); }
+      await original.call(this, session);
+    };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('published'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500);
+    assert.equal((await rpc(report, agent)).status, 200); host.persist = original;
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].mergePending, false);
+    assert.equal((await call('execution', { executionId: command.executionId })).data.error, undefined);
+    assert.equal((await call('read', { path: 'result.txt' })).data.content, encoded('published'));
+  });
+
+  it('preserves queued kernels when a deletion or visibility change is rejected', async () => {
+    await registerVps();
+    let snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    snapshot = (await call('mkdir', { path: 'private', visibility: 'private', expectedRevision: snapshot.revision })).data;
+    const joined = await guest();
+    const launched = await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'survives-rejection' });
+    const before = (await call('view')).data.generation;
+    for (const [operation, input, credential, status] of [
+      ['remove', { path: 'private', expectedRevision: snapshot.revision }, joined.token, 404],
+      ['remove', { path: '../escape', expectedRevision: snapshot.revision }, joined.token, 400],
+      ['remove', { path: 'work.ipynb', expectedRevision: 0 }, joined.token, 409],
+      ['visibility', { path: 'missing', visibility: 'private', expectedRevision: snapshot.revision }, owner.token, 404],
+      ['rename', { path: 'work.ipynb', newPath: 'private/work.ipynb', expectedRevision: 0 }, owner.token, 409],
+    ] as const) {
+      assert.equal((await call(operation, input, credential)).status, status);
+      assert.equal((await call('view')).data.generation, before);
+    }
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command.executionId, launched.data.id);
+  });
+
+  for (const recovery of ['report retry', 'server restart']) it(`finishes durable project publication after interruption during ${recovery}`, async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'merge-recovery' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    // Interrupt between durable terminal receipt/notebook outputs and returned
+    // file publication. Recovery must finish without launching the cell again.
+    host.saveResults = async () => { throw new Error('Simulated interruption before returned-file publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed',
+      events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'recovered output' } }],
+      files: [{ path: 'result.txt', content: encoded('durable artifact'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500);
+    host.saveResults = original;
+    if (recovery === 'server restart') { await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`; }
+    assert.equal((await rpc(report, agent)).status, 200);
+    const result = await call('read', { path: 'result.txt' });
+    assert.equal(result.status, 200); assert.equal(result.data.content, encoded('durable artifact'));
+    const saved = JSON.parse(Buffer.from((await call('read', { path: 'work.ipynb' })).data.content, 'base64').toString());
+    assert.equal(saved.cells[0].outputs[0].text, 'recovered output');
+    assert.equal((await call('execution', { executionId: command.executionId })).data.error, undefined);
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].mergePending, false);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+  });
+
+  it('retries artifact merging idempotently without overwriting a concurrent different file', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'partial-artifact-merge' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    host.saveResults = async function (...args: unknown[]) { await original.apply(this, args); throw new Error('Simulated crash after file publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [],
+      files: [{ path: 'same.txt', content: encoded('accepted'), version: 0 }, { path: 'changed.txt', content: encoded('accepted'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.saveResults = original;
+    const latest = (await call('snapshot')).data;
+    assert.equal((await call('write', { path: 'changed.txt', content: encoded('newer edit'), expectedRevision: latest.revision })).status, 200);
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'same.txt' })).data.content, encoded('accepted'));
+    assert.equal((await call('read', { path: 'changed.txt' })).data.content, encoded('newer edit'));
+    assert.match((await call('execution', { executionId: command.executionId })).data.error, /conflicts/);
   });
 
   it('runs canonical public notebook cells with idempotent reports and conflict-safe saved output', async () => {

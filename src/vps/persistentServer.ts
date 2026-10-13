@@ -32,6 +32,7 @@ interface ExecutionRecord {
   sourceHash: string; notebookVersion: number; offset: number; reports: { offset: number; digest: string; end: number }[];
   aclEpoch: number; controls: { id: string; command: Record<string, unknown> }[];
   kernelCommand?: 'restart' | 'release';
+  mergePending?: boolean;
 }
 interface SessionRecord {
   version: 1; id: string; name: string; state: 'running' | 'stopped'; ownerId: string;
@@ -76,6 +77,7 @@ export class PersistentSessionHost {
       }
       this.retireRevokedReporting(session);
       this.sessions.set(record.id, session);
+      for (const run of record.executions) if (run.mergePending) await this.finishResultMerge(session, run);
       await this.persist(session);
     }
     this.sweep = setInterval(() => {
@@ -135,7 +137,7 @@ export class PersistentSessionHost {
   private async trimHistory(session: Session, capacity = false, reserveBytes = 0, excludedId = ''): Promise<void> {
     const bytes = (): number => session.record.executions.reduce((total, run) => total + Buffer.byteLength(JSON.stringify(run.execution.events)), 0);
     while ((capacity && session.record.executions.length >= MAX_EXECUTIONS) || bytes() + reserveBytes > 4 * 1024 * 1024) {
-      const index = session.record.executions.findIndex((run) => run.execution.id !== excludedId && run.execution.state !== 'queued' && run.execution.state !== 'running');
+      const index = session.record.executions.findIndex((run) => !run.mergePending && run.execution.id !== excludedId && run.execution.state !== 'queued' && run.execution.state !== 'running');
       if (index < 0) break;
       const run = session.record.executions[index]!;
       const artifact = path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`);
@@ -180,6 +182,7 @@ export class PersistentSessionHost {
         || Buffer.byteLength(JSON.stringify(run.execution.events)) > MAX_EVENTS_BYTES || !Array.isArray(run.reports) || run.reports.length > 4096
         || !Number.isSafeInteger(run.aclEpoch) || run.aclEpoch < 1 || !Array.isArray(run.controls) || run.controls.length > 128
         || (run.kernelCommand !== undefined && run.kernelCommand !== 'restart' && run.kernelCommand !== 'release')
+        || (run.mergePending !== undefined && (typeof run.mergePending !== 'boolean' || (run.mergePending && !['completed', 'failed'].includes(run.execution.state))))
         || !['queued', 'running', 'completed', 'failed', 'interrupted'].includes(run.execution.state)) throw new Error('Invalid saved execution.');
     }
   }
@@ -209,6 +212,9 @@ export class PersistentSessionHost {
     }
   }
   private active(session: Session): void { if (session.record.state !== 'running') throw new SessionError(409, 'Session is stopped. Start it explicitly.'); }
+  private async privacyBarrier(session: Session): Promise<void> {
+    session.record.aclEpoch++; session.policy.invalidateKernels(); await this.persist(session);
+  }
   private owner(session: Session, member: MemberRecord): void { if (member.id !== session.record.ownerId) throw new SessionError(403, 'Only the owner can change this authority.'); }
   private administrator(member: MemberRecord): void { if (member.role !== 'owner' && member.role !== 'admin') throw new SessionError(403, 'Session administration permission is required.'); }
   private string(body: PersistentRpcRequest, key: string): string { const value = body[key]; if (typeof value !== 'string') throw new SessionError(400, `Invalid ${key}.`); return value; }
@@ -255,6 +261,10 @@ export class PersistentSessionHost {
         return { registered: true };
       }
       for (const session of this.sessions.values()) session.policy.heartbeatDevice('vps');
+      // One configured VPS worker serves every session. Recover its accepted
+      // work first, including stopped sessions, before claiming another queue.
+      const running = [...this.sessions.values()].find((session) => session.record.executions.some((run) => run.execution.deviceId === 'vps' && run.execution.state === 'running'));
+      if (running) return this.claim(running, 'vps');
       for (const session of this.sessions.values()) {
         if (session.record.state === 'running') { const result = await this.claim(session, 'vps'); if (result.command) return result; }
       }
@@ -307,19 +317,16 @@ export class PersistentSessionHost {
       const entries = session.workspace.snapshot(owner).entries;
       const hidesPublicFiles = owner && entries.some((entry) => entry.visibility === 'public' && (entry.path === source || entry.path.startsWith(`${source}/`)))
         && entries.some((entry) => entry.visibility === 'private' && entry.type === 'directory' && target.startsWith(`${entry.path}/`));
-      if (hidesPublicFiles) { session.record.aclEpoch++; session.policy.invalidateKernels(); await this.persist(session); }
-      return session.workspace.rename(source, target, this.revision(body), owner);
+      return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session) : undefined);
     }
     if (body.operation === 'remove') {
       // Deletion retires kernels holding the old public snapshot.
-      session.record.aclEpoch++; session.policy.invalidateKernels(); await this.persist(session);
-      return session.workspace.remove(this.string(body, 'path'), this.revision(body), owner);
+      return session.workspace.remove(this.string(body, 'path'), this.revision(body), owner, () => this.privacyBarrier(session));
     }
     if (body.operation === 'visibility') {
       this.owner(session, member); if (body.visibility !== 'public' && body.visibility !== 'private') throw new SessionError(400, 'Invalid visibility.');
       // Commit the prospective privacy barrier before publishing changed ACLs.
-      session.record.aclEpoch++; session.policy.invalidateKernels(); await this.persist(session);
-      return session.workspace.setVisibility(this.string(body, 'path'), body.visibility, this.revision(body));
+      return session.workspace.setVisibility(this.string(body, 'path'), body.visibility, this.revision(body), () => this.privacyBarrier(session));
     }
     if (body.operation === 'settings') { if (typeof body.allowMemberSwitch !== 'boolean') throw new SessionError(400, 'Invalid switching setting.'); session.policy.setAllowMemberSwitch(member.id, body.allowMemberSwitch); }
     else if (body.operation === 'registerDevice') session.policy.registerDevice(member.id, body.device as PersistentDeviceInput);
@@ -403,6 +410,7 @@ export class PersistentSessionHost {
     const existing = session.record.executions.find((run) => run.requestId === requestId) ?? await session.history.lookupRequest(requestId);
     if (existing) {
       if (existing.execution.requesterId !== member.id || existing.execution.notebook !== body.notebook || existing.execution.cellIndex !== (body.operation === 'kernel' ? 0 : body.cellIndex)) throw new SessionError(409, 'Execution request ID has different input.');
+      if (body.expectedSourceHash !== undefined && body.expectedSourceHash !== existing.sourceHash) throw new SessionError(409, 'Execution request ID has different source.');
       if (existing.aclEpoch !== session.record.aclEpoch && member.id !== session.record.ownerId) throw new SessionError(403, 'Execution predates a privacy change.');
       await session.workspace.read(existing.execution.notebook, member.id === session.record.ownerId);
       return existing.execution;
@@ -419,6 +427,10 @@ export class PersistentSessionHost {
       const cell = notebook.cells[index as number]!;
       if (cell.cell_type !== 'code') throw new SessionError(400, 'Only a code cell can execute.');
       source = this.source(cell); cellIdentity = cell.id ?? `index:${index}`;
+      if (body.expectedSourceHash !== undefined && (typeof body.expectedSourceHash !== 'string'
+        || !/^[a-f0-9]{64}$/.test(body.expectedSourceHash) || body.expectedSourceHash !== sha(source))) {
+        throw new SessionError(409, 'The saved cell differs from the editor. Reload or save before execution.');
+      }
     }
     const { target, generation } = session.policy.executionTarget(member.id); const id = randomUUID(); const commandId = randomUUID();
     const raw: Record<string, unknown> = { command: 'execute', requestId: commandId, codeBase64: Buffer.from(source).toString('base64') };
@@ -454,12 +466,15 @@ export class PersistentSessionHost {
   }
 
   private async claim(session: Session, deviceId: string): Promise<{ command: PersistentCommand | null; controls?: { id: string; command: Record<string, unknown> }[]; recoverOnly?: boolean }> {
-    this.active(session); session.policy.heartbeatDevice(deviceId);
+    session.policy.heartbeatDevice(deviceId);
     const running = session.record.executions.find((run) => run.execution.deviceId === deviceId && run.execution.state === 'running');
     if (running) {
       const command = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${running.commandId}.json`), 16 * 1024 * 1024)) as PersistentCommand;
       return { command: { ...command, files: [], command: {} }, controls: running.controls, recoverOnly: true };
     }
+    this.active(session);
+    if (deviceId === 'vps' && [...this.sessions.values()].some((candidate) => candidate !== session
+      && candidate.record.executions.some((run) => run.execution.deviceId === 'vps' && run.execution.state === 'running'))) return { command: null };
     for (const run of session.record.executions) {
       if (run.execution.deviceId !== deviceId || run.execution.state !== 'queued') continue;
       try {
@@ -485,19 +500,37 @@ export class PersistentSessionHost {
     if (Buffer.byteLength(JSON.stringify({ files: body.files, removedFiles: body.removedFiles })) > 8 * 1024 * 1024) throw new SessionError(413, 'Returned artifacts exceed limits.');
     const digest = sha(JSON.stringify({ events: body.events, state: body.state, error: body.error, files: body.files, removedFiles: body.removedFiles }));
     const previous = run.reports.find((report) => report.offset === body.offset && report.digest === digest);
-    if (previous) return { offset: previous.end };
+    if (previous) { if (run.mergePending) await this.finishResultMerge(session, run); return { offset: previous.end }; }
     if (run.execution.state !== 'running' || run.offset !== body.offset) throw new SessionError(409, 'Execution report offset or state is stale.');
     if (run.reports.length >= 4096 || Buffer.byteLength(JSON.stringify([...run.execution.events, ...body.events])) > MAX_EVENTS_BYTES) throw new SessionError(413, 'Execution output limit reached.');
     const events = body.events as Record<string, unknown>[];
     await this.trimHistory(session, false, Buffer.byteLength(JSON.stringify(events)), run.execution.id);
     if (events.some((event) => event.requestId !== undefined && event.requestId !== run.commandId && !run.controls.some((control) => control.id === event.requestId))) throw new SessionError(403, 'Event belongs to another command.');
-    run.execution.events.push(...events); run.offset += events.length;
-    run.execution.state = body.state as PersistentExecution['state'];
-    if (body.error !== undefined) { if (typeof body.error !== 'string' || body.error.length > 2000) throw new SessionError(400, 'Invalid execution error.'); run.execution.error = body.error; }
-    if (body.files !== undefined || body.removedFiles !== undefined) await this.writeMetadata(path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`), JSON.stringify({ files: body.files ?? [], removedFiles: body.removedFiles ?? [] }));
-    run.reports.push({ offset: body.offset as number, digest, end: run.offset }); await this.persist(session);
-    if ((run.execution.state === 'completed' || run.execution.state === 'failed') && run.aclEpoch === session.record.aclEpoch) { await this.saveOutputs(session, run); await this.saveResults(session, run, body.files, body.removedFiles); }
+    const terminalMerge = body.state === 'completed' || body.state === 'failed';
+    if (terminalMerge || body.files !== undefined || body.removedFiles !== undefined) await this.writeMetadata(path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`), JSON.stringify({ files: body.files ?? [], removedFiles: body.removedFiles ?? [] }));
+    const before = { ...run, mergePending: run.mergePending };
+    run.execution = { ...run.execution, events: [...run.execution.events, ...events], state: body.state as PersistentExecution['state'],
+      ...(body.error !== undefined ? { error: body.error as string } : {}) };
+    run.offset += events.length;
+    run.mergePending = terminalMerge;
+    run.reports = [...run.reports, { offset: body.offset as number, digest, end: run.offset }];
+    try { await this.persist(session); }
+    catch (error) { Object.assign(run, before); throw error; }
+    if (run.mergePending) await this.finishResultMerge(session, run);
     await this.trimHistory(session); await this.persist(session); return { offset: run.offset };
+  }
+
+  private async finishResultMerge(session: Session, run: ExecutionRecord): Promise<void> {
+    // Terminal receipt and artifacts precede project publication. A crash in
+    // between is reconciled on startup or by the same report acknowledgement.
+    if (run.aclEpoch === session.record.aclEpoch) {
+      const result = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`), 8 * 1024 * 1024)) as { files?: unknown; removedFiles?: unknown };
+      await this.saveOutputs(session, run);
+      await this.saveResults(session, run, result.files, result.removedFiles);
+    }
+    run.mergePending = false;
+    try { await this.persist(session); }
+    catch (error) { run.mergePending = true; throw error; }
   }
 
   private async saveOutputs(session: Session, run: ExecutionRecord): Promise<void> {
@@ -510,23 +543,39 @@ export class PersistentSessionHost {
       const rendered = persistentNotebookOutputs(run.execution.events);
       cell.outputs = rendered.outputs; cell.execution_count = rendered.executionCount;
       await session.workspace.write(run.execution.notebook, Buffer.from(JSON.stringify(notebook, null, 2)).toString('base64'), file.revision, false);
-    } catch { /* Source/ACL conflicts retain the execution result without overwriting user edits. */ }
+    } catch (error) {
+      if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
+      run.execution.error = 'Notebook outputs could not be merged; the execution result remains available.';
+    }
   }
   private async saveResults(session: Session, run: ExecutionRecord, value: unknown, removed: unknown): Promise<void> {
     if (value !== undefined && (!Array.isArray(value) || value.length > 256)) { run.execution.error = 'Returned files exceed result limits.'; return; }
     for (const item of (value ?? []) as { path?: unknown; content?: unknown; version?: unknown }[]) {
       if (!item || !safeJobPath(item.path) || typeof item.content !== 'string' || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
       const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
-      if ((current?.version ?? 0) !== item.version) { run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.'; continue; }
+      if ((current?.version ?? 0) !== item.version) {
+        // A previous merge may have published this exact content before a
+        // crash. Acknowledge it without overwriting a subsequent different edit.
+        if (current?.type === 'file' && (await session.workspace.read(item.path, false)).content === item.content) continue;
+        run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.'; continue;
+      }
       try { await session.workspace.write(item.path, item.content, snapshot.revision, false); }
-      catch { run.execution.error = 'A returned file could not be merged safely; execution events remain available.'; }
+      catch (error) {
+        if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
+        run.execution.error = 'A returned file could not be merged safely; execution events remain available.';
+      }
     }
     if (removed !== undefined && (!Array.isArray(removed) || removed.length > 256)) { run.execution.error = 'Returned deletions exceed result limits.'; return; }
     for (const item of (removed ?? []) as { path?: unknown; version?: unknown }[]) {
       if (!item || !safeJobPath(item.path) || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
       const snapshot = session.workspace.snapshot(false); const current = snapshot.entries.find((entry) => entry.path === item.path);
-      if (!current || current.type !== 'file' || current.version !== item.version) { run.execution.error = 'Returned deletion conflicts with a newer server version.'; continue; }
-      try { await session.workspace.remove(item.path, snapshot.revision, false); } catch { run.execution.error = 'Returned deletion could not be merged safely.'; }
+      if (!current) continue;
+      if (current.type !== 'file' || current.version !== item.version) { run.execution.error = 'Returned deletion conflicts with a newer server version.'; continue; }
+      try { await session.workspace.remove(item.path, snapshot.revision, false); }
+      catch (error) {
+        if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
+        run.execution.error = 'Returned deletion could not be merged safely.';
+      }
     }
   }
 }

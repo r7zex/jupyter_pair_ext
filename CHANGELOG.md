@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1 - 2026-10-13 (persistent session review)
+
+- Checks file paths, ACLs and revision conflicts before retiring public kernels. Rejected deletion, rename or visibility requests cannot reset an accepted computation.
+- Recovers durable terminal reports whose notebook/artifact publication was interrupted, on restart or acknowledgement retry. Partial file publication is idempotent and preserves newer edits; failed terminal receipt writes remain retryable.
+- Keeps one VPS worker on its accepted execution across all sessions, including recovery after an administrative session stop. Scoped claims cannot bypass that admission fence.
+- Binds notebook queues, delayed file reads/saves and kernel input to their original connection. Admission checks the displayed cell's source hash against the saved server cell.
+- Activates for the persistent filesystem and keeps P2P restore/backing-folder operations on filesystem folders. Shows participant revocation only to the owner.
+- Adds persistent agent/admin/real CPU integration to CI and retains the matching standalone server alongside the VSIX. See the requirement review in `docs/PERSISTENT_VPS_REVIEW_0.6.1.md`; production isolation, physical CUDA, live VS Code and external VPS operation still need their own verification.
+
 ## 0.6.0 - 2026-10-13 (persistent VPS sessions, development build)
 
 - Adds a server-owned session lifecycle, salted scrypt password joins, independent member credentials, administrative grants and revocation. Empty sessions survive disconnects and process restarts.

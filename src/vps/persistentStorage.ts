@@ -181,7 +181,7 @@ export class PersistentWorkspace {
     });
   }
 
-  rename(value: string, newValue: string, expectedRevision: number, owner: boolean): Promise<PersistentSnapshot> {
+  rename(value: string, newValue: string, expectedRevision: number, owner: boolean, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, (next) => {
       const name = normalizePath(value);
       const target = normalizePath(newValue);
@@ -202,10 +202,10 @@ export class PersistentWorkspace {
       }
       // Moving an inherited private subtree out of its parent must not accidentally publish it.
       source.visibility = sourceVisibility;
-    });
+    }, beforePublish);
   }
 
-  remove(value: string, expectedRevision: number, owner: boolean): Promise<PersistentSnapshot> {
+  remove(value: string, expectedRevision: number, owner: boolean, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, (next) => {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
@@ -213,11 +213,11 @@ export class PersistentWorkspace {
       if (!removing.length) missing();
       this.authorizeSubtree(removing, owner, next);
       next.entries = next.entries.filter((entry) => !within(entry.path, name));
-    });
+    }, beforePublish);
   }
 
   /** This API is owner-only; the authenticated server must check the caller before calling it. */
-  setVisibility(value: string, visibility: 'public' | 'private', expectedRevision: number): Promise<PersistentSnapshot> {
+  setVisibility(value: string, visibility: 'public' | 'private', expectedRevision: number, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, true, (next) => {
       const name = normalizePath(value);
       if (visibility !== 'public' && visibility !== 'private') invalid('Invalid visibility.');
@@ -226,10 +226,10 @@ export class PersistentWorkspace {
       entry.visibility = visibility;
       entry.version = next.revision;
       entry.mtime = Date.now();
-    });
+    }, beforePublish);
   }
 
-  private mutate(expectedRevision: number, owner: boolean, change: (next: Manifest) => void | Promise<void>): Promise<PersistentSnapshot> {
+  private mutate(expectedRevision: number, owner: boolean, change: (next: Manifest) => void | Promise<void>, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
     return this.enqueue(async () => {
       const current = this.current();
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
@@ -239,6 +239,9 @@ export class PersistentWorkspace {
       const next: Manifest = { format: 1, revision: current.revision + 1, entries: current.entries.map((entry) => ({ ...entry })) };
       await change(next);
       this.validateEntries(next);
+      // Validate CAS, paths and ACLs before retiring kernels, while committing
+      // the privacy barrier before the new file manifest becomes visible.
+      await beforePublish?.();
       await this.publish(next);
       this.manifest = next;
       await this.collectGarbage();

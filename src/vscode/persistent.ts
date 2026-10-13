@@ -93,6 +93,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     const key = this.check(uri);
     const connection = this.requireConnection();
     const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
+    if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the read.');
     // A second read may be a comparison view while the original editor stays dirty.
     // Only reopening or a successful save establishes a new editing baseline.
     const content = Buffer.from(response.content, 'base64');
@@ -115,6 +116,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
           const baseline = this.readContents.get(input.path);
           if (!baseline) throw error;
           const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: input.path });
+          if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
           const latest = Buffer.from(response.content, 'base64');
           const desired = Buffer.from(input.content, 'base64');
           const merged = latest.equals(baseline) ? desired : input.path.endsWith('.ipynb') ? mergePersistentNotebookOutputs(baseline, desired, latest) : undefined;
@@ -123,6 +125,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
           // Exactly one CAS retry. A concurrent edit after this read still fails.
           snapshot = await connection.client.call<PersistentSnapshot>(operation, request);
         }
+        if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
         this.accept(snapshot);
         if (operation === 'write' && typeof input.path === 'string' && 'content' in request && typeof request.content === 'string') {
           this.readRevisions.set(input.path, snapshot.revision);
@@ -533,8 +536,8 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const owner = member?.role === 'owner';
     const admin = owner || member?.role === 'admin';
     const actions = [{ label: 'Copy session connection details', action: 'invite' }, { label: 'Choose compute device', action: 'compute' }];
-    if (admin) actions.push({ label: 'Stop session', action: 'stop' }, { label: 'Start session', action: 'start' }, { label: 'Restart session', action: 'restart' }, { label: 'Delete session permanently', action: 'delete' }, { label: 'Revoke participant access', action: 'revoke' });
-    if (owner) actions.push({ label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
+    if (admin) actions.push({ label: 'Stop session', action: 'stop' }, { label: 'Start session', action: 'start' }, { label: 'Restart session', action: 'restart' }, { label: 'Delete session permanently', action: 'delete' });
+    if (owner) actions.push({ label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
     const action = await vscode.window.showQuickPick(actions, { title: `${view.name} · ${view.id}` });
     if (!action) return;
     if (action.action === 'invite') { await vscode.env.clipboard.writeText(`${this.requireConnection().endpoint}\nSession ID: ${view.id}`); return; }
@@ -586,12 +589,19 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     }
   }
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
+    const connection = this.requireConnection();
     const key = filePath(notebook.uri);
-    if (notebook.uri.scheme !== SCHEME || notebook.uri.authority !== this.connection?.sessionId) throw new Error('This notebook is outside the connected VPS project.');
+    if (notebook.uri.scheme !== SCHEME || notebook.uri.authority !== connection.sessionId) throw new Error('This notebook is outside the connected VPS project.');
+    const requireOriginalSession = (): void => {
+      if (this.disposed || connection !== this.connection) throw new Error('The persistent session changed; queued cells were not submitted.');
+    };
     const previous = this.notebookQueues.get(key) ?? Promise.resolve();
     const queued = previous.catch(() => undefined).then(async () => {
+      requireOriginalSession();
       if (!await notebook.save()) throw new Error('Save the notebook before execution. Resolve any server conflict first.');
+      requireOriginalSession();
       for (const cell of cells) if (cell.kind === vscode.NotebookCellKind.Code && cell.document.languageId === 'python') {
+        requireOriginalSession();
         const requestId = randomUUID();
         this.executions.set(requestId, { notebook: key, requestId });
         await this.context.globalState.update('pairNotebook.persistentExecutions', [...this.executions.values()].slice(-50));
@@ -600,10 +610,13 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         await execution.clearOutput();
         try {
           await this.files.refresh();
-          const result = await this.rpc<PersistentExecution>('execute', { notebook: key, cellIndex: cell.index, expectedRevision: this.files.revision, requestId });
+          requireOriginalSession();
+          const expectedSourceHash = createHash('sha256').update(cell.document.getText()).digest('hex');
+          const result = await connection.client.call<PersistentExecution>('execute', { sessionId: connection.sessionId, notebook: key, cellIndex: cell.index,
+            expectedRevision: this.files.revision, expectedSourceHash, requestId });
           this.executions.set(requestId, { notebook: key, requestId, id: result.id });
           await this.context.globalState.update('pairNotebook.persistentExecutions', [...this.executions.values()].slice(-50));
-          const completed = await this.observe(result, execution);
+          const completed = await this.observe(result, execution, connection);
           execution.end(completed.state === 'completed', Date.now());
           await this.files.refresh();
         } catch (error) {
@@ -615,8 +628,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.notebookQueues.set(key, queued);
     try { await queued; } finally { if (this.notebookQueues.get(key) === queued) this.notebookQueues.delete(key); }
   }
-  private async observe(initial: PersistentExecution, handle?: vscode.NotebookCellExecution): Promise<PersistentExecution> {
-    const connection = this.requireConnection();
+  private async observe(initial: PersistentExecution, handle?: vscode.NotebookCellExecution, connection = this.requireConnection()): Promise<PersistentExecution> {
     const state = createJupyterRenderState();
     let seen = 0;
     let result = initial;
@@ -627,8 +639,9 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         if (handle && update.executionOrder !== undefined) handle.executionOrder = update.executionOrder;
         if (event.type === 'inputRequest') {
           const value = await vscode.window.showInputBox({ title: 'VPS Jupyter input', prompt: String(event.content?.prompt ?? 'Input').slice(0, 4096), password: event.content?.password === true, ignoreFocusOut: true });
-          if (value !== undefined) await this.rpc('kernelControl', { executionId: result.id, command: { command: 'inputReply', value } });
-          else await this.rpc('kernelControl', { executionId: result.id, command: { command: 'interrupt' } });
+          if (connection !== this.connection || this.disposed) throw new Error('The persistent session changed during kernel input.');
+          await connection.client.call('kernelControl', { sessionId: connection.sessionId, executionId: result.id,
+            command: value !== undefined ? { command: 'inputReply', value } : { command: 'interrupt' } });
         }
       }
       seen = result.events.length;
