@@ -22,6 +22,7 @@ async function main(): Promise<void> {
     clientToken: process.env.PAIR_VPS_CLIENT_TOKEN ?? '', agentTokens,
     ...(clientPrincipals ? { clientPrincipals } : {}),
     dataDirectory: path.resolve(process.env.PAIR_VPS_DATA ?? './.pair-vps'),
+    persistentVpsAgentId: process.env.PAIR_VPS_SESSION_AGENT_ID ?? 'vps',
   });
   await server.start(port, process.env.PAIR_VPS_BIND ?? '127.0.0.1');
   console.log(`Pair Notebook VPS service is listening on port ${port}.`);

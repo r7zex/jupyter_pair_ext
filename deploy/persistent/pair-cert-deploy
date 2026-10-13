@@ -1,0 +1,14 @@
+#!/bin/sh
+# Run by Certbot as root. It copies only this IP's certificate for Caddy.
+set -eu
+lineage=/etc/letsencrypt/live/144.172.69.57
+if [ -n "${RENEWED_LINEAGE:-}" ] && [ "$RENEWED_LINEAGE" != "$lineage" ]; then
+    exit 0
+fi
+install -d -o root -g caddy -m 0750 /etc/caddy/pair-tls
+install -o root -g caddy -m 0640 "$lineage/fullchain.pem" /etc/caddy/pair-tls/fullchain.pem.new
+install -o root -g caddy -m 0640 "$lineage/privkey.pem" /etc/caddy/pair-tls/privkey.pem.new
+mv /etc/caddy/pair-tls/fullchain.pem.new /etc/caddy/pair-tls/fullchain.pem
+mv /etc/caddy/pair-tls/privkey.pem.new /etc/caddy/pair-tls/privkey.pem
+/usr/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+/usr/bin/systemctl reload caddy

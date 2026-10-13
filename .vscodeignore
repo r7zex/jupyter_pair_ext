@@ -9,6 +9,7 @@ scripts/**
 out/test/**
 src/**
 upload/**
+artifacts/**
 node_modules/.cache/**
 node_modules/**
 .venv/**

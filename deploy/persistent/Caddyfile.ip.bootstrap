@@ -1,0 +1,10 @@
+# Initial certificate issuance only. No session API is exposed over HTTP.
+http://144.172.69.57 {
+    handle /.well-known/acme-challenge/* {
+        root * /var/lib/pair-acme
+        file_server
+    }
+    handle {
+        redir https://144.172.69.57{uri} 308
+    }
+}

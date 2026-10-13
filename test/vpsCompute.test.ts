@@ -439,6 +439,8 @@ describe('VPS durable background compute', function () {
       assert.equal(compact.data.job.files, undefined); assert.equal(compact.data.job.args, undefined);
       assert.equal(compact.data.job.createdAt, submitted.createdAt); assert.equal(compact.data.job.ownerIdentity, submitted.ownerIdentity);
       assert.equal(compact.data.job.projectId, 'compact-project'); assert.equal(compact.data.job.sessionId, 'compact-session');
+      // Compact polling starts before the detached worker has staged its workspace.
+      await until(async () => { try { return (await readFile(path.join(work, 'launches'), 'utf8')) === 'once\n'; } catch { return false; } });
       await writeFile(path.join(work, 'release'), 'release');
       await until(async () => (await client.job(submitted.id)).status === 'succeeded');
       assert.equal(await readFile(path.join(work, 'launches'), 'utf8'), 'once\n');

@@ -75,7 +75,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.view = view;
     view.webview.options = {
       enableScripts: true,
-      enableCommandUris: ['pairNotebook.startSession', 'pairNotebook.joinSession'],
+      enableCommandUris: ['pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.connectVps'],
       localResourceRoots: [],
     };
     this.messageSubscription?.dispose();
@@ -158,6 +158,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
 const commandMap: Record<string, string> = {
   start: 'pairNotebook.startSession',
   join: 'pairNotebook.joinSession',
+  vps: 'pairNotebook.connectVps',
   invite: 'pairNotebook.copyInvite',
   leave: 'pairNotebook.leaveSession',
   end: 'pairNotebook.endSession',
@@ -398,7 +399,7 @@ function html(): string {
   <h1>PAIR NOTEBOOK</h1>
   <main id="content">
     <p class="hero">Совместная работа с Jupyter и кодом через защищённое P2P-подключение.</p>
-    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Начать сессию</a><a class="fallback-button" href="command:pairNotebook.joinSession">Подключиться</a></div>
+    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Начать сессию</a><a class="fallback-button" href="command:pairNotebook.joinSession">Подключиться</a><a class="fallback-button" href="command:pairNotebook.connectVps">Постоянная VPS-сессия</a></div>
     <p class="tiny">Если интерактивная панель не загрузится, эти две команды всё равно работают.</p>
   </main>
   <script nonce="${nonce}">
@@ -440,9 +441,10 @@ function html(): string {
       const root = document.getElementById('content');
       if (!state.live) {
         const recent = (state.recent || []).map(item => '<div class="card"><strong>Сессия: '+esc(item.name)+'</strong><div>Хост: '+esc(item.hostName)+'</div><div class="tiny">Вы вышли '+esc(item.relativeExit)+' • '+esc(item.exitDate)+'</div><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
-        root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать сессию</button><button id="join" class="secondary">Подключиться</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
+        root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать сессию</button><button id="join" class="secondary">Подключиться</button><button id="vps" class="secondary">Постоянная VPS-сессия</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
         document.getElementById('start').onclick = () => command('start');
         document.getElementById('join').onclick = () => command('join');
+        document.getElementById('vps').onclick = () => command('vps');
         if (document.getElementById('recent')) document.getElementById('recent').onclick = () => command('recent');
         return;
       }

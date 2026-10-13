@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew the Pair Notebook public IP certificate
+Wants=network-online.target
+After=network-online.target caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/snap/bin/certbot renew --quiet --deploy-hook /usr/local/sbin/pair-cert-deploy
+# This service performs certificate administration only; it never executes notebooks.
+UMask=0077

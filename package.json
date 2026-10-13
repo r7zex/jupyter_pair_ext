@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Encrypted VS Code and Jupyter collaboration with pinned host execution, VPN recovery, WebRTC, Iroh QUIC and redundant relay fallback.",
-  "version": "0.5.39",
+  "version": "0.6.0",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -43,7 +43,7 @@
       "description": "Pair Notebook stays loaded only to preserve an explicit Start/Join handoff while VS Code asks for Workspace Trust. Session networking, synchronization, and execution remain blocked until the folder is trusted."
     },
     "virtualWorkspaces": {
-      "supported": false
+      "supported": true
     }
   },
   "contributes": {
@@ -152,6 +152,74 @@
         "icon": "$(plug)"
       },
       {
+        "command": "pairNotebook.connectVpsCompute",
+        "title": "Pair Notebook: Connect to VPS Compute",
+        "icon": "$(remote)"
+      },
+      {
+        "command": "pairNotebook.createVpsSession",
+        "title": "Pair Notebook: Create Persistent VPS Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "pairNotebook.joinVpsSession",
+        "title": "Pair Notebook: Join Persistent VPS Session"
+      },
+      {
+        "command": "pairNotebook.manageVpsSession",
+        "title": "Pair Notebook: Manage Persistent VPS Session"
+      },
+      {
+        "command": "pairNotebook.leaveVpsSession",
+        "title": "Pair Notebook: Leave Persistent VPS Session",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.uploadVpsFolder",
+        "title": "Pair Notebook: Upload Files to VPS",
+        "enablement": "pairNotebook.inVpsSession && pairNotebook.vpsOwner"
+      },
+      {
+        "command": "pairNotebook.selectVpsCompute",
+        "title": "Pair Notebook: Select Persistent Compute Device",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.shareVpsComputer",
+        "title": "Pair Notebook: Share My Computer in VPS Session",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.recoverVpsExecution",
+        "title": "Pair Notebook: Recover Persistent Execution",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.restartVpsKernel",
+        "title": "Pair Notebook: Restart Persistent Notebook Kernel",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.releaseVpsKernel",
+        "title": "Pair Notebook: Release Persistent Notebook Kernel",
+        "enablement": "pairNotebook.inVpsSession"
+      },
+      {
+        "command": "pairNotebook.refreshVpsSession",
+        "title": "Pair Notebook: Refresh Persistent VPS Session",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "pairNotebook.vpsFolderPublic",
+        "title": "Pair Notebook: Make VPS Folder Public",
+        "enablement": "pairNotebook.vpsOwner"
+      },
+      {
+        "command": "pairNotebook.vpsFolderPrivate",
+        "title": "Pair Notebook: Make VPS Folder Private",
+        "enablement": "pairNotebook.vpsOwner"
+      },
+      {
         "command": "pairNotebook.runVpsJob",
         "title": "Pair Notebook: Run Python on VPS Compute",
         "icon": "$(play)"
@@ -208,10 +276,26 @@
         {
           "id": "pairNotebook.vpsCompute",
           "name": "VPS Compute"
+        },
+        {
+          "id": "pairNotebook.persistentSessions",
+          "name": "Persistent VPS Sessions"
         }
       ]
     },
     "menus": {
+      "explorer/context": [
+        {
+          "command": "pairNotebook.vpsFolderPublic",
+          "when": "resourceScheme == pair-vps && explorerResourceIsFolder && pairNotebook.vpsOwner",
+          "group": "pairNotebook@1"
+        },
+        {
+          "command": "pairNotebook.vpsFolderPrivate",
+          "when": "resourceScheme == pair-vps && explorerResourceIsFolder && pairNotebook.vpsOwner",
+          "group": "pairNotebook@2"
+        }
+      ],
       "notebook/cell/title": [
         {
           "command": "pairNotebook.runActiveCell",
@@ -221,9 +305,24 @@
       ],
       "view/title": [
         {
-          "command": "pairNotebook.connectVps",
+          "command": "pairNotebook.connectVpsCompute",
           "when": "view == pairNotebook.vpsCompute",
           "group": "navigation@0"
+        },
+        {
+          "command": "pairNotebook.connectVps",
+          "when": "view == pairNotebook.persistentSessions",
+          "group": "navigation@0"
+        },
+        {
+          "command": "pairNotebook.createVpsSession",
+          "when": "view == pairNotebook.persistentSessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "pairNotebook.refreshVpsSession",
+          "when": "view == pairNotebook.persistentSessions",
+          "group": "navigation@2"
         },
         {
           "command": "pairNotebook.runVpsJob",
@@ -321,7 +420,7 @@
           "default": "",
           "scope": "machine",
           "restricted": true,
-          "description": "HTTPS endpoint of your own Pair Notebook VPS relay and durable compute service. Run Connect to VPS to store its team token securely. All participants can submit background jobs to any registered compute agent, independently of the session host."
+          "description": "HTTPS endpoint of your own Pair Notebook VPS relay and durable compute service. Run Connect to VPS Compute to store its team token securely. Persistent session participants instead use Connect to VPS with their session password."
         }
       }
     }
@@ -343,6 +442,10 @@
     "test:live:mqtt": "node scripts/mqtt-live-smoke.mjs",
     "vps:server": "node out/src/vps/cli.js",
     "vps:agent": "python3 scripts/pair-notebook-agent.py",
+    "package:persistent-server": "node scripts/package-persistent-server.mjs",
+    "test:persistent:agent": "python3 test/persistent_session_agent_test.py -q",
+    "test:persistent:cpu": "python3 test/persistent_session_cpu_integration_test.py -q",
+    "test:persistent:admin": "python3 test/persistent_session_admin_test.py -q",
     "test:reference": "python3 -W error::ResourceWarning test/anti_fraud_reference_test.py -q"
   },
   "dependencies": {

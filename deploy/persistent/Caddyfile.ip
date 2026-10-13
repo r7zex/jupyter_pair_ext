@@ -1,0 +1,15 @@
+http://144.172.69.57 {
+    handle /.well-known/acme-challenge/* {
+        root * /var/lib/pair-acme
+        file_server
+    }
+    handle {
+        redir https://144.172.69.57{uri} 308
+    }
+}
+
+https://144.172.69.57 {
+    tls /etc/caddy/pair-tls/fullchain.pem /etc/caddy/pair-tls/privkey.pem
+    header Cache-Control "no-store"
+    reverse_proxy 127.0.0.1:8787
+}
