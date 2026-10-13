@@ -70,6 +70,7 @@ def main():
         if not personal_sandbox.ready: raise RuntimeError(personal_sandbox.reason)
         personal_config=argparse.Namespace(id='soak-personal',session=owners[0]['sessionId'],url=endpoint,token_file=None,config_token=owners[0]['token'],python=sys.executable,bridge=str(ROOT/'media/jupyter_kernel_bridge.py'),state=str(state/'personal'),name='Real consenting owner container executor',share=True,max_kernels=1)
         personal=AGENT.SessionAgent(personal_config,sandbox=personal_sandbox); personal.tick()
+        started = time.monotonic()  # Count >=24h only AFTER real sessions/executors are ready.
         record('started', sourceCommit=commit, pid=os.getpid(), runtimeImage=sandbox.image, hoursRequested=args.hours, shortHarnessCheck=args.check)
         while args.check and sequence<2 or not args.check and time.monotonic()-started<args.hours*3600:
             for owner,guest in zip(owners,guests):
