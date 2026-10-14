@@ -1,0 +1,312 @@
+{
+  "observedUtc": "2026-10-14T22:58:54.624346+03:00",
+  "runtimeSourceCommit": "7b93d81fb073ea85d17eeb4f0a89365183f19def",
+  "baseCommit": "2537e62d28d1bba4858ec0b513863058b7cbacb7",
+  "methods": {
+    "windows": "Windows 11 / official portable VS Code 1.139.1 / two independent native Extension Hosts",
+    "posix": "Ubuntu-22.04 WSL2 / private mount namespace / bounded tmpfs / existing E-backed ext4 Python",
+    "target": "Ubuntu 24.04.4 VPS / non-root production worker / real bwrap Jupyter"
+  },
+  "fullPosixGate": {
+    "passing": 4942,
+    "result": "PASS",
+    "log": "continuation-full-ext4-gate-7b93d81f.log",
+    "pending": 0,
+    "failing": 0,
+    "commandExitCode": 0
+  },
+  "windowsArtifactsGate": {
+    "passing": 4823,
+    "pending": 32,
+    "failing": 16,
+    "result": "FAIL",
+    "log": "continuation-artifacts-network-7b93d81f.log"
+  },
+  "persistentPosixGate": {
+    "passing": 169,
+    "result": "PASS",
+    "log": "continuation-persistent-posix-7b93d81f.log"
+  },
+  "agentGate": {
+    "passed": 34,
+    "failed": 0,
+    "seconds": 90.039,
+    "backend": "actual WSL/POSIX/bwrap"
+  },
+  "pythonBridgeGate": {
+    "passed": 9,
+    "failed": 0
+  },
+  "productionDependencyAudit": {
+    "vulnerabilities": 0
+  },
+  "native": {
+    "runId": "435ad138-100c-4374-8c22-c849ef09bb6e",
+    "owner": "PASS",
+    "member": "PASS",
+    "checks": [
+      {
+        "scenario": "native Private listing/read boundary",
+        "result": "PASS"
+      },
+      {
+        "scenario": "production relative cursor presence and native decoration creation",
+        "result": "PASS"
+      },
+      {
+        "scenario": "concurrent actual editor API input and deletion on different lines of one cell",
+        "result": "PASS",
+        "editorApiEdits": 141,
+        "maxLocalCommandMs": 111.45880000000034,
+        "medianLocalCommandMs": 43.95889999999963
+      },
+      {
+        "scenario": "same-line joint native editing without locks and native save",
+        "result": "PASS"
+      },
+      {
+        "scenario": "native Unicode/UTF-16 multiline replacements, joins and local input with 900ms delayed actor response",
+        "result": "PASS",
+        "delayedResponses": 1,
+        "localEditorApi": {
+          "samples": 4,
+          "medianMs": 58.07440000000133,
+          "p95Ms": 77.74969999999666,
+          "maxMs": 77.74969999999666
+        }
+      },
+      {
+        "scenario": "actual native undo/redo and convergence",
+        "result": "PASS"
+      },
+      {
+        "scenario": "native insert/delete/reorder/code-to-markdown and durable user notebook/cell metadata",
+        "result": "PASS"
+      },
+      {
+        "scenario": "native concurrent saves/incoming edit/repeated Save, dirty=false",
+        "result": "PASS"
+      },
+      {
+        "scenario": "owner native edit to peer native event",
+        "result": "PASS",
+        "milliseconds": 249
+      },
+      {
+        "scenario": "production native Run Cell and peer output",
+        "result": "PASS",
+        "endToEndMs": 5410
+      },
+      {
+        "scenario": "native saved output remains visible while editing executed source and saving after Run",
+        "result": "PASS"
+      },
+      {
+        "scenario": "production native warm Run Cell and peer output",
+        "result": "PASS",
+        "endToEndMs": 1107
+      },
+      {
+        "scenario": "native Private save state",
+        "dirtyBefore": true,
+        "saved": true,
+        "dirtyAfter": false
+      },
+      {
+        "scenario": "owner native Private execution has separate namespace, native output and member direct-read denial",
+        "result": "PASS"
+      }
+    ],
+    "peerPropagation": {
+      "samples": 20,
+      "medianMs": 235,
+      "p95Ms": 415,
+      "maxMs": 600
+    },
+    "httpsSnapshotRpcBaseline": {
+      "samples": 15,
+      "medianMs": 119.22429999999804,
+      "p95Ms": 143.7394000000022,
+      "maxMs": 143.7394000000022
+    },
+    "offlineEditorApi": {
+      "owner": {
+        "commands": 140,
+        "medianCommandMs": 14.640000000000327,
+        "maxCommandMs": 125.76339999999982
+      },
+      "member": {
+        "commands": 140,
+        "medianCommandMs": 13.8721000000005,
+        "maxCommandMs": 113.10550000000057
+      }
+    },
+    "synchronousStage": {
+      "owner": {
+        "calls": 199,
+        "synchronousMs": 21.63229999999203,
+        "maxMs": 3.696799999997893
+      },
+      "member": {
+        "calls": 167,
+        "synchronousMs": 30.121200000026874,
+        "maxMs": 6.776099999999133
+      }
+    },
+    "concurrentSave": {
+      "firstSave": false,
+      "savingVersion": 411,
+      "versionAfter": 413,
+      "dirtyAfter": true
+    },
+    "load": "Windows full artifacts suite ran concurrently; VPS aggregate capped at 35% CPU, own soak running within that aggregate",
+    "ownerUtc": "2026-10-14T19:04:32.068Z",
+    "memberUtc": "2026-10-14T19:04:31.695Z"
+  },
+  "productionJupyter": {
+    "queueVariables": 42,
+    "duplicateLedgerCount": 1,
+    "stdin": "PASS",
+    "ValueError": "PASS",
+    "interruptSeconds": 0.5567636690102518,
+    "networkAndOwnSecretCanaries": "PASS",
+    "silentSeconds": 65,
+    "silentEndToEndSeconds": 69.78251874120906,
+    "stdinCancel": "KeyboardInterrupt"
+  },
+  "installedMain": {
+    "utc": "2026-10-14T19:16:16.057Z",
+    "sourceCommit": "7b93d81fb073ea85d17eeb4f0a89365183f19def",
+    "dirty": false,
+    "activatedCodeSha256": "fcede017f90d8715a4036ee01d2f21b93d4626c903c4a3e7006d7954e16c7b35",
+    "codeHashMatches": true,
+    "fullMainActivateCompleted": true,
+    "connectionAndRun": "unverified; subsequent native probe timed out"
+  },
+  "artifacts": {
+    "commit": "7b93d81fb073ea85d17eeb4f0a89365183f19def",
+    "version": "0.6.3",
+    "allPayloadHashesVerified": true,
+    "serverSha256": "a7657f83a802757f1fb89ed883583abc9df79c72cdc719092485186fd4754022",
+    "vsixSha256": "a2b3b7858551709c0bded9919ae25523615a43b59d8b7062335c6407ae6daba1"
+  },
+  "standalonePackagedSmoke": {
+    "result": "PASS",
+    "declaredFileHashes": 24,
+    "backend": "actual POSIX, empty cwd, no node_modules"
+  },
+  "resources": {
+    "observedUtc": "2026-10-14T22:58:55.065477+03:00",
+    "cgroup": {
+      "memory.current": "271437824",
+      "memory.peak": "336027648",
+      "memory.max": "402653184",
+      "memory.swap.max": "134217728",
+      "memory.events": "low 0\nhigh 632\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+      "cpu.max": "35000 100000",
+      "pids.current": "59"
+    },
+    "soakRestarts": "0",
+    "soakErrorPriorityRecords": 0,
+    "validatedHttpsHealth": 200,
+    "unauthenticatedAdminStatus": 401
+  },
+  "coexistence": {
+    "observedUtc": "2026-10-14T22:48:13.115103+03:00",
+    "originalServices": [
+      {
+        "service": "xray",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "vpn-manager",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "hysteria-recovery",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "hysteria-recovery-alt",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "hysteria-t2-http3",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "hysteria-t2-salamander",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "tailscaled",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      },
+      {
+        "service": "docker",
+        "active": "active",
+        "pidUnchanged": true,
+        "invocationUnchanged": true
+      }
+    ],
+    "originalConfigurationUnchanged": true,
+    "firewallUnchanged": true,
+    "diskFreeGB": 14.54
+  },
+  "fstab": {
+    "ownPairMountLines": 2,
+    "baselineHashMatchesInventory": true,
+    "currentIsExactOriginalPlusOwnAppend": true,
+    "originalFileChangedByProbe": false
+  },
+  "botJournal": {
+    "utc": "2026-10-14T22:48:14.59888+03:00",
+    "last10Minutes": {
+      "entries": 60,
+      "httpSuccess": 60,
+      "httpFailure": 0,
+      "errorPriority": 0
+    },
+    "newBotApiRequests": 0,
+    "messagesSent": 0,
+    "credentialsExtracted": false
+  },
+  "soak": {
+    "evidenceDirectory": "/var/lib/pair-notebook-worker/soak/long-20261014T124106Z",
+    "summary": {
+      "sourceCommit": "7b93d81fb073ea85d17eeb4f0a89365183f19def",
+      "elapsedSeconds": 26235.1684780661,
+      "executions": 688,
+      "cycles": 344,
+      "status": "running",
+      "shortHarnessCheck": false,
+      "acceptance24Hours": false
+    }
+  },
+  "remaining": [
+    "actual >=24-hour completion",
+    "physical keyboard/cursor pixels and original user-window reload",
+    "fully connected installed-VSIX command/UI scenario",
+    "two-person folder/offline/rename UI acceptance",
+    "character-level live ordinary-text-file editing",
+    "macOS",
+    "external/mobile VPN handshake",
+    "original ACME renewal",
+    "bot handlers/direct getMe"
+  ],
+  "provenance": "This continuation changes documentation only; deployed binaries and the live soak remain pinned to runtimeSourceCommit. Historical 4f9 GPU/backup results are not relabeled as fresh 7b93 runs."
+}

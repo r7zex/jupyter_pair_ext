@@ -1,5 +1,7 @@
 # Persistent VPS sessions — 0.6.3: implementation and acceptance
 
+This is the historical implementation report. Later target observations and remaining limitations are recorded in [14 October target acceptance](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md); those observations supersede the earlier target-access/GPU/UI blockers below. Full acceptance remains incomplete.
+
 Start: 13 October 2026. The clean local checkout was `work` at main
 `1e67beab4c7167258142af8a3127f38e7fdf4ee4`. Git fetch and connected GitHub API
 confirmed main at that SHA and open/unmerged PR #25 at
