@@ -1,10 +1,12 @@
 # Pair Notebook architecture
 
-In 0.5.38 editor sessions, transport routes and durable compute jobs have separate lifetimes. For unattended research, an independent agent owns a detached supervisor/runner and immutable source/data receipts; the broker persists scoped cancellation intents. Interactive kernels and the shared host shell still belong to Extension Host. [Persistent research](PERSISTENT_RESEARCH.md) documents these limits and the exact typed `CONFIRM` contract.
+Version 0.6.3 has three execution lifetimes. Peer sessions retain a human Session Host and its Extension Host kernels/shell. [Persistent VPS sessions](PERSISTENT_VPS_ARCHITECTURE.md) keep session authority on the server and stateful kernels on independent isolated agents. [Background jobs](PERSISTENT_RESEARCH.md) use their own detached supervisor/runner, immutable inputs and durable receipts. A transport connection is not the lifetime of accepted computation.
+
+The component and peer execution contracts below describe human-host sessions. Persistent sessions reuse the editor/Jupyter mechanisms through a separate server protocol; their device consent, Public/Private namespaces and reconnect rules are documented separately.
 
 ## Responsibilities
 
-Version 0.5.13 adds shared source-only editor replicas with version-aware merges, stable-ID structural deltas, and native execution ownership guards. Incremental notebook mutations account for the aggregate source/output budget, including retained cells. File lifecycle transitions remove obsolete CRDT/binary representations before materialization.
+Peer sessions use shared source-only editor replicas with version-aware merges, stable-ID structural deltas, and native execution ownership guards. Incremental notebook mutations account for the aggregate source/output budget, including retained cells. File lifecycle transitions remove obsolete CRDT/binary representations before materialization.
 
 Guest execution synchronizes project dependencies before request retries, then materializes the host working copy. Kernel controls have a separate inbound queue from bulk transfers. Controller cancellation generations stop remaining and queued batches, while stable notebook queue identities and migrated kernel maps preserve execution through rename. Invitations carry the current host epoch. Terminal transport disconnect explicitly clears coordinator recovery state.
 

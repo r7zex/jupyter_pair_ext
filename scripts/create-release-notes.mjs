@@ -59,14 +59,15 @@ ${changes}
 
 ## Download
 
-- \`${vsixName}\` — the only release asset users need. GitHub displays its SHA-256 digest next to the file.
+- \`${vsixName}\` — install this extension on every participating computer. GitHub displays its SHA-256 digest next to the file.
 - \`pair-notebook-complete-${version}.zip\` — full source and matching compute agent for compute owners. Update editors, broker and agent together.
+- \`pair-notebook-server-persistent.tar.gz\` and its \`.sha256\` file — the matching dependency-bundled server, interactive agent and service templates for VPS operators. Follow \`docs/PERSISTENT_VPS.md\` in the archive; preserve existing data and take a backup before updating.
 
 GitHub also adds automatic **Source code** archives. They are for reading the source and cannot be installed as a VS Code extension.
 
 ## Verification
 
-GitHub Actions publishes this release only after a clean dependency install, Python bridge tests, production dependency audit, TypeScript lint/build/tests, and packaged-artifact validation succeed.
+GitHub Actions publishes this release only after a clean dependency install, Python bridge tests, production dependency audit, TypeScript lint/build/tests, and packaged extension/server validation succeed. Physical UI acceptance, macOS compute and an actually completed 24-hour soak are separate from this release gate; see the current acceptance document in the source archive.
 `;
 
 fs.writeFileSync(outputPath, notes, 'utf8');
