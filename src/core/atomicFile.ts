@@ -25,14 +25,17 @@ export async function atomicWriteFile(target: string, bytes: Uint8Array | string
 }
 
 export async function publishTemporaryFile(temporary: string, target: string): Promise<void> {
+  let replaced = false;
   try {
     await rename(temporary, target);
-    await syncParentDirectory(target);
-    return;
+    replaced = true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES') throw error;
   }
+  // A failed directory fsync is an uncertain commit, not a failed rename.
+  // Never move the newly published target into the Windows backup fallback.
+  if (replaced) { await syncParentDirectory(target); return; }
 
   try {
     if ((await lstat(target)).isDirectory()) {
@@ -76,9 +79,10 @@ async function syncParentDirectory(target: string): Promise<void> {
     handle = await open(path.dirname(target), 'r');
     await handle.sync();
   } catch (error) {
-    // Windows and some filesystems do not permit opening/syncing directories.
+    // Some non-Linux filesystems do not permit opening/syncing directories.
+    // Persistent Linux metadata must fail closed when this durability step fails.
     const code = (error as NodeJS.ErrnoException).code;
-    if (!['EACCES', 'EBADF', 'EISDIR', 'EINVAL', 'ENOSYS', 'ENOTSUP', 'EPERM'].includes(code ?? '')) throw error;
+    if (process.platform === 'linux' || !['EACCES', 'EBADF', 'EISDIR', 'EINVAL', 'ENOSYS', 'ENOTSUP', 'EPERM'].includes(code ?? '')) throw error;
   } finally {
     await handle?.close().catch(() => undefined);
   }

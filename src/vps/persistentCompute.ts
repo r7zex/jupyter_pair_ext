@@ -227,10 +227,13 @@ export class PersistentComputePolicy {
   select(memberId: string, target: PersistentTarget): PersistentSelection {
     this.reconcile();
     const device = this.validateTarget(target);
-    this.requireSwitchPermission(memberId, device);
+    // Requesting access to the current target never transfers selection authority.
+    const executionOnly = memberId !== this.ownerId && sameTarget(target, this.target);
+    if (executionOnly) {
+      if (!this.requireMember(memberId).online) throw new PersistentComputeError('The requesting member must be online.');
+    } else this.requireSwitchPermission(memberId, device);
     this.requireAvailable(device);
-    this.selectionVersion++;
-    this.latestPendingId = undefined;
+    if (!executionOnly) { this.selectionVersion++; this.latestPendingId = undefined; }
     if (device.id !== 'vps' && device.ownerId !== memberId && !this.hasConsent(memberId, target)) {
       this.pruneObsoleteConsents();
       if (this.consents.length >= MAX_CONSENTS) throw new PersistentComputeError('Compute consent limit reached.', 409);
@@ -239,10 +242,10 @@ export class PersistentComputePolicy {
         ...(target.gpuUuid === undefined ? {} : { gpuUuid: target.gpuUuid }), status: 'pending',
         selectionVersion: this.selectionVersion, requestSequence: ++this.requestSequence };
       this.consents.push(consent);
-      this.latestPendingId = consent.id;
+      if (!executionOnly) this.latestPendingId = consent.id;
       return { target: copyTarget(this.target), generation: this.generation, consent: { ...consent } };
     }
-    this.applySelection(memberId, target);
+    if (!executionOnly) this.applySelection(memberId, target);
     return { target: copyTarget(this.target), generation: this.generation };
   }
 

@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -47,26 +48,50 @@ jobs:
           npm run lint
           npm audit --omit=dev
           npm run compile
+      - name: Prepare the real non-root Linux sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Run complete host and VPS integration suite without skips
         run: node node_modules/mocha/bin/mocha.js --timeout 20000 --forbid-pending --exit 'out/test/**/*.test.js'
+      - name: Build the immutable isolated Linux-container runtime
+        run: docker build --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt -f deploy/persistent/Containerfile --iidfile "$RUNNER_TEMP/pair-runtime-image" deploy/persistent
+      - name: Require real container isolation and stateful kernel acceptance
+        env:
+          PAIR_NOTEBOOK_CONTAINER_IMAGE_FILE: ${{ runner.temp }}/pair-runtime-image
+          PAIR_CONTAINER_EVIDENCE: ${{ runner.temp }}/pair-container-evidence.json
+        run: python -W error::ResourceWarning test/persistent_container_integration_test.py -v
       - name: Check kernel and detached process lifecycle
+        env:
+          PAIR_NOTEBOOK_REQUIRE_SANDBOX: '1'
         run: |
           python -W error::ResourceWarning test/jupyter_bridge_unit.py -q
+          python -W error::ResourceWarning test/persistent_session_agent_test.py -v
+          python -W error::ResourceWarning test/persistent_session_admin_test.py -q
+          python -W error::ResourceWarning test/persistent_session_cpu_integration_test.py -q
           python -W error::ResourceWarning test/vps_agent_audit.py -q
           python -W error::ResourceWarning test/anti_fraud_reference_test.py -q
           python -W error::ResourceWarning test/persistent_soak_test.py -q
           PAIR_REFERENCE_PYTHON="$(command -v python)" python -W error::ResourceWarning test/persistent_reference_integration_test.py -q
       - name: Package the verified extension and agent sources
         run: |
+          npm run package:persistent-server
+          npm run test:persistent:server
           node scripts/make-artifacts.mjs --preflight-only
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
       - name: Save installable extension and full source archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pair-notebook-training-${{ github.sha }}
+          name: pair-notebook-training-${{ github.event.pull_request.head.sha || github.sha }}
           if-no-files-found: error
           retention-days: 14
           path: |
             pair-notebook-*.vsix
             pair-notebook-complete-*.zip
+            artifacts/pair-notebook-server-persistent.tar.gz
+            artifacts/pair-notebook-server-persistent.tar.gz.sha256
+            ${{ runner.temp }}/pair-container-evidence.json

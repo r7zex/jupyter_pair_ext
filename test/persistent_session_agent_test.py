@@ -498,13 +498,28 @@ class RealRuntimeTests(unittest.TestCase):
     def test_production_bubblewrap_cpu_smoke_when_supported(self):
         sandbox = agent_module.Sandbox(self.python(), ROOT / "media/jupyter_kernel_bridge.py")
         if not sandbox.ready:
+            if os.environ.get("PAIR_NOTEBOOK_REQUIRE_SANDBOX") == "1":
+                self.fail("Required production sandbox unavailable: " + sandbox.reason)
             self.skipTest("Actual production sandbox unavailable: " + sandbox.reason)
         with tempfile.TemporaryDirectory(prefix="pair-real-sandbox-") as temporary:
-            bridge = agent_module.Bridge(sandbox, Path(temporary), None)
+            private = Path(temporary) / "private-canary.txt"
+            private.write_text("private-host-canary")
+            workspace = Path(temporary) / "public"
+            workspace.mkdir()
+            with patch.dict(os.environ, {"PAIR_PRIVATE_CANARY_TOKEN": "private-env-canary"}):
+                bridge = agent_module.Bridge(sandbox, workspace, None)
             try:
                 bridge.start()
+                code = ("import os,sys,torch;assert os.geteuid()!=0;"
+                        "assert os.environ['CUDA_VISIBLE_DEVICES']=='';"
+                        "assert 'PAIR_PRIVATE_CANARY_TOKEN' not in os.environ;"
+                        "assert not os.path.exists('/etc/shadow');assert not os.path.exists('/home');"
+                        f"assert not os.path.exists({str(private)!r});"
+                        f"assert sys.executable=={sandbox.python!r};"
+                        "assert not torch.cuda.is_available();assert torch.cuda.device_count()==0;"
+                        "assert torch.ones(4).sum().item()==4.0")
                 bridge.send({"command": "execute", "requestId": "sandbox-cpu", "codeBase64": base64.b64encode(
-                    b"import os;assert os.environ['CUDA_VISIBLE_DEVICES']=='';assert not os.path.exists('/etc/shadow');assert not os.path.exists('/home')").decode()})
+                    code.encode()).decode()})
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     event = bridge.events.get(timeout=5)

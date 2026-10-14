@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import Module from 'node:module';
 import path from 'node:path';
@@ -67,6 +68,7 @@ describe('Persistent session transport and credential boundaries', () => {
 });
 
 let warningChoice: string | undefined;
+let quickPick: ((items: unknown[]) => Promise<unknown>) | undefined;
 const informationMessages: string[] = [];
 const boundary = {
   TreeItem: class {},
@@ -77,12 +79,24 @@ const boundary = {
   },
   Uri: { from: (value: unknown) => value },
   FileType: { File: 1, Directory: 2 },
+  NotebookCellKind: { Code: 2 },
   FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
   FileSystemError: { Unavailable: (message: string) => new Error(message), NoPermissions: (message: string) => new Error(message) },
   window: {
     activeNotebookEditor: undefined as { notebook: { uri: vscode.Uri } } | undefined,
     showWarningMessage: async () => warningChoice,
+    showQuickPick: async (items: unknown[]) => quickPick?.(items),
+    showOpenDialog: async () => [{ scheme: 'file', path: '/selected.txt' }],
+    showInputBox: async () => 'upload',
     showInformationMessage: async (message: string) => { informationMessages.push(message); },
+  },
+  commands: { executeCommand: async () => undefined },
+  workspace: {
+    isTrusted: true,
+    workspaceFolders: undefined as vscode.WorkspaceFolder[] | undefined,
+    notebookDocuments: [] as vscode.NotebookDocument[],
+    updateWorkspaceFolders: () => true,
+    fs: { stat: async () => ({ type: 1, size: 5 }), readFile: async () => Buffer.from('local private fixture') },
   },
 };
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
@@ -107,6 +121,42 @@ function loadPersistentUi(): typeof import('../src/vscode/persistent') {
 const { PersistentFileSystem, PersistentSessionController } = loadPersistentUi();
 
 describe('Persistent server file save conflicts', () => {
+  it('rejects a delayed read from a disconnected session without poisoning the new editing baseline', async () => {
+    const provider = new PersistentFileSystem();
+    let resolveRead!: (value: { content: string; revision: number }) => void;
+    const oldRead = new Promise<{ content: string; revision: number }>((resolve) => { resolveRead = resolve; });
+    const connection = (client: unknown) => ({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Test', client }) as Parameters<typeof provider.setConnection>[0];
+    provider.setConnection(connection({ call: async () => oldRead }));
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/main.py' } as vscode.Uri;
+    const pending = provider.readFile(uri);
+    const writes: Record<string, unknown>[] = [];
+    provider.setConnection(connection({ call: async (operation: string, input: Record<string, unknown>) => {
+      if (operation === 'read') return { content: Buffer.from('new connection').toString('base64'), revision: 2 };
+      writes.push(input); return { revision: 3, entries: [] };
+    } }));
+    resolveRead({ content: Buffer.from('old private content').toString('base64'), revision: 99 });
+    await assert.rejects(pending, /session changed/);
+    assert.equal(Buffer.from(await provider.readFile(uri)).toString(), 'new connection');
+    await provider.writeFile(uri, Buffer.from('new edit'), { create: true, overwrite: true });
+    assert.equal(writes[0]?.expectedRevision, 2);
+    provider.dispose();
+  });
+
+  it('rejects a delayed save acknowledgement without replacing a new session snapshot', async () => {
+    const provider = new PersistentFileSystem();
+    let resolveWrite!: (value: { revision: number; entries: [] }) => void;
+    const pendingWrite = new Promise<{ revision: number; entries: [] }>((resolve) => { resolveWrite = resolve; });
+    const connection = (client: unknown) => ({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Test', client }) as Parameters<typeof provider.setConnection>[0];
+    provider.setConnection(connection({ call: async () => pendingWrite }));
+    const pending = provider.writeFile({ scheme: 'pair-vps', authority: 'session', path: '/main.py' } as vscode.Uri, Buffer.from('edit'), { create: true, overwrite: true });
+    await Promise.resolve();
+    provider.setConnection(connection({ call: async () => ({ revision: 2, entries: [] }) }));
+    provider.accept({ revision: 2, entries: [] });
+    resolveWrite({ revision: 99, entries: [] });
+    await assert.rejects(pending, /session changed/);
+    assert.equal(provider.revision, 2);
+    provider.dispose();
+  });
   it('rejects a nonrecursive delete of a nonempty folder without sending a server mutation', async () => {
     const provider = new PersistentFileSystem();
     const operations: string[] = [];
@@ -171,6 +221,159 @@ describe('Persistent server file save conflicts', () => {
     assert.equal(writes, 0);
     assert.match(content, /collaborator edit/);
     provider.dispose();
+  });
+});
+
+describe('Persistent notebook execution connection ownership', () => {
+  it('shows fresh-kernel namespace reset events even when the server generation did not change', async () => {
+    informationMessages.length = 0;
+    const message = 'A fresh Python kernel was started; previous variables are unavailable.';
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { sessionId: 'session' }, disposed: false,
+    }) as { observe: (initial: PersistentExecution) => Promise<PersistentExecution> };
+    await ui.observe({ id: 'fresh-kernel', notebook: 'work.ipynb', cellIndex: 0, requesterId: 'member', deviceId: 'vps',
+      generation: 1, state: 'completed', events: [{ type: 'kernelState', message }] });
+    assert.ok(informationMessages.includes(message));
+  });
+
+  for (const change of ['generation', 'source']) it(`keeps late outputs and errors in recovery after a ${change} change`, async () => {
+    const calls: string[] = []; const source = change === 'source' ? 'changed cell' : 'admitted cell';
+    const handle = { cell: { document: { getText: () => source, isClosed: false } }, replaceOutput: async () => { calls.push('outputs'); }, appendOutput: async () => { calls.push('errors'); } } as unknown as vscode.NotebookCellExecution;
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), { connection: { sessionId: 'session' }, disposed: false, view: { generation: change === 'generation' ? 2 : 1 } }) as { observe: (initial: PersistentExecution, handle: vscode.NotebookCellExecution) => Promise<PersistentExecution> };
+    const result: PersistentExecution = { id: 'late', notebook: 'work.ipynb', cellIndex: 0, requesterId: 'member', deviceId: 'old-device', generation: 1, state: 'completed', sourceHash: createHash('sha256').update('admitted cell').digest('hex'), events: [], error: 'late private error' };
+    assert.equal(await ui.observe(result, handle), result); assert.deepEqual(calls, []);
+  });
+
+  type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
+  for (const phase of ['queue', 'save']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
+    let unblock!: () => void;
+    const wait = new Promise<void>((resolve) => { unblock = resolve; });
+    let saves = 0;
+    const connection = { sessionId: 'original', client: { call: async () => { throw new Error('No RPC should be sent'); } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(phase === 'queue' ? [['work.ipynb', wait]] : []), disposed: false,
+    }) as ExecutionUi;
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => { saves++; await wait; return true; } } as unknown as vscode.NotebookDocument;
+    const pending = ui.execute([], notebook);
+    if (phase === 'save') { await Promise.resolve(); await Promise.resolve(); }
+    ui.connection = { sessionId: 'replacement' };
+    unblock();
+    await assert.rejects(pending, /session changed/);
+    assert.equal(saves, phase === 'queue' ? 0 : 1);
+  });
+
+  it('binds admission to the original session and the actual displayed cell source', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const connection = { sessionId: 'original', client: { call: async (_operation: string, input: Record<string, unknown>) => {
+      calls.push(input); return { id: 'accepted', state: 'completed', events: [] };
+    } } };
+    const handle = { start: () => undefined, clearOutput: async () => undefined, end: () => undefined };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(), executions: new Map(), disposed: false,
+      files: { revision: 9, refresh: async () => undefined },
+      context: { globalState: { update: async () => undefined } },
+      notebook: { createNotebookCellExecution: () => handle },
+      observe: async () => ({ state: 'completed' }),
+    }) as ExecutionUi;
+    const cell = { index: 0, kind: 2, document: { languageId: 'python', getText: () => 'print("displayed")' } } as unknown as vscode.NotebookCell;
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => true } as unknown as vscode.NotebookDocument;
+    await ui.execute([cell], notebook);
+    assert.equal(calls[0]?.sessionId, 'original');
+    assert.equal(calls[0]?.expectedSourceHash, createHash('sha256').update('print("displayed")').digest('hex'));
+  });
+});
+
+describe('Persistent compute selection UI', () => {
+  afterEach(() => { quickPick = undefined; warningChoice = undefined; });
+  for (const phase of ['dialog', 'response']) it(`keeps current-device consent attached to the original connection during ${phase}`, async () => {
+    let release!: () => void; let submitted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { submitted = resolve; });
+    const calls: unknown[] = [];
+    const view = { memberId: 'member', target: { deviceId: 'pc' }, members: [], consents: [], devices: [
+      { id: 'pc', ownerId: 'owner', name: 'Machine', python: '/python', cpu: 'CPU', isolation: 'bwrap', enabled: true, online: true, gpus: [] },
+    ] };
+    const connection = { sessionId: 'original', client: { call: async (_operation: string, input: unknown) => {
+      calls.push(input); submitted(); await gate; return view;
+    } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), { connection, view, poll: async () => undefined }) as {
+      selectCompute: () => Promise<void>; connection: unknown; view: unknown;
+    };
+    quickPick = async (items) => { if (phase === 'dialog') { submitted(); await gate; } return items[0]; };
+    warningChoice = 'Request access';
+    const pending = ui.selectCompute(); await started;
+    const replacement = { target: { deviceId: 'new-session-pc' } };
+    ui.connection = { sessionId: 'replacement' }; ui.view = replacement;
+    release(); await pending;
+    assert.equal(calls.length, phase === 'dialog' ? 0 : 1);
+    assert.equal(ui.view, replacement);
+  });
+});
+
+describe('Persistent session actions preserve their original connection', () => {
+  afterEach(() => { quickPick = undefined; warningChoice = undefined; });
+  for (const action of ['manage', 'shareComputer', 'upload', 'recoverExecution']) it(`rejects ${action} after a session changes during its dialog`, async () => {
+    let release!: () => void; let opened!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const dialog = new Promise<void>((resolve) => { opened = resolve; });
+    const calls: unknown[] = [];
+    const original = { sessionId: 'original', client: { call: async () => { calls.push('original'); return {}; } } };
+    const replacement = { sessionId: 'replacement', client: { call: async () => { calls.push('replacement'); return { id: 'run', notebook: 'old.ipynb', state: 'completed' }; } } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: original, disposed: false, poll: async () => undefined,
+      view: { id: 'original', name: 'Original', ownerId: 'owner', memberId: 'owner', allowMemberSwitch: false,
+        members: [{ id: 'owner', role: 'owner' }], consents: [], devices: [{ id: 'pc', ownerId: 'owner', enabled: true }] },
+      context: { globalState: { get: () => [{ notebook: 'old.ipynb', requestId: 'old-request' }] } },
+      files: { refresh: async () => undefined, uri: () => ({}), createPrivateDirectory: async () => { calls.push('mkdir'); },
+        writeFile: async () => { calls.push('upload'); } },
+    }) as { connection: unknown; [key: string]: unknown };
+    quickPick = async (items) => {
+      opened(); await gate;
+      return action === 'manage' ? items.find((item) => (item as { action?: string }).action === 'settings')
+        : action === 'shareComputer' ? items.find((item) => (item as { action?: string }).action === 'toggle') : items[0];
+    };
+    const pending = (ui[action] as () => Promise<void>)(); await dialog;
+    ui.connection = replacement; release();
+    await assert.rejects(pending, /session changed/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('does not clear a replacement connection when an old leave acknowledgement arrives late', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const replacement = { sessionId: 'replacement' };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { sessionId: 'original', client: { call: async () => gate } },
+      files: { setConnection: () => undefined }, status: { hide: () => undefined }, changed: { fire: () => undefined },
+    }) as { connection: unknown; leave: () => Promise<void> };
+    const pending = ui.leave(); ui.connection = replacement; release(); await pending;
+    assert.equal(ui.connection, replacement);
+  });
+
+  it('keeps a newer attachment while retaining credentials from a delayed older heartbeat', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const originalCall = PersistentClient.prototype.call;
+    PersistentClient.prototype.call = async function <T>(): Promise<T> {
+      if (this.endpoint.includes('first.example')) await gate;
+      return { id: this.endpoint, memberId: 'member', ownerId: 'owner' } as T;
+    };
+    let saved: unknown[] = []; const credentials: string[] = [];
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      disposed: false, connectionAttempt: 0, credentialWrites: Promise.resolve(), updateUi: () => undefined,
+      context: { secrets: { store: async (key: string) => { credentials.push(key); } },
+        globalState: { get: () => saved, update: async (_key: string, value: unknown[]) => { saved = value; } } },
+      files: { setConnection: () => undefined, refresh: async () => undefined, uri: () => ({ toString: () => 'pair-vps://second/' }) },
+    }) as { attach: (saved: unknown, token: string) => Promise<void>; connection: { sessionId: string } };
+    const descriptor = (name: string) => ({ endpoint: `https://${name}.example`, sessionId: name, memberId: 'member', name });
+    const first = ui.attach(descriptor('first'), 'a'.repeat(40));
+    try {
+      await ui.attach(descriptor('second'), 'b'.repeat(40)); release();
+      await assert.rejects(first, /connection changed/);
+      assert.equal(ui.connection.sessionId, 'second');
+      assert.equal(credentials.length, 2);
+      assert.deepEqual(saved.map((item) => (item as { sessionId: string }).sessionId), ['second', 'first']);
+    } finally { release(); PersistentClient.prototype.call = originalCall; }
   });
 });
 

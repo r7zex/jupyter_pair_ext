@@ -289,6 +289,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
     openLabel: 'Use as backing folder',
   });
   if (!chosen?.[0]) return;
+  if (!['file', 'vscode-remote'].includes(chosen[0].scheme)) throw new Error('Choose a filesystem backing folder for a P2P session.');
   const backingFolder = chosen[0].fsPath;
   const projectName = path.basename(backingFolder);
   const projectNameError = validateProjectName(projectName);
@@ -476,7 +477,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
     throw new Error('Trust this workspace before starting or reconnecting a Pair Notebook session.');
   }
   const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) return;
+  if (!folder || !['file', 'vscode-remote'].includes(folder.uri.scheme)) return;
   const marker = path.join(folder.uri.fsPath, MARKER);
   let descriptor: SessionDescriptor;
   try {
@@ -711,7 +712,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
 function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
   runUiBackground('Workspace session continuation offer', async () => {
     const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) return;
+    if (!folder || !['file', 'vscode-remote'].includes(folder.uri.scheme)) return;
     try {
       const marker = await lstat(path.join(folder.uri.fsPath, MARKER));
       if (!marker.isFile()) return;

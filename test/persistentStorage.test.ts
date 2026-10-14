@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import filesystem from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'mocha';
@@ -144,6 +145,76 @@ describe('persistent workspace storage and server ACLs', function () {
     assert.equal((await restored.read('safe.txt', true)).content, base64('committed'));
     assert.ok(!(await readdir(root)).includes(temporary));
     assert.ok(!(await readdir(path.join(root, 'blobs'))).includes(hash));
+  });
+
+  it('syncs a reused blob after its first fsync fails, before acknowledging the manifest', async () => {
+    const bytes = 'fsync-retry'; const target = path.join(root, 'blobs', createHash('sha256').update(bytes).digest('hex'));
+    const original = filesystem.open; let syncs = 0;
+    filesystem.open = async (...args) => {
+      const handle = await original(...args);
+      if (String(args[0]) === target) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => { if (++syncs === 1) throw Object.assign(new Error('Blob fsync failed'), { code: 'EIO' }); await sync(); };
+      }
+      return handle;
+    };
+    try {
+      await assert.rejects(workspace.write('result.txt', base64(bytes), revision(), false), /Blob fsync failed/);
+      await workspace.write('result.txt', base64(bytes), revision(), false);
+      assert.ok(syncs >= 2, 'The acknowledged blob must have a successful fsync after the failed one');
+    } finally { filesystem.open = original; }
+    const restored = new PersistentWorkspace(root); await restored.init();
+    assert.equal((await restored.read('result.txt', false)).content, base64(bytes));
+  });
+
+  it('repairs an unreferenced partial blob on retry without requiring server restart', async () => {
+    const bytes = 'complete-blob'; const target = path.join(root, 'blobs', createHash('sha256').update(bytes).digest('hex'));
+    const original = filesystem.open; let fail = true;
+    filesystem.open = async (...args) => {
+      const handle = await original(...args);
+      if (String(args[0]) === target && fail) {
+        const write = handle.writeFile.bind(handle);
+        handle.writeFile = async () => { fail = false; await write('partial'); throw Object.assign(new Error('Partial blob write'), { code: 'EIO' }); };
+      }
+      return handle;
+    };
+    try {
+      await assert.rejects(workspace.write('result.txt', base64(bytes), revision(), false), /Partial blob write/);
+      await workspace.write('result.txt', base64(bytes), revision(), false);
+    } finally { filesystem.open = original; }
+    assert.equal((await workspace.read('result.txt', false)).content, base64(bytes));
+  });
+
+  it('commits result receipts with their files across a post-publication failure and preserves later rename and deletion', async () => {
+    const id = 'execution:write:0';
+    const storage = workspace as unknown as { publish: (...args: unknown[]) => Promise<void> };
+    const original = storage.publish;
+    storage.publish = async function (...args) { await original.apply(this, args); throw new Error('Directory acknowledgement lost'); };
+    await assert.rejects(workspace.write('result.txt', base64('once'), revision(), false, id), /acknowledgement lost/);
+    storage.publish = original;
+    workspace = new PersistentWorkspace(root); await workspace.init();
+    assert.equal(workspace.hasPublication(id), true);
+    await workspace.rename('result.txt', 'renamed.txt', revision(), false);
+    await workspace.write('result.txt', base64('once'), revision(), false, id);
+    await assert.rejects(workspace.read('result.txt', false), errorCode('NOT_FOUND'));
+    await workspace.remove('renamed.txt', revision(), false);
+    workspace = new PersistentWorkspace(root); await workspace.init();
+    await workspace.write('result.txt', base64('once'), revision(), false, id);
+    assert.deepEqual(workspace.snapshot(false).entries, []);
+    await workspace.retainPublications([]);
+    assert.equal(workspace.hasPublication(id), false);
+  });
+
+  it('does not record a publication whose manifest write fails before commit', async () => {
+    const storage = workspace as unknown as { publish: (...args: unknown[]) => Promise<void> };
+    const original = storage.publish;
+    storage.publish = async () => { throw new Error('Disk full before publication'); };
+    await assert.rejects(workspace.write('result.txt', base64('once'), revision(), false, 'execution:write:0'), /Disk full/);
+    storage.publish = original;
+    workspace = new PersistentWorkspace(root); await workspace.init();
+    assert.equal(workspace.hasPublication('execution:write:0'), false);
+    await workspace.write('result.txt', base64('once'), revision(), false, 'execution:write:0');
+    assert.equal((await workspace.read('result.txt', false)).content, base64('once'));
   });
 
   it('fails startup on corrupt metadata instead of silently resetting the workspace', async () => {

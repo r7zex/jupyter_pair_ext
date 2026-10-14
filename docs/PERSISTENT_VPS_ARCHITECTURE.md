@@ -1,3 +1,5 @@
+> Historical first-stage architecture. Current implementation and acceptance: [0.6.3](PERSISTENT_VPS_REVIEW_0.6.3.md).
+
 # Persistent VPS sessions: implementation architecture
 
 Base inspected: `main` at `3cc515793a4dfaa9b9a1803af60a85c64899b48b`, release 0.5.39.

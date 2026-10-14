@@ -18,7 +18,8 @@ interface StoredEntry {
   path: string; type: 'file' | 'directory'; size: number; mtime: number; version: number;
   visibility?: 'public' | 'private'; blob?: string;
 }
-interface Manifest { format: 1; revision: number; entries: StoredEntry[] }
+interface Manifest { format: 1; revision: number; entries: StoredEntry[]; publications?: string[] }
+const PUBLICATION_ID = /^[A-Za-z0-9_-]{1,128}:(?:write|remove):[0-9]{1,3}$/;
 const BLOB_NAME = /^[a-f0-9]{64}$/;
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const INITIALIZED_MARKER = 'pair-persistent-workspace-v1\n';
@@ -132,11 +133,11 @@ export class PersistentWorkspace {
   }
 
   /** Compute snapshots always use the member ACL, including when the requester is the owner. */
-  publicSnapshot(maxBytes = 10 * 1024 * 1024): Promise<{ path: string; content: string }[]> {
+  publicSnapshot(maxBytes = 10 * 1024 * 1024, privateExecution = false): Promise<{ path: string; content: string }[]> {
     return this.enqueue(async () => {
       const manifest = this.current();
       if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) quota();
-      const publicFiles = manifest.entries.filter((entry) => entry.type === 'file' && this.visibility(entry.path, manifest) === 'public');
+      const publicFiles = manifest.entries.filter((entry) => entry.type === 'file' && (privateExecution || this.visibility(entry.path, manifest) === 'public'));
       // Bound serialized command size before allocating content buffers on a small VPS.
       const serializedBytes = publicFiles.reduce((sum, entry) => sum + Math.ceil(entry.size / 3) * 4
         + Buffer.byteLength(JSON.stringify(entry.path), 'utf8') + 26, 2);
@@ -150,22 +151,35 @@ export class PersistentWorkspace {
     });
   }
 
-  write(value: string, content: string, expectedRevision: number, owner: boolean): Promise<PersistentSnapshot> {
+  hasPublication(id: string): boolean { return this.current().publications?.includes(id) === true; }
+
+  async retainPublications(executionIds: string[]): Promise<void> {
+    const keep = this.current().publications?.filter((id) => executionIds.includes(id.split(':')[0]!)) ?? [];
+    if (keep.length === (this.current().publications?.length ?? 0)) return;
+    await this.mutate(this.current().revision, true, (next) => { next.publications = keep; });
+  }
+
+  write(value: string, content: string, expectedRevision: number, owner: boolean, publicationId?: string, privateResult = false): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, async (next) => {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
       const bytes = decodeContent(content, this.limits.maxFileBytes);
       const existing = next.entries.find((entry) => entry.path === name);
+      if (privateResult && (!owner || (existing && this.visibility(name, next) !== 'private'))) {
+        throw new PersistentStorageError('FORBIDDEN', 'Private execution cannot publish into Public files.');
+      }
       if (existing?.type === 'directory') invalid('A directory cannot be overwritten by a file.');
+      const originalParents = privateResult ? new Set(next.entries.map((entry) => entry.path)) : undefined;
       this.ensureParents(name, next);
+      if (originalParents) for (const entry of next.entries) if (entry.type === 'directory' && !originalParents.has(entry.path)) entry.visibility = 'private';
       const blob = createHash('sha256').update(bytes).digest('hex');
       const entry: StoredEntry = { path: name, type: 'file', size: bytes.length, mtime: Date.now(),
-        version: next.revision, blob, ...(existing?.visibility ? { visibility: existing.visibility } : {}) };
+        version: next.revision, blob, ...(privateResult ? { visibility: 'private' as const } : existing?.visibility ? { visibility: existing.visibility } : {}) };
       next.entries = next.entries.filter((item) => item.path !== name);
       next.entries.push(entry);
       this.validateEntries(next);
       await this.storeBlob(blob, bytes);
-    });
+    }, undefined, publicationId);
   }
 
   mkdir(value: string, expectedRevision: number, owner: boolean, visibility?: 'public' | 'private'): Promise<PersistentSnapshot> {
@@ -181,7 +195,7 @@ export class PersistentWorkspace {
     });
   }
 
-  rename(value: string, newValue: string, expectedRevision: number, owner: boolean): Promise<PersistentSnapshot> {
+  rename(value: string, newValue: string, expectedRevision: number, owner: boolean, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, (next) => {
       const name = normalizePath(value);
       const target = normalizePath(newValue);
@@ -202,10 +216,10 @@ export class PersistentWorkspace {
       }
       // Moving an inherited private subtree out of its parent must not accidentally publish it.
       source.visibility = sourceVisibility;
-    });
+    }, beforePublish);
   }
 
-  remove(value: string, expectedRevision: number, owner: boolean): Promise<PersistentSnapshot> {
+  remove(value: string, expectedRevision: number, owner: boolean, beforePublish?: () => Promise<void>, publicationId?: string): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, (next) => {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
@@ -213,32 +227,48 @@ export class PersistentWorkspace {
       if (!removing.length) missing();
       this.authorizeSubtree(removing, owner, next);
       next.entries = next.entries.filter((entry) => !within(entry.path, name));
-    });
+    }, beforePublish, publicationId);
   }
 
   /** This API is owner-only; the authenticated server must check the caller before calling it. */
-  setVisibility(value: string, visibility: 'public' | 'private', expectedRevision: number): Promise<PersistentSnapshot> {
-    return this.mutate(expectedRevision, true, (next) => {
+  setVisibility(value: string, visibility: 'public' | 'private', expectedRevision: number, beforePublish?: () => Promise<void>): Promise<PersistentSnapshot> {
+    return this.mutate(expectedRevision, true, async (next) => {
       const name = normalizePath(value);
       if (visibility !== 'public' && visibility !== 'private') invalid('Invalid visibility.');
       const entry = next.entries.find((item) => item.path === name);
       if (!entry) missing();
+      const previouslyPrivate = next.entries.filter((item) => within(item.path, name) && item.type === 'file' && item.path.endsWith('.ipynb') && this.visibility(item.path, next) === 'private');
       entry.visibility = visibility;
       entry.version = next.revision;
       entry.mtime = Date.now();
-    });
+      if (visibility === 'public') for (const item of previouslyPrivate) {
+        const notebook = JSON.parse((await this.readBlob(item)).toString('utf8')) as { cells?: { outputs?: unknown[]; execution_count?: number | null }[]; metadata?: Record<string, unknown> };
+        if (!Array.isArray(notebook.cells)) invalid('Cannot publish an invalid Private notebook.');
+        for (const cell of notebook.cells) { if (cell.outputs) cell.outputs = []; if ('execution_count' in cell) cell.execution_count = null; }
+        if (notebook.metadata) { delete notebook.metadata.pair_crdt; delete notebook.metadata.widgets; }
+        const bytes = Buffer.from(JSON.stringify(notebook)); item.blob = createHash('sha256').update(bytes).digest('hex');
+        item.size = bytes.length; item.version = next.revision; item.mtime = Date.now(); await this.storeBlob(item.blob, bytes);
+      }
+    }, beforePublish);
   }
 
-  private mutate(expectedRevision: number, owner: boolean, change: (next: Manifest) => void | Promise<void>): Promise<PersistentSnapshot> {
+  private mutate(expectedRevision: number, owner: boolean, change: (next: Manifest) => void | Promise<void>, beforePublish?: () => Promise<void>, publicationId?: string): Promise<PersistentSnapshot> {
     return this.enqueue(async () => {
       const current = this.current();
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
         throw new PersistentStorageError('CONFLICT', 'Workspace changed; reload its current revision.');
       }
       await this.checkDirectories();
-      const next: Manifest = { format: 1, revision: current.revision + 1, entries: current.entries.map((entry) => ({ ...entry })) };
+      if (publicationId !== undefined && !PUBLICATION_ID.test(publicationId)) invalid('Invalid result publication identity.');
+      if (publicationId && this.hasPublication(publicationId)) return this.snapshot(owner);
+      const next: Manifest = { format: 1, revision: current.revision + 1, entries: current.entries.map((entry) => ({ ...entry })),
+        ...(current.publications ? { publications: [...current.publications] } : {}) };
       await change(next);
+      if (publicationId) (next.publications ??= []).push(publicationId);
       this.validateEntries(next);
+      // Validate CAS, paths and ACLs before retiring kernels, while committing
+      // the privacy barrier before the new file manifest becomes visible.
+      await beforePublish?.();
       await this.publish(next);
       this.manifest = next;
       await this.collectGarbage();
@@ -316,13 +346,18 @@ export class PersistentWorkspace {
         ...(entry.visibility ? { visibility: entry.visibility as 'public' | 'private' } : {}),
         ...(entry.type === 'file' ? { blob: entry.blob as string } : {}) });
     }
-    const manifest: Manifest = { format: 1, revision: candidate.revision as number, entries };
+    if (candidate.publications !== undefined && (!Array.isArray(candidate.publications) || candidate.publications.length > 16384
+      || candidate.publications.some((id: unknown) => typeof id !== 'string' || !PUBLICATION_ID.test(id))
+      || new Set(candidate.publications).size !== candidate.publications.length)) corrupt();
+    const manifest: Manifest = { format: 1, revision: candidate.revision as number, entries,
+      ...(candidate.publications ? { publications: candidate.publications as string[] } : {}) };
     try { this.validateEntries(manifest); } catch { corrupt(); }
     return manifest;
   }
 
   private validateEntries(manifest: Manifest): void {
     if (manifest.entries.length > this.limits.maxEntries) quota();
+    if ((manifest.publications?.length ?? 0) > 16384) quota();
     let totalBytes = 0;
     const names = new Map<string, StoredEntry>();
     const portableNames = new Set<string>();
@@ -366,15 +401,23 @@ export class PersistentWorkspace {
 
   private async storeBlob(name: string, bytes: Buffer): Promise<void> {
     const destination = path.join(this.blobDirectory, name);
-    try {
-      const handle = await open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
-      await syncDirectory(this.blobDirectory);
-    } catch (error) {
-      if (!hasCode(error, 'EEXIST')) throw error;
-      const existing = await readRegularFile(destination, this.limits.maxFileBytes);
-      if (!existing.equals(bytes)) corrupt();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const handle = await open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+        await syncDirectory(this.blobDirectory); return;
+      } catch (error) {
+        if (!hasCode(error, 'EEXIST')) throw error;
+        // A previous attempt may have written all bytes but failed its fsync.
+        const existing = await readRegularFile(destination, this.limits.maxFileBytes, true);
+        if (existing.equals(bytes)) { await syncDirectory(this.blobDirectory); return; }
+        // Only an unreferenced regular orphan can be repaired. Never conceal
+        // corruption of a published blob or replace a symlink/hardlink.
+        if (this.current().entries.some((entry) => entry.blob === name)) corrupt();
+        await unlink(destination); await syncDirectory(this.blobDirectory);
+      }
     }
+    corrupt();
   }
 
   private async publish(manifest: Manifest): Promise<void> {
@@ -452,13 +495,16 @@ async function assertRegularFile(filename: string): Promise<void> {
   if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) corrupt();
 }
 
-async function readRegularFile(filename: string, maximum: number): Promise<Buffer> {
+async function readRegularFile(filename: string, maximum: number, synchronize = false): Promise<Buffer> {
   await assertRegularFile(filename);
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.nlink !== 1 || stat.size > maximum) corrupt();
-    return await handle.readFile();
+    const bytes = await handle.readFile();
+    if (bytes.length > maximum) corrupt();
+    if (synchronize) await handle.sync();
+    return bytes;
   } finally { await handle.close(); }
 }
 

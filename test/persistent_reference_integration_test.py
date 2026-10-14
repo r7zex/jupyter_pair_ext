@@ -23,6 +23,13 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+
+# Complete runtime dependency closure of the compiled broker, retained and hashed.
+FROZEN_MODULES = [
+    "vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js",
+    "vps/persistentServer.js", "vps/persistentStorage.js", "vps/persistentCompute.js",
+    "vps/persistentHistory.js", "vps/persistentNotebookOutputs.js", "vps/persistentNotebookCrdt.js", "core/projectPath.js",
+]
 import urllib.error
 import urllib.request
 
@@ -126,9 +133,9 @@ class PersistentReferenceIntegrationTest(unittest.TestCase):
         self.job_directory = self.state / "jobs" / self.job_id
         self.work = self.job_directory / "work"
         self.frozen = self.root / "compiled-broker"
-        # Freeze only the four relevant compiled modules; restart must exercise
+        # Freeze the complete broker dependency closure; restart must exercise
         # the same broker bytes even when another test rebuilds the checkout.
-        for relative in ["vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js"]:
+        for relative in FROZEN_MODULES:
             destination = self.frozen / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(REPO / "out/src" / relative, destination)
@@ -276,7 +283,7 @@ class PersistentReferenceIntegrationTest(unittest.TestCase):
             "launches": 1, "watcherSigkill": True, "brokerRestart": True, "immutableOwnerData": True,
             "exportMetricsEqual": True, "externalVps": "not-evaluated", "physicalGpu": "not-evaluated",
             "brokerSha256": {name: digest(self.frozen / name) for name in
-                ["vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js"]},
+                FROZEN_MODULES},
             "agentSha256": digest(self.agent_script), "testMetrics": result["test"]}
         (self.root / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True))
         print(f"Persistent reference integration evidence: {self.root}", flush=True)
@@ -354,7 +361,7 @@ class PersistentReferenceIntegrationTest(unittest.TestCase):
                 "scopeOwnerMetadataUnchanged": True, "runningMetricsReported": True,
                 "confirmedCancellationDeliveredByCompactPoll": True, "trainingProcessGone": True,
                 "brokerSha256": {name: digest(self.frozen / name) for name in
-                    ["vps/cli.js", "vps/server.js", "vps/protocol.js", "core/atomicFile.js"]},
+                    FROZEN_MODULES},
                 "agentSha256": digest(self.agent_script), "externalVps": "not-evaluated"}
             (self.root / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True))
             print(f"Compact poll cancellation integration evidence: {self.root}", flush=True)

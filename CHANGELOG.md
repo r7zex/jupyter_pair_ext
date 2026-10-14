@@ -1,5 +1,35 @@
 # Changelog
 
+
+## 0.6.3 — persistent session completion work
+
+- Durable Yjs notebook updates with stable IDs, order/source/metadata, local replica journals, epoch fencing and acknowledged execution identity.
+- Continuous local-folder reconciliation with durable three-way baselines, CAS, ACL-preserving renames, conflict choices and reload/offline recovery.
+- Owner-only Private scopes, isolated snapshots/kernels/artifacts/results, owner/VPS target restriction and output cleanup on declassification.
+- Password-based session discovery and expiring/revocable read-only or Public edit invitations; separate hashed credentials and authentication throttling.
+- Actual isolated Linux-container backend with pinned image Python, readiness/resources/lifecycle; WSL2 Windows launcher and documented macOS Docker Desktop runtime.
+- Required real container CI acceptance, a measured 24-hour background soak harness and explicit full-disk production budget. Native Windows/macOS, physical CUDA, two real VS Code, target VPS and completed 24-hour soak remain acceptance blockers.
+
+## 0.6.2
+
+- Record result publication in the atomic workspace manifest, so report retries preserve later artifact renames/deletions, including after restart.
+- Resync reused blobs after write failures, repair only unreferenced partial blobs, and propagate Linux metadata directory-sync failures without entering rename fallback.
+- Normalize and bound live kernel-control payloads; retire stdin controls with the durable terminal report.
+- Align the interactive agent response bound with admitted commands and recovery controls, preventing oversized accepted claims from wedging the shared VPS worker.
+- Allow personal execution consent on the owner-selected device while member switching stays disabled; fence compute-selection dialogs and late responses to their original connection.
+- Freeze the complete broker dependency closure in real reference integration tests; require a non-root bubblewrap CPU/privacy smoke in Linux CI and show sandbox skip reasons locally.
+- Bind VSIX and standalone-server manifests to the checked source commit and verify packaged runtime hashes.
+- Show fresh-kernel reset notices, retire stale notebook namespaces after rename, and fence session actions/uploads/recovery and attachment handoffs to their original connection.
+
+## 0.6.1 - 2026-10-13 (persistent session review)
+
+- Checks file paths, ACLs and revision conflicts before retiring public kernels. Rejected deletion, rename or visibility requests cannot reset an accepted computation.
+- Recovers durable terminal reports whose notebook/artifact publication was interrupted, on restart or acknowledgement retry. Partial file publication is idempotent and preserves newer edits; failed terminal receipt writes remain retryable.
+- Keeps one VPS worker on its accepted execution across all sessions, including recovery after an administrative session stop. Scoped claims cannot bypass that admission fence.
+- Binds notebook queues, delayed file reads/saves and kernel input to their original connection. Admission checks the displayed cell's source hash against the saved server cell.
+- Activates for the persistent filesystem and keeps P2P restore/backing-folder operations on filesystem folders. Shows participant revocation only to the owner.
+- Adds persistent agent/admin/real CPU integration to CI and retains the matching standalone server alongside the VSIX. See the requirement review in `docs/PERSISTENT_VPS_REVIEW_0.6.1.md`; production isolation, physical CUDA, live VS Code and external VPS operation still need their own verification.
+
 ## 0.6.0 - 2026-10-13 (persistent VPS sessions, development build)
 
 - Adds a server-owned session lifecycle, salted scrypt password joins, independent member credentials, administrative grants and revocation. Empty sessions survive disconnects and process restarts.

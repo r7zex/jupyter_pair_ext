@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -65,6 +66,169 @@ describe('Persistent VPS Session Host', () => {
     const joined = await guest(); assert.equal((await call('password', { password: 'new protected password' })).status, 200);
     assert.equal((await call('view', {}, joined.token)).status, 401); assert.equal((await call('view')).status, 200);
     assert.equal((await rpc({ operation: 'join', sessionId: owner.sessionId, password, name: 'Old password' })).status, 401);
+  });
+
+  it('rejects a changed editor source before accepting work, even with the latest project revision', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook('print("collaborator")'), expectedRevision: 0 })).data;
+    const input = { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'displayed-source',
+      expectedSourceHash: createHash('sha256').update('print("my cell")').digest('hex') };
+    assert.equal((await call('execute', input)).status, 409);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+    const accepted = { ...input, expectedSourceHash: createHash('sha256').update('print("collaborator")').digest('hex') };
+    assert.equal((await call('execute', accepted)).status, 200);
+    assert.equal((await call('execute', input)).status, 409, 'A request ID cannot substitute another displayed source.');
+  });
+
+  it('keeps the VPS worker on accepted work across sessions and stopped-session recovery', async () => {
+    await registerVps();
+    const other = (await rpc({ operation: 'create', name: 'Second session', password }, admin)).data as PersistentMembership;
+    const inOther = (operation: string, fields: Record<string, unknown> = {}) => rpc({ operation, sessionId: other.sessionId, ...fields }, other.token);
+    const snapshot = (await inOther('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await inOther('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'second-session-first-run' });
+    const accepted = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal(accepted.sessionId, other.sessionId);
+    const firstSnapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    const queued = (await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: firstSnapshot.revision, requestId: 'first-session-queued-run' })).data;
+    // A scoped API request must not bypass the cross-session admission fence.
+    assert.equal((await call('claim', { deviceId: 'vps' }, agent)).data.command, null);
+    for (const stopped of [false, true]) {
+      if (stopped) assert.equal((await inOther('lifecycle', { action: 'stop' })).status, 200);
+      const recovery = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data;
+      assert.equal(recovery.command.executionId, accepted.executionId); assert.equal(recovery.recoverOnly, true);
+      assert.deepEqual(recovery.command.files, []); assert.deepEqual(recovery.command.command, {});
+      assert.equal((await call('execution', { executionId: queued.id })).data.state, 'queued');
+    }
+    assert.equal((await rpc({ operation: 'report', sessionId: other.sessionId, deviceId: 'vps', commandId: accepted.id,
+      executionId: accepted.executionId, generation: accepted.generation, offset: 0, state: 'completed', events: [] }, agent)).status, 200);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command.executionId, queued.id);
+  });
+
+  it('rolls back an unpersisted terminal report so the same offset can retry safely', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'report-storage-retry' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { persist: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.persist;
+    host.persist = async () => { throw new Error('Simulated terminal receipt write failure'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('retry result'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.persist = original;
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].execution.state, 'running');
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'result.txt' })).data.content, encoded('retry result'));
+  });
+
+  it('retries the final merge receipt instead of acknowledging an unpersisted completion', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'merge-receipt-retry' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { persist: (session: { record: { executions: { mergePending?: boolean }[] } }) => Promise<void> } }).persistent;
+    const original = host.persist;
+    let failed = false;
+    host.persist = async function (session) {
+      if (!failed && session.record.executions[0]?.mergePending === false) { failed = true; throw new Error('Final receipt write failed'); }
+      await original.call(this, session);
+    };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('published'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500);
+    assert.equal((await rpc(report, agent)).status, 200); host.persist = original;
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].mergePending, false);
+    assert.equal((await call('execution', { executionId: command.executionId })).data.error, undefined);
+    assert.equal((await call('read', { path: 'result.txt' })).data.content, encoded('published'));
+  });
+
+  it('preserves queued kernels when a deletion or visibility change is rejected', async () => {
+    await registerVps();
+    let snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    snapshot = (await call('mkdir', { path: 'private', visibility: 'private', expectedRevision: snapshot.revision })).data;
+    const joined = await guest();
+    const launched = await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'survives-rejection' });
+    const before = (await call('view')).data.generation;
+    for (const [operation, input, credential, status] of [
+      ['remove', { path: 'private', expectedRevision: snapshot.revision }, joined.token, 404],
+      ['remove', { path: '../escape', expectedRevision: snapshot.revision }, joined.token, 400],
+      ['remove', { path: 'work.ipynb', expectedRevision: 0 }, joined.token, 409],
+      ['visibility', { path: 'missing', visibility: 'private', expectedRevision: snapshot.revision }, owner.token, 404],
+      ['rename', { path: 'work.ipynb', newPath: 'private/work.ipynb', expectedRevision: 0 }, owner.token, 409],
+    ] as const) {
+      assert.equal((await call(operation, input, credential)).status, status);
+      assert.equal((await call('view')).data.generation, before);
+    }
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command.executionId, launched.data.id);
+  });
+
+  for (const recovery of ['report retry', 'server restart']) it(`finishes durable project publication after interruption during ${recovery}`, async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'merge-recovery' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    // Interrupt between durable terminal receipt/notebook outputs and returned
+    // file publication. Recovery must finish without launching the cell again.
+    host.saveResults = async () => { throw new Error('Simulated interruption before returned-file publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed',
+      events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'recovered output' } }],
+      files: [{ path: 'result.txt', content: encoded('durable artifact'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500);
+    host.saveResults = original;
+    if (recovery === 'server restart') { await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`; }
+    assert.equal((await rpc(report, agent)).status, 200);
+    const result = await call('read', { path: 'result.txt' });
+    assert.equal(result.status, 200); assert.equal(result.data.content, encoded('durable artifact'));
+    const saved = JSON.parse(Buffer.from((await call('read', { path: 'work.ipynb' })).data.content, 'base64').toString());
+    assert.equal(saved.cells[0].outputs[0].text, 'recovered output');
+    assert.equal((await call('execution', { executionId: command.executionId })).data.error, undefined);
+    const record = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.equal(record.executions[0].mergePending, false);
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
+  });
+
+  it('retries artifact merging idempotently without overwriting a concurrent different file', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'partial-artifact-merge' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    host.saveResults = async function (...args: unknown[]) { await original.apply(this, args); throw new Error('Simulated crash after file publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [],
+      files: [{ path: 'same.txt', content: encoded('accepted'), version: 0 }, { path: 'changed.txt', content: encoded('accepted'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.saveResults = original;
+    const latest = (await call('snapshot')).data;
+    assert.equal((await call('write', { path: 'changed.txt', content: encoded('newer edit'), expectedRevision: latest.revision })).status, 200);
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'same.txt' })).data.content, encoded('accepted'));
+    assert.equal((await call('read', { path: 'changed.txt' })).data.content, encoded('newer edit'));
+    assert.match((await call('execution', { executionId: command.executionId })).data.error, /conflicts/);
+  });
+
+  for (const recovery of ['report retry', 'server restart']) it(`preserves a user rename after partial artifact publication during ${recovery}`, async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'rename-artifact' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const host = (server as unknown as { persistent: { saveResults: (...args: unknown[]) => Promise<void> } }).persistent;
+    const original = host.saveResults;
+    host.saveResults = async function (...args: unknown[]) { await original.apply(this, args); throw new Error('Crash after publication'); };
+    const report = { operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [], files: [{ path: 'result.txt', content: encoded('published once'), version: 0 }] };
+    assert.equal((await rpc(report, agent)).status, 500); host.saveResults = original;
+    const current = (await call('snapshot')).data;
+    assert.equal((await call('rename', { path: 'result.txt', newPath: 'renamed.txt', expectedRevision: current.revision })).status, 200);
+    if (recovery === 'server restart') { await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`; }
+    assert.equal((await rpc(report, agent)).status, 200);
+    assert.equal((await call('read', { path: 'result.txt' })).status, 404);
+    assert.equal((await call('read', { path: 'renamed.txt' })).data.content, encoded('published once'));
+    assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
   });
 
   it('runs canonical public notebook cells with idempotent reports and conflict-safe saved output', async () => {
@@ -238,6 +402,54 @@ describe('Persistent VPS Session Host', () => {
     assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command, null);
   });
 
+  it('allows member consent on the locked owner target and rechecks its revocation at claim', async () => {
+    await registerVps(); const joined = await guest();
+    assert.equal((await call('registerDevice', { device: { id: 'owner-pc', name: 'Owner machine', python: '/selected/python', cpu: 'CPU', gpus: [], isolation: 'test policy inventory' } })).status, 200);
+    await call('share', { deviceId: 'owner-pc', enabled: true });
+    const target = { deviceId: 'owner-pc' };
+    const selected = (await call('select', { target })).data;
+    const requested = await call('select', { target }, joined.token);
+    assert.equal(requested.status, 200); assert.equal(requested.data.allowMemberSwitch, false);
+    const consent = requested.data.consent;
+    await call('consent', { consentId: consent.id, approved: true });
+    const view = (await call('view')).data;
+    assert.equal(view.generation, selected.generation);
+    const saved = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.deepEqual(saved.policy.ownerBaseline, target);
+    assert.equal((await call('select', { target: { deviceId: 'vps' } }, joined.token)).status, 403);
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    const run = await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'locked-target-run' }, joined.token);
+    assert.equal(run.status, 200); assert.equal(run.data.deviceId, 'owner-pc');
+    await call('revokeConsent', { consentId: consent.id });
+    assert.equal((await call('claim', { deviceId: 'owner-pc' })).data.command, null);
+    assert.equal((await call('execution', { executionId: run.data.id }, joined.token)).data.state, 'failed');
+  });
+
+  it('normalizes live kernel controls instead of retaining arbitrary RPC fields', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'normalized-controls' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'interrupt', unrelatedPayload: 'x'.repeat(1024 * 1024) } })).status, 200);
+    const controls = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.controls;
+    assert.deepEqual(Object.keys(controls[0].command).sort(), ['command', 'requestId']);
+  });
+
+  it('bounds aggregate stdin bytes and retires delivered input after terminal reporting', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data;
+    await call('execute', { notebook: 'work.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: 'bounded-controls' });
+    const command = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    for (let i = 0; i < 3; i++) assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'inputReply', value: 'x'.repeat(65536) } })).status, 200);
+    assert.equal((await call('kernelControl', { executionId: command.executionId, command: { command: 'inputReply', value: 'x'.repeat(65536) } })).status, 409);
+    assert.equal((await rpc({ operation: 'report', sessionId: owner.sessionId, deviceId: 'vps', executionId: command.executionId, commandId: command.id,
+      generation: command.generation, offset: 0, state: 'completed', events: [] }, agent)).status, 200);
+    const saved = JSON.parse(await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8'));
+    assert.deepEqual(saved.executions[0].controls, []);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('execution', { executionId: command.executionId })).data.state, 'completed');
+  });
+
   it('requires device owner consent and invalidates a queued solo exception when another human joins', async () => {
     await registerVps(); const snap = (await call('write', { path: 'work.ipynb', content: notebook(), expectedRevision: 0 })).data; const joined = await guest();
     const device = { id: 'guest-pc', name: 'Guest PC', python: 'python3', cpu: '8 CPUs', gpus: [], isolation: 'test isolation', ready: true };
@@ -259,4 +471,65 @@ describe('Persistent VPS Session Host', () => {
     assert.equal((await call('report',{deviceId:device.id,commandId:command.id,executionId:command.executionId,generation:command.generation,offset:0,events:[],state:'completed'})).status,403);
     assert.equal((await call('report',{deviceId:device.id,commandId:command.id,executionId:command.executionId,generation:command.generation,offset:0,events:[],state:'completed'},joined.token)).status,200);
   });
+  it('discovers only password-authorized sessions and separates expiring invitations from member/admin credentials', async () => {
+    const another = await rpc({ operation: 'create', name: 'Another project', password }, admin);
+    await rpc({ operation: 'create', name: 'Hidden name', password: 'another secret password' }, admin);
+    const discovered = await rpc({ operation: 'discover', password });
+    assert.equal(discovered.status, 200);
+    assert.deepEqual(discovered.data.sessions.map((item: any) => item.id).sort(), [owner.sessionId, another.data.sessionId].sort());
+    const invite = await call('createInvitation', { lifetimeSeconds: 60, readOnly: true });
+    assert.equal(invite.status, 200);
+    assert.equal((await call('view', {}, invite.data.invitationToken)).status, 401);
+    const input = { operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.data.invitationToken, name: 'Invited' };
+    assert.equal((await rpc({ ...input, sessionId: another.data.sessionId })).status, 401);
+    const joined = await rpc(input); assert.equal(joined.status, 200);
+    assert.equal((await call('write', { path: 'forbidden', content: encoded('x'), expectedRevision: 0 }, joined.data.token)).status, 403);
+    assert.equal((await rpc({ operation: 'create', name: 'forbidden', password }, joined.data.token)).status, 401);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('snapshot', {}, joined.data.token)).status, 200);
+    await call('revokeInvitation', { invitationId: invite.data.id });
+    assert.equal((await rpc(input)).status, 401);
+    assert.equal((await call('view', {}, joined.data.token)).status, 401);
+    const serialized = await readFile(path.join(directory, 'sessions', owner.sessionId, 'session.json'), 'utf8');
+    assert.equal(serialized.includes(invite.data.invitationToken), false);
+  });
+
+  it('expires saved invitation/member authority without reviving it after process recovery', async () => {
+    const invite = (await call('createInvitation', { lifetimeSeconds: 60, readOnly: false })).data;
+    const joined = await rpc({ operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.invitationToken, name: 'Expiring' });
+    assert.equal(joined.status, 200); await server.stop();
+    const filename = path.join(directory, 'sessions', owner.sessionId, 'session.json'); const record = JSON.parse(await readFile(filename, 'utf8'));
+    record.invitations[0].expiresAt = Date.now() - 1; record.members.find((member: any) => member.id === joined.data.memberId).expiresAt = Date.now() - 1;
+    await import('node:fs/promises').then((fs) => fs.writeFile(filename, JSON.stringify(record)));
+    server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('view', {}, joined.data.token)).status, 401);
+    assert.equal((await rpc({ operation: 'acceptInvitation', sessionId: owner.sessionId, invitationToken: invite.invitationToken, name: 'Expired' })).status, 401);
+    assert.equal((await call('view')).status, 200);
+  });
+
+  it('isolates owner Private execution, artifacts and recovery from members even after declassification', async () => {
+    await registerVps(); const joined = await guest();
+    let snapshot = (await call('write', { path: 'secret.ipynb', content: notebook('private_value = "secret"'), expectedRevision: 0 })).data;
+    snapshot = (await call('visibility', { path: 'secret.ipynb', visibility: 'private', expectedRevision: snapshot.revision })).data;
+    const input = { notebook: 'secret.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, expectedCellId: 'stable-cell', requestId: 'private-run' };
+    assert.equal((await call('execute', input, joined.token)).status, 404);
+    const accepted = await call('execute', input); assert.equal(accepted.status, 200); assert.equal(accepted.data.scope, 'private');
+    const claim = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal(claim.scope, 'private'); assert.match(claim.kernelId, /:private:/);
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+    assert.equal((await call('kernelControl', { executionId: accepted.data.id, command: { command: 'inputReply', value: 'stolen' } }, joined.token)).status, 409);
+    const report = { deviceId: 'vps', executionId: accepted.data.id, commandId: claim.id, generation: claim.generation, offset: 0,
+      state: 'completed', events: [{ type: 'stream', name: 'stdout', text: 'private output', requestId: claim.id }], files: [{ path: 'artifact.txt', content: encoded('private artifact'), version: 0 }, { path: 'private-results/value.txt', content: encoded('private tree'), version: 0 }] };
+    assert.equal((await call('report', report, agent)).status, 200);
+    assert.equal((await call('snapshot', {}, joined.token)).data.entries.length, 0);
+    assert.equal((await call('read', { path: 'artifact.txt' }, joined.token)).status, 404);
+    const current = (await call('snapshot')).data;
+    await call('visibility', { path: 'secret.ipynb', visibility: 'public', expectedRevision: current.revision });
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+    assert.equal((await call('artifacts', { executionId: accepted.data.id }, joined.token)).status, 404);
+    await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`;
+    assert.equal((await call('execution', { executionId: accepted.data.id })).data.events[0].text, 'private output');
+    assert.equal((await call('execution', { executionId: accepted.data.id }, joined.token)).status, 404);
+  });
+
 });
