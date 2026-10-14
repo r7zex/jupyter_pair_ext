@@ -61,7 +61,7 @@ export function saveNotebookCrdt(doc: Y.Doc, epoch: string, template: Record<str
   if (Buffer.byteLength(update) > 6 * 1024 * 1024) throw new Error('CRDT retention limit reached. Export and reopen the notebook explicitly.');
   const old = new Map<string, any>(template.cells.map((cell: any) => [cell.id, cell]));
   return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update, ...(template.metadata?.pair_crdt?.intents ? { intents: template.metadata.pair_crdt.intents } : {}) } }, cells: state.cells.map((cell) => {
-    const before = old.get(cell.id); const source = Array.isArray(before?.source) ? before.source.join('') : before?.source;
-    return { ...cell, ...(cell.cell_type === 'code' ? { outputs: source === cell.source ? before?.outputs ?? [] : [], execution_count: source === cell.source ? before?.execution_count ?? null : null } : {}) };
+    const before = old.get(cell.id);
+    return { ...cell, ...(cell.cell_type === 'code' ? { outputs: before?.cell_type === 'code' ? before.outputs ?? [] : [], execution_count: before?.cell_type === 'code' ? before.execution_count ?? null : null } : {}) };
   }) })).toString('base64');
 }

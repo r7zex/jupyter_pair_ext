@@ -151,6 +151,15 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
     await assert.rejects(rpc('execute', { notebook: 'book.ipynb', cellIndex: 0, requestId: 'identity-test', expectedRevision: restored.revision, expectedCellId: 'third' }), /changed|HTTP 409|Reload/);
     left.destroy(); right.destroy();
   });
+  it('retains saved output and execution count when live source is edited before another execution', async () => {
+    const output = { output_type: 'stream', name: 'stdout', text: 'saved 7\n' };
+    await rpc('write', { path: 'book.ipynb', expectedRevision: 0, content: encoded(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'print(7)', metadata: {}, outputs: [output], execution_count: 7 }] })) });
+    const start = await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb' });
+    await member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'K'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'print(7)', changes: [{ offset: 6, deleteCount: 1, insertText: '8' }] } });
+    const saved = await rpc<{ content: string }>('read', { path: 'book.ipynb' });
+    const cell = JSON.parse(Buffer.from(saved.content, 'base64').toString()).cells[0];
+    assert.equal(cell.source, 'print(8)'); assert.equal(cell.execution_count, 7); assert.deepEqual(cell.outputs, [output]);
+  });
   it('fences replaced/deleted notebooks and never exposes Private CRDT through direct API', async () => {
     await rpc('write', { path: 'secret.ipynb', content: encoded(JSON.stringify({ cells: [{ id: 'secret', cell_type: 'code', source: 'token = "private"', metadata: {} }], metadata: {} })), expectedRevision: 0 });
     const start = await rpc<NotebookSyncReply>('notebookSync', { path: 'secret.ipynb' });
