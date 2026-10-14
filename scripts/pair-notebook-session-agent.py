@@ -819,11 +819,13 @@ class SessionAgent:
         if bridge is None or self.active["receipt"]["state"] != "running":
             return
         receipt = self.active["receipt"]
+        changed = False
         for _ in range(128):
             try:
                 event = bridge.events.get_nowait()
             except queue.Empty:
                 break
+            changed = True
             kind = event.get("type")
             if kind == "bridgeExited":
                 receipt["state"] = "interrupted"
@@ -847,7 +849,8 @@ class SessionAgent:
                 receipt["state"] = "failed"
                 receipt["error"] = "Jupyter rejected the accepted command."
                 break
-        self._persist()
+        if changed:
+            self._persist()
 
     def _report(self):
         receipt = self.active["receipt"]
@@ -867,6 +870,8 @@ class SessionAgent:
                 pending.append(event)
                 size += event_size
             final = offset + len(pending) == len(receipt["events"]) and receipt["state"] != "running"
+            if not pending and not final:
+                return
             body = {"sessionId": identity["sessionId"], "deviceId": identity["deviceId"], "commandId": identity["id"],
                     "executionId": identity["executionId"], "generation": identity["generation"], "offset": offset,
                     "events": pending, "state": receipt["state"] if final else "running"}
@@ -1013,7 +1018,7 @@ def main():
     parser.add_argument("--bridge", default=str(Path(__file__).resolve().parents[1] / "media" / "jupyter_kernel_bridge.py"))
     parser.add_argument("--state", default=str(Path.home() / ".pair-notebook-session-agent"))
     parser.add_argument("--share", action="store_true", help="Explicitly allow this session's Python code to run in the isolated public workspace")
-    parser.add_argument("--poll-seconds", type=float, default=0.5)
+    parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--max-kernels", type=int, default=MAX_KERNELS, choices=(1, 2))
     parser.add_argument("--check-isolation", action="store_true", help="Verify the actual selected isolated runtime and exit without credentials")
     args = parser.parse_args()

@@ -309,6 +309,7 @@ class AgentProtocolTests(unittest.TestCase):
                 raise urllib.error.HTTPError("https://vps/report", 404, "Session was deleted", {}, None)
             return original_request(operation, **body)
         transport.request = deleted_report
+        FakeBridge.instances[1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "before deletion"}})
         agent.tick()
         self.assertEqual(agent.active["receipt"]["state"], "running")
         self.assertFalse(any(bridge.closed for bridge in FakeBridge.instances))
@@ -346,6 +347,7 @@ class AgentProtocolTests(unittest.TestCase):
                         raise urllib.error.HTTPError("https://vps/report", status, "Credential revoked", {}, None)
                     return original_request(operation, **body)
                 transport.request = revoked
+                FakeBridge.instances[-1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "before revocation"}})
                 agent.tick()
                 bridge = FakeBridge.instances[-1]
                 self.assertTrue(agent.credentials_revoked)
@@ -405,6 +407,22 @@ class AgentProtocolTests(unittest.TestCase):
             agent.tick()
             agent.tick()
         self.assertEqual(sum(operation == "registerDevice" for operation, _ in transport.calls), 1)
+
+    def test_silent_running_kernel_does_not_rewrite_or_report_unchanged_receipts(self):
+        transport = FakeTransport([command("a", source="wait")])
+        agent = self.make_agent(transport)
+        agent.tick()
+        transport.calls.clear()
+        with patch.object(agent, "_persist", wraps=agent._persist) as persist:
+            for _ in range(10):
+                agent.tick()
+            self.assertEqual(persist.call_count, 0)
+        self.assertEqual(sum(operation == "claim" for operation, _ in transport.calls), 10)
+        self.assertFalse(any(operation == "report" for operation, _ in transport.calls))
+        FakeBridge.instances[-1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "ready"}})
+        agent.tick()
+        self.assertTrue(any(operation == "report" for operation, _ in transport.calls))
+        self.assertEqual(agent.active["receipt"]["events"][-1]["content"]["text"], "ready")
 
     def test_heartbeat_does_not_reenable_revoked_sharing(self):
         transport = FakeTransport()

@@ -40,7 +40,7 @@ interface State {
   connection: Connection; notebook: vscode.NotebookDocument; key: string; file: string; doc: Y.Doc; project: CollaborativeProject;
   ids: StableCellIdRegistry<vscode.NotebookCell>; epoch: string; revision: number; actor: string; sequence: number;
   intents: Intent[]; ready: Promise<void>; sending?: Promise<void>; editor?: EditorSynchronizer;
-  activeIntent?: Intent; acknowledgedSequence: number;
+  activeIntent?: Intent; acknowledgedSequence: number; identity?: string | undefined;
   journalTail?: Promise<void>;
   conflictPrompted?: boolean;
   savedCells?: Map<string, CellSnapshot>;
@@ -178,7 +178,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
     const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
     state.acknowledgedSequence = reply.acknowledgedSequence ?? 0;
-    Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.epoch = reply.epoch; state.revision = reply.revision;
+    Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.epoch = reply.epoch; state.revision = reply.revision; state.identity = reply.identity;
     const vector = Y.encodeStateVector(state.doc);
     if (saved) {
       if (saved.epoch !== reply.epoch) { await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify(saved)); state.blocked = true; throw new PersistentHttpError(409); }
@@ -190,13 +190,16 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     shared = { ...shared, metadata: notebookUserMetadata(shared.metadata), cells: shared.cells.map((cell) => ({ ...cell, metadata: cellUserMetadata(cell.metadata, typeof cell.metadata.id === 'string' && !!cell.metadata.metadata) })) };
     editSharedNotebook(state.doc, shared);
     const cleaned = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64') }); this.current(state);
-    Y.applyUpdate(state.doc, Buffer.from(cleaned.update, 'base64')); state.revision = cleaned.revision;
+    Y.applyUpdate(state.doc, Buffer.from(cleaned.update, 'base64')); state.revision = cleaned.revision; state.identity = cleaned.identity;
     state.acknowledgedSequence = Math.max(state.acknowledgedSequence, cleaned.acknowledgedSequence ?? 0);
     await this.readSavedCells(state); state.project.ensureNotebook(state.key, this.projectedSnapshot(state));
     if (saved?.snapshot) { state.project.reconcileNotebook(state.key, { metadata: normalizeNotebookMetadata(saved.snapshot.metadata), cells: saved.snapshot.cells.map((cell) => ({ id: cell.id, source: cell.source, kind: cell.cell_type === 'code' ? 2 : 1, language: cell.cell_type === 'code' ? 'python' : 'markdown', metadata: cell.metadata, outputs: [] })) }, REMOTE_ORIGIN); state.structural = 1; }
     state.notebook.getCells().forEach((cell) => { const id = typeof cell.metadata.id === 'string' ? cell.metadata.id : cell.metadata.pairNotebookCellId; if (id) state.ids.seed(cell, undefined, id); });
     state.project.on('update', (event) => { if (event.origin !== REMOTE_ORIGIN && event.scope?.type !== 'cellText' && event.scope?.type !== 'cellState') { state.structural++; void this.send(state).catch((error) => this.report(error)); } });
-    state.editor = new EditorSynchronizer(state.project, '', this.log, state.ids, this.cellStateRenderer,
+    const renderer = this.cellStateRenderer && { ...this.cellStateRenderer,
+      // Live runs use the controller's observer; fields read from disk are completed snapshots.
+      renderRemoteCellState: (cell: vscode.NotebookCell, request: Parameters<NotebookCellStateRenderer['renderRemoteCellState']>[1]) => this.cellStateRenderer!.renderRemoteCellState(cell, { ...request, executionMode: 'snapshot' as const }) };
+    state.editor = new EditorSynchronizer(state.project, '', this.log, state.ids, renderer,
       (request) => this.stage(state, request),
       (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined);
     await state.editor.whenNotebookReady(state.notebook); state.initial.clear(); await this.journal(state); this.schedulePresence();
@@ -279,7 +282,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         if (!intent) snapshot = this.outbound(state);
         try {
           const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64'), ...(intent ? { intent } : { snapshot, snapshotStateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') }) }); this.current(state);
-          Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision);
+          Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity;
           if (intent) { state.acknowledgedSequence = Math.max(state.acknowledgedSequence, intent.sequence); state.intents.shift(); } else if (state.structural === structuralVersion) state.structural = 0;
           this.applyCanonical(state); this.schedulePresence(); await this.journal(state);
         } catch (error) {
@@ -291,6 +294,13 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     state.sending = work.finally(() => { delete state.sending; delete state.activeIntent; this.schedulePresence(); }); return state.sending;
   }
   async flush(notebook: vscode.NotebookDocument, capture = false): Promise<NotebookSyncReply | undefined> {
+    return this.synchronize(notebook, capture, true);
+  }
+  async prepareExecution(notebook: vscode.NotebookDocument): Promise<NotebookSyncReply | undefined> {
+    // Admission validates identity, cell ID, source hash and generation on the server.
+    return this.synchronize(notebook, true, false);
+  }
+  private async synchronize(notebook: vscode.NotebookDocument, capture: boolean, refresh: boolean): Promise<NotebookSyncReply | undefined> {
     if (capture && notebook.isClosed) throw new Error('Cannot save a closed notebook.');
     const connection = this.connection(); if (!connection || notebook.uri.scheme !== 'pair-vps' || notebook.uri.authority !== connection.sessionId) return undefined;
     this.ensureStream(); let state = this.states.get(notebook);
@@ -300,11 +310,12 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         initial: new Map(notebook.getCells().map((cell) => [cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell.document.getText()])) };
       this.states.set(notebook, state); state.ready = this.initialize(state);
     }
-    try { await state.ready; this.current(state); await this.send(state); }
+    try { await state.ready; this.current(state); if (capture) await state.editor?.prepareWorkingCopy(false); await this.send(state); }
     catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
+    if (!refresh) return { epoch: state.epoch, revision: state.revision, ...(state.identity ? { identity: state.identity } : {}), update: '', ...sharedNotebook(state.doc) };
     try {
       const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') });
-      this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state);
+      this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity; state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state);
       await state.editor?.prepareWorkingCopy(false); await this.journal(state);
       return { ...reply, revision: state.revision, ...sharedNotebook(state.doc) };
     } catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }

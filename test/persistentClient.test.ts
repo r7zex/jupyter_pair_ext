@@ -80,6 +80,8 @@ const boundary = {
   Uri: { from: (value: unknown) => value },
   FileType: { File: 1, Directory: 2 },
   NotebookCellKind: { Code: 2 },
+  NotebookCellOutput: class { public constructor(public items: unknown[]) {} },
+  NotebookCellOutputItem: { error: (error: Error) => ({ mime: 'application/vnd.code.notebook.error', data: Buffer.from(error.message) }) },
   FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
   FileSystemError: { Unavailable: (message: string) => new Error(message), NoPermissions: (message: string) => new Error(message) },
   window: {
@@ -133,6 +135,22 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  it('wakes a running observer on its authenticated live update before the polling fallback', async () => {
+    const controller = Object.create(PersistentSessionController.prototype) as any;
+    const run = { id: 'live-run', state: 'running', events: [] };
+    let reads = 0;
+    const connection = { client: { call: async () => { reads++; return { ...run, state: 'completed' }; } } };
+    controller.connection = connection; controller.disposed = false;
+    controller.executionChanges = new Map(); controller.executionWaiters = new Map();
+    const observing = controller.observe(run, undefined, connection, false);
+    assert.equal(controller.executionWaiters.has(run.id), true);
+    controller.notifyExecution(run.id);
+    let timer!: NodeJS.Timeout;
+    try {
+      const result = await Promise.race([observing, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Live update waited for the polling fallback')), 200); })]);
+      assert.equal(result.state, 'completed'); assert.equal(reads, 1); assert.equal(controller.executionWaiters.size, 0);
+    } finally { clearTimeout(timer); }
+  });
   it('keeps a managed notebook save stamp stable across its live durable publications', async () => {
     const provider = new PersistentFileSystem(); let revision = 1; let managed = false;
     const snapshot = () => ({ revision, entries: [{ path: 'book.ipynb', type: 'file' as const, size: 12 + revision, mtime: revision, version: revision, visibility: 'public' as const }] });
@@ -272,7 +290,7 @@ describe('Persistent notebook execution connection ownership', () => {
   });
 
   type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
-  for (const phase of ['queue', 'save']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
+  for (const phase of ['queue']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
     let unblock!: () => void;
     const wait = new Promise<void>((resolve) => { unblock = resolve; });
     let saves = 0;
@@ -282,11 +300,27 @@ describe('Persistent notebook execution connection ownership', () => {
     }) as ExecutionUi;
     const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => { saves++; await wait; return true; } } as unknown as vscode.NotebookDocument;
     const pending = ui.execute([], notebook);
-    if (phase === 'save') { await Promise.resolve(); await Promise.resolve(); }
     ui.connection = { sessionId: 'replacement' };
     unblock();
     await assert.rejects(pending, /session changed/);
-    assert.equal(saves, phase === 'queue' ? 0 : 1);
+    assert.equal(saves, 0);
+  });
+  it('does not admit a cell into a replacement session after waiting for source synchronization', async () => {
+    let release!: () => void; let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; }); const synchronized = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0; let ended: boolean | undefined;
+    const connection = { sessionId: 'original', client: { call: async () => { calls++; throw new Error('No RPC should be sent'); } } };
+    const handle = { start: () => undefined, clearOutput: async () => undefined, appendOutput: async () => undefined, end: (success: boolean) => { ended = success; } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(), executions: new Map(), disposed: false,
+      context: { globalState: { update: async () => undefined } }, notebook: { createNotebookCellExecution: () => handle },
+      notebookSync: { prepareExecution: async () => { entered(); await waiting; return { revision: 1, cells: [] }; } },
+    }) as ExecutionUi;
+    const cell = { index: 0, kind: 2, document: { languageId: 'python', getText: () => 'print(1)' } } as unknown as vscode.NotebookCell;
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' }, save: async () => { throw new Error('Native save must not gate Run Cell'); } } as unknown as vscode.NotebookDocument;
+    const pending = ui.execute([cell], notebook); await synchronized;
+    ui.connection = { sessionId: 'replacement' }; release(); await pending;
+    assert.equal(calls, 0); assert.equal(ended, false);
   });
 
   it('binds admission to the original session and the actual displayed cell source', async () => {
