@@ -656,7 +656,8 @@ export class PersistentSessionHost {
 
   private publishExecution(session: Session, run: ExecutionRecord): void {
     if (run.kernelCommand) return;
-    session.live.broadcast({ kind: 'execution', path: run.execution.notebook, id: run.execution.id },
+    const inline = Buffer.byteLength(JSON.stringify(run.execution)) <= 64 * 1024;
+    session.live.broadcast({ kind: 'execution', path: run.execution.notebook, id: run.execution.id, ...(inline ? { execution: run.execution } : {}) },
       (memberId) => memberId === session.record.ownerId || (run.execution.scope !== 'private' && run.aclEpoch === session.record.aclEpoch));
   }
 

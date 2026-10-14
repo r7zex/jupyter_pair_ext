@@ -68,9 +68,15 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
       const claimed = await agent.call<any>('claim', { sessionId: owner.sessionId, deviceId: 'vps' }); const command = claimed.command;
       await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 0, state: 'running', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'shared 7\n' } }] });
       const running = await member.call<any>('execution', { sessionId: owner.sessionId, executionId: run.id }); assert.equal(running.events[0].content.text, 'shared 7\n');
+      for (let n = 0; n < 100 && !events.some((event) => event.kind === 'execution' && event.execution?.events.length === 1); n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      const inline = events.find((event) => event.kind === 'execution' && event.execution?.events.length === 1);
+      assert.ok(inline?.kind === 'execution'); assert.equal((inline.execution!.events[0]!.content as any).text, 'shared 7\n');
+      await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 1, state: 'running', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'X'.repeat(70 * 1024) } }] });
+      for (let n = 0; n < 100 && events.filter((event) => event.kind === 'execution').at(-1)?.execution !== undefined; n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(events.filter((event) => event.kind === 'execution').at(-1)?.execution, undefined, 'Large cumulative output falls back to bounded notification');
       await rpc('visibility', { path: 'book.ipynb', visibility: 'private', expectedRevision: (await rpc<any>('snapshot')).revision });
       await new Promise((resolve) => setTimeout(resolve, 30)); const previous = events.filter((event) => event.kind === 'execution').length;
-      await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 1, state: 'completed', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'PRIVATE_AFTER_PRIVACY\n' } }] });
+      await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 2, state: 'completed', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'PRIVATE_AFTER_PRIVACY\n' } }] });
       await new Promise((resolve) => setTimeout(resolve, 30)); assert.equal(events.filter((event) => event.kind === 'execution').length, previous);
       assert.equal(JSON.stringify(events).includes('PRIVATE_AFTER_PRIVACY'), false); await assert.rejects(member.call('execution', { sessionId: owner.sessionId, executionId: run.id }));
       assert.deepEqual((await member.call<{ executions: any[] }>('executions', { sessionId: owner.sessionId })).executions, []);

@@ -1,9 +1,10 @@
 import type { ServerResponse } from 'node:http';
 import type { PresenceState } from '../runtime/session';
+import type { PersistentExecution } from './persistentProtocol';
 
 export type PersistentPresence = PresenceState & { epoch: string; readOnly: boolean };
 export type PersistentLiveEvent = { kind: 'ready' } | { kind: 'invalidate' } | { kind: 'presence'; states: PersistentPresence[] }
-  | { kind: 'execution'; path: string; id: string }
+  | { kind: 'execution'; path: string; id: string; execution?: PersistentExecution }
   | { kind: 'notebook'; path: string; epoch: string; revision: number; update: string; acknowledgement?: { actor: string; sequence: number } };
 interface Subscriber { response: ServerResponse; memberId: string; valid: () => boolean; visible: (path: string) => boolean }
 

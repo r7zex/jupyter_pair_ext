@@ -173,7 +173,16 @@ def install_snapshot(root, files, previous=()):
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise AgentError("Workspace snapshot target is unsafe.")
             except FileNotFoundError:
-                pass
+                info = None
+            if info is not None and info.st_size == len(data) and stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid():
+                descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(descriptor, "rb") as current:
+                    actual = os.fstat(current.fileno())
+                    if not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1:
+                        raise AgentError("Workspace snapshot target is unsafe.")
+                    if actual.st_uid == os.geteuid() and stat.S_IMODE(actual.st_mode) == 0o600 and current.read(len(data) + 1) == data:
+                        baseline[name] = {"sha256": hashlib.sha256(data).hexdigest(), "version": version}
+                        continue
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(data)
