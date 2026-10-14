@@ -201,4 +201,18 @@ describe('Persistent adapter through the existing production editor', () => {
       await assert.rejects(sync.flush(notebook), /changed/); await sync.flush(notebook); assert.equal(cell.document.text, 'public'); assert.deepEqual(cell.outputs, []);
     } finally { boundary.window.showWarningMessage = warning; }
   });
+  it('keeps already displayed saved output while a source acknowledgement precedes its refreshed file snapshot', async () => {
+    sync.dispose(); rawOutputs = [{ output_type: 'stream', name: 'stdout', text: 'saved 7\n' }];
+    const renderer = { isManagingCellState: () => false, renderRemoteCellState: async (target: any, request: any) => { target.outputs = [...request.outputs]; } };
+    sync = new Sync({ globalStorageUri: { fsPath: root } } as vscode.ExtensionContext, () => connection, { appendLine() {} }, undefined, undefined, renderer);
+    await sync.flush(notebook); assert.equal(cell.outputs.length, 1);
+    const delayed = pause(); change(4, 0, '!'); await delayed.reached;
+    const state = (sync as any).states.get(notebook);
+    push!({ kind: 'notebook', path: 'book.ipynb', epoch, revision: 2, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), acknowledgement: { actor: state.actor, sequence: state.activeIntent.sequence } });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 30)); await state.editor.prepareWorkingCopy(false);
+      assert.equal(cell.document.text, 'base!'); assert.equal(cell.outputs.length, 1, 'A source ACK must not erase existing outputs while their snapshot is stale');
+    } finally { delayed.release(); }
+    await sync.flush(notebook); assert.equal(cell.outputs.length, 1);
+  });
 });

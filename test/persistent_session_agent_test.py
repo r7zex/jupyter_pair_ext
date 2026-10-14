@@ -261,12 +261,12 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(transport.reports[-1]["state"], "completed")
         self.assertIn("no live kernel", transport.reports[-1]["events"][0]["message"])
 
-    def test_release_does_not_close_another_generation_or_gpu_key(self):
-        original = command("a")
+    def test_release_does_not_close_newer_generations_or_another_gpu_key(self):
+        original = command("a", generation=2)
         original["gpuUuid"] = "GPU-12345678-1234-1234-1234-123456789abc"
-        another_generation = command("release-generation", generation=2)
+        another_generation = command("release-generation", generation=1)
         another_generation["gpuUuid"] = original["gpuUuid"]
-        another_gpu = command("release-gpu")
+        another_gpu = command("release-gpu", generation=2)
         another_gpu["gpuUuid"] = "GPU-22345678-1234-1234-1234-123456789abc"
         for release in (another_generation, another_gpu):
             release["command"] = {"command": "release", "requestId": release["id"]}
@@ -277,6 +277,24 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(len(FakeBridge.instances), 1)
         self.assertFalse(FakeBridge.instances[0].closed)
         self.assertEqual(len(agent.kernels), 1)
+
+    def test_release_retires_obsolete_idle_generation_after_broker_recovery_without_starting_a_kernel(self):
+        original = command("before-recovery")
+        release = command("release-after-recovery", generation=2)
+        release["command"] = {"command": "release", "requestId": release["id"]}
+        next_session = command("next-session", generation=2)
+        next_session["sessionId"] = "other-session"
+        for item in (original, release, next_session):
+            item["deviceId"] = "vps"
+        transport = FakeTransport([original, release, next_session])
+        agent = self.make_agent(transport, max_kernels=1, session=None)
+        agent.tick()
+        agent.tick()
+        self.assertTrue(FakeBridge.instances[0].closed)
+        self.assertEqual(len(FakeBridge.instances), 1, "Release must not create a replacement kernel")
+        agent.tick()
+        self.assertEqual(len(FakeBridge.instances), 2)
+        self.assertEqual(transport.reports[-1]["state"], "completed")
 
     def test_queued_release_waits_for_accepted_cell_to_finish(self):
         release = command("release")

@@ -747,15 +747,18 @@ class SessionAgent:
             self.active["commandKind"] = command["command"].get("command")
             if self.active["commandKind"] == "release":
                 # The broker queues release behind accepted execution. Closing
-                # only this exact idle notebook key cannot cancel another run
-                # or manufacture a kernel just to shut it down.
+                # obsolete idle generations cannot cancel an accepted run or
+                # manufacture a kernel just to shut it down.
+                obsolete = [entry for entry in self.kernels if entry[0] == key[0] and entry[2] < key[2]]
+                for entry in obsolete:
+                    self.kernels.pop(entry).close()
                 bridge = self.kernels.pop(key, None)
                 if bridge is not None:
                     bridge.close()
                 self._append({"type": "kernelState", "requestId": self.active["requestId"],
                               "generation": command["generation"],
                               "message": "The selected notebook kernel was released; its variables were cleared."
-                              if bridge is not None else "The selected notebook has no live kernel to release."})
+                              if bridge is not None or obsolete else "The selected notebook has no live kernel to release."})
                 self._append({"type": "commandResult", "requestId": self.active["requestId"], "command": "release"})
                 receipt["state"] = "completed"
                 self._persist()

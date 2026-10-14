@@ -241,8 +241,8 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       const previous = state.project.has(state.key) ? state.project.notebookCellSnapshot(state.key, cell.id) : undefined;
       const local = state.notebook.getCells().find((candidate) => candidate.metadata.id === cell.id || candidate.metadata.pairNotebookCellId === cell.id);
       const saved = state.savedCells?.get(cell.id); const managing = !!local && this.cellStateRenderer?.isManagingCellState?.(local);
-      const outputs = saved && !managing ? saved.source === cell.source ? saved.outputs : [] : previous?.outputs ?? local?.outputs.map((output) => ({ metadata: output.metadata, items: output.items.map((item) => ({ mime: item.mime, dataBase64: Buffer.from(item.data).toString('base64') })) })) ?? [];
-      const execution = managing || (previous?.execution?.executionOrder === saved?.execution?.executionOrder && JSON.stringify(previous?.outputs) === JSON.stringify(outputs)) ? previous?.execution : saved?.source === cell.source ? saved.execution : undefined;
+      const outputs = saved && !managing && saved.source === cell.source ? saved.outputs : previous?.outputs ?? local?.outputs.map((output) => ({ metadata: output.metadata, items: output.items.map((item) => ({ mime: item.mime, dataBase64: Buffer.from(item.data).toString('base64') })) })) ?? [];
+      const execution = managing || (saved && saved.source !== cell.source) || (previous?.execution?.executionOrder === saved?.execution?.executionOrder && JSON.stringify(previous?.outputs) === JSON.stringify(outputs)) ? previous?.execution : saved?.source === cell.source ? saved.execution : undefined;
       return { id: cell.id, kind: cell.cell_type === 'code' ? 2 : 1, language: cell.cell_type === 'code' ? 'python' : 'markdown', source: cell.source, metadata: cell.metadata,
         outputs, execution };
     }) };
