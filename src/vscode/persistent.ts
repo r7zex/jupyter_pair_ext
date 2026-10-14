@@ -47,6 +47,8 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   private snapshot: PersistentSnapshot = { revision: 0, entries: [] };
   private readonly readRevisions = new Map<string, number>();
   private readonly readContents = new Map<string, Buffer>();
+  private readonly notebookStats = new Map<string, vscode.FileStat>();
+  public notebookManaged: ((uri: vscode.Uri) => boolean) | undefined;
   private connection: ActiveConnection | undefined;
   private mutation = Promise.resolve();
   public setConnection(connection: ActiveConnection | undefined): void {
@@ -54,6 +56,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     this.snapshot = { revision: 0, entries: [] };
     this.readRevisions.clear();
     this.readContents.clear();
+    this.notebookStats.clear();
   }
   public get revision(): number { return this.snapshot.revision; }
   public visibilityOf(key: string): 'public' | 'private' | undefined { return this.snapshot.entries.find((entry) => entry.path === key)?.visibility; }
@@ -68,7 +71,8 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   }
   public accept(snapshot: PersistentSnapshot): void {
     if (snapshot.revision < this.snapshot.revision) return;
-    const events = sameEntries(this.snapshot, snapshot).map((event) => ({ ...event, uri: this.uri(filePath(event.uri)) }));
+    const events = sameEntries(this.snapshot, snapshot).map((event) => ({ ...event, uri: this.uri(filePath(event.uri)) }))
+      .filter((event) => event.type !== vscode.FileChangeType.Changed || !this.notebookManaged?.(event.uri));
     this.snapshot = snapshot;
     if (events.length) this.changed.fire(events);
   }
@@ -84,7 +88,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     await this.refresh();
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!entry) throw vscode.FileSystemError.FileNotFound(uri);
-    return { type: entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
+    const current = { type: entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
+    if (this.notebookManaged?.(uri)) {
+      if (!this.notebookStats.has(key)) this.notebookStats.set(key, current);
+      return this.notebookStats.get(key)!;
+    }
+    return current;
   }
   public async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
     const key = this.check(uri);
@@ -104,6 +113,8 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     if (!this.readRevisions.has(key)) {
       this.readRevisions.set(key, response.revision);
       this.readContents.set(key, content);
+      const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
+      if (key.endsWith('.ipynb') && entry) this.notebookStats.set(key, { type: vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size });
     }
     return content;
   }
@@ -151,7 +162,10 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!options.create && !entry) throw vscode.FileSystemError.FileNotFound(uri);
     if (!options.overwrite && entry) throw vscode.FileSystemError.FileExists(uri);
-    if (entry && key.endsWith('.ipynb') && await this.notebookSave?.(uri)) return;
+    if (entry && key.endsWith('.ipynb') && await this.notebookSave?.(uri)) {
+      const stat = this.notebookStats.get(key); if (stat) this.notebookStats.set(key, { ...stat, size: content.length });
+      return;
+    }
     await this.mutate('write', { path: key, content: Buffer.from(content).toString('base64'), expectedRevision: this.readRevisions.get(key) ?? this.snapshot.revision });
   }
   public async createDirectory(uri: vscode.Uri): Promise<void> { await this.mutate('mkdir', { path: this.check(uri) }); }
@@ -172,6 +186,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     if (uri.scheme === SCHEME && uri.authority === this.connection?.sessionId) {
       this.readRevisions.delete(filePath(uri));
       this.readContents.delete(filePath(uri));
+      this.notebookStats.delete(filePath(uri));
     }
   }
   public dispose(): void { this.changed.dispose(); }
@@ -225,6 +240,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       isManagingCellState: (cell) => this.managesCell(cell),
       renderRemoteCellState: async (cell, request) => { if (!this.managesCell(cell)) await renderNotebookCellState(this.notebook, this.cellMirrors, cell, request); },
     });
+    this.files.notebookManaged = (uri) => uri.scheme === SCHEME && uri.authority === this.connection?.sessionId && vscode.workspace.notebookDocuments.some((document) => !document.isClosed && document.uri.toString() === uri.toString());
     this.files.notebookSave = async (uri) => {
       const document = vscode.workspace.notebookDocuments.find((notebook) => notebook.uri.toString() === uri.toString());
       if (!document) return false;

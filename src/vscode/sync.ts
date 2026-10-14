@@ -27,7 +27,6 @@ import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
 import { OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import { EditorTextReplica } from './editorTextReplica';
 import { rebaseInitialTextChanges } from './initialTextChanges';
-import type { LineTouchChange } from '../core/lineLock';
 import { cellUserMetadata, nativeNotebookMetadata, notebookUserMetadata, renderedNotebookMetadata, renderedCellMetadata } from './persistentNotebookMetadata';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = OUTPUT_STATE_CADENCE_MS;
@@ -63,7 +62,6 @@ export interface EditorTextIntentRequest {
 
 /** Returns true when the host protocol owns canonical publication. */
 export type EditorTextIntentPublisher = (request: EditorTextIntentRequest) => boolean;
-export type LineLockGuard = (key: string, cellId: string | undefined, changes: readonly LineTouchChange[], source: string) => string | undefined;
 
 interface PendingTextEdit {
   readonly document: vscode.TextDocument;
@@ -108,7 +106,6 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
     private readonly textIntentPublisher?: EditorTextIntentPublisher,
-    private readonly lineLockGuard?: LineLockGuard,
     private readonly uriKey?: (uri: vscode.Uri) => string | undefined,
   ) {
     this.disposables.push(
@@ -1111,9 +1108,6 @@ export class EditorSynchronizer implements vscode.Disposable {
     let replica = this.textReplicas.get(uri);
     const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
     const baseline = replica?.source() ?? canonical.toString();
-    const guarded = this.lineLockGuard && replica ? replica.canonicalChanges(changes) : changes;
-    const locked = this.lineLockGuard?.(key, cellId, guarded.map((change) => ({ rangeOffset: change.offset, rangeLength: change.deleteCount })), canonical.toString());
-    if (locked) throw new Error(locked);
     const result = applyBufferedTextChanges(baseline, changes);
     if (result !== undefined && this.textIntentPublisher?.({ key, cellId, baseline, changes: [...changes], result })) {
       if (!replica) {
@@ -1338,12 +1332,6 @@ export class EditorSynchronizer implements vscode.Disposable {
       this.log.appendLine(`[error] Could not restore rejected editor update: ${formatError(error)}`);
     });
     this.warnRejectedEditorUpdate(detail);
-  }
-
-  public rejectPendingText(key: string, cellId: string): void {
-    const notebook = vscode.workspace.notebookDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
-    const cell = notebook && this.findNotebookCellByStableId(notebook, cellId)?.cell;
-    if (cell) this.restoreRejectedText(cell.document, this.project.cellSource(key, cellId).toString(), 'The VPS rejected input on an occupied line; the attempted input was archived locally.');
   }
 
   private warnRejectedEditorUpdate(detail: string): void {

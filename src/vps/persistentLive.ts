@@ -4,7 +4,7 @@ import type { PresenceState } from '../runtime/session';
 export type PersistentPresence = PresenceState & { epoch: string; readOnly: boolean };
 export type PersistentLiveEvent = { kind: 'ready' } | { kind: 'invalidate' } | { kind: 'presence'; states: PersistentPresence[] }
   | { kind: 'execution'; path: string; id: string }
-  | { kind: 'notebook'; path: string; epoch: string; revision: number; update: string };
+  | { kind: 'notebook'; path: string; epoch: string; revision: number; update: string; acknowledgement?: { actor: string; sequence: number } };
 interface Subscriber { response: ServerResponse; memberId: string; valid: () => boolean; visible: (path: string) => boolean }
 
 /** Authenticated push transport for the existing editor and presence protocol. */
