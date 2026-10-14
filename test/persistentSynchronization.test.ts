@@ -17,6 +17,16 @@ const encoded = (value: string): string => Buffer.from(value).toString('base64')
 describe('Persistent continuous synchronization over actual HTTP', () => {
   let root: string; let server: VpsServer; let client: PersistentClient; let member: PersistentClient; let owner: PersistentMembership; let endpoint: string;
   const rpc = <T = any>(operation: string, fields: Record<string, unknown> = {}): Promise<T> => client.call(operation, { sessionId: owner.sessionId, ...fields });
+  it('stops cleanly while an authenticated live stream remains open', async () => {
+    let ready!: () => void; const connected = new Promise<void>((resolve) => { ready = resolve; });
+    const stream = client.subscribe(owner.sessionId, (event) => { if (event.kind === 'ready') ready(); }, () => undefined);
+    try {
+      await connected;
+      let timer!: NodeJS.Timeout;
+      try { await Promise.race([server.stop(), new Promise<void>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Live stream prevented graceful shutdown')), 1000); })]); }
+      finally { clearTimeout(timer); }
+    } finally { stream.dispose(); }
+  });
   beforeEach(async () => {
     installProxyAwareWebSocket({ env: {} }); root = await mkdtemp(path.join(os.tmpdir(), 'pair-sync-')); server = new VpsServer({ dataDirectory: path.join(root, 'server'), clientToken: 'A'.repeat(40), agentTokens: { vps: 'Z'.repeat(40) } });
     endpoint = `http://127.0.0.1:${await server.start()}`;

@@ -305,7 +305,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     try {
       const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') });
       this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state);
-      await state.editor?.prepareWorkingCopy(); await this.journal(state);
+      await state.editor?.prepareWorkingCopy(false); await this.journal(state);
       return { ...reply, revision: state.revision, ...sharedNotebook(state.doc) };
     } catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
   }

@@ -243,6 +243,7 @@ export class VpsServer {
     for (const socket of this.sockets.clients) socket.terminate();
     const closed = this.server.listening ? new Promise<void>((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve())) : Promise.resolve();
     this.server.closeIdleConnections();
+    this.persistent.closeLiveConnections();
     await Promise.allSettled([...this.requests]);
     await this.serial;
     await this.persistent.stop();

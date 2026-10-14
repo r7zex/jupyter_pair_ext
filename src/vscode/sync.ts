@@ -195,7 +195,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   /** Materializes every open document before local execution needs a physical filesystem snapshot. */
-  public async prepareWorkingCopy(): Promise<void> {
+  public async prepareWorkingCopy(forceSave = true): Promise<void> {
     if (this.disposed) return;
     const keys = new Set<string>();
     for (const notebook of vscode.workspace.notebookDocuments) {
@@ -207,7 +207,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       const key = this.keyForUri(document.uri);
       if (key) keys.add(key);
     }
-    for (const key of keys) await this.persistOpenWorkingCopy(key, true);
+    for (const key of keys) await this.persistOpenWorkingCopy(key, forceSave);
   }
 
   private async persistOpenWorkingCopy(relativePath: string, forceSave: boolean): Promise<boolean> {

@@ -82,6 +82,12 @@ describe('Persistent adapter through the existing production editor', () => {
     delayed.release(); await sync.flush(notebook);
     assert.equal(cell.document.text, ''); assert.equal(sharedNotebook(doc).cells[0]!.source, '');
   });
+  it('prepares a VPS working copy without recursively invoking the notebook save provider', async () => {
+    let saves = 0; notebook.save = async () => { saves++; throw new Error('Reentered native save'); };
+    await sync.flush(notebook, true); assert.equal(saves, 0);
+    change(4, 0, '-local'); await sync.flush(notebook, true); assert.equal(saves, 0);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local');
+  });
   it('coalesces a fast typing and deletion burst behind one immutable in-flight request', async () => {
     await sync.flush(notebook);
     const delayed = pause(); change(4, 0, '!'); await delayed.reached;
