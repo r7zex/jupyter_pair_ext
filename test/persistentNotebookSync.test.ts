@@ -133,6 +133,20 @@ describe('Persistent adapter through the existing production editor', () => {
     } finally { boundary.window.activeTextEditor = previous; delayed.release(); }
     await sync.flush(notebook);
   });
+  it('suppresses unchanged cursor packets between renewals without delaying movement or expiring an idle cursor', async () => {
+    await sync.flush(notebook); const previous = boundary.window.activeTextEditor; let published = 0;
+    const original = connection.client.call;
+    connection.client.call = async (operation: string, input: any) => { if (operation === 'presence') published++; return original(operation, input); };
+    cell.document.offsetAt = (position: any) => position.character;
+    boundary.window.activeTextEditor = { document: cell.document, selection: { anchor: { line: 0, character: 1 }, active: { line: 0, character: 1 } } };
+    try {
+      await (sync as any).publishPresence(); await (sync as any).publishPresence(); assert.equal(published, 1);
+      boundary.window.activeTextEditor.selection = { anchor: { line: 0, character: 2 }, active: { line: 0, character: 2 } };
+      await (sync as any).publishPresence(); assert.equal(published, 2, 'A real cursor move must publish immediately');
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      assert.ok(published >= 3, 'An unchanged idle cursor must still renew its server lease');
+    } finally { boundary.window.activeTextEditor = previous; }
+  });
   it('coalesces a fast typing and deletion burst behind one immutable in-flight request', async () => {
     await sync.flush(notebook);
     const delayed = pause(); change(4, 0, '!'); await delayed.reached;

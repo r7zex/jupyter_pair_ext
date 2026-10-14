@@ -75,6 +75,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private presenceSending = false;
   private presenceAgain = false;
   private lastPresence: Record<string, unknown> | undefined;
+  private lastPresenceAt = 0;
   private lastWarning = 0;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly connection: () => Connection | undefined, private readonly log: Pick<vscode.OutputChannel, 'appendLine'> = { appendLine: () => undefined }, private readonly invalidate: () => void = () => undefined, private readonly execution: (event: Extract<PersistentLiveEvent, { kind: 'execution' }>) => void = () => undefined, private readonly cellStateRenderer?: NotebookCellStateRenderer) {
@@ -190,8 +191,9 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       }
       else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
     }
+    if (this.lastPresence && JSON.stringify(fields) === JSON.stringify(this.lastPresence) && Date.now() - this.lastPresenceAt < 750) return;
     const reply = await connection.client.call<{ states: PersistentPresence[] }>('presence', { sessionId: connection.sessionId, ...fields });
-    if (this.connection() === connection) { this.lastPresence = fields; this.presence = reply.states; this.presenceEvents.emit('presence'); }
+    if (this.connection() === connection) { this.lastPresence = fields; this.lastPresenceAt = Date.now(); this.presence = reply.states; this.presenceEvents.emit('presence'); }
   }
   private async journal(state: State): Promise<void> {
     const write = (state.journalTail ?? Promise.resolve()).catch(() => undefined).then(async () => {
