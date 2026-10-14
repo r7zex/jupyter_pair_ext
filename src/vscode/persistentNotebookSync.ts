@@ -1,110 +1,354 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdir, readFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import * as Y from 'yjs';
+import { diffChars } from 'diff';
 import { atomicWriteFile } from '../core/atomicFile';
+import { CollaborativeProject, type NotebookSnapshot, type CellSnapshot, type TextChange } from '../core/crdt';
+import { createSharedCursorPosition, encodeRelativeOffset, resolveRelativeOffset, resolveSharedCursorPosition } from '../core/cursorPosition';
+import { rebaseTextChanges } from '../core/textChanges';
+import { StableCellIdRegistry } from '../core/notebookIdentity';
+import { normalizeNotebookMetadata, parseIpynb } from '../core/projectFiles';
+import { REMOTE_ORIGIN } from '../core/types';
+import type { PresenceState } from '../runtime/session';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
 import { editSharedNotebook, sharedNotebook, type NotebookSyncReply, type SharedNotebook } from '../vps/persistentNotebookCrdt';
-interface Connection { sessionId: string; memberId: string; endpoint: string; client: PersistentClient }
-interface State { doc: Y.Doc; epoch: string; file: string; ids: WeakMap<vscode.NotebookCell, string>; pending: Promise<unknown>; applying: boolean; revision: number; closed: boolean; blocked: boolean; initialCells: vscode.NotebookCell[]; initialSources: string[]; pendingSnapshot?: SharedNotebook; pendingCells?: vscode.NotebookCell[] }
+import type { PersistentLiveEvent, PersistentPresence } from '../vps/persistentLive';
+import { cellUserMetadata, hasLegacyNotebookMetadata, notebookUserMetadata } from './persistentNotebookMetadata';
+import { PresenceRenderer, type PresenceSource } from './presence';
+import { EditorSynchronizer, type EditorTextIntentRequest, type NotebookCellStateRenderer } from './sync';
+import { rebaseInitialTextChanges } from './initialTextChanges';
 
-/** Each editor replica retains its Yjs state before HTTP submission; replay is idempotent. */
+interface Connection { sessionId: string; memberId: string; endpoint: string; client: PersistentClient }
+interface Intent { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[] }
+function applyChanges(source: string, changes: readonly TextChange[]): string {
+  for (const change of [...changes].sort((a, b) => b.offset - a.offset)) source = source.slice(0, change.offset) + change.insertText + source.slice(change.offset + change.deleteCount);
+  return source;
+}
+function changesBetween(before: string, after: string): TextChange[] | undefined {
+  const parts = diffChars(before, after, { timeout: 5 }); if (!parts) return undefined;
+  const changes: TextChange[] = []; let offset = 0;
+  for (const part of parts) {
+    if (part.added) changes.push({ offset, deleteCount: 0, insertText: part.value });
+    else { if (part.removed) changes.push({ offset, deleteCount: part.value.length, insertText: '' }); offset += part.value.length; }
+  }
+  return changes.length > 100 ? undefined : changes.length ? changes : [{ offset: 0, deleteCount: 0, insertText: '' }];
+}
+function mapTextOffset(before: string, after: string, offset: number): number | undefined {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > before.length) return undefined;
+  if (before === after) return offset;
+  const changes = changesBetween(before, after); if (!changes) return undefined;
+  let adjustment = 0;
+  for (const change of changes) {
+    if (offset < change.offset) break;
+    if (offset < change.offset + change.deleteCount) return change.offset + adjustment + change.insertText.length;
+    adjustment += change.insertText.length - change.deleteCount;
+  }
+  return offset + adjustment;
+}
+interface State {
+  connection: Connection; notebook: vscode.NotebookDocument; key: string; file: string; doc: Y.Doc; project: CollaborativeProject;
+  ids: StableCellIdRegistry<vscode.NotebookCell>; epoch: string; revision: number; actor: string; sequence: number;
+  intents: Intent[]; ready: Promise<void>; sending?: Promise<void>; editor?: EditorSynchronizer;
+  activeIntent?: Intent; acknowledgedSequence: number; identity?: string | undefined;
+  journalTail?: Promise<void>;
+  conflictPrompted?: boolean;
+  savedCells?: Map<string, CellSnapshot>;
+  structural: number; closed: boolean; blocked: boolean;
+  initial: Map<string, string>;
+}
+
+/** VPS transport adapter for the EditorSynchronizer/EditorTextReplica used by a human host. */
 export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private readonly states = new Map<vscode.NotebookDocument, State>();
+  private readonly presenceEvents = new EventEmitter();
+  private presence: PersistentPresence[] = [];
+  private stream: { dispose(): void } | undefined;
+  private streamConnection: Connection | undefined;
+  private reconnect: NodeJS.Timeout | undefined;
   private readonly listeners: vscode.Disposable[];
-  constructor(private readonly context: vscode.ExtensionContext, private readonly connection: () => Connection | undefined) {
-    this.listeners = [vscode.workspace.onDidChangeNotebookDocument((event) => {
-      const state = this.states.get(event.notebook);
-      if ((!state || !state.applying) && (event.contentChanges.length || event.cellChanges.some((change) => change.document || change.metadata))) void this.flush(event.notebook, true).catch(() => undefined);
-    }), vscode.workspace.onDidCloseNotebookDocument((notebook) => { const state = this.states.get(notebook); if (state) { state.closed = true; state.doc.destroy(); this.states.delete(notebook); } })];
+  private readonly heartbeat: NodeJS.Timeout;
+  private renderer: PresenceRenderer | undefined;
+  private presencePending = false;
+  private presenceSending = false;
+  private presenceAgain = false;
+  private lastPresence: Record<string, unknown> | undefined;
+  private lastPresenceAt = 0;
+  private lastWarning = 0;
+
+  constructor(private readonly context: vscode.ExtensionContext, private readonly connection: () => Connection | undefined, private readonly log: Pick<vscode.OutputChannel, 'appendLine'> = { appendLine: () => undefined }, private readonly invalidate: () => void = () => undefined, private readonly execution: (event: Extract<PersistentLiveEvent, { kind: 'execution' }>) => void = () => undefined, private readonly cellStateRenderer?: NotebookCellStateRenderer) {
+    this.listeners = [vscode.workspace.onDidCloseNotebookDocument((notebook) => { const state = this.states.get(notebook); if (state) { if (state.intents.length || state.structural) void this.journal(state).catch((error) => this.report(error)).finally(() => this.closeState(state)); else this.closeState(state); } }),
+      vscode.window.onDidChangeTextEditorSelection(() => this.schedulePresence()),
+      vscode.window.onDidChangeActiveTextEditor(() => this.schedulePresence()),
+      vscode.window.onDidChangeWindowState(() => this.schedulePresence())];
+    this.heartbeat = setInterval(() => { this.ensureStream(); this.schedulePresence(); }, 1000); this.heartbeat.unref();
   }
-  dispose(): void { for (const listener of this.listeners) listener.dispose(); this.reset(); }
-  reset(): void { for (const state of this.states.values()) { state.closed = true; state.doc.destroy(); } this.states.clear(); }
-  private displayed(notebook: vscode.NotebookDocument, state: State): SharedNotebook {
-    const metadata = notebook.metadata.custom?.metadata ?? notebook.metadata;
-    return { metadata, cells: notebook.getCells().map((cell) => {
-      const id = state.ids.get(cell) ?? cell.metadata.pairNotebookCellId ?? randomUUID(); state.ids.set(cell, id);
-      return { id, cell_type: cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown', source: cell.document.getText(), metadata: cell.metadata.custom?.metadata ?? cell.metadata };
+  dispose(): void { clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose(); this.reset(); }
+  reset(): void {
+    this.stream?.dispose(); this.stream = undefined; this.streamConnection = undefined;
+    if (this.reconnect) clearTimeout(this.reconnect); this.reconnect = undefined;
+    for (const state of [...this.states.values()]) this.closeState(state);
+    this.renderer?.dispose(); this.renderer = undefined; this.presence = []; this.presenceEvents.emit('presence');
+    this.lastPresence = undefined;
+  }
+  private closeState(state: State): void { state.closed = true; state.editor?.dispose(); state.project.destroy(); state.doc.destroy(); this.states.delete(state.notebook); this.schedulePresence(); }
+  private current(state: State): void {
+    if (state.closed || this.connection() !== state.connection) throw new Error('Notebook synchronization connection changed.');
+    if (state.blocked) throw new Error('Offline notebook replica is preserved; reload the notebook after reviewing its conflict.');
+  }
+  private report(error: unknown): void {
+    this.log.appendLine(`[error] Persistent notebook synchronization: ${error instanceof Error ? error.message : 'Operation failed.'}`);
+    if (Date.now() - this.lastWarning > 10_000) { this.lastWarning = Date.now(); void vscode.window.showWarningMessage(`Pair Notebook VPS: ${error instanceof Error ? error.message : 'Synchronization failed.'}`); }
+  }
+  private async conflict(state: State): Promise<void> {
+    if (state.conflictPrompted || state.closed) return; state.conflictPrompted = true; state.blocked = true;
+    await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
+    await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), intents: state.intents,
+      displayed: state.notebook.getCells().map((cell) => ({ id: state.ids.knownId(cell), source: cell.document.getText(), metadata: cell.metadata })) }));
+    const answer = await vscode.window.showWarningMessage('This notebook was replaced or its privacy changed. Local edits were archived. Reload the server version?', 'Preserve replica and reload');
+    if (answer !== 'Preserve replica and reload' || state.closed || this.connection() !== state.connection) return;
+    try { await rename(state.file, `${state.file}.conflict-journal-${randomUUID()}.json`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    this.closeState(state); await this.flush(state.notebook);
+  }
+  private ensureStream(): void {
+    const connection = this.connection(); if (!connection || this.reconnect || this.streamConnection === connection) return;
+    if (this.streamConnection) this.reset(); this.streamConnection = connection;
+    try { this.stream = connection.client.subscribe(connection.sessionId, (event) => { if (this.streamConnection === connection) this.receive(event); }, () => {
+      if (this.streamConnection !== connection) return;
+      this.stream = undefined; this.streamConnection = undefined; this.presence = []; this.presenceEvents.emit('presence');
+      this.reconnect = setTimeout(() => { this.reconnect = undefined; this.ensureStream(); }, 1000); this.reconnect.unref();
+    }); } catch (error) {
+      this.streamConnection = undefined; this.report(error);
+      this.reconnect = setTimeout(() => { this.reconnect = undefined; this.ensureStream(); }, 1000); this.reconnect.unref(); return;
+    }
+    if (!this.renderer) {
+      const source: PresenceSource = { exactCursor: true, descriptor: { workingFolder: '', localPeer: { peerId: connection.memberId } },
+        on: (_event, listener) => this.presenceEvents.on('presence', listener), off: (_event, listener) => this.presenceEvents.off('presence', listener),
+        snapshot: () => ({ awareness: this.presence }), notebookKey: (uri) => uri.scheme === 'pair-vps' && uri.authority === connection.sessionId ? uri.path.slice(1) : undefined,
+        notebookCellId: (cell) => this.states.get(cell.notebook)?.ids.knownId(cell), resolvePresenceLineOffset: (state) => this.presenceOffset(state),
+        resolvePresenceCursor: (presence) => {
+          const state = [...this.states.values()].find((item) => item.key === presence.activeFile); const cellId = presence.activeNotebookCellId ?? '';
+          const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(cellId)?.get('source'); const cursor = text instanceof Y.Text && presence.cursor ? resolveSharedCursorPosition(text, presence.cursor) : undefined;
+          if (!state || !cursor) return undefined;
+          const anchor = this.displayedOffset(state, cellId, cursor.anchor); const active = this.displayedOffset(state, cellId, cursor.active);
+          return anchor !== undefined && active !== undefined ? { anchor, active } : undefined;
+        } };
+      this.renderer = new PresenceRenderer(source);
+    }
+  }
+  private receive(event: PersistentLiveEvent): void {
+    if (event.kind === 'execution') { this.execution(event); return; }
+    if (event.kind === 'presence') { this.presence = event.states; this.presenceEvents.emit('presence'); return; }
+    if (event.kind === 'ready' || event.kind === 'invalidate') {
+      this.invalidate(); for (const state of this.states.values()) void this.flush(state.notebook).catch((error) => this.report(error)); return;
+    }
+    for (const state of this.states.values()) if (state.key === event.path && state.epoch === event.epoch && !state.closed && !state.blocked) {
+      if (event.acknowledgement?.actor === state.actor) state.acknowledgedSequence = Math.max(state.acknowledgedSequence, event.acknowledgement.sequence);
+      Y.applyUpdate(state.doc, Buffer.from(event.update, 'base64')); state.revision = Math.max(state.revision, event.revision); this.applyCanonical(state);
+    }
+  }
+  private presenceOffset(presence: PresenceState): number | undefined {
+    const state = [...this.states.values()].find((item) => item.key === presence.activeFile);
+    const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(presence.activeNotebookCellId ?? '')?.get('source');
+    const offset = resolveRelativeOffset(text instanceof Y.Text ? text : undefined, presence.activeLineAnchor, undefined);
+    return state && offset !== undefined ? this.displayedOffset(state, presence.activeNotebookCellId ?? '', offset) : undefined;
+  }
+  private displayedOffset(state: State, cellId: string, offset: number): number | undefined {
+    const text = state.doc.getMap<Y.Map<unknown>>('cells').get(cellId)?.get('source');
+    const cell = state.notebook.getCells().find((candidate) => state.ids.knownId(candidate) === cellId);
+    if (!(text instanceof Y.Text) || !cell || !state.project.has(state.key)) return undefined;
+    const projected = state.project.notebookCellSnapshot(state.key, cellId)?.source; if (projected === undefined) return undefined;
+    const position = mapTextOffset(text.toString(), projected, offset);
+    return position !== undefined ? mapTextOffset(projected, cell.document.getText(), position) : undefined;
+  }
+  private schedulePresence(): void {
+    if (this.presencePending) return; this.presencePending = true;
+    const timer = setTimeout(() => {
+      this.presencePending = false; if (this.presenceSending) { this.presenceAgain = true; return; } this.presenceSending = true;
+      void this.publishPresence().catch((error) => this.log.appendLine(`[debug] Persistent presence unavailable: ${error instanceof Error ? error.message : 'Disconnected.'}`)).finally(() => {
+        this.presenceSending = false; if (this.presenceAgain) { this.presenceAgain = false; this.schedulePresence(); }
+      });
+    }, 30); timer.unref();
+  }
+  private async publishPresence(): Promise<void> {
+    const connection = this.connection(); if (!connection || !this.stream) return;
+    const editor = vscode.window.activeTextEditor;
+    const state = editor && [...this.states.values()].find((item) => item.notebook.getCells().some((cell) => cell.document === editor.document));
+    const cell = state && editor && state.notebook.getCells().find((item) => item.document === editor.document);
+    let fields: Record<string, unknown> = {};
+    if (state && cell && state.editor && state.epoch && !state.blocked) {
+      const cellId = state.ids.knownId(cell); const offset = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(new vscode.Position(editor!.selection.active.line, 0)));
+      const text = state.doc.getMap<Y.Map<unknown>>('cells').get(cellId ?? '')?.get('source');
+      if (text instanceof Y.Text && offset !== undefined) {
+        const projected = state.project.cellSource(state.key, cellId!).toString(); const confirmed = text.toString();
+        const anchor = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(editor!.selection.anchor));
+        const active = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(editor!.selection.active));
+        const linePosition = mapTextOffset(projected, confirmed, offset); const anchorPosition = anchor !== undefined ? mapTextOffset(projected, confirmed, anchor) : undefined; const activePosition = active !== undefined ? mapTextOffset(projected, confirmed, active) : undefined;
+        if (linePosition !== undefined) fields = { path: state.key, epoch: state.epoch, cellId, activeLineAnchor: encodeRelativeOffset(text, linePosition), ...(anchorPosition !== undefined && activePosition !== undefined ? { cursor: createSharedCursorPosition(text, anchorPosition, activePosition) } : {}) };
+        else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
+      }
+      else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
+    }
+    if (this.lastPresence && JSON.stringify(fields) === JSON.stringify(this.lastPresence) && Date.now() - this.lastPresenceAt < 750) return;
+    const reply = await connection.client.call<{ states: PersistentPresence[] }>('presence', { sessionId: connection.sessionId, ...fields });
+    if (this.connection() === connection) { this.lastPresence = fields; this.lastPresenceAt = Date.now(); this.presence = reply.states; this.presenceEvents.emit('presence'); }
+  }
+  private async journal(state: State): Promise<void> {
+    const write = (state.journalTail ?? Promise.resolve()).catch(() => undefined).then(async () => {
+      await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 }); this.current(state);
+      await atomicWriteFile(state.file, JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), actor: state.actor, sequence: state.sequence, intents: state.intents, ...(state.structural ? { snapshot: this.outbound(state) } : {}) }));
+    });
+    state.journalTail = write; return write;
+  }
+  private async initialize(state: State): Promise<void> {
+    let saved: { epoch: string; update: string; actor?: string; sequence?: number; intents?: Intent[]; snapshot?: SharedNotebook } | undefined;
+    try { saved = JSON.parse(await readFile(state.file, 'utf8')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    this.current(state);
+    if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
+    const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
+    state.acknowledgedSequence = reply.acknowledgedSequence ?? 0;
+    Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.epoch = reply.epoch; state.revision = reply.revision; state.identity = reply.identity;
+    const vector = Y.encodeStateVector(state.doc);
+    if (saved) {
+      if (saved.epoch !== reply.epoch) { await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify(saved)); state.blocked = true; throw new PersistentHttpError(409); }
+      Y.applyUpdate(state.doc, Buffer.from(saved.update, 'base64'));
+    }
+    let shared = sharedNotebook(state.doc);
+    await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
+    if (hasLegacyNotebookMetadata(shared.metadata)) await atomicWriteFile(`${state.file}.legacy-metadata-${randomUUID()}.json`, JSON.stringify(saved ?? { epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64') }));
+    shared = { ...shared, metadata: notebookUserMetadata(shared.metadata), cells: shared.cells.map((cell) => ({ ...cell, metadata: cellUserMetadata(cell.metadata, typeof cell.metadata.id === 'string' && !!cell.metadata.metadata) })) };
+    editSharedNotebook(state.doc, shared);
+    const cleaned = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64') }); this.current(state);
+    Y.applyUpdate(state.doc, Buffer.from(cleaned.update, 'base64')); state.revision = cleaned.revision; state.identity = cleaned.identity;
+    state.acknowledgedSequence = Math.max(state.acknowledgedSequence, cleaned.acknowledgedSequence ?? 0);
+    await this.readSavedCells(state); state.project.ensureNotebook(state.key, this.projectedSnapshot(state));
+    if (saved?.snapshot) { state.project.reconcileNotebook(state.key, { metadata: normalizeNotebookMetadata(saved.snapshot.metadata), cells: saved.snapshot.cells.map((cell) => ({ id: cell.id, source: cell.source, kind: cell.cell_type === 'code' ? 2 : 1, language: cell.cell_type === 'code' ? 'python' : 'markdown', metadata: cell.metadata, outputs: [] })) }, REMOTE_ORIGIN); state.structural = 1; }
+    state.notebook.getCells().forEach((cell) => { const id = typeof cell.metadata.id === 'string' ? cell.metadata.id : cell.metadata.pairNotebookCellId; if (id) state.ids.seed(cell, undefined, id); });
+    state.project.on('update', (event) => { if (event.origin !== REMOTE_ORIGIN && event.scope?.type !== 'cellText' && event.scope?.type !== 'cellState') { state.structural++; void this.send(state).catch((error) => this.report(error)); } });
+    const renderer = this.cellStateRenderer && { ...this.cellStateRenderer,
+      // Live runs use the controller's observer; fields read from disk are completed snapshots.
+      renderRemoteCellState: (cell: vscode.NotebookCell, request: Parameters<NotebookCellStateRenderer['renderRemoteCellState']>[1]) => this.cellStateRenderer!.renderRemoteCellState(cell, { ...request, executionMode: 'snapshot' as const }) };
+    state.editor = new EditorSynchronizer(state.project, '', this.log, state.ids, renderer,
+      (request) => this.stage(state, request),
+      (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined);
+    await state.editor.whenNotebookReady(state.notebook); state.initial.clear(); await this.journal(state); this.schedulePresence();
+  }
+  private projectSnapshot(state: State): NotebookSnapshot {
+    const shared = sharedNotebook(state.doc);
+    return { metadata: normalizeNotebookMetadata(notebookUserMetadata(shared.metadata)), cells: shared.cells.map((cell) => {
+      const previous = state.project.has(state.key) ? state.project.notebookCellSnapshot(state.key, cell.id) : undefined;
+      const local = state.notebook.getCells().find((candidate) => candidate.metadata.id === cell.id || candidate.metadata.pairNotebookCellId === cell.id);
+      const saved = state.savedCells?.get(cell.id); const managing = !!local && this.cellStateRenderer?.isManagingCellState?.(local);
+      const outputs = saved && !managing && saved.source === cell.source ? saved.outputs : previous?.outputs ?? local?.outputs.map((output) => ({ metadata: output.metadata, items: output.items.map((item) => ({ mime: item.mime, dataBase64: Buffer.from(item.data).toString('base64') })) })) ?? [];
+      const execution = managing || (saved && saved.source !== cell.source) || (previous?.execution?.executionOrder === saved?.execution?.executionOrder && JSON.stringify(previous?.outputs) === JSON.stringify(outputs)) ? previous?.execution : saved?.source === cell.source ? saved.execution : undefined;
+      return { id: cell.id, kind: cell.cell_type === 'code' ? 2 : 1, language: cell.cell_type === 'code' ? 'python' : 'markdown', source: cell.source, metadata: cell.metadata,
+        outputs, execution };
     }) };
   }
-  async flush(notebook: vscode.NotebookDocument, capture = false): Promise<NotebookSyncReply | undefined> {
-    const connection = this.connection();
-    if (!connection || notebook.uri.scheme !== 'pair-vps' || notebook.uri.authority !== connection.sessionId) return undefined;
-    let state = this.states.get(notebook);
-    if (!state) {
-      state = { doc: new Y.Doc(), epoch: '', ids: new WeakMap(), file: path.join(this.context.globalStorageUri.fsPath, 'persistent-replicas', createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId, notebook.uri.path])).digest('hex') + '.json'), pending: Promise.resolve(), applying: false, revision: 0, closed: false, blocked: false, initialCells: notebook.getCells(), initialSources: notebook.getCells().map((cell) => cell.document.getText()) };
-      this.states.set(notebook, state);
+  private async readSavedCells(state: State): Promise<void> {
+    const file = await state.connection.client.call<{ content: string }>('read', { sessionId: state.connection.sessionId, path: state.key }); this.current(state);
+    if (typeof file.content === 'string') state.savedCells = new Map(parseIpynb(Buffer.from(file.content, 'base64').toString('utf8')).cells.map((cell) => [cell.id, cell]));
+  }
+  private applyCanonical(state: State): void {
+    if (!state.editor) return; const next = this.projectedSnapshot(state); const previous = state.project.notebookSnapshot(state.key);
+    if (!state.structural && (previous.cells.length !== next.cells.length || previous.cells.some((cell, index) => cell.id !== next.cells[index]?.id || cell.kind !== next.cells[index]?.kind))) { state.project.reconcileNotebook(state.key, next, REMOTE_ORIGIN); return; }
+    this.applyCells(state, next, previous);
+  }
+  private projectedSnapshot(state: State): NotebookSnapshot {
+    const next = this.projectSnapshot(state);
+    // Keep newer local input visible while projecting an earlier server commit.
+    for (const intent of state.intents) if (intent.sequence > state.acknowledgedSequence) {
+      const cell = next.cells.find((item) => item.id === intent.cellId);
+      if (cell) cell.source = applyChanges(cell.source, rebaseTextChanges(intent.baseline, cell.source, intent.changes));
     }
-    const original = state;
-    if (original.blocked) throw new Error('Notebook sync conflict is awaiting an explicit reload; offline edits remain preserved.');
-    const captured = capture && !!original.epoch;
-    if (captured) editSharedNotebook(original.doc, this.displayed(notebook, original));
-    else if (capture) { original.pendingSnapshot = this.displayed(notebook, original); original.pendingCells = notebook.getCells(); }
-    const current = (allowConflict = false): void => { if (this.connection() !== connection || original.closed || this.states.get(notebook) !== original) throw new Error('Notebook synchronization connection changed.'); if (original.blocked && !allowConflict) throw new Error('Notebook sync conflict is awaiting an explicit reload.'); };
-    const work = original.pending.catch(() => undefined).then(async () => {
-      current();
-      if (!original.epoch) {
+    return next;
+  }
+  private applyCells(state: State, next: NotebookSnapshot, previous: NotebookSnapshot): void {
+    for (const cell of next.cells) {
+      if (!state.project.hasNotebookCell(state.key, cell.id)) continue;
+      const text = state.project.cellSource(state.key, cell.id).toString();
+      if (text !== cell.source) {
+        let start = 0; let end = 0; while (start < Math.min(text.length, cell.source.length) && text[start] === cell.source[start]) start++;
+        while (end < Math.min(text.length, cell.source.length) - start && text[text.length - end - 1] === cell.source[cell.source.length - end - 1]) end++;
+        state.project.applyCellTextChanges(state.key, cell.id, [{ offset: start, deleteCount: text.length - start - end, insertText: cell.source.slice(start, cell.source.length - end) }], REMOTE_ORIGIN);
+      }
+      if (!state.structural && JSON.stringify(state.project.notebookCellSnapshot(state.key, cell.id)?.metadata) !== JSON.stringify(cell.metadata)) state.project.setCellMetadata(state.key, cell.id, cell.metadata, REMOTE_ORIGIN);
+      const current = state.project.notebookCellSnapshot(state.key, cell.id);
+      if (JSON.stringify(current?.outputs) !== JSON.stringify(cell.outputs)) state.project.setCellOutputs(state.key, cell.id, cell.outputs, REMOTE_ORIGIN);
+      if (JSON.stringify(current?.execution) !== JSON.stringify(cell.execution)) state.project.setCellExecution(state.key, cell.id, cell.execution, REMOTE_ORIGIN);
+    }
+    if (!state.structural && JSON.stringify(previous.metadata) !== JSON.stringify(next.metadata)) state.project.setNotebookMetadata(state.key, next.metadata, REMOTE_ORIGIN);
+  }
+  private outbound(state: State): SharedNotebook {
+    const next = state.project.notebookSnapshot(state.key); const metadata = notebookUserMetadata(next.metadata); delete metadata.pairNotebookNbformat;
+    return { metadata, cells: next.cells.map((cell) => ({ id: cell.id, source: cell.source, cell_type: cell.kind === 2 ? 'code' : 'markdown', metadata: cell.metadata })) };
+  }
+  private stage(state: State, request: EditorTextIntentRequest): boolean {
+    this.current(state); if (!request.cellId) return false;
+    const baseline = request.baseline; let changes = [...request.changes]; const initial = state.initial.get(request.cellId);
+    if (initial !== undefined && baseline !== initial) {
+      let start = 0; let end = 0; while (start < Math.min(initial.length, request.result.length) && initial[start] === request.result[start]) start++;
+      while (end < Math.min(initial.length, request.result.length) - start && initial[initial.length - end - 1] === request.result[request.result.length - end - 1]) end++;
+      changes = rebaseInitialTextChanges(initial, baseline, [{ offset: start, deleteCount: initial.length - start - end, insertText: request.result.slice(start, request.result.length - end) }]);
+    }
+    state.initial.delete(request.cellId);
+    if (!changes.some((change) => change.deleteCount || change.insertText)) return true;
+    const tail = state.intents.at(-1);
+    const merged = tail && tail !== state.activeIntent && tail.cellId === request.cellId && applyChanges(tail.baseline, tail.changes) === baseline ? changesBetween(tail.baseline, request.result) : undefined;
+    if (tail && merged) state.intents[state.intents.length - 1] = { ...tail, changes: merged };
+    else state.intents.push({ actor: state.actor, sequence: ++state.sequence, cellId: request.cellId, baseline, changes });
+    void this.send(state).catch((error) => this.report(error)); return true;
+  }
+  private send(state: State): Promise<void> {
+    if (state.sending) return state.sending;
+    const work = Promise.resolve().then(async () => {
+      await state.ready; this.current(state);
+      while (state.intents.length || state.structural) {
+        if (state.intents[0]) state.activeIntent = state.intents[0]; else delete state.activeIntent;
+        await this.journal(state); this.current(state);
+        const intent = state.activeIntent; let snapshot: SharedNotebook | undefined;
+        const structuralVersion = state.structural;
+        if (!intent) snapshot = this.outbound(state);
         try {
-          const saved = JSON.parse(await readFile(original.file, 'utf8')) as { epoch: string; update: string };
-          current(); Y.applyUpdate(original.doc, Buffer.from(saved.update, 'base64')); original.epoch = saved.epoch;
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-        const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: notebook.uri.path.slice(1), ...(original.epoch ? { epoch: original.epoch } : {}) });
-        current(); Y.applyUpdate(original.doc, Buffer.from(reply.update, 'base64')); original.epoch = reply.epoch;
-        if (original.pendingSnapshot && (reply.cells.length !== original.initialSources.length || reply.cells.some((cell, index) => cell.source !== original.initialSources[index]))) {
-          await mkdir(path.dirname(original.file), { recursive: true, mode: 0o700 }); current();
-          await atomicWriteFile(`${original.file}.initial-conflict-${randomUUID()}.json`, JSON.stringify(original.pendingSnapshot));
-          throw new PersistentHttpError(409);
-        }
-        original.initialCells.forEach((cell, index) => { const id = reply.cells[index]?.id; if (id) original.ids.set(cell, id); });
-        if (original.pendingSnapshot) {
-          const pending = original.pendingSnapshot;
-          pending.cells.forEach((cell, index) => { const document = original.pendingCells?.[index]; if (document) cell.id = original.ids.get(document) ?? cell.id; });
-          editSharedNotebook(original.doc, pending); delete original.pendingSnapshot; delete original.pendingCells;
+          const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64'), ...(intent ? { intent } : { snapshot, snapshotStateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') }) }); this.current(state);
+          Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity;
+          if (intent) { state.acknowledgedSequence = Math.max(state.acknowledgedSequence, intent.sequence); state.intents.shift(); } else if (state.structural === structuralVersion) state.structural = 0;
+          this.applyCanonical(state); this.schedulePresence(); await this.journal(state);
+        } catch (error) {
+          if (error instanceof PersistentHttpError && error.status === 409) { await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify({ epoch: state.epoch, intents: state.intents, snapshot })); state.blocked = true; void this.conflict(state).catch((failure) => this.report(failure)); }
+          throw error;
         }
       }
-      if (capture && !captured) editSharedNotebook(original.doc, this.displayed(notebook, original));
-      await mkdir(path.dirname(original.file), { recursive: true, mode: 0o700 }); current();
-      await atomicWriteFile(original.file, JSON.stringify({ epoch: original.epoch, update: Buffer.from(Y.encodeStateAsUpdate(original.doc)).toString('base64') }));
-      current();
-      const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: notebook.uri.path.slice(1), epoch: original.epoch,
-        update: Buffer.from(Y.encodeStateAsUpdate(original.doc)).toString('base64'), stateVector: Buffer.from(Y.encodeStateVector(original.doc)).toString('base64') });
-      current(); Y.applyUpdate(original.doc, Buffer.from(reply.update, 'base64')); original.revision = reply.revision;
-      await atomicWriteFile(original.file, JSON.stringify({ epoch: original.epoch, update: Buffer.from(Y.encodeStateAsUpdate(original.doc)).toString('base64') })); current();
-      const merged = sharedNotebook(original.doc); const cells = notebook.getCells(); const edit = new vscode.WorkspaceEdit(); const notebookEdits: vscode.NotebookEdit[] = [];
-      original.applying = true;
-      try {
-        const sameOrder = cells.length === merged.cells.length && cells.every((cell, index) => original.ids.get(cell) === merged.cells[index]?.id);
-        if (sameOrder) {
-          cells.forEach((cell, index) => { const shared = merged.cells[index]!;
-            if (JSON.stringify(cell.metadata.custom?.metadata ?? cell.metadata) !== JSON.stringify(shared.metadata)) notebookEdits.push(vscode.NotebookEdit.updateCellMetadata(index, { custom: { metadata: shared.metadata }, pairNotebookCellId: shared.id }));
-            const source = shared.source; if (source !== cell.document.getText()) edit.replace(cell.document.uri, new vscode.Range(cell.document.positionAt(0), cell.document.positionAt(cell.document.getText().length)), source); });
-        } else {
-          const data = merged.cells.map((cell) => { const value = new vscode.NotebookCellData(cell.cell_type === 'code' ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup, cell.source, cell.cell_type === 'code' ? 'python' : 'markdown'); value.metadata = { custom: { metadata: cell.metadata }, pairNotebookCellId: cell.id }; return value; });
-          notebookEdits.push(vscode.NotebookEdit.replaceCells(new vscode.NotebookRange(0, notebook.cellCount), data));
-        }
-        if (notebookEdits.length) edit.set(notebook.uri, notebookEdits);
-        current(); if (edit.size && !await vscode.workspace.applyEdit(edit)) throw new Error('Could not apply shared notebook edits.'); current();
-        notebook.getCells().forEach((cell, index) => { const id = merged.cells[index]?.id; if (id) original.ids.set(cell, id); });
-      } finally { original.applying = false; }
-      return { ...reply, ...merged };
     });
-    const protectedWork = work.catch(async (error: unknown) => {
-      current(true);
-      if (error instanceof PersistentHttpError && error.status === 409) {
-        original.blocked = true;
-        const answer = await vscode.window.showWarningMessage('This notebook was replaced or its privacy changed. Keep the offline replica separately and reload the server version?', 'Preserve replica and reload');
-        current(true);
-        if (answer === 'Preserve replica and reload') {
-          const archive = `${original.file}.conflict-${randomUUID()}.json`;
-          try { await rename(original.file, archive); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; await atomicWriteFile(archive, JSON.stringify({ epoch: original.epoch, update: Buffer.from(Y.encodeStateAsUpdate(original.doc)).toString('base64'), pending: original.pendingSnapshot })); }
-          current(true);
-          original.closed = true; original.doc.destroy(); this.states.delete(notebook);
-          await vscode.window.showInformationMessage('Offline notebook edits were preserved in the local replica archive. The next sync reloads the server version.');
-        }
-      }
-      throw error;
-    });
-    original.pending = protectedWork; return protectedWork;
+    state.sending = work.finally(() => { delete state.sending; delete state.activeIntent; this.schedulePresence(); }); return state.sending;
+  }
+  async flush(notebook: vscode.NotebookDocument, capture = false): Promise<NotebookSyncReply | undefined> {
+    return this.synchronize(notebook, capture, true);
+  }
+  async prepareExecution(notebook: vscode.NotebookDocument): Promise<NotebookSyncReply | undefined> {
+    // Admission validates identity, cell ID, source hash and generation on the server.
+    return this.synchronize(notebook, true, false);
+  }
+  private async synchronize(notebook: vscode.NotebookDocument, capture: boolean, refresh: boolean): Promise<NotebookSyncReply | undefined> {
+    if (capture && notebook.isClosed) throw new Error('Cannot save a closed notebook.');
+    const connection = this.connection(); if (!connection || notebook.uri.scheme !== 'pair-vps' || notebook.uri.authority !== connection.sessionId) return undefined;
+    this.ensureStream(); let state = this.states.get(notebook);
+    if (!state) {
+      state = { connection, notebook, key: notebook.uri.path.slice(1), file: path.join(this.context.globalStorageUri.fsPath, 'persistent-replicas', createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId, notebook.uri.path])).digest('hex') + '.json'),
+        doc: new Y.Doc(), project: new CollaborativeProject(), ids: new StableCellIdRegistry(), epoch: '', revision: 0, actor: randomUUID(), sequence: 0, acknowledgedSequence: 0, intents: [], ready: Promise.resolve(), structural: 0, closed: false, blocked: false,
+        initial: new Map(notebook.getCells().map((cell) => [cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell.document.getText()])) };
+      this.states.set(notebook, state); state.ready = this.initialize(state);
+    }
+    try { await state.ready; this.current(state); if (capture) await state.editor?.prepareWorkingCopy(false); await this.send(state); }
+    catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
+    if (!refresh) return { epoch: state.epoch, revision: state.revision, ...(state.identity ? { identity: state.identity } : {}), update: '', ...sharedNotebook(state.doc) };
+    try {
+      const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') });
+      this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity; state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state);
+      await state.editor?.prepareWorkingCopy(false); await this.journal(state);
+      return { ...reply, revision: state.revision, ...sharedNotebook(state.doc) };
+    } catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
   }
 }

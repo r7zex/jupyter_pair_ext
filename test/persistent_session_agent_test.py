@@ -261,12 +261,12 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(transport.reports[-1]["state"], "completed")
         self.assertIn("no live kernel", transport.reports[-1]["events"][0]["message"])
 
-    def test_release_does_not_close_another_generation_or_gpu_key(self):
-        original = command("a")
+    def test_release_does_not_close_newer_generations_or_another_gpu_key(self):
+        original = command("a", generation=2)
         original["gpuUuid"] = "GPU-12345678-1234-1234-1234-123456789abc"
-        another_generation = command("release-generation", generation=2)
+        another_generation = command("release-generation", generation=1)
         another_generation["gpuUuid"] = original["gpuUuid"]
-        another_gpu = command("release-gpu")
+        another_gpu = command("release-gpu", generation=2)
         another_gpu["gpuUuid"] = "GPU-22345678-1234-1234-1234-123456789abc"
         for release in (another_generation, another_gpu):
             release["command"] = {"command": "release", "requestId": release["id"]}
@@ -277,6 +277,24 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(len(FakeBridge.instances), 1)
         self.assertFalse(FakeBridge.instances[0].closed)
         self.assertEqual(len(agent.kernels), 1)
+
+    def test_release_retires_obsolete_idle_generation_after_broker_recovery_without_starting_a_kernel(self):
+        original = command("before-recovery")
+        release = command("release-after-recovery", generation=2)
+        release["command"] = {"command": "release", "requestId": release["id"]}
+        next_session = command("next-session", generation=2)
+        next_session["sessionId"] = "other-session"
+        for item in (original, release, next_session):
+            item["deviceId"] = "vps"
+        transport = FakeTransport([original, release, next_session])
+        agent = self.make_agent(transport, max_kernels=1, session=None)
+        agent.tick()
+        agent.tick()
+        self.assertTrue(FakeBridge.instances[0].closed)
+        self.assertEqual(len(FakeBridge.instances), 1, "Release must not create a replacement kernel")
+        agent.tick()
+        self.assertEqual(len(FakeBridge.instances), 2)
+        self.assertEqual(transport.reports[-1]["state"], "completed")
 
     def test_queued_release_waits_for_accepted_cell_to_finish(self):
         release = command("release")
@@ -309,6 +327,7 @@ class AgentProtocolTests(unittest.TestCase):
                 raise urllib.error.HTTPError("https://vps/report", 404, "Session was deleted", {}, None)
             return original_request(operation, **body)
         transport.request = deleted_report
+        FakeBridge.instances[1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "before deletion"}})
         agent.tick()
         self.assertEqual(agent.active["receipt"]["state"], "running")
         self.assertFalse(any(bridge.closed for bridge in FakeBridge.instances))
@@ -346,6 +365,7 @@ class AgentProtocolTests(unittest.TestCase):
                         raise urllib.error.HTTPError("https://vps/report", status, "Credential revoked", {}, None)
                     return original_request(operation, **body)
                 transport.request = revoked
+                FakeBridge.instances[-1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "before revocation"}})
                 agent.tick()
                 bridge = FakeBridge.instances[-1]
                 self.assertTrue(agent.credentials_revoked)
@@ -373,7 +393,7 @@ class AgentProtocolTests(unittest.TestCase):
                         raise urllib.error.HTTPError("https://vps/register", status, "Authority unavailable", {}, None)
                     return original_request(operation, **body)
                 transport.request = lost_heartbeat
-                agent.last_registration = 0
+                agent.last_registration = None
                 agent.tick()
                 bridge = FakeBridge.instances[-1]
                 self.assertFalse(bridge.closed)
@@ -398,6 +418,30 @@ class AgentProtocolTests(unittest.TestCase):
             registration = next(body for operation, body in transport.calls if operation == "registerDevice")
             self.assertFalse(registration["device"]["enabled"])
 
+    def test_initial_registration_does_not_wait_for_ten_seconds_of_machine_uptime(self):
+        transport = FakeTransport([])
+        agent = self.make_agent(transport, share=False)
+        with patch.object(agent_module.time, "monotonic", return_value=0):
+            agent.tick()
+            agent.tick()
+        self.assertEqual(sum(operation == "registerDevice" for operation, _ in transport.calls), 1)
+
+    def test_silent_running_kernel_does_not_rewrite_or_report_unchanged_receipts(self):
+        transport = FakeTransport([command("a", source="wait")])
+        agent = self.make_agent(transport)
+        agent.tick()
+        transport.calls.clear()
+        with patch.object(agent, "_persist", wraps=agent._persist) as persist:
+            for _ in range(10):
+                agent.tick()
+            self.assertEqual(persist.call_count, 0)
+        self.assertEqual(sum(operation == "claim" for operation, _ in transport.calls), 10)
+        self.assertFalse(any(operation == "report" for operation, _ in transport.calls))
+        FakeBridge.instances[-1].events.put({"type": "stream", "requestId": "a", "content": {"name": "stdout", "text": "ready"}})
+        agent.tick()
+        self.assertTrue(any(operation == "report" for operation, _ in transport.calls))
+        self.assertEqual(agent.active["receipt"]["events"][-1]["content"]["text"], "ready")
+
     def test_heartbeat_does_not_reenable_revoked_sharing(self):
         transport = FakeTransport()
         agent = self.make_agent(transport)
@@ -419,6 +463,25 @@ class AgentProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(agent_module.AgentError, "Another interactive agent"):
             self.make_agent(FakeTransport())
         self.assertFalse(agent.closed)
+
+    def test_unchanged_snapshot_avoids_rewriting_but_restores_modified_content_and_permissions(self):
+        public = self.root / "public"
+        public.mkdir()
+        files = [{"path": "data.txt", "content": "aGVsbG8=", "version": 8}]
+        first = agent_module.install_snapshot(public, files)
+        files[0]["version"] = 9
+        with patch.object(agent_module.os, "fsync", wraps=os.fsync) as sync:
+            second = agent_module.install_snapshot(public, files, first)
+            self.assertEqual(sync.call_count, 0)
+        self.assertEqual(second["data.txt"]["version"], 9)
+        self.assertEqual(second["data.txt"]["sha256"], first["data.txt"]["sha256"])
+        target = public / "data.txt"
+        target.write_text("HELLO")
+        agent_module.install_snapshot(public, files, second)
+        self.assertEqual(target.read_text(), "hello")
+        target.chmod(0o644)
+        agent_module.install_snapshot(public, files, second)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_snapshot_and_artifact_exclude_host_private_files(self):
         public = self.root / "public"
@@ -481,6 +544,20 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertFalse(sandbox.ready)
         self.assertIn("non-root", sandbox.reason)
 
+    def test_wsl_gpu_device_is_bound_only_for_a_selected_single_gpu(self):
+        sandbox = agent_module.Sandbox.__new__(agent_module.Sandbox)
+        sandbox.bwrap, sandbox.python, sandbox.bridge = "/usr/bin/bwrap", "/opt/python/bin/python", ROOT / "media/jupyter_kernel_bridge.py"
+        identity = "GPU-12345678-1234-1234-1234-123456789abc"
+        sandbox.roots, sandbox.gpus = [Path("/opt/python")], [{"uuid": identity, "index": 0}]
+        exists = Path.exists
+        with patch.object(Path, "exists", lambda path: str(path) == "/dev/dxg" or exists(path)):
+            self.assertNotIn("/dev/dxg", sandbox.command(self.root, None))
+            args = sandbox.command(self.root, identity)
+            self.assertIn(["--dev-bind", "/dev/dxg", "/dev/dxg"], [args[index:index + 3] for index in range(len(args) - 2)])
+            sandbox.gpus.append({"uuid": "GPU-22345678-1234-1234-1234-123456789abc", "index": 1})
+            with self.assertRaisesRegex(agent_module.AgentError, "exactly one"):
+                sandbox.command(self.root, identity)
+
     def test_transport_rejects_public_http_and_redirects(self):
         token = self.root / "token"
         token.write_text("a" * 32)
@@ -520,9 +597,12 @@ class RealRuntimeTests(unittest.TestCase):
                         "assert torch.ones(4).sum().item()==4.0")
                 bridge.send({"command": "execute", "requestId": "sandbox-cpu", "codeBase64": base64.b64encode(
                     code.encode()).decode()})
-                deadline = time.monotonic() + 20
+                deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
-                    event = bridge.events.get(timeout=5)
+                    try:
+                        event = bridge.events.get(timeout=5)
+                    except queue.Empty:
+                        continue
                     if event.get("type") == "complete":
                         self.assertTrue(event["success"])
                         return

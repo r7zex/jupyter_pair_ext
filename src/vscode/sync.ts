@@ -27,6 +27,7 @@ import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../core/types';
 import { OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import { EditorTextReplica } from './editorTextReplica';
 import { rebaseInitialTextChanges } from './initialTextChanges';
+import { cellUserMetadata, nativeNotebookMetadata, notebookUserMetadata, renderedNotebookMetadata, renderedCellMetadata } from './persistentNotebookMetadata';
 
 const NOTEBOOK_CELL_STATE_COALESCE_MS = OUTPUT_STATE_CADENCE_MS;
 const NOTEBOOK_CELL_STATE_RENDER_TIMEOUT_MS = 5_000;
@@ -101,10 +102,11 @@ export class EditorSynchronizer implements vscode.Disposable {
   public constructor(
     private readonly project: CollaborativeProject,
     private readonly root: string,
-    private readonly log: vscode.OutputChannel,
+    private readonly log: Pick<vscode.OutputChannel, 'appendLine'>,
     private readonly cellIds = new StableCellIdRegistry<vscode.NotebookCell>(),
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
     private readonly textIntentPublisher?: EditorTextIntentPublisher,
+    private readonly uriKey?: (uri: vscode.Uri) => string | undefined,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
@@ -193,7 +195,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   /** Materializes every open document before local execution needs a physical filesystem snapshot. */
-  public async prepareWorkingCopy(): Promise<void> {
+  public async prepareWorkingCopy(forceSave = true): Promise<void> {
     if (this.disposed) return;
     const keys = new Set<string>();
     for (const notebook of vscode.workspace.notebookDocuments) {
@@ -205,7 +207,7 @@ export class EditorSynchronizer implements vscode.Disposable {
       const key = this.keyForUri(document.uri);
       if (key) keys.add(key);
     }
-    for (const key of keys) await this.persistOpenWorkingCopy(key, true);
+    for (const key of keys) await this.persistOpenWorkingCopy(key, forceSave);
   }
 
   private async persistOpenWorkingCopy(relativePath: string, forceSave: boolean): Promise<boolean> {
@@ -473,7 +475,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const targetCanonical = canonicalJsonObject(target.metadata);
     if (sameJson(currentCanonical, targetCanonical)
       && metadataCellId(located.cell.metadata) === cellId) return;
-    const metadata = { ...targetCanonical, pairNotebookCellId: cellId };
+    const metadata = { ...renderedCellMetadata(located.cell.metadata, { id: cellId, metadata: targetCanonical, source: target.source, cell_type: target.kind === 2 ? 'code' : 'markdown' }, nativeNotebookMetadata(notebook.metadata)), pairNotebookCellId: cellId };
     const uri = notebook.uri.toString();
     this.applyingNotebooks.add(uri);
     try {
@@ -1364,7 +1366,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         // minimal structural splice computed from stable logical cell IDs.
         edit.set(notebook.uri, [vscode.NotebookEdit.replaceCells(
           new vscode.NotebookRange(splice.start, splice.start + splice.deleteCount),
-          splice.cells.map(toNotebookCellData),
+          splice.cells.map((cell) => { const value = toNotebookCellData(cell); if (nativeNotebookMetadata(notebook.metadata)) value.metadata = { id: cell.id, metadata: cell.metadata, pairNotebookCellId: cell.id }; return value; }),
         )]);
         if (!await vscode.workspace.applyEdit(edit)) throw new Error('VS Code rejected remote notebook structure.');
         if (this.disposed || notebook.isClosed) return;
@@ -1385,7 +1387,7 @@ export class EditorSynchronizer implements vscode.Disposable {
         const located = this.findNotebookCellByStableId(notebook, target.id);
         if (!located) continue;
         const current = located.cell;
-        const desiredMetadata = { ...canonicalJsonObject(target.metadata), pairNotebookCellId: target.id };
+        const desiredMetadata = { ...renderedCellMetadata(current.metadata, { id: target.id, metadata: canonicalJsonObject(target.metadata), source: target.source, cell_type: target.kind === 2 ? 'code' : 'markdown' }, nativeNotebookMetadata(notebook.metadata)), pairNotebookCellId: target.id };
         const outputsChanged = !sameJson(outputsFromCell(current), target.outputs);
         const executionChanged = !sameJson(
       executionFromCell(current),
@@ -1504,6 +1506,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private keyForUri(uri: vscode.Uri): string | undefined {
+    if (this.uriKey) return this.uriKey(uri);
     if (uri.scheme !== 'file') return undefined;
     const relative = path.relative(this.root, uri.fsPath);
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
@@ -1525,6 +1528,7 @@ function toVscodeNotebookMetadata(
   const metadata = { ...normalized };
   delete metadata.pairNotebookNbformat;
   const currentRecord = asRecord(current);
+  if (nativeNotebookMetadata(currentRecord)) return renderedNotebookMetadata(currentRecord, notebookUserMetadata(metadata));
   const currentCustom = asRecord(currentRecord.custom);
   const usesJupyterWrapper = 'custom' in currentRecord
     || Array.isArray(currentRecord.cells)
@@ -1623,7 +1627,7 @@ function minimalEdit(current: string, target: string): TextChange {
 }
 
 function stripCollaborationMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
-  const copy = { ...metadata };
+  const copy = { ...cellUserMetadata(metadata, typeof metadata.id === 'string' && !!metadata.metadata) };
   delete copy.pairNotebookCellId;
   return copy;
 }
@@ -1653,6 +1657,7 @@ function editorVisibleExecution(
 ): CellExecutionSnapshot | undefined {
   if (!execution) return undefined;
   const { executionOrder, success, timing } = execution;
+  if (executionOrder === undefined && success === undefined && !timing) return undefined;
   return {
     ...(executionOrder !== undefined ? { executionOrder } : {}),
     ...(success !== undefined ? { success } : {}),
@@ -1662,7 +1667,7 @@ function editorVisibleExecution(
 
 function executionFromCell(cell: vscode.NotebookCell): CellExecutionSnapshot | undefined {
   const summary = cell.executionSummary;
-  if (!summary) return undefined;
+  if (!summary || (summary.executionOrder === undefined && summary.success === undefined && !summary.timing)) return undefined;
   return {
     executionOrder: summary.executionOrder,
     success: summary.success,

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { renderNotebookCellState } from './notebookCellStateRenderer';
 import { CellExecutionSnapshot } from '../core/crdt';
 import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import { PerNotebookExecutionQueue } from '../core/executionQueue';
@@ -186,41 +187,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       // same execution identity and must not be applied a second time.
       return;
     }
-    let state = this.mirroredExecutions.get(cell);
-    if (!state) {
-      state = {
-        execution: this.controller.createNotebookCellExecution(cell),
-        started: false,
-      };
-      this.mirroredExecutions.set(cell, state);
-    }
-
-    if (request.executionChanged) {
-      state.execution.executionOrder = target?.executionOrder;
-    } else if (target?.executionOrder !== undefined) {
-      state.execution.executionOrder = target.executionOrder;
-    }
-
-    if (target && !state.started) {
-      state.execution.start(target.timing?.startTime);
-      state.started = true;
-    }
-
-    if (request.outputsChanged) {
-      await state.execution.replaceOutput(request.outputs);
-    }
-
-    const liveRunning = request.executionMode === 'live'
-      && target !== undefined
-      && target.success === undefined;
-    if (liveRunning) return;
-
-    if (!state.started) {
-      state.execution.start(target?.timing?.startTime);
-      state.started = true;
-    }
-    state.execution.end(target?.success, target?.timing?.endTime);
-    this.mirroredExecutions.delete(cell);
+    await renderNotebookCellState(this.controller, this.mirroredExecutions, cell, request);
   }
 
   private finishMirroredExecutions(): void {

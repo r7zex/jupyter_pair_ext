@@ -1,43 +1,18 @@
 # Changelog
 
 
-## 0.6.3 — persistent session completion work
+## 0.6.3 - 2026-10-14 (persistent VPS notebooks)
 
-- Durable Yjs notebook updates with stable IDs, order/source/metadata, local replica journals, epoch fencing and acknowledged execution identity.
-- Continuous local-folder reconciliation with durable three-way baselines, CAS, ACL-preserving renames, conflict choices and reload/offline recovery.
-- Owner-only Private scopes, isolated snapshots/kernels/artifacts/results, owner/VPS target restriction and output cleanup on declassification.
-- Password-based session discovery and expiring/revocable read-only or Public edit invitations; separate hashed credentials and authentication throttling.
-- Actual isolated Linux-container backend with pinned image Python, readiness/resources/lifecycle; WSL2 Windows launcher and documented macOS Docker Desktop runtime.
-- Required real container CI acceptance, a measured 24-hour background soak harness and explicit full-disk production budget. Native Windows/macOS, physical CUDA, two real VS Code, target VPS and completed 24-hour soak remain acceptance blockers.
+- Adds permanent server-owned sessions, password discovery, revocable invitations, durable files and Public/Private folder permissions. Preserves peer sessions and independent background jobs as separate modes.
+- Reuses the existing editor synchronizer, text replicas and presence renderer for optimistic Yjs notebook editing. Removes occupied-row locks; concurrent edits in the same cell and line are permitted. Retains pending local intents until actor acknowledgement and makes lost-ACK retries idempotent.
+- Fixes self-save conflicts, recursive reserved metadata, native execution handle/version changes and Save immediately after Run. Ordinary source edits preserve previous outputs and execution counts; stale execution results remain fenced by cell identity, source, generation and privacy.
+- Streams small execution and cursor events without waiting for unrelated acknowledgements. Isolated Jupyter agents retain state across sequential cells, support stdin/interrupt and keep accepted work independent of the editor. Switching devices transfers files into a fresh kernel; Python RAM is not migrated.
+- Adds owner-only Private kernels/results, device-owner consent/revocation, bounded durable execution receipts, recovery of interrupted result publication and cleanup of idle kernels from old broker generations.
+- Includes matching VSIX and standalone-server provenance manifests, payload checksums, Ubuntu service templates, Linux bubblewrap/container isolation and a Windows WSL2 launcher. Release assets now include the bundled server and SHA-256 alongside the VSIX and source archive.
+- Removes obsolete implementation plans, superseded audits, the unrelated anti-fraud example and its exclusive tests, and the one-time 0.5.31–0.5.38 release publisher. Keeps current operator/user guides, legal notices and source-specific acceptance evidence. No historical VSIX binaries are tracked in the repository.
+- Verification and limits: [the target acceptance record](https://github.com/r7zex/jupyter_pair_ext/blob/v0.6.3/docs/PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) distinguishes native API tests, actual HTTPS/VPS execution, the earlier physical CUDA pipeline and pending physical UI/macOS checks. The real 24-hour run remains pending until its own source-specific completion evidence; this release does not inherit elapsed time from another build.
 
-## 0.6.2
-
-- Record result publication in the atomic workspace manifest, so report retries preserve later artifact renames/deletions, including after restart.
-- Resync reused blobs after write failures, repair only unreferenced partial blobs, and propagate Linux metadata directory-sync failures without entering rename fallback.
-- Normalize and bound live kernel-control payloads; retire stdin controls with the durable terminal report.
-- Align the interactive agent response bound with admitted commands and recovery controls, preventing oversized accepted claims from wedging the shared VPS worker.
-- Allow personal execution consent on the owner-selected device while member switching stays disabled; fence compute-selection dialogs and late responses to their original connection.
-- Freeze the complete broker dependency closure in real reference integration tests; require a non-root bubblewrap CPU/privacy smoke in Linux CI and show sandbox skip reasons locally.
-- Bind VSIX and standalone-server manifests to the checked source commit and verify packaged runtime hashes.
-- Show fresh-kernel reset notices, retire stale notebook namespaces after rename, and fence session actions/uploads/recovery and attachment handoffs to their original connection.
-
-## 0.6.1 - 2026-10-13 (persistent session review)
-
-- Checks file paths, ACLs and revision conflicts before retiring public kernels. Rejected deletion, rename or visibility requests cannot reset an accepted computation.
-- Recovers durable terminal reports whose notebook/artifact publication was interrupted, on restart or acknowledgement retry. Partial file publication is idempotent and preserves newer edits; failed terminal receipt writes remain retryable.
-- Keeps one VPS worker on its accepted execution across all sessions, including recovery after an administrative session stop. Scoped claims cannot bypass that admission fence.
-- Binds notebook queues, delayed file reads/saves and kernel input to their original connection. Admission checks the displayed cell's source hash against the saved server cell.
-- Activates for the persistent filesystem and keeps P2P restore/backing-folder operations on filesystem folders. Shows participant revocation only to the owner.
-- Adds persistent agent/admin/real CPU integration to CI and retains the matching standalone server alongside the VSIX. See the requirement review in `docs/PERSISTENT_VPS_REVIEW_0.6.1.md`; production isolation, physical CUDA, live VS Code and external VPS operation still need their own verification.
-
-## 0.6.0 - 2026-10-13 (persistent VPS sessions, development build)
-
-- Adds a server-owned session lifecycle, salted scrypt password joins, independent member credentials, administrative grants and revocation. Empty sessions survive disconnects and process restarts.
-- Stores projects as immutable file blobs and atomic revisioned manifests, enforcing inherited private-folder ACLs on snapshots, direct APIs, mutation and compute preparation. Stale saves preserve local edits; output-only notebook changes can merge safely.
-- Separates compute selection from session ownership, with exact machine-owner consent, server-checked sharing, the sole-participant exception and safe fallback for subsequent runs.
-- Adds an independent Linux interactive Jupyter agent using the selected interpreter and real CUDA UUID masks. Public workspace isolation fails closed; changing device creates a new Python namespace. Receipts prevent hidden replay, and bounded output archives preserve request identities.
-- Integrates persistent Explorer workspaces, notebook execution, device/consent controls and owner credential import into VS Code. Preserves the existing P2P runtime and background broker as separate modes.
-- Includes a standalone server package, direct VPS administration helper, systemd templates, IP certificate renewal and backup instructions. This stage provides save-based synchronization. Real NVIDIA hardware, production VPS/TLS, native Windows/macOS agent isolation, live VPS CRDT editing and a completed long soak remain separate work or validation.
+Versions 0.6.0–0.6.2 were development stages incorporated into this first published 0.6.x release.
 
 ## 0.5.39 - 2026-10-11 (durable recovery and experiment ownership)
 
@@ -47,7 +22,6 @@
 - Gives each reference experiment one process-owned writer lock, rejects checkpoints from another run and inconsistent epoch/step metadata, and verifies the data manifest during export evaluation.
 - Freezes the detached soak observer and dependencies, adopts only verified service process identities after observer restart, preserves fault history and writes explicit completion verification. Fresh 0.5.39 evidence is separate from historical 0.5.38 results.
 
-See [the current audit](docs/HOST_TRAINING_AUDIT_0.5.39_2026-10-11.md). External VPS, native Windows, physical GPU and a completed multi-hour run on this version require separate evidence. No Release or production deployment is part of this branch update.
 
 ## 0.5.38 - 2026-10-10 (persistent research and confirmed stops)
 
@@ -60,7 +34,6 @@ See [the current audit](docs/HOST_TRAINING_AUDIT_0.5.39_2026-10-11.md). External
 - Adds an independently supervised soak runner and version-specific evidence. The real Linux CPU loopback run completed 4 hours 27.668 seconds with one launch and recovered broker/observer outages; external VPS and native Windows/GPU require separate verification.
 - Retires a crashed Jupyter bridge before settling the failed cell, allowing immediate replacement execution even when its fatal message and process exit arrive later.
 
-See [persistent research operations](docs/PERSISTENT_RESEARCH.md) and the 0.5.38 audit. Upgrade all editors and agents together; this branch push does not publish a Release or deploy production services.
 
 ## 0.5.37 - 2026-10-09 (host repository and training reliability)
 
@@ -73,7 +46,6 @@ See [persistent research operations](docs/PERSISTENT_RESEARCH.md) and the 0.5.38
 - Repairs IPv6 proxy readiness/bypass and SOCKS4a remote DNS without invalidating stored credentials. Rechecks encrypted VPS relay readiness and reconnects half-open routes within the peer recovery window.
 - Updates `ip-address` to 10.7.3, clearing the production dependency audit, and adds branch CI for complete CPU PyTorch/Jupyter/VPS training plus native Extension Host checks.
 
-See [the critical audit](docs/HOST_TRAINING_AUDIT_0.5.37_2026-10-09.md) for reproduced failures, validation and deployment limits. Update the extension on all participants; external VPS/SSH acceptance depends on outbound access to the selected server.
 
 ## 0.5.36 - 2026-10-09 (critical training lifecycle fixes)
 

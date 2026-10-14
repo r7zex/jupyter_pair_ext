@@ -467,7 +467,7 @@ def prepare(args):
     config = {'steps': args.steps, 'minimumStepSeconds': args.step_seconds,
         'checkpointEverySteps': args.checkpoint_steps, 'stdoutEverySteps': args.stdout_steps,
         'updatesPerStep': args.updates_per_step, 'seed': 41, 'datasetSha256': dataset_hash,
-        'datasetDescription': 'Synthetic infrastructure fixture; not research anti-fraud results'}
+        'datasetDescription': 'Synthetic infrastructure fixture; not a research benchmark'}
     with socket.socket() as candidate:
         candidate.bind(('127.0.0.1', 0))
         port = candidate.getsockname()[1]

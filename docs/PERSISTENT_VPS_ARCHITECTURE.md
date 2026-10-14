@@ -1,91 +1,42 @@
-> Historical first-stage architecture. Current implementation and acceptance: [0.6.3](PERSISTENT_VPS_REVIEW_0.6.3.md).
+# Persistent VPS architecture — 0.6.3
 
-# Persistent VPS sessions: implementation architecture
+The server is the permanent Session Host. Editors may disconnect without transferring authority or ending accepted computation. The existing human-host peer runtime and detached background-job broker remain separate modes. Persistent sessions reuse the existing Yjs/editor/Jupyter mechanisms through an authenticated server adapter.
 
-Base inspected: `main` at `3cc515793a4dfaa9b9a1803af60a85c64899b48b`, release 0.5.39.
-The working branch is `work`; GitHub branch/release metadata was checked through
-the connected GitHub API. Shell Git access failed because the environment proxy
-was unavailable. The local base matches the GitHub main commit.
+## Components
 
-## Existing contracts and the required boundary
+| Component | Responsibility |
+|---|---|
+| `src/vps/persistentServer.ts` | Membership, session lifecycle, permissions, discovery, execution admission and authorized result delivery |
+| `persistentStorage.ts`, `persistentNotebookCrdt.ts` | Immutable blobs, atomic revisioned manifests, stable notebook identities and durable Yjs state |
+| `persistentLive.ts`, `persistentClient.ts` | Authorized live events, presence and client RPC/recovery |
+| `persistentHistory.ts` | Durable execution reservations, terminal receipts, bounded result archives and retry without hidden reruns |
+| `persistentCompute.ts` | Target selection, machine-owner consent, sharing and kernel generations |
+| `src/vscode/persistent.ts`, `persistentNotebookSync.ts` | Virtual filesystem, optimistic notebook replicas, journals, native save and execution integration |
+| `scripts/pair-notebook-session-agent.py` | Independent isolated stateful Jupyter kernels and retained execution reports |
+| `scripts/pair-notebook-session-admin.py` | Administrative creation/listing and owner-authorized lifecycle without VS Code |
 
-The [existing VPS service](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/src/vps/server.ts)
-persists background jobs and relays opaque editor traffic. It does not own the
-collaborative filesystem. [Ordinary execution](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/src/runtime/session.ts#L1216)
-requires the current VS Code Session Host. The lifetime limit is explicitly
-documented in [PERSISTENT_RESEARCH.md](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/docs/PERSISTENT_RESEARCH.md).
-The existing [Jupyter bridge](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/media/jupyter_kernel_bridge.py)
-can be reused as an actual stateful kernel engine.
+## Editing and persistence
 
-## Independent server mode
+`EditorSynchronizer`, `EditorTextReplica` and `PresenceRenderer` retain their existing roles. The persistent notebook adapter applies local input optimistically, coalesces outgoing intents and keeps unacknowledged work until actor acknowledgement. Idempotent retries handle lost acknowledgements. Delayed echoes must not replace newer local typing. Cursors and selections are advisory; editing an occupied line is permitted.
 
-- `src/vps/persistentServer.ts` owns session identity, lifecycle, password joins,
-  member tokens, roles, presence, execution admission and results. It attaches
-  `/v1/sessions/rpc` to `src/vps/server.ts`, preserving the existing broker and
-  its single-writer data-directory lock.
-- `src/vps/persistentStorage.ts` publishes revisioned project manifests and
-  immutable file blobs. The server is the permanent authority. Folder ACLs are
-  enforced before listing, reading, mutation and compute snapshot creation.
-- `src/vps/persistentHistory.ts` reserves request/execution identities before
-  dispatch and archives terminal results separately from the rolling session
-  cache. Permanent receipts prevent duplicate execution after output retention
-  expires; an incomplete receipt restores an interrupted state without rerun.
-- `src/vps/persistentCompute.ts` separates session owner from execution target.
-  Selection, explicit machine-owner consent, sharing, human presence and
-  authorization are rechecked on the server. A target change advances kernel
-  generation for subsequent runs without cancelling accepted work.
-- `src/vps/persistentProtocol.ts` and `persistentClient.ts` define the separate
-  protocol/client. Session bearer credentials cannot authorize legacy jobs or
-  administrative creation. Passwords are used at join only.
-- `scripts/pair-notebook-session-agent.py` owns interactive bridge processes on
-  the chosen machine. A clean environment and restricted public workspace keep
-  server metadata, private project files and agent tokens outside Python's
-  filesystem namespace. Execution fails if isolation is unavailable.
-- `scripts/pair-notebook-session-admin.py` creates/lists sessions over loopback
-  without VS Code and writes a private owner JSON. The extension imports that
-  credential; password joins create ordinary members. Lifecycle actions require
-  an owner/delegated member credential rather than the server creation token.
-- `src/vscode/persistent.ts` supplies a server-backed Explorer filesystem and a
-  dedicated notebook controller. `extension.ts`, `dashboard.ts` and the command
-  manifest expose create/join, lifecycle, visibility, device and consent actions.
+Stable cell IDs, order, source, metadata and Yjs state are persisted together. Own-save reconciliation avoids replacing the editor with an older file snapshot. Source changes retain previous outputs/execution counts, as an ordinary local notebook does. The controller owns native execution handles and records their end before Save after Run settles. A save concurrent with a later incoming version can require another save; a successful earlier save cannot include future changes.
 
-## Delivery criteria and explicit limits
+Ordinary files use revision checks and continuous folder reconciliation with durable baselines. Ambiguous offline rename/edit conflicts retain both copies for explicit resolution. This is distinct from live character editing of notebook sources. Epoch changes after replacement or privacy transitions reject old replicas and preserve recoverable local work.
 
-The first independently testable stage provides durable headless sessions,
-password membership, server-enforced file privacy, conflict-safe synchronization
-on save, compute policy and genuine stateful Jupyter execution via an independent
-agent. It is a new session mode, not a background-job alias. The existing P2P
-CRDT runtime remains a separate path. Per-keystroke server CRDT collaboration is
-a later stage; a stale save must return a conflict and preserve the editor copy.
+## Execution and privacy
 
-All execution snapshots in this stage are public-only, including owner runs.
-Private notebooks cannot execute in the shared kernel. A later isolated owner
-kernel must use separate snapshots, authorization and outputs before private
-execution can be offered safely. Device switching creates a new namespace;
-Python objects are not migrated between machines.
+Admission binds the acknowledged source hash, cell identity, privacy scope, target and kernel generation. Independent agents reuse a stateful namespace for compatible sequential cells. Small execution events and cursor updates avoid whole-project replay. Accepted healthy execution has no artificial training-duration deadline; network operations, preparation and resource use remain bounded.
 
-Session/file metadata survive a server restart. In-memory kernel objects cannot
-survive a compute-machine reboot. Ambiguous accepted work must not be relaunched
-silently. Retained results remain inspectable even when file source has changed.
+Public and owner-only Private notebooks use separate snapshots, kernels, result namespaces and authorization. Member requests and live events cannot read Private files, outputs or execution identities. Declassification clears the appropriate namespace. Consent, sharing, membership and target eligibility are checked on the server.
 
-Capacity is bounded to 16 sessions, four pending executions per session, and
-32 recent execution records with 4 MiB total cached output. Older terminal
-outputs move to a 128 MiB disk archive per session. Permanent receipts outlive
-output pruning, so the recent-record limit does not impose a lifetime run count.
-Each project permits 128 MiB, 8 MiB per file and 4096 paths. Public snapshots
-permit 10 MiB of encoded JSON; RPC bodies permit 12 MiB. The Python agent also
-enforces 4 MiB decoded snapshot data and 256 files, with one retained kernel in
-the supplied VPS unit or two by default on an external agent. These application
-limits do not cap disk use by immutable versions, receipts or dependencies.
+Changing the device or generation creates a fresh Python namespace. Files can transfer to the executor; Python RAM does not migrate. Delayed output from an old source/identity/generation cannot publish into a replacement cell. Ordinary source edits preserving past output do not relax those fences.
 
-Leaving a session or changing devices keeps accepted computation running on its
-original target. Kernel release waits behind accepted work and clears only the
-selected notebook namespace. Deleting the session removes server authority and
-results; accepted agent work finishes locally and its idle kernel is reclaimed,
-while subsequent result publication is refused.
+## Recovery and isolation
 
-Readiness requires TypeScript build/lint, persistence/auth/ACL/policy tests,
-agent tests, P2P regressions and packaged artifacts. A physical NVIDIA GPU test,
-public TLS deployment, native Windows isolation, completed long soak and actual
-VPS provisioning require separate evidence and must not be reported as passed
-based on loopback tests.
+The server retains membership, manifests, execution identities and terminal results across restart. Reservations precede dispatch; ambiguous accepted execution is reconciled under its original ID. Permanent receipts outlive bounded output retention. Interrupted result publication retries without overwriting newer edits or repeating side effects. Old idle generations are released so they cannot occupy the worker's sole kernel slot indefinitely.
+
+Agents run fail-closed isolation checks against the selected interpreter. Linux uses bubblewrap or a pinned Linux container; Windows uses a non-root WSL2 runtime. Kernel execution has no network or host credentials. The worker's narrowly scoped `ProtectKernelTunables=false` permits its mount namespace; other hardening remains enabled. The coordinator and private state stay outside untrusted kernel mounts.
+
+Kernel RAM cannot survive executor reboot, OOM or kernel termination. Restoring durable files/receipts does not restore Python objects. Resource, disk, output and admission limits complement OS quotas and service budgets; workspace quotas alone do not cap historical blobs, receipts or dependencies.
+
+See the [operator guide](PERSISTENT_VPS.md) and [source-specific acceptance](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) for measured behavior and remaining physical UI/macOS/24-hour requirements.

@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 export interface SharedCell { id: string; cell_type: string; source: string; metadata: Record<string, unknown> }
 export interface SharedNotebook { cells: SharedCell[]; metadata: Record<string, unknown> }
-export interface NotebookSyncReply { epoch: string; update: string; revision: number; cells: SharedCell[]; metadata: Record<string, unknown> }
+export interface NotebookSyncReply { epoch: string; update: string; revision: number; identity?: string; acknowledgedSequence?: number; cells: SharedCell[]; metadata: Record<string, unknown> }
 const validId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 export function sharedNotebook(doc: Y.Doc): SharedNotebook {
   const order = doc.getArray<string>('order').toArray(); const cells = doc.getMap<Y.Map<unknown>>('cells');
@@ -60,8 +60,8 @@ export function saveNotebookCrdt(doc: Y.Doc, epoch: string, template: Record<str
   const state = sharedNotebook(doc); const update = Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64');
   if (Buffer.byteLength(update) > 6 * 1024 * 1024) throw new Error('CRDT retention limit reached. Export and reopen the notebook explicitly.');
   const old = new Map<string, any>(template.cells.map((cell: any) => [cell.id, cell]));
-  return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update } }, cells: state.cells.map((cell) => {
-    const before = old.get(cell.id); const source = Array.isArray(before?.source) ? before.source.join('') : before?.source;
-    return { ...cell, ...(cell.cell_type === 'code' ? { outputs: source === cell.source ? before?.outputs ?? [] : [], execution_count: source === cell.source ? before?.execution_count ?? null : null } : {}) };
+  return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update, ...(template.metadata?.pair_crdt?.intents ? { intents: template.metadata.pair_crdt.intents } : {}) } }, cells: state.cells.map((cell) => {
+    const before = old.get(cell.id);
+    return { ...cell, ...(cell.cell_type === 'code' ? { outputs: before?.cell_type === 'code' ? before.outputs ?? [] : [], execution_count: before?.cell_type === 'code' ? before.execution_count ?? null : null } : {}) };
   }) })).toString('base64');
 }

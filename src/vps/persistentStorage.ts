@@ -3,6 +3,7 @@ import { lstat, mkdir as makeDirectory, open, readdir, rename as moveFile, unlin
 import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { portablePathComparisonKey, safeRelativePath } from '../core/projectPath';
+import { hasLegacyNotebookMetadata, notebookUserMetadata, cellUserMetadata } from '../core/notebookMetadata';
 import type { PersistentFileEntry, PersistentSnapshot } from './persistentProtocol';
 
 export interface PersistentStorageLimits { maxFileBytes: number; maxProjectBytes: number; maxEntries: number }
@@ -17,6 +18,7 @@ export class PersistentStorageError extends Error {
 interface StoredEntry {
   path: string; type: 'file' | 'directory'; size: number; mtime: number; version: number;
   visibility?: 'public' | 'private'; blob?: string;
+  notebookIdentity?: string;
 }
 interface Manifest { format: 1; revision: number; entries: StoredEntry[]; publications?: string[] }
 const PUBLICATION_ID = /^[A-Za-z0-9_-]{1,128}:(?:write|remove):[0-9]{1,3}$/;
@@ -152,18 +154,33 @@ export class PersistentWorkspace {
   }
 
   hasPublication(id: string): boolean { return this.current().publications?.includes(id) === true; }
+  notebookIdentity(value: string, owner: boolean): string {
+    const name = normalizePath(value); const manifest = this.current(); this.authorize(name, owner, manifest);
+    const entry = manifest.entries.find((item) => item.path === name); if (!entry || entry.type !== 'file' || !name.endsWith('.ipynb')) missing();
+    return entry.notebookIdentity ?? createHash('sha256').update(JSON.stringify([entry.path, entry.blob, entry.version])).digest('hex').slice(0, 32);
+  }
 
-  async retainPublications(executionIds: string[]): Promise<void> {
-    const keep = this.current().publications?.filter((id) => executionIds.includes(id.split(':')[0]!)) ?? [];
+  async retainPublications(executionIds: string[], publicationIds: string[] = []): Promise<void> {
+    const keep = this.current().publications?.filter((id) => executionIds.includes(id.split(':')[0]!) || publicationIds.includes(id)) ?? [];
     if (keep.length === (this.current().publications?.length ?? 0)) return;
     await this.mutate(this.current().revision, true, (next) => { next.publications = keep; });
   }
 
-  write(value: string, content: string, expectedRevision: number, owner: boolean, publicationId?: string, privateResult = false): Promise<PersistentSnapshot> {
+  write(value: string, content: string, expectedRevision: number, owner: boolean, publicationId?: string, privateResult = false, preserveNotebookIdentity = false): Promise<PersistentSnapshot> {
     return this.mutate(expectedRevision, owner, async (next) => {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
-      const bytes = decodeContent(content, this.limits.maxFileBytes);
+      let bytes = decodeContent(content, this.limits.maxFileBytes);
+      if (name.endsWith('.ipynb') && !preserveNotebookIdentity) {
+        // Raw file replacement must not retain an obsolete embedded replica.
+        try { const notebook = JSON.parse(bytes.toString('utf8')) as { metadata?: Record<string, unknown> };
+          if (notebook.metadata?.pair_crdt || (notebook.metadata && hasLegacyNotebookMetadata(notebook.metadata))) {
+            const legacy = hasLegacyNotebookMetadata(notebook.metadata!);
+            notebook.metadata = legacy ? notebookUserMetadata(notebook.metadata!) : { ...notebook.metadata }; delete notebook.metadata.pair_crdt;
+            bytes = Buffer.from(JSON.stringify(notebook));
+          }
+        } catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+      }
       const existing = next.entries.find((entry) => entry.path === name);
       if (privateResult && (!owner || (existing && this.visibility(name, next) !== 'private'))) {
         throw new PersistentStorageError('FORBIDDEN', 'Private execution cannot publish into Public files.');
@@ -175,6 +192,7 @@ export class PersistentWorkspace {
       const blob = createHash('sha256').update(bytes).digest('hex');
       const entry: StoredEntry = { path: name, type: 'file', size: bytes.length, mtime: Date.now(),
         version: next.revision, blob, ...(privateResult ? { visibility: 'private' as const } : existing?.visibility ? { visibility: existing.visibility } : {}) };
+      if (name.endsWith('.ipynb')) entry.notebookIdentity = preserveNotebookIdentity && existing ? this.notebookIdentity(name, owner) : randomBytes(16).toString('hex');
       next.entries = next.entries.filter((item) => item.path !== name);
       next.entries.push(entry);
       this.validateEntries(next);
@@ -242,10 +260,11 @@ export class PersistentWorkspace {
       entry.version = next.revision;
       entry.mtime = Date.now();
       if (visibility === 'public') for (const item of previouslyPrivate) {
-        const notebook = JSON.parse((await this.readBlob(item)).toString('utf8')) as { cells?: { outputs?: unknown[]; execution_count?: number | null }[]; metadata?: Record<string, unknown> };
+        const notebook = JSON.parse((await this.readBlob(item)).toString('utf8')) as { cells?: { outputs?: unknown[]; execution_count?: number | null; metadata?: Record<string, unknown> }[]; metadata?: Record<string, unknown> };
         if (!Array.isArray(notebook.cells)) invalid('Cannot publish an invalid Private notebook.');
-        for (const cell of notebook.cells) { if (cell.outputs) cell.outputs = []; if ('execution_count' in cell) cell.execution_count = null; }
-        if (notebook.metadata) { delete notebook.metadata.pair_crdt; delete notebook.metadata.widgets; }
+        const legacyEnvelope = !!notebook.metadata && hasLegacyNotebookMetadata(notebook.metadata);
+        for (const cell of notebook.cells) { if (cell.outputs) cell.outputs = []; if ('execution_count' in cell) cell.execution_count = null; if (legacyEnvelope && cell.metadata) cell.metadata = cellUserMetadata(cell.metadata, true); }
+        if (notebook.metadata) { notebook.metadata = legacyEnvelope ? notebookUserMetadata(notebook.metadata) : { ...notebook.metadata }; delete notebook.metadata.pair_crdt; delete notebook.metadata.widgets; }
         const bytes = Buffer.from(JSON.stringify(notebook)); item.blob = createHash('sha256').update(bytes).digest('hex');
         item.size = bytes.length; item.version = next.revision; item.mtime = Date.now(); await this.storeBlob(item.blob, bytes);
       }
@@ -339,12 +358,14 @@ export class PersistentWorkspace {
         || !Number.isSafeInteger(entry.mtime) || (entry.mtime as number) < 0
         || !Number.isSafeInteger(entry.version) || (entry.version as number) < 0 || (entry.version as number) > (candidate.revision as number)
         || (entry.visibility !== undefined && entry.visibility !== 'public' && entry.visibility !== 'private')
+        || (entry.notebookIdentity !== undefined && (typeof entry.notebookIdentity !== 'string' || !/^[a-f0-9]{32}$/.test(entry.notebookIdentity)))
         || (entry.type === 'file' && (typeof entry.blob !== 'string' || !BLOB_NAME.test(entry.blob)))
         || (entry.type === 'directory' && (entry.size !== 0 || entry.blob !== undefined))) corrupt();
       entries.push({ path: entry.path, type: entry.type, size: entry.size as number,
         mtime: entry.mtime as number, version: entry.version as number,
         ...(entry.visibility ? { visibility: entry.visibility as 'public' | 'private' } : {}),
-        ...(entry.type === 'file' ? { blob: entry.blob as string } : {}) });
+        ...(entry.type === 'file' ? { blob: entry.blob as string } : {}),
+        ...(entry.notebookIdentity ? { notebookIdentity: entry.notebookIdentity as string } : {}) });
     }
     if (candidate.publications !== undefined && (!Array.isArray(candidate.publications) || candidate.publications.length > 16384
       || candidate.publications.some((id: unknown) => typeof id !== 'string' || !PUBLICATION_ID.test(id))

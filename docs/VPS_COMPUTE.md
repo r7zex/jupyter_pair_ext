@@ -1,5 +1,8 @@
 # Your VPS and persistent compute machines
 
+Version 0.6.3. This guide covers **Connect to VPS Compute**, the optional encrypted relay and independent background-job broker. **Connect to VPS** instead opens a server-owned collaborative workspace with session credentials; follow [Persistent VPS sessions](PERSISTENT_VPS.md) for that mode.
+
+
 Pair Notebook can use your own VPS as an additional **end-to-end encrypted P2P relay** and as a **durable background-job broker**. A standalone agent on a PC executes Python jobs using that PC's CPU or NVIDIA GPU. The PC connects outward over HTTPS; it does not need a public IP, inbound port, VS Code, or the Session Host role. You can also run an agent on the VPS itself.
 
 Once the agent starts a job, switching off the submitting laptop, leaving the collaborative session, closing VS Code, losing the VPS connection, or restarting the agent service does not terminate its detached training process. Reconnect later, from any team computer, to inspect the shared job and output. The compute PC must remain awake and powered on.
@@ -107,7 +110,7 @@ On Windows, run the same script with the selected Python executable and Windows 
 
 ## 3. Connect every collaborator
 
-Install an extension built from this branch on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to VPS**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
+Install Pair Notebook 0.6.3 on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to VPS Compute**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
 
 Each collaborator keeps using the normal session invitation for editing. Start or rejoin the session after connecting the VPS to add its private relay. Direct P2P and the existing public relay paths remain available. Only holders of the session invite can decrypt relay frames; the VPS handles opaque ciphertext and routing metadata. The VPS service does not need the session invitation secret.
 
@@ -154,10 +157,12 @@ The P2P editor session retains its existing host availability rules. A persisten
 
 Notebook jobs preserve cell boundaries, a shared Python namespace and future-import state. The selected environment can run IPython magics and shell syntax when IPython is installed; ordinary Python cells also work without it. The first failed cell stops the job. Source snapshots remain bounded text inputs; binary datasets are owner-provisioned and copied through a pinned, hash-verified manifest.
 
-## Verification in this branch
+## Verification
 
 Automated loopback checks cover credential separation, path validation, idempotent submissions, durable claims after a VPS restart, bounded/idempotent log replay, queued/running cancellation, encrypted P2P delivery and reconnection. A real Python agent test kills the polling daemon and stops the VPS while the detached program continues, then reconnects with the original state and verifies exactly one execution and recovered output. Additional real process tests kill the private supervisor, kill and terminate the detached runner, cancel training, and complete entrypoints that leave workers alive. They verify that descendants stop before completion or recovery, including Linux workers that create their own session, and that recovery never launches an accepted job again.
 
-The [extended audit](VPS_AUDIT.md) documents 2047 staged adversarial scenarios plus recovery, UI and transport regressions. Run `npm run compile`, `npm run test:vps:audit`, and `npm run test:vps:agent` to repeat them.
+The repository retains generic broker, recovery, UI and transport regression tests. Run `npm run compile`, `npm run test:vps:audit`, and `npm run test:vps:agent` to repeat them.
 
 These checks use local CPU processes on Linux and a substituted VS Code API boundary for UI tests. Windows Job Object supervision is implemented but has not been verified on native Windows. Deployment certificates, public-network routing, a real VS Code extension host, Windows service wrappers and physical GPU training must be tested in their respective environments.
+
+For source-specific target VPS, native editor and WSL/CUDA evidence, see the [current acceptance record](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md). Those observations do not imply every backend or physical UI path was exercised.

@@ -173,7 +173,16 @@ def install_snapshot(root, files, previous=()):
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise AgentError("Workspace snapshot target is unsafe.")
             except FileNotFoundError:
-                pass
+                info = None
+            if info is not None and info.st_size == len(data) and stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid():
+                descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(descriptor, "rb") as current:
+                    actual = os.fstat(current.fileno())
+                    if not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1:
+                        raise AgentError("Workspace snapshot target is unsafe.")
+                    if actual.st_uid == os.geteuid() and stat.S_IMODE(actual.st_mode) == 0o600 and current.read(len(data) + 1) == data:
+                        baseline[name] = {"sha256": hashlib.sha256(data).hexdigest(), "version": version}
+                        continue
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(data)
@@ -388,6 +397,11 @@ class Sandbox:
             gpu = next((item for item in self.gpus if item["uuid"] == gpu_uuid), None)
             if not gpu or not GPU_ID.fullmatch(gpu_uuid):
                 raise AgentError("Selected NVIDIA GPU is no longer available.")
+            if Path("/dev/dxg").exists():
+                # WSL exposes one shared GPU device rather than per-GPU nodes.
+                if len(self.gpus) != 1:
+                    raise AgentError("WSL GPU isolation requires exactly one available NVIDIA GPU.")
+                args += ["--dev-bind", "/dev/dxg", "/dev/dxg"]
             for device in (f"/dev/nvidia{gpu['index']}", "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"):
                 if Path(device).exists():
                     args += ["--dev-bind", device, device]
@@ -398,7 +412,7 @@ class Sandbox:
             with __import__("tempfile").TemporaryDirectory(prefix="pair-cuda-probe-") as temporary:
                 probe = "import torch;assert torch.cuda.is_available();assert torch.cuda.device_count()==1;print(torch.cuda.get_device_name(0))"
                 result = subprocess.run(self.command(Path(temporary), gpu_uuid, ["-I", "-c", probe]),
-                                        env=self.environment(gpu_uuid), capture_output=True, text=True, timeout=20)
+                                        env=self.environment(gpu_uuid), capture_output=True, text=True, timeout=30)
                 return result.returncode == 0
         except (AgentError, OSError, subprocess.SubprocessError):
             return False
@@ -649,7 +663,7 @@ class SessionAgent:
             self.sandbox.recover()
         self.kernels = {}
         self.active = None
-        self.last_registration = 0
+        self.last_registration = None
         self.initial_share_applied = False
         self.closed = False
         self.credentials_revoked = False
@@ -733,15 +747,18 @@ class SessionAgent:
             self.active["commandKind"] = command["command"].get("command")
             if self.active["commandKind"] == "release":
                 # The broker queues release behind accepted execution. Closing
-                # only this exact idle notebook key cannot cancel another run
-                # or manufacture a kernel just to shut it down.
+                # obsolete idle generations cannot cancel an accepted run or
+                # manufacture a kernel just to shut it down.
+                obsolete = [entry for entry in self.kernels if entry[0] == key[0] and entry[2] < key[2]]
+                for entry in obsolete:
+                    self.kernels.pop(entry).close()
                 bridge = self.kernels.pop(key, None)
                 if bridge is not None:
                     bridge.close()
                 self._append({"type": "kernelState", "requestId": self.active["requestId"],
                               "generation": command["generation"],
                               "message": "The selected notebook kernel was released; its variables were cleared."
-                              if bridge is not None else "The selected notebook has no live kernel to release."})
+                              if bridge is not None or obsolete else "The selected notebook has no live kernel to release."})
                 self._append({"type": "commandResult", "requestId": self.active["requestId"], "command": "release"})
                 receipt["state"] = "completed"
                 self._persist()
@@ -814,11 +831,13 @@ class SessionAgent:
         if bridge is None or self.active["receipt"]["state"] != "running":
             return
         receipt = self.active["receipt"]
+        changed = False
         for _ in range(128):
             try:
                 event = bridge.events.get_nowait()
             except queue.Empty:
                 break
+            changed = True
             kind = event.get("type")
             if kind == "bridgeExited":
                 receipt["state"] = "interrupted"
@@ -842,7 +861,8 @@ class SessionAgent:
                 receipt["state"] = "failed"
                 receipt["error"] = "Jupyter rejected the accepted command."
                 break
-        self._persist()
+        if changed:
+            self._persist()
 
     def _report(self):
         receipt = self.active["receipt"]
@@ -862,6 +882,8 @@ class SessionAgent:
                 pending.append(event)
                 size += event_size
             final = offset + len(pending) == len(receipt["events"]) and receipt["state"] != "running"
+            if not pending and not final:
+                return
             body = {"sessionId": identity["sessionId"], "deviceId": identity["deviceId"], "commandId": identity["id"],
                     "executionId": identity["executionId"], "generation": identity["generation"], "offset": offset,
                     "events": pending, "state": receipt["state"] if final else "running"}
@@ -941,7 +963,7 @@ class SessionAgent:
                     return
         if self.credentials_revoked or self.session_deleted:
             return
-        if time.monotonic() - self.last_registration >= 10:
+        if self.last_registration is None or time.monotonic() - self.last_registration >= 10:
             self.register()
         if not self.args.share or not self.sandbox.ready:
             return
@@ -1008,7 +1030,7 @@ def main():
     parser.add_argument("--bridge", default=str(Path(__file__).resolve().parents[1] / "media" / "jupyter_kernel_bridge.py"))
     parser.add_argument("--state", default=str(Path.home() / ".pair-notebook-session-agent"))
     parser.add_argument("--share", action="store_true", help="Explicitly allow this session's Python code to run in the isolated public workspace")
-    parser.add_argument("--poll-seconds", type=float, default=0.5)
+    parser.add_argument("--poll-seconds", type=float, default=0.1)
     parser.add_argument("--max-kernels", type=int, default=MAX_KERNELS, choices=(1, 2))
     parser.add_argument("--check-isolation", action="store_true", help="Verify the actual selected isolated runtime and exit without credentials")
     args = parser.parse_args()

@@ -55,12 +55,21 @@ export interface PersistentCommand {
 }
 /** POST /v1/sessions/rpc, JSON {operation, sessionId?, ...}. Responses are JSON.
  * Operations: create/list (admin bearer), join (password), view/heartbeat/leave,
+ * subscribe (authenticated SSE), presence (file/cell relative anchors), notebookSync,
  * snapshot/read/write/mkdir/rename/remove/visibility, lifecycle/password/revoke/role,
- * settings/registerDevice/share/select/consent/revokeConsent, execute/execution,
+ * settings/registerDevice/share/select/consent/revokeConsent, execute/execution/executions,
  * claim/report (device owner bearer; configured VPS agent token for deviceId=vps).
  * Files use base64 content; mutations require expectedRevision, rename also newPath.
  * execute uses notebook, cellIndex, expectedRevision, requestId and optional
  * expectedSourceHash (SHA-256 of the displayed cell) to reject concurrent source changes. report uses commandId,
+ * expectedNotebookIdentity + expectedCellId + expectedSourceHash permit admission
+ * across unrelated live edits, while expectedGeneration fences compute changes.
  * executionId, events (bridge envelopes), state, optional error/files.
+ * notebookSync supports legacy Yjs updates and host-serialized text intents
+ * {actor, sequence, cellId, baseline, changes}. Intent sequences are durable per
+ * notebook epoch and member. Structural snapshots require snapshotStateVector.
+ * compact replies omit the redundant plain-text snapshot; update remains Yjs.
+ * Raw notebook replacement resets replica identity. Trusted CRDT/output writes
+ * retain it so editing another cell does not discard a running cell's results.
  */
 export interface PersistentRpcRequest { operation: string; sessionId?: string; [key: string]: unknown }
