@@ -23,6 +23,19 @@ describe('persistent workspace storage and server ACLs', function () {
     await workspace.init();
   });
   afterEach(async () => { await rm(directory, { recursive: true, force: true }); });
+  it('removes Private outputs hidden in a legacy native serializer envelope before making the notebook Public', async () => {
+    await workspace.mkdir('private', revision(), true, 'private');
+    const output = { output_type: 'stream', name: 'stdout', text: 'PRIVATE_OUTPUT_CANARY' };
+    const notebook = { nbformat: 4, nbformat_minor: 5,
+      metadata: { nbformat: 4, nbformat_minor: 5, cells: [{ id: 'stable', outputs: [output] }], metadata: { tag: 'retained', pair_crdt: { epoch: 'legacy', update: 'AA==' } } },
+      cells: [{ id: 'stable', cell_type: 'code', source: 'print(1)', outputs: [output], execution_count: 1,
+        metadata: { id: 'stable', outputs: [output], metadata: { tags: ['retained'] } } }] };
+    await workspace.write('private/book.ipynb', base64(JSON.stringify(notebook)), revision(), true, undefined, false, true);
+    await workspace.setVisibility('private', 'public', revision());
+    const contents = Buffer.from((await workspace.read('private/book.ipynb', false)).content, 'base64').toString('utf8');
+    assert.equal(contents.includes('PRIVATE_OUTPUT_CANARY'), false); const published = JSON.parse(contents);
+    assert.deepEqual(published.metadata, { tag: 'retained' }); assert.deepEqual(published.cells[0].metadata, { tags: ['retained'] }); assert.deepEqual(published.cells[0].outputs, []); assert.equal(published.cells[0].execution_count, null);
+  });
 
   it('restores binary files, directory metadata, ACLs and revisions without any connected client', async () => {
     const content = Buffer.from([0, 1, 255, 127, 32, 10]).toString('base64');

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,13 +10,15 @@ import { PersistentFolderSync } from '../src/vps/persistentFolderSync';
 import { editSharedNotebook, sharedNotebook, type NotebookSyncReply } from '../src/vps/persistentNotebookCrdt';
 import { installProxyAwareWebSocket } from '../src/runtime/proxyWebSocket';
 import type { PersistentMembership, PersistentSnapshot } from '../src/vps/persistentProtocol';
+import { encodeRelativeOffset } from '../src/core/cursorPosition';
+import type { PersistentLiveEvent } from '../src/vps/persistentLive';
 const encoded = (value: string): string => Buffer.from(value).toString('base64');
 
 describe('Persistent continuous synchronization over actual HTTP', () => {
   let root: string; let server: VpsServer; let client: PersistentClient; let member: PersistentClient; let owner: PersistentMembership; let endpoint: string;
   const rpc = <T = any>(operation: string, fields: Record<string, unknown> = {}): Promise<T> => client.call(operation, { sessionId: owner.sessionId, ...fields });
   beforeEach(async () => {
-    installProxyAwareWebSocket({ env: {} }); root = await mkdtemp(path.join(os.tmpdir(), 'pair-sync-')); server = new VpsServer({ dataDirectory: path.join(root, 'server'), clientToken: 'A'.repeat(40), agentTokens: {} });
+    installProxyAwareWebSocket({ env: {} }); root = await mkdtemp(path.join(os.tmpdir(), 'pair-sync-')); server = new VpsServer({ dataDirectory: path.join(root, 'server'), clientToken: 'A'.repeat(40), agentTokens: { vps: 'Z'.repeat(40) } });
     endpoint = `http://127.0.0.1:${await server.start()}`;
     owner = await new PersistentClient(endpoint, { kind: 'admin', token: 'A'.repeat(40) }).call('create', { name: 'Sync test', password: 'sync test password' });
     client = new PersistentClient(endpoint, { kind: 'membership', token: owner.token });
@@ -23,6 +26,117 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
     member = new PersistentClient(endpoint, { kind: 'membership', token: joined.token });
   });
   afterEach(async () => { await server.stop(); await rm(root, { recursive: true, force: true }); installProxyAwareWebSocket({ env: {} }); });
+  const liveNotebook = async (source = 'owner\nmember'): Promise<NotebookSyncReply> => {
+    await rpc('write', { path: 'book.ipynb', expectedRevision: 0, content: encoded(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source, metadata: {}, outputs: [] }] })) });
+    return rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb' });
+  };
+  const linePresence = async (start: NotebookSyncReply, offset: number): Promise<void> => {
+    const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(start.update, 'base64')); const text = doc.getMap<Y.Map<unknown>>('cells').get('stable')!.get('source') as Y.Text;
+    await rpc('presence', { path: 'book.ipynb', epoch: start.epoch, cellId: 'stable', activeLineAnchor: encodeRelativeOffset(text, offset) }); doc.destroy();
+  };
+  it('pushes committed edits to another authenticated client without a polling request', async () => {
+    const start = await liveNotebook(); const events: PersistentLiveEvent[] = [];
+    const stream = member.subscribe(owner.sessionId, (event) => events.push(event), () => undefined);
+    try {
+      for (let n = 0; n < 100 && !events.some((event) => event.kind === 'ready'); n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(events.some((event) => event.kind === 'ready'));
+      const actor = 'A'.repeat(36); await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 5, deleteCount: 0, insertText: '!' }] } });
+      for (let n = 0; n < 100 && !events.some((event) => event.kind === 'notebook'); n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      const pushed = events.find((event) => event.kind === 'notebook'); assert.ok(pushed && pushed.kind === 'notebook');
+      const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(start.update, 'base64')); Y.applyUpdate(doc, Buffer.from(pushed.update, 'base64')); assert.equal(sharedNotebook(doc).cells[0]!.source, 'owner!\nmember'); doc.destroy();
+    } finally { stream.dispose(); }
+  });
+  it('pushes execution discovery and live output availability, then fences it after a privacy change', async () => {
+    const start = await liveNotebook('print(7)'); const agent = new PersistentClient(endpoint, { kind: 'membership', token: 'Z'.repeat(40) });
+    await agent.call('registerDevice', { sessionId: owner.sessionId, deviceId: 'vps', device: { id: 'vps', name: 'VPS CPU', python: 'python3', cpu: 'CPU', gpus: [], isolation: 'protocol test adapter', ready: true } });
+    const run = await rpc<any>('execute', { notebook: 'book.ipynb', cellIndex: 0, expectedRevision: start.revision, requestId: 'live-output-test' });
+    const events: PersistentLiveEvent[] = []; const stream = member.subscribe(owner.sessionId, (event) => events.push(event), () => undefined);
+    try {
+      for (let n = 0; n < 100 && !events.some((event) => event.kind === 'execution'); n++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(events.some((event) => event.kind === 'execution' && event.id === run.id));
+      const active = await member.call<{ executions: any[] }>('executions', { sessionId: owner.sessionId }); assert.equal(active.executions[0]!.id, run.id); assert.deepEqual(active.executions[0]!.events, []);
+      const claimed = await agent.call<any>('claim', { sessionId: owner.sessionId, deviceId: 'vps' }); const command = claimed.command;
+      await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 0, state: 'running', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'shared 7\n' } }] });
+      const running = await member.call<any>('execution', { sessionId: owner.sessionId, executionId: run.id }); assert.equal(running.events[0].content.text, 'shared 7\n');
+      await rpc('visibility', { path: 'book.ipynb', visibility: 'private', expectedRevision: (await rpc<any>('snapshot')).revision });
+      await new Promise((resolve) => setTimeout(resolve, 30)); const previous = events.filter((event) => event.kind === 'execution').length;
+      await agent.call('report', { sessionId: owner.sessionId, deviceId: 'vps', executionId: run.id, commandId: command.id, generation: command.generation, offset: 1, state: 'completed', events: [{ type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text: 'PRIVATE_AFTER_PRIVACY\n' } }] });
+      await new Promise((resolve) => setTimeout(resolve, 30)); assert.equal(events.filter((event) => event.kind === 'execution').length, previous);
+      assert.equal(JSON.stringify(events).includes('PRIVATE_AFTER_PRIVACY'), false); await assert.rejects(member.call('execution', { sessionId: owner.sessionId, executionId: run.id }));
+      assert.deepEqual((await member.call<{ executions: any[] }>('executions', { sessionId: owner.sessionId })).executions, []);
+    } finally { stream.dispose(); }
+  });
+  it('enforces the original occupied-line guard on the VPS and permits another line of the same cell', async () => {
+    const start = await liveNotebook(); await linePresence(start, 0);
+    const intent = { actor: 'B'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: 'denied' }] };
+    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
+    intent.changes = [{ offset: 6, deleteCount: 0, insertText: 'allowed ' }];
+    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(result.cells[0]!.source, 'owner\nallowed member');
+    const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(result.update, 'base64')); const update = sharedNotebook(doc); update.cells[0]!.source = 'overwrite\nallowed member'; editSharedNotebook(doc, update);
+    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }), /occupied/); doc.destroy();
+    await rpc('presence'); intent.sequence = 2; intent.baseline = result.cells[0]!.source; intent.changes = [{ offset: 1, deleteCount: 0, insertText: 'free' }];
+    const freed = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(freed.cells[0]!.source, 'ofreewner\nallowed member');
+  });
+  it('acquires the edited row even when the first cursor packet has not arrived', async () => {
+    const start = await liveNotebook();
+    await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'H'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '!' }] } });
+    const intent = { actor: 'I'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'o!wner\nmember', changes: [{ offset: 2, deleteCount: 0, insertText: 'denied' }] };
+    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
+    intent.changes = [{ offset: 7, deleteCount: 0, insertText: 'allowed ' }];
+    assert.equal((await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent })).cells[0]!.source, 'o!wner\nallowed member');
+  });
+  it('admits an unchanged cell while another cell is edited, and fences a full file replacement', async () => {
+    const initial = await liveNotebook('print(7)'); const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(initial.update, 'base64'));
+    const before = sharedNotebook(doc); before.cells.push({ id: 'other', cell_type: 'code', source: 'b = 1', metadata: {} }); editSharedNotebook(doc, before);
+    const acknowledged = await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb', epoch: initial.epoch, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') });
+    const after = sharedNotebook(doc); after.cells[1]!.source = 'b = 2'; editSharedNotebook(doc, after);
+    await member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: initial.epoch, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') });
+    const agent = new PersistentClient(endpoint, { kind: 'membership', token: 'Z'.repeat(40) });
+    await agent.call('registerDevice', { sessionId: owner.sessionId, deviceId: 'vps', device: { id: 'vps', name: 'CPU', python: 'python3', cpu: 'CPU', gpus: [], isolation: 'protocol test adapter', ready: true } });
+    const fields = { notebook: 'book.ipynb', cellIndex: 0, expectedRevision: acknowledged.revision, expectedNotebookIdentity: acknowledged.identity, expectedCellId: 'stable', expectedSourceHash: createHash('sha256').update('print(7)').digest('hex') };
+    assert.equal((await rpc<any>('execute', { ...fields, requestId: 'unchanged-cell' })).state, 'queued');
+    const replacement = await rpc<any>('read', { path: 'book.ipynb' });
+    const raw = JSON.parse(Buffer.from(replacement.content, 'base64').toString('utf8')); raw.metadata.userReplacement = true;
+    await rpc('write', { path: 'book.ipynb', content: encoded(JSON.stringify(raw)), expectedRevision: replacement.revision });
+    await assert.rejects(rpc('execute', { ...fields, requestId: 'after-replacement', expectedRevision: (await rpc<any>('snapshot')).revision }), /changed/);
+    const renewed = await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb' }); assert.notEqual(renewed.identity, acknowledged.identity); assert.notEqual(renewed.epoch, initial.epoch); assert.equal(renewed.cells[1]!.source, 'b = 2'); doc.destroy();
+  });
+  it('keeps the occupied row anchored when a different row inserts a newline', async () => {
+    const start = await liveNotebook(); await linePresence(start, 6);
+    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'G'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 5, deleteCount: 1, insertText: '' }] } }), /occupied/);
+    const intent = { actor: 'C'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 0, deleteCount: 0, insertText: 'new\n' }] };
+    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(result.cells[0]!.source, 'new\nowner\nmember');
+    intent.sequence = 2; intent.baseline = result.cells[0]!.source; intent.changes = [{ offset: 11, deleteCount: 0, insertText: 'denied' }];
+    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
+  });
+  it('releases the row after a disconnected stream and after its real presence timeout', async () => {
+    const start = await liveNotebook(); const events: PersistentLiveEvent[] = [];
+    const stream = client.subscribe(owner.sessionId, (event) => events.push(event), () => undefined);
+    for (let n = 0; n < 100 && !events.some((event) => event.kind === 'ready'); n++) await new Promise((resolve) => setTimeout(resolve, 10));
+    await linePresence(start, 0); stream.dispose(); await new Promise((resolve) => setTimeout(resolve, 50));
+    const intent = { actor: 'F'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: 'free' }] };
+    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(result.cells[0]!.source, 'ofreewner\nmember');
+    await linePresence(result, 0); await new Promise((resolve) => setTimeout(resolve, 5100));
+    intent.sequence = 2; intent.baseline = result.cells[0]!.source; intent.changes = [{ offset: 0, deleteCount: 0, insertText: 'after-timeout ' }];
+    assert.equal((await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent })).cells[0]!.source, 'after-timeout ofreewner\nmember');
+  });
+  it('persists host text intent identity through lost acknowledgement and server restart', async () => {
+    const start = await liveNotebook(); const request = { path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'D'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 5, deleteCount: 0, insertText: '!' }] } };
+    const accepted = await rpc<NotebookSyncReply>('notebookSync', request);
+    assert.equal((await rpc<NotebookSyncReply>('notebookSync', request)).revision, accepted.revision);
+    await server.stop(); server = new VpsServer({ dataDirectory: path.join(root, 'server'), clientToken: 'A'.repeat(40), agentTokens: {} }); endpoint = `http://127.0.0.1:${await server.start()}`; client = new PersistentClient(endpoint, { kind: 'membership', token: owner.token });
+    const recovered = await rpc<NotebookSyncReply>('notebookSync', request); assert.equal(recovered.revision, accepted.revision); assert.equal(recovered.cells[0]!.source, 'owner!\nmember');
+  });
+  it('filters Private cursor and notebook events from the member stream', async () => {
+    await rpc('write', { path: 'secret.ipynb', expectedRevision: 0, visibility: 'private', content: encoded(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'private', metadata: {}, outputs: [] }] })) });
+    const events: PersistentLiveEvent[] = []; const stream = member.subscribe(owner.sessionId, (event) => events.push(event), () => undefined);
+    try {
+      const start = await rpc<NotebookSyncReply>('notebookSync', { path: 'secret.ipynb' }); const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(start.update, 'base64')); const text = doc.getMap<Y.Map<unknown>>('cells').get('stable')!.get('source') as Y.Text;
+      await rpc('presence', { path: 'secret.ipynb', epoch: start.epoch, cellId: 'stable', activeLineAnchor: encodeRelativeOffset(text, 0) }); doc.destroy();
+      await rpc('notebookSync', { path: 'secret.ipynb', epoch: start.epoch, intent: { actor: 'E'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'private', changes: [{ offset: 7, deleteCount: 0, insertText: '!' }] } });
+      await new Promise((resolve) => setTimeout(resolve, 50)); assert.equal(JSON.stringify(events).includes('secret.ipynb'), false); assert.equal(JSON.stringify(events).includes('private!'), false);
+    } finally { stream.dispose(); }
+  });
   it('merges two offline replicas, persists stable IDs/order/metadata, and admits exactly the acknowledged displayed cell', async () => {
     await rpc('write', { path: 'book.ipynb', content: encoded(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: { kernelspec: { name: 'python3' } }, cells: [{ id: 'first', cell_type: 'code', source: 'abc', metadata: { tag: 'retained' }, outputs: [] }, { id: 'second', cell_type: 'markdown', source: 'notes', metadata: {} }] })), expectedRevision: 0 });
     const start = await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb' });

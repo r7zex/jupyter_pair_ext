@@ -18,7 +18,17 @@
 
 Исходники новой реализации: [серверный entrypoint](../src/vps/cli.ts), [HTTP-сервер](../src/vps/server.ts), [RPC-контракт](../src/vps/persistentProtocol.ts), [интерактивный агент](../scripts/pair-notebook-session-agent.py), [Jupyter bridge](../media/jupyter_kernel_bridge.py). Старый entrypoint можно сверить с [базовым кодом GitHub](https://github.com/r7zex/jupyter_pair_ext/blob/3cc515793a4dfaa9b9a1803af60a85c64899b48b/src/vps/cli.ts). После публикации используйте immutable commit ссылки именно на новую версию.
 
-В 0.6.3 notebook CRDT и двусторонний folder reconciliation работают непрерывно, с durable local journals и серверным CAS. Collaborative cursors не реализованы. Серверные файлы, права и результаты сохраняются; Python-объекты в RAM не восстанавливаются после перезапуска worker/VPS и не мигрируют при смене устройства.
+Notebook editing uses the existing host editor components (`EditorSynchronizer`, `EditorTextReplica`, `PresenceRenderer`) with the VPS as the permanent authority. An authenticated event stream on the session RPC endpoint pushes committed text updates and participant presence immediately. Text intents have durable actor/sequence identities, so reconnecting or recovering a lost acknowledgement does not repeat an edit. Folder reconciliation retains its durable journal and server CAS.
+
+The selected-line policy from the earlier human-host implementation is enforced in both the editor and VPS. Participants can edit different lines of the same cell. A competing selection uses stable participant order; deleting a newline that touches an occupied line is also rejected. Presence follows Yjs relative anchors, is filtered by file visibility, and is released on leave, stream disconnect, revocation, or five seconds without renewal. Character carets and participant names use the existing presence renderer. Private cursors and source updates are never sent to members without access.
+
+The native VS Code ipynb serializer envelope is normalized before publication; transient `cells` and reserved `pair_crdt` state are not recursively copied into user metadata. Legacy inflated replicas are archived locally before repair. Structural changes use a state-vector fence and conflicting local changes remain archived. Server files, permissions and results persist, but Python objects in RAM do not survive a worker/VPS restart or move between compute devices.
+
+Execution notifications use the same authenticated stream and the existing Jupyter observation/rendering code. Other participants see permitted outputs but never answer another participant's stdin prompt. Stored outputs use the same native NotebookController state renderer as the human-host path. Private promotion also removes legacy serialized copies of Private outputs before making the file readable to members.
+
+Execution admission validates the acknowledged notebook identity, stable cell ID, source hash and selected compute generation. Unrelated live edits do not invalidate an unchanged cell. Running results can merge after a trusted edit to another cell; replacing the notebook, editing the executed source or changing privacy still fences the old result. Raw notebook replacement resets its stored replica rather than allowing an obsolete embedded CRDT to restore old text.
+
+For a selected WSL GPU, the agent binds `/dev/dxg` in addition to the runtime libraries. CPU kernels do not receive that device. Because WSL exposes a shared GPU node, this sandbox permits GPU execution only when exactly one NVIDIA GPU is advertised; multiple-GPU WSL hosts fail closed rather than exposing unselected devices.
 
 ## 2. Совпадающие артефакты и зависимости
 
@@ -124,6 +134,14 @@ journalctl -u pair-notebook-server.service -u pair-notebook-worker.service --sin
 Наличие `bwrap` само по себе не доказывает работоспособность sandbox. В новых Ubuntu политики AppArmor могут запрещать unprivileged user namespaces; исправляйте установку/профиль bubblewrap по документации вашей Ubuntu, сохраняя изоляцию. Не отключайте системную защиту глобально и не запускайте агент root. При недоступном sandbox или зависимостях агент должен показывать устройство как недоступное для запуска; обычное непривилегированное выполнение без sandbox не является запасным вариантом.
 
 В unit worker разрешены namespaces, необходимые bubblewrap. Шаблон является CPU-шаблоном (`PrivateDevices=true`); его нельзя переносить на GPU-машину без настройки доступа к реальным NVIDIA devices. Сервер и worker имеют разные UID, разные каталоги данных и разные credentials.
+
+The worker checks its actual selected sandbox with `ExecStartPre` inside the
+systemd unit. A standalone `runuser` probe does not establish unit readiness.
+`ProtectKernelTunables=false` is deliberate for this worker: systemd's procfs
+masking prevents bubblewrap from mounting its own private `/proc`. Keep the
+remaining systemd restrictions and bubblewrap isolation enabled; do not disable
+AppArmor user-namespace restrictions globally. Ubuntu may require a confined
+AppArmor profile for the worker's bubblewrap executable.
 
 ## 5. HTTPS непосредственно для 144.172.69.57
 

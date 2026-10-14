@@ -11,6 +11,13 @@ import { PersistentHistory } from './persistentHistory';
 import * as Y from 'yjs';
 import { loadNotebookCrdt, saveNotebookCrdt, sharedNotebook } from './persistentNotebookCrdt';
 import { persistentNotebookOutputs } from './persistentNotebookOutputs';
+import { PersistentLive, type PersistentPresence } from './persistentLive';
+import { lineLockMessage } from '../core/lineLock';
+import { createSharedCursorPosition, encodeRelativeOffset, resolveRelativeOffset, resolveSharedCursorPosition, type SharedCursorPosition } from '../core/cursorPosition';
+import { rebaseTextChanges } from '../core/textChanges';
+import { diffChars } from 'diff';
+import type { TextChange } from '../core/crdt';
+import { editSharedNotebook, type NotebookSyncReply } from './persistentNotebookCrdt';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
 import { safeJobPath, VPS_ID, visibleVpsText } from './protocol';
 
@@ -34,9 +41,11 @@ interface Invitation { id: string; tokenHash: string; expiresAt: number; readOnl
 interface ExecutionRecord {
   execution: PersistentExecution; requestId: string; commandId: string; cellIdentity: string;
   sourceHash: string; notebookVersion: number; offset: number; reports: { offset: number; digest: string; end: number }[];
+  notebookIdentity?: string;
   aclEpoch: number; controls: { id: string; command: Record<string, unknown> }[];
   kernelCommand?: 'restart' | 'release';
   mergePending?: boolean;
+  outputPublication?: { fromVersion: number; toVersion: number };
 }
 interface SessionRecord {
   version: 1; id: string; name: string; state: 'running' | 'stopped'; ownerId: string;
@@ -45,7 +54,7 @@ interface SessionRecord {
   aclEpoch: number;
   invitations?: Invitation[];
 }
-interface Session { record: SessionRecord; workspace: PersistentWorkspace; policy: PersistentComputePolicy; seen: Map<string, number>; history: PersistentHistory }
+interface Session { record: SessionRecord; workspace: PersistentWorkspace; policy: PersistentComputePolicy; seen: Map<string, number>; history: PersistentHistory; live: PersistentLive }
 interface NotebookCell { id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown[]; execution_count?: number | null }
 interface Notebook { cells: NotebookCell[]; [key: string]: unknown }
 export interface PersistentHostOptions { directory: string; administrativeTokens: string[]; vpsAgentToken?: string }
@@ -73,7 +82,7 @@ export class PersistentSessionHost {
       const workspace = new PersistentWorkspace(path.join(this.options.directory, record.id, 'workspace'));
       await workspace.init();
       const policy = new PersistentComputePolicy(record.id, record.ownerId, record.policy);
-      const session: Session = { record, workspace, policy, seen: new Map(), history: new PersistentHistory(this.directory(record.id)) };
+      const session: Session = { record, workspace, policy, seen: new Map(), history: new PersistentHistory(this.directory(record.id)), live: new PersistentLive() };
       policy.setMembers(this.members(session));
       for (const run of record.executions) {
         if (run.execution.state === 'queued') {
@@ -83,7 +92,7 @@ export class PersistentSessionHost {
       this.retireRevokedReporting(session);
       this.sessions.set(record.id, session);
       for (const run of record.executions) if (run.mergePending) await this.finishResultMerge(session, run);
-      await workspace.retainPublications(record.executions.filter((run) => run.mergePending).map((run) => run.execution.id));
+      await this.retainResultPublications(session);
       await this.persist(session);
     }
     this.sweep = setInterval(() => {
@@ -104,6 +113,7 @@ export class PersistentSessionHost {
 
   public async stop(): Promise<void> {
     this.closing = true;
+    for (const session of this.sessions.values()) session.live.close();
     if (this.sweep) clearInterval(this.sweep);
     await this.serial;
     for (const session of this.sessions.values()) await this.persist(session);
@@ -122,7 +132,23 @@ export class PersistentSessionHost {
       if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.operation !== 'string') throw new SessionError(400, 'Invalid session operation.');
       const auth = request.headers.authorization;
       const credential = typeof auth === 'string' && /^Bearer [A-Za-z0-9_-]{32,256}$/.test(auth) ? auth.slice(7) : '';
-      const value = await this.enqueue(() => this.dispatch(body, credential, request.socket.remoteAddress ?? 'unknown'));
+      if (body.operation === 'subscribe') {
+        await this.enqueue(async () => {
+          const session = this.sessions.get(this.string(body, 'sessionId')); if (!session) throw new SessionError(404, 'Session unavailable.');
+          const member = this.membership(session, credential); this.active(session);
+          session.live.attach({ response, memberId: member.id,
+            valid: () => { try { return !this.closing && session.record.state === 'running' && this.membership(session, credential).id === member.id; } catch { return false; } },
+            visible: (filename) => session.workspace.snapshot(member.id === session.record.ownerId).entries.some((entry) => entry.path === filename && entry.type === 'file'),
+          });
+          for (const run of session.record.executions) if (run.execution.state === 'queued' || run.execution.state === 'running') this.publishExecution(session, run);
+        });
+        return;
+      }
+      const value = await this.enqueue(async () => {
+        const result = await this.dispatch(body, credential, request.socket.remoteAddress ?? 'unknown');
+        if (['write', 'mkdir', 'rename', 'remove', 'visibility', 'lifecycle', 'revoke', 'revokeInvitation', 'password'].includes(body.operation)) this.sessions.get(body.sessionId ?? '')?.live.invalidate();
+        return result;
+      });
       response.end(JSON.stringify(value));
     } catch (error) {
       let status = error instanceof SessionError ? error.status : 500;
@@ -145,7 +171,7 @@ export class PersistentSessionHost {
   private async trimHistory(session: Session, capacity = false, reserveBytes = 0, excludedId = ''): Promise<void> {
     const bytes = (): number => session.record.executions.reduce((total, run) => total + Buffer.byteLength(JSON.stringify(run.execution.events)), 0);
     while ((capacity && session.record.executions.length >= MAX_EXECUTIONS) || bytes() + reserveBytes > 4 * 1024 * 1024) {
-      const index = session.record.executions.findIndex((run) => !run.mergePending && run.execution.id !== excludedId && run.execution.state !== 'queued' && run.execution.state !== 'running');
+      const index = session.record.executions.findIndex((run) => !run.mergePending && !this.hasOutputDependents(session, run) && run.execution.id !== excludedId && run.execution.state !== 'queued' && run.execution.state !== 'running');
       if (index < 0) break;
       const run = session.record.executions[index]!;
       const artifact = path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`);
@@ -192,8 +218,10 @@ export class PersistentSessionHost {
         || Buffer.byteLength(JSON.stringify(run.execution.events)) > MAX_EVENTS_BYTES || !Array.isArray(run.reports) || run.reports.length > 4096
         || !Number.isSafeInteger(run.aclEpoch) || run.aclEpoch < 1 || !Array.isArray(run.controls) || run.controls.length > 128
         || (run.execution.scope !== undefined && !['public', 'private'].includes(run.execution.scope))
+        || (run.notebookIdentity !== undefined && (typeof run.notebookIdentity !== 'string' || !/^[a-f0-9]{32}$/.test(run.notebookIdentity)))
         || (run.kernelCommand !== undefined && run.kernelCommand !== 'restart' && run.kernelCommand !== 'release')
         || (run.mergePending !== undefined && (typeof run.mergePending !== 'boolean' || (run.mergePending && !['completed', 'failed'].includes(run.execution.state))))
+        || (run.outputPublication !== undefined && (!run.outputPublication || !Number.isSafeInteger(run.outputPublication.fromVersion) || run.outputPublication.fromVersion < 1 || !Number.isSafeInteger(run.outputPublication.toVersion) || run.outputPublication.toVersion <= run.outputPublication.fromVersion))
         || !['queued', 'running', 'completed', 'failed', 'interrupted'].includes(run.execution.state)) throw new Error('Invalid saved execution.');
     }
   }
@@ -282,7 +310,7 @@ export class PersistentSessionHost {
       const password = await this.password(body.password); const id = randomUUID(); const memberId = randomUUID(); const secret = token();
       const policy = new PersistentComputePolicy(id, memberId); const workspace = new PersistentWorkspace(path.join(this.directory(id), 'workspace')); await workspace.init();
       const session: Session = { record: { version: 1, id, name, state: 'running', ownerId: memberId, password,
-        members: [{ id: memberId, name: typeof body.memberName === 'string' && visibleVpsText(body.memberName, 120) ? body.memberName : 'Owner', role: 'owner', tokenHash: sha(secret), revoked: false }], policy: policy.serialize(), executions: [], aclEpoch: 1 }, workspace, policy, seen: new Map([[memberId, Date.now()]]), history: new PersistentHistory(this.directory(id)) };
+        members: [{ id: memberId, name: typeof body.memberName === 'string' && visibleVpsText(body.memberName, 120) ? body.memberName : 'Owner', role: 'owner', tokenHash: sha(secret), revoked: false }], policy: policy.serialize(), executions: [], aclEpoch: 1 }, workspace, policy, seen: new Map([[memberId, Date.now()]]), history: new PersistentHistory(this.directory(id)), live: new PersistentLive() };
       policy.setMembers(this.members(session)); if (this.vpsInventory) policy.registerVps(this.vpsInventory);
       await this.persist(session); this.sessions.set(id, session);
       return { sessionId: id, memberId, token: secret, name } satisfies PersistentMembership;
@@ -322,7 +350,7 @@ export class PersistentSessionHost {
     if (!['leave', 'claim', 'report', 'registerDevice', 'share'].includes(body.operation)) session.seen.set(member.id, Date.now());
     session.policy.setMembers(this.members(session));
     const owner = member.id === session.record.ownerId;
-    if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'artifacts', 'notebookSync'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
+    if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'executions', 'artifacts', 'notebookSync', 'presence'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
     if (body.operation === 'invitations') { this.owner(session, member); return { invitations: (session.record.invitations ?? []).map((invite) => ({ id: invite.id, expiresAt: invite.expiresAt, readOnly: invite.readOnly, revoked: invite.revoked })) }; }
     if (body.operation === 'createInvitation') {
       this.owner(session, member);
@@ -341,7 +369,7 @@ export class PersistentSessionHost {
       session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return { revoked: true };
     }
     if (body.operation === 'view' || body.operation === 'heartbeat') { await this.persist(session); return this.view(session, member); }
-    if (body.operation === 'leave') { session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
+    if (body.operation === 'leave') { session.live.remove(member.id); session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
     if (body.operation === 'lifecycle') return this.lifecycle(session, member, this.string(body, 'action'));
     if (body.operation === 'password') {
       this.owner(session, member); session.record.password = await this.password(body.password);
@@ -362,6 +390,32 @@ export class PersistentSessionHost {
       return this.report(session, body, deviceId);
     }
     this.active(session);
+    if (body.operation === 'executions') {
+      const visible = new Set(session.workspace.snapshot(owner).entries.filter((entry) => entry.type === 'file').map((entry) => entry.path));
+      return { executions: session.record.executions.filter((run) => !run.kernelCommand && ['queued', 'running'].includes(run.execution.state)
+        && visible.has(run.execution.notebook) && (owner || (run.execution.scope !== 'private' && run.aclEpoch === session.record.aclEpoch))).map((run) => ({ ...run.execution, events: [] })) };
+    }
+    if (body.operation === 'presence') {
+      if (!body.path) session.live.update(member.id, undefined);
+      else {
+        const filename = this.string(body, 'path'); const file = await session.workspace.read(filename, owner);
+        const { doc, epoch } = loadNotebookCrdt(file.content);
+        try {
+          if (body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced.');
+          const cellId = this.string(body, 'cellId'); const text = doc.getMap<Y.Map<unknown>>('cells').get(cellId)?.get('source');
+          if (!(text instanceof Y.Text) || !sharedNotebook(doc).cells.some((cell) => cell.id === cellId)) throw new SessionError(404, 'Cell unavailable.');
+          const anchor = this.string(body, 'activeLineAnchor'); const offset = resolveRelativeOffset(text, anchor, undefined);
+          if (offset === undefined) throw new SessionError(400, 'Invalid presence anchor.');
+          if (body.cursor !== undefined && (!body.cursor || typeof body.cursor !== 'object' || Array.isArray(body.cursor))) throw new SessionError(400, 'Invalid presence cursor.');
+          const cursor = body.cursor === undefined ? undefined : resolveSharedCursorPosition(text, body.cursor as SharedCursorPosition);
+          if (body.cursor !== undefined && !cursor) throw new SessionError(400, 'Invalid presence cursor.');
+          session.live.update(member.id, { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) },
+            epoch, readOnly: !!member.readOnly, kernelStatus: 'Idle', activeFile: filename, activeNotebookCellId: cellId,
+            activeLineAnchor: anchor, activeLine: text.toString().slice(0, offset).split('\n').length - 1, shareCursor: true, cursorColor: '#4FC3F7', ...(cursor ? { cursor: createSharedCursorPosition(text, cursor.anchor, cursor.active) } : {}) });
+        } finally { doc.destroy(); }
+      }
+      return { states: session.live.states((filename) => session.workspace.snapshot(owner).entries.some((entry) => entry.path === filename && entry.type === 'file')) };
+    }
     if (body.operation === 'notebookSync') {
       const filename = this.string(body, 'path');
       if (!filename.endsWith('.ipynb')) throw new SessionError(400, 'Select a notebook.');
@@ -370,24 +424,87 @@ export class PersistentSessionHost {
       try {
         if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced. Preserve offline edits and reopen it.');
         const before = Buffer.from(Y.encodeStateAsUpdate(doc));
+        const previous = sharedNotebook(doc);
+        const states = session.live.states().filter((state) => !state.readOnly && state.activeFile === filename && state.epoch === epoch);
+        const offsets = new Map(states.map((state) => { const text = doc.getMap<Y.Map<unknown>>('cells').get(state.activeNotebookCellId ?? '')?.get('source'); return [state.peer.peerId, resolveRelativeOffset(text instanceof Y.Text ? text : undefined, state.activeLineAnchor, undefined)] as const; }));
+        const guard = (cellId: string, changes: readonly TextChange[], source: string): void => {
+          const message = lineLockMessage(states, member.id, filename, cellId, changes.map((change) => ({ rangeOffset: change.offset, rangeLength: change.deleteCount })), source,
+            (state) => offsets.get(state.peer.peerId));
+          if (message) throw new SessionError(423, message);
+        };
+        let intentApplied = false;
+        let implicitPresence: PersistentPresence | undefined;
+        if (body.intent !== undefined) {
+          if (member.readOnly) throw new SessionError(403, 'This invitation grants read access only.');
+          const intent = body.intent as { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[] };
+          if (!intent || !/^[A-Za-z0-9_-]{32,64}$/.test(intent.actor) || !Number.isSafeInteger(intent.sequence) || intent.sequence < 1
+            || typeof intent.baseline !== 'string' || Buffer.byteLength(intent.baseline) > 2 * 1024 * 1024 || !Array.isArray(intent.changes) || !intent.changes.length || intent.changes.length > 100) throw new SessionError(400, 'Invalid text intent.');
+          let end = 0;
+          for (const change of [...intent.changes].sort((a, b) => a.offset - b.offset)) {
+            if (!Number.isSafeInteger(change.offset) || !Number.isSafeInteger(change.deleteCount) || change.offset < end || change.deleteCount < 0 || change.offset + change.deleteCount > intent.baseline.length || typeof change.insertText !== 'string' || Buffer.byteLength(change.insertText) > 2 * 1024 * 1024) throw new SessionError(400, 'Invalid text changes.');
+            end = change.offset + change.deleteCount;
+          }
+          const ledger = (template.metadata?.pair_crdt?.intents ?? {}) as Record<string, { member: string; sequence: number; digest: string }>;
+          const last = ledger[intent.actor]; const digest = sha(JSON.stringify(intent));
+          if (last && (last.member !== member.id || (last.sequence === intent.sequence && last.digest !== digest))) throw new SessionError(409, 'Text intent identity was reused.');
+          if (!last || intent.sequence > last.sequence) {
+            if (intent.sequence !== (last?.sequence ?? 0) + 1 || (!last && Object.keys(ledger).length >= 64)) throw new SessionError(409, 'Text intent sequence is unavailable.');
+            const cell = previous.cells.find((item) => item.id === intent.cellId); if (!cell) throw new SessionError(409, 'Cell was removed.');
+            const changes = rebaseTextChanges(intent.baseline, cell.source, intent.changes); guard(cell.id, changes, cell.source);
+            const text = doc.getMap<Y.Map<unknown>>('cells').get(cell.id)!.get('source') as Y.Text;
+            doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
+            const offset = Math.min(text.length, (changes[0]?.offset ?? 0) + (changes[0]?.insertText.length ?? 0));
+            const start = offset <= 0 ? 0 : text.toString().lastIndexOf('\n', offset - 1) + 1;
+            implicitPresence = { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) }, epoch, readOnly: false,
+              kernelStatus: 'Idle', activeFile: filename, activeNotebookCellId: cell.id, activeLineAnchor: encodeRelativeOffset(text, start),
+              activeLine: text.toString().slice(0, start).split('\n').length - 1, cursor: createSharedCursorPosition(text, offset, offset), shareCursor: true, cursorColor: '#4FC3F7' };
+            template.metadata ??= {};
+            template.metadata.pair_crdt = { ...template.metadata.pair_crdt, intents: { ...ledger, [intent.actor]: { member: member.id, sequence: intent.sequence, digest } } }; intentApplied = true;
+          }
+        }
         if (body.update !== undefined) {
           const update = this.string(body, 'update');
           if (update.length > 2 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(update)) throw new SessionError(413, 'CRDT update exceeds limits.');
           try { Y.applyUpdate(doc, Buffer.from(update, 'base64')); } catch { throw new SessionError(400, 'Invalid CRDT update.'); }
         }
+        if (body.snapshot !== undefined) {
+          if (typeof body.snapshotStateVector !== 'string' || body.snapshotStateVector !== Buffer.from(Y.encodeStateVector(doc)).toString('base64')) throw new SessionError(409, 'Notebook changed before its structural save.');
+          const snapshot = body.snapshot as ReturnType<typeof sharedNotebook>;
+          // Text uses host-serialized intents; a structural save must not replace unseen input.
+          if (!snapshot || !Array.isArray(snapshot.cells) || snapshot.cells.some((cell) => previous.cells.some((old) => old.id === cell.id && old.source !== cell.source))) throw new SessionError(409, 'Reload notebook text before changing its structure.');
+          try { editSharedNotebook(doc, snapshot); } catch { throw new SessionError(400, 'Invalid notebook structure.'); }
+        }
+        if (body.update !== undefined || body.snapshot !== undefined) {
+          const after = sharedNotebook(doc);
+          for (const old of previous.cells) {
+            const next = after.cells.find((cell) => cell.id === old.id);
+            if (!next && states.some((state) => state.activeNotebookCellId === old.id && state.peer.peerId !== member.id)) throw new SessionError(423, 'Cell contains another participant\'s selected line.');
+            if (next && next.source !== old.source) {
+              const parts = diffChars(old.source, next.source, { timeout: 25 }); if (!parts) throw new SessionError(409, 'Text reconciliation exceeds its limit.');
+              let offset = 0; const changes: TextChange[] = [];
+              for (const part of parts) { if (part.added) changes.push({ offset, deleteCount: 0, insertText: part.value }); else { if (part.removed) changes.push({ offset, deleteCount: part.value.length, insertText: '' }); offset += part.value.length; } }
+              guard(old.id, changes, old.source);
+            }
+          }
+        }
         if (member.readOnly && !Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw new SessionError(403, 'This invitation grants read access only.');
         let content: string;
         try { content = saveNotebookCrdt(doc, epoch, template); } catch { throw new SessionError(400, 'Invalid or oversized notebook CRDT.'); }
-        const revision = content === file.content ? file.revision : (await session.workspace.write(filename, content, file.revision, owner)).revision;
+        const revision = content === file.content && !intentApplied ? file.revision : (await session.workspace.write(filename, content, file.revision, owner, undefined, false, true)).revision;
+        if (revision !== file.revision) session.live.broadcast({ kind: 'notebook', path: filename, epoch, revision, update: Buffer.from(Y.encodeStateAsUpdate(doc, Y.encodeStateVectorFromUpdate(before))).toString('base64') });
+        if (implicitPresence) session.live.update(member.id, implicitPresence);
         const vector = typeof body.stateVector === 'string' && body.stateVector.length <= 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
         let update: string;
         try { update = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); } catch { throw new SessionError(400, 'Invalid CRDT state vector.'); }
-        return { epoch, revision, update, ...sharedNotebook(doc) };
+        return { epoch, revision, update, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
       } finally { doc.destroy(); }
     }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);
     if (body.operation === 'read') return session.workspace.read(this.string(body, 'path'), owner);
     if (body.operation === 'write') {
+      const filename = this.string(body, 'path');
+      if (filename.endsWith('.ipynb') && session.workspace.snapshot(owner).entries.some((entry) => entry.path === filename)
+        && session.live.states().some((state) => state.activeFile === filename && state.peer.peerId !== member.id && !state.readOnly)) throw new SessionError(423, 'Notebook contains another participant\'s selected line.');
       if (body.visibility !== undefined && (!owner || body.visibility !== 'private')) throw new SessionError(403, 'Only the owner can create a Private file.');
       return session.workspace.write(this.string(body, 'path'), this.string(body, 'content'), this.revision(body), owner, undefined, body.visibility === 'private');
     }
@@ -477,7 +594,7 @@ export class PersistentSessionHost {
   private async lifecycle(session: Session, member: MemberRecord, action: string): Promise<unknown> {
     this.administrator(member);
     if (!['start', 'stop', 'restart', 'delete'].includes(action)) throw new SessionError(400, 'Invalid lifecycle action.');
-    if (action === 'delete') { session.record.state = 'stopped'; await this.persist(session); await rm(this.directory(session.record.id), { recursive: true }); this.sessions.delete(session.record.id); return { deleted: true }; }
+    if (action === 'delete') { session.record.state = 'stopped'; await this.persist(session); await rm(this.directory(session.record.id), { recursive: true }); session.live.close(); this.sessions.delete(session.record.id); return { deleted: true }; }
     if (action === 'stop' || action === 'restart') {
       session.record.state = 'stopped';
       for (const run of session.record.executions) if (run.execution.state === 'queued') { run.execution.state = 'interrupted'; run.execution.error = 'Session stopped before execution was claimed.'; }
@@ -515,7 +632,11 @@ export class PersistentSessionHost {
     const snapshot = session.workspace.snapshot(member.id === session.record.ownerId);
     const privateExecution = snapshot.entries.find((entry) => entry.path === notebookPath)?.visibility === 'private';
     const scope = privateExecution ? 'private' : 'public';
-    if (body.operation === 'execute' && file.revision !== this.revision(body)) throw new SessionError(409, 'Notebook snapshot changed. Refresh before execution.');
+    const notebookIdentity = session.workspace.notebookIdentity(notebookPath, member.id === session.record.ownerId);
+    if (body.expectedNotebookIdentity !== undefined && body.expectedNotebookIdentity !== notebookIdentity) throw new SessionError(409, 'Notebook was replaced before execution.');
+    if (body.expectedGeneration !== undefined && body.expectedGeneration !== session.policy.view().generation) throw new SessionError(409, 'Compute changed before execution.');
+    const scopedAdmission = body.expectedNotebookIdentity === notebookIdentity && typeof body.expectedCellId === 'string' && typeof body.expectedSourceHash === 'string';
+    if (body.operation === 'execute' && file.revision !== this.revision(body) && !scopedAdmission) throw new SessionError(409, 'Notebook snapshot changed. Refresh before execution.');
     const notebook = this.notebook(file.content); const index = body.operation === 'kernel' ? 0 : body.cellIndex;
     let source = ''; let cellIdentity = 'kernel-control';
     if (body.operation === 'execute') {
@@ -546,10 +667,16 @@ export class PersistentSessionHost {
       files: files.map((item) => ({ ...item, version: snapshot.entries.find((entry) => entry.path === item.path)?.version ?? 0 })), command: raw };
     if (Buffer.byteLength(JSON.stringify(command)) > 16 * 1024 * 1024) throw new SessionError(413, 'Public compute snapshot exceeds the 16 MiB transport limit.');
     await this.writeMetadata(path.join(this.directory(session.record.id), 'commands', `${commandId}.json`), JSON.stringify(command));
-    const run: ExecutionRecord = { execution, requestId, commandId, sourceHash: sha(source), cellIdentity, notebookVersion: snapshot.entries.find((entry) => entry.path === notebookPath)!.version, offset: 0, reports: [], aclEpoch: session.record.aclEpoch, controls: [],
+    const run: ExecutionRecord = { execution, requestId, commandId, sourceHash: sha(source), cellIdentity, notebookIdentity, notebookVersion: snapshot.entries.find((entry) => entry.path === notebookPath)!.version, offset: 0, reports: [], aclEpoch: session.record.aclEpoch, controls: [],
       ...(body.operation === 'kernel' ? { kernelCommand: body.command as 'restart' | 'release' } : {}) };
     await session.history.reserve(run); session.record.executions.push(run);
-    await this.persist(session); return execution;
+    await this.persist(session); this.publishExecution(session, run); return execution;
+  }
+
+  private publishExecution(session: Session, run: ExecutionRecord): void {
+    if (run.kernelCommand) return;
+    session.live.broadcast({ kind: 'execution', path: run.execution.notebook, id: run.execution.id },
+      (memberId) => memberId === session.record.ownerId || (run.execution.scope !== 'private' && run.aclEpoch === session.record.aclEpoch));
   }
 
   private async kernelControl(session: Session, member: MemberRecord, body: PersistentRpcRequest): Promise<PersistentExecution> {
@@ -590,7 +717,7 @@ export class PersistentSessionHost {
         void file;
       }
       catch { run.execution.state = 'failed'; run.execution.error = 'Execution authority or public notebook access was revoked before launch.'; await this.persist(session); continue; }
-      run.execution.state = 'running'; await this.persist(session);
+      run.execution.state = 'running'; await this.persist(session); this.publishExecution(session, run);
       return { command: JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${run.commandId}.json`), 16 * 1024 * 1024)) as PersistentCommand };
     }
     return { command: null };
@@ -625,7 +752,7 @@ export class PersistentSessionHost {
     try { await this.persist(session); }
     catch (error) { Object.assign(run, before); throw error; }
     if (run.mergePending) await this.finishResultMerge(session, run);
-    await this.trimHistory(session); await this.persist(session); return { offset: run.offset };
+    await this.trimHistory(session); await this.persist(session); this.publishExecution(session, run); return { offset: run.offset };
   }
 
   private async finishResultMerge(session: Session, run: ExecutionRecord): Promise<void> {
@@ -639,20 +766,53 @@ export class PersistentSessionHost {
     run.mergePending = false;
     try { await this.persist(session); }
     catch (error) { run.mergePending = true; throw error; }
-    await session.workspace.retainPublications(session.record.executions.filter((item) => item.mergePending).map((item) => item.execution.id));
+    await this.retainResultPublications(session);
+  }
+
+  private outputPublicationId(run: ExecutionRecord): string {
+    // Returned artifact writes occupy indexes 0..255; reserve 256 for outputs.
+    return `${run.execution.id}:write:256`;
+  }
+  private sameNotebookScope(first: ExecutionRecord, second: ExecutionRecord): boolean {
+    return first.execution.notebook === second.execution.notebook && first.execution.scope === second.execution.scope
+      && first.execution.generation === second.execution.generation && first.aclEpoch === second.aclEpoch;
+  }
+  private hasOutputDependents(session: Session, publisher: ExecutionRecord): boolean {
+    return !!publisher.outputPublication && session.record.executions.some((run) => run !== publisher && this.sameNotebookScope(run, publisher)
+      && (run.mergePending || run.execution.state === 'queued' || run.execution.state === 'running')
+      && run.notebookVersion <= publisher.outputPublication!.fromVersion);
+  }
+  private async retainResultPublications(session: Session): Promise<void> {
+    await session.workspace.retainPublications(session.record.executions.filter((run) => run.mergePending).map((run) => run.execution.id),
+      session.record.executions.filter((run) => this.hasOutputDependents(session, run)).map((run) => this.outputPublicationId(run)));
+  }
+  private hasOutputLineage(session: Session, run: ExecutionRecord, currentVersion: number | undefined): boolean {
+    let version = run.notebookVersion;
+    const publishers = session.record.executions.filter((candidate) => candidate.outputPublication && this.sameNotebookScope(candidate, run))
+      .sort((first, second) => first.outputPublication!.fromVersion - second.outputPublication!.fromVersion);
+    for (const publisher of publishers) {
+      const publication = publisher.outputPublication!;
+      if (publication.fromVersion === version && session.workspace.hasPublication(this.outputPublicationId(publisher))) version = publication.toVersion;
+    }
+    return version === currentVersion;
   }
 
   private async saveOutputs(session: Session, run: ExecutionRecord): Promise<void> {
     if (run.kernelCommand) return;
     try {
+      if (run.outputPublication && session.workspace.hasPublication(this.outputPublicationId(run))) return;
       const privateExecution = run.execution.scope === 'private';
       const file = await session.workspace.read(run.execution.notebook, privateExecution); const notebook = this.notebook(file.content);
       const version = session.workspace.snapshot(privateExecution).entries.find((entry) => entry.path === run.execution.notebook)?.version;
-      if (version !== run.notebookVersion) return;
+      if (version === undefined || (run.notebookIdentity ? session.workspace.notebookIdentity(run.execution.notebook, privateExecution) !== run.notebookIdentity : !this.hasOutputLineage(session, run, version))) return;
       const cell = notebook.cells[run.execution.cellIndex]; if (!cell || cell.cell_type !== 'code' || (cell.id ?? `index:${run.execution.cellIndex}`) !== run.cellIdentity || sha(this.source(cell)) !== run.sourceHash) return;
       const rendered = persistentNotebookOutputs(run.execution.events);
       cell.outputs = rendered.outputs; cell.execution_count = rendered.executionCount;
-      await session.workspace.write(run.execution.notebook, Buffer.from(JSON.stringify(notebook, null, 2)).toString('base64'), file.revision, privateExecution, undefined, privateExecution);
+      const previous = run.outputPublication;
+      run.outputPublication = { fromVersion: version, toVersion: file.revision + 1 };
+      try { await this.persist(session); }
+      catch (error) { if (previous) run.outputPublication = previous; else delete run.outputPublication; throw error; }
+      await session.workspace.write(run.execution.notebook, Buffer.from(JSON.stringify(notebook, null, 2)).toString('base64'), file.revision, privateExecution, this.outputPublicationId(run), privateExecution, true);
     } catch (error) {
       if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
       run.execution.error = 'Notebook outputs could not be merged; the execution result remains available.';
