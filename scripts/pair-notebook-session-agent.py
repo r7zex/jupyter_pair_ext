@@ -412,7 +412,7 @@ class Sandbox:
             with __import__("tempfile").TemporaryDirectory(prefix="pair-cuda-probe-") as temporary:
                 probe = "import torch;assert torch.cuda.is_available();assert torch.cuda.device_count()==1;print(torch.cuda.get_device_name(0))"
                 result = subprocess.run(self.command(Path(temporary), gpu_uuid, ["-I", "-c", probe]),
-                                        env=self.environment(gpu_uuid), capture_output=True, text=True, timeout=20)
+                                        env=self.environment(gpu_uuid), capture_output=True, text=True, timeout=30)
                 return result.returncode == 0
         except (AgentError, OSError, subprocess.SubprocessError):
             return False

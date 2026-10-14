@@ -777,6 +777,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         const restored = this.cellMirrors?.get(cell);
         if (restored) { restored.execution.end(undefined, Date.now()); this.cellMirrors.delete(cell); }
         const execution = this.notebook.createNotebookCellExecution(cell);
+        this.managedRuns?.delete(cell);
         this.localRunning?.add(cell);
         execution.start(Date.now());
         try {
@@ -796,12 +797,13 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
           const completed = await this.observe(result, execution, connection);
           const currentOutput = (!this.view || this.view.generation === completed.generation)
             && (!completed.sourceHash || completed.sourceHash === createHash('sha256').update(cell.document.getText()).digest('hex'));
-          execution.end(currentOutput ? completed.state === 'completed' : undefined, Date.now());
+          this.managedRuns?.set(cell, completed);
+          await this.endExecution(execution, cell, currentOutput ? completed.state === 'completed' : undefined);
           void this.files.refresh().catch((error) => this.log.appendLine(`[debug] Execution workspace refresh: ${error instanceof Error ? error.message : 'Unavailable.'}`));
         } catch (error) {
           await execution.appendOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(new Error(`${error instanceof Error ? error.message : 'Execution failed.'} Recovery request ID: ${requestId}`))]));
-          execution.end(false, Date.now());
-        } finally { this.localRunning?.delete(cell); this.managedRuns?.delete(cell); }
+          await this.endExecution(execution, cell, false);
+        } finally { this.localRunning?.delete(cell); if (['queued', 'running'].includes(this.managedRuns?.get(cell)?.state ?? 'running')) this.managedRuns?.delete(cell); }
       }
     });
     this.notebookQueues.set(key, queued);
@@ -828,14 +830,17 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       if (this.files.visibilityOf(run.notebook) !== (run.scope ?? 'public') || (this.view && this.view.generation !== run.generation)) return;
       const notebook = vscode.workspace.notebookDocuments.find((item) => item.uri.scheme === SCHEME && item.uri.authority === connection.sessionId && item.uri.path.slice(1) === run.notebook);
       const cell = notebook?.getCells().find((item) => (item.metadata.pairNotebookCellId ?? item.metadata.id) === run.cellId);
-      if (!cell || (this.selectedNotebooks && !this.selectedNotebooks.has(notebook!)) || this.localRunning.has(cell) || (run.sourceHash && createHash('sha256').update(cell.document.getText()).digest('hex') !== run.sourceHash)) return;
+      if (!cell || (this.selectedNotebooks && !this.selectedNotebooks.has(notebook!)) || this.localRunning.has(cell)
+        || (this.managedRuns.get(cell)?.id === run.id && this.managesCell(cell))
+        || (run.sourceHash && createHash('sha256').update(cell.document.getText()).digest('hex') !== run.sourceHash)) return;
       const handle = this.notebook.createNotebookCellExecution(cell); handle.start(Date.now());
       this.managedRuns.set(cell, run);
       let success: boolean | undefined;
       try { const finished = await this.observe(run, handle, connection, false);
+        this.managedRuns.set(cell, finished);
         if (connection === this.connection && (!this.view || this.view.generation === run.generation)
           && (!run.sourceHash || createHash('sha256').update(cell.document.getText()).digest('hex') === run.sourceHash)) success = finished.state === 'completed';
-      } finally { this.managedRuns.delete(cell); if (!cell.document.isClosed) handle.end(success, Date.now()); }
+      } finally { if (['queued', 'running'].includes(this.managedRuns.get(cell)?.state ?? 'running')) this.managedRuns.delete(cell); if (!cell.document.isClosed) await this.endExecution(handle, cell, success); }
     });
     this.mirroredRuns.set(id, work);
     void work.finally(() => { if (this.mirroredRuns.get(id) === work) this.mirroredRuns.delete(id); }).catch(() => undefined);
@@ -844,6 +849,21 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private latestExecution(id: string, connection: ActiveConnection): PersistentExecution | undefined {
     const cached = this.latestExecutions?.get(id);
     return cached && cached.connection === connection ? cached.execution : undefined;
+  }
+  private endExecution(handle: vscode.NotebookCellExecution, cell: vscode.NotebookCell, success: boolean | undefined): Promise<void> {
+    // Native end() updates arrive asynchronously; returning early races Save's notebook version.
+    const endTime = Date.now();
+    return new Promise((resolve, reject) => {
+      const done = (): void => { listener?.dispose(); if (timer) clearTimeout(timer); resolve(); };
+      const listener = vscode.workspace.onDidChangeNotebookDocument?.((event) => {
+        if (event.notebook === cell.notebook && cell.executionSummary?.timing?.endTime === endTime) done();
+      });
+      const timer = setTimeout(done, 1000); timer.unref();
+      try {
+        handle.end(success, endTime);
+        if (!listener || cell.document.isClosed || cell.executionSummary?.timing?.endTime === endTime) done();
+      } catch (error) { listener?.dispose(); clearTimeout(timer); reject(error); }
+    });
   }
   private notifyExecution(id: string, execution?: PersistentExecution): void {
     const previous = this.latestExecution(id, this.connection!);
