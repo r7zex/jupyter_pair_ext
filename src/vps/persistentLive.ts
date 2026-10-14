@@ -13,7 +13,7 @@ export class PersistentLive {
   private readonly presence = new Map<string, { state: PersistentPresence; at: number }>();
   private readonly timer: NodeJS.Timeout;
   constructor() { this.timer = setInterval(() => this.sweep(), 1000); this.timer.unref(); }
-  close(): void { clearInterval(this.timer); for (const subscriber of this.subscribers) subscriber.response.end(); this.subscribers.clear(); this.presence.clear(); }
+  close(): void { clearInterval(this.timer); for (const subscriber of this.subscribers) { const socket = subscriber.response.socket; subscriber.response.end(); socket?.end(); } this.subscribers.clear(); this.presence.clear(); }
   attach(subscriber: Subscriber): void {
     if (this.subscribers.size >= 64 || [...this.subscribers].filter((item) => item.memberId === subscriber.memberId).length >= 4) throw Object.assign(new Error('Live connection limit reached.'), { status: 429 });
     subscriber.response.setHeader('content-type', 'text/event-stream'); subscriber.response.setHeader('x-accel-buffering', 'no'); subscriber.response.flushHeaders();

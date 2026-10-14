@@ -111,10 +111,13 @@ export class PersistentSessionHost {
 
   public async stop(): Promise<void> {
     this.closing = true;
-    for (const session of this.sessions.values()) session.live.close();
+    this.closeLiveConnections();
     if (this.sweep) clearInterval(this.sweep);
     await this.serial;
     for (const session of this.sessions.values()) await this.persist(session);
+  }
+  public closeLiveConnections(): void {
+    for (const session of this.sessions.values()) session.live.close();
   }
 
   public async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
