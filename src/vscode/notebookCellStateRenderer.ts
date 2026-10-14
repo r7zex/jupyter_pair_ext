@@ -6,7 +6,8 @@ export interface MirroredCellState { execution: vscode.NotebookCellExecution; st
 /** Shared native NotebookController presentation from the existing host path. */
 export async function renderNotebookCellState(controller: vscode.NotebookController, states: Map<vscode.NotebookCell, MirroredCellState>, cell: vscode.NotebookCell, request: NotebookCellRenderRequest): Promise<void> {
   const target = request.execution;
-  if (!states.has(cell) && !cell.executionSummary
+  const summary = cell.executionSummary;
+  if (!states.has(cell) && summary?.executionOrder === undefined && summary?.success === undefined && !summary?.timing
     && target?.executionOrder === undefined && target?.success === undefined && !target?.timing
     && !request.outputs.length && !cell.outputs.length) return;
     let state = states.get(cell);

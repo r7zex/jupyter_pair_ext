@@ -1657,6 +1657,7 @@ function editorVisibleExecution(
 ): CellExecutionSnapshot | undefined {
   if (!execution) return undefined;
   const { executionOrder, success, timing } = execution;
+  if (executionOrder === undefined && success === undefined && !timing) return undefined;
   return {
     ...(executionOrder !== undefined ? { executionOrder } : {}),
     ...(success !== undefined ? { success } : {}),
@@ -1666,7 +1667,7 @@ function editorVisibleExecution(
 
 function executionFromCell(cell: vscode.NotebookCell): CellExecutionSnapshot | undefined {
   const summary = cell.executionSummary;
-  if (!summary) return undefined;
+  if (!summary || (summary.executionOrder === undefined && summary.success === undefined && !summary.timing)) return undefined;
   return {
     executionOrder: summary.executionOrder,
     success: summary.success,

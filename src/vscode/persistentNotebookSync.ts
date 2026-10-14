@@ -36,6 +36,18 @@ function changesBetween(before: string, after: string): TextChange[] | undefined
   }
   return changes.length > 100 ? undefined : changes.length ? changes : [{ offset: 0, deleteCount: 0, insertText: '' }];
 }
+function mapTextOffset(before: string, after: string, offset: number): number | undefined {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > before.length) return undefined;
+  if (before === after) return offset;
+  const changes = changesBetween(before, after); if (!changes) return undefined;
+  let adjustment = 0;
+  for (const change of changes) {
+    if (offset < change.offset) break;
+    if (offset < change.offset + change.deleteCount) return change.offset + adjustment + change.insertText.length;
+    adjustment += change.insertText.length - change.deleteCount;
+  }
+  return offset + adjustment;
+}
 interface State {
   connection: Connection; notebook: vscode.NotebookDocument; key: string; file: string; doc: Y.Doc; project: CollaborativeProject;
   ids: StableCellIdRegistry<vscode.NotebookCell>; epoch: string; revision: number; actor: string; sequence: number;
@@ -102,7 +114,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private ensureStream(): void {
     const connection = this.connection(); if (!connection || this.reconnect || this.streamConnection === connection) return;
     if (this.streamConnection) this.reset(); this.streamConnection = connection;
-    try { this.stream = connection.client.subscribe(connection.sessionId, (event) => this.receive(event), () => {
+    try { this.stream = connection.client.subscribe(connection.sessionId, (event) => { if (this.streamConnection === connection) this.receive(event); }, () => {
       if (this.streamConnection !== connection) return;
       this.stream = undefined; this.streamConnection = undefined; this.presence = []; this.presenceEvents.emit('presence');
       this.reconnect = setTimeout(() => { this.reconnect = undefined; this.ensureStream(); }, 1000); this.reconnect.unref();
@@ -115,7 +127,13 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         on: (_event, listener) => this.presenceEvents.on('presence', listener), off: (_event, listener) => this.presenceEvents.off('presence', listener),
         snapshot: () => ({ awareness: this.presence }), notebookKey: (uri) => uri.scheme === 'pair-vps' && uri.authority === connection.sessionId ? uri.path.slice(1) : undefined,
         notebookCellId: (cell) => this.states.get(cell.notebook)?.ids.knownId(cell), resolvePresenceLineOffset: (state) => this.presenceOffset(state),
-        resolvePresenceCursor: (presence) => { const state = [...this.states.values()].find((item) => item.key === presence.activeFile); const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(presence.activeNotebookCellId ?? '')?.get('source'); return text instanceof Y.Text && presence.cursor ? resolveSharedCursorPosition(text, presence.cursor) : undefined; } };
+        resolvePresenceCursor: (presence) => {
+          const state = [...this.states.values()].find((item) => item.key === presence.activeFile); const cellId = presence.activeNotebookCellId ?? '';
+          const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(cellId)?.get('source'); const cursor = text instanceof Y.Text && presence.cursor ? resolveSharedCursorPosition(text, presence.cursor) : undefined;
+          if (!state || !cursor) return undefined;
+          const anchor = this.displayedOffset(state, cellId, cursor.anchor); const active = this.displayedOffset(state, cellId, cursor.active);
+          return anchor !== undefined && active !== undefined ? { anchor, active } : undefined;
+        } };
       this.renderer = new PresenceRenderer(source);
     }
   }
@@ -133,7 +151,16 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private presenceOffset(presence: PresenceState): number | undefined {
     const state = [...this.states.values()].find((item) => item.key === presence.activeFile);
     const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(presence.activeNotebookCellId ?? '')?.get('source');
-    return resolveRelativeOffset(text instanceof Y.Text ? text : undefined, presence.activeLineAnchor, undefined);
+    const offset = resolveRelativeOffset(text instanceof Y.Text ? text : undefined, presence.activeLineAnchor, undefined);
+    return state && offset !== undefined ? this.displayedOffset(state, presence.activeNotebookCellId ?? '', offset) : undefined;
+  }
+  private displayedOffset(state: State, cellId: string, offset: number): number | undefined {
+    const text = state.doc.getMap<Y.Map<unknown>>('cells').get(cellId)?.get('source');
+    const cell = state.notebook.getCells().find((candidate) => state.ids.knownId(candidate) === cellId);
+    if (!(text instanceof Y.Text) || !cell || !state.project.has(state.key)) return undefined;
+    const projected = state.project.notebookCellSnapshot(state.key, cellId)?.source; if (projected === undefined) return undefined;
+    const position = mapTextOffset(text.toString(), projected, offset);
+    return position !== undefined ? mapTextOffset(projected, cell.document.getText(), position) : undefined;
   }
   private schedulePresence(): void {
     if (this.presencePending) return; this.presencePending = true;
@@ -146,7 +173,6 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   }
   private async publishPresence(): Promise<void> {
     const connection = this.connection(); if (!connection || !this.stream) return;
-    if ([...this.states.values()].some((state) => state.intents.length || state.sending)) return;
     const editor = vscode.window.activeTextEditor;
     const state = editor && [...this.states.values()].find((item) => item.notebook.getCells().some((cell) => cell.document === editor.document));
     const cell = state && editor && state.notebook.getCells().find((item) => item.document === editor.document);
@@ -154,10 +180,13 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (state && cell && state.editor && state.epoch && !state.blocked) {
       const cellId = state.ids.knownId(cell); const offset = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(new vscode.Position(editor!.selection.active.line, 0)));
       const text = state.doc.getMap<Y.Map<unknown>>('cells').get(cellId ?? '')?.get('source');
-      if (text instanceof Y.Text && offset !== undefined && text.toString() === state.project.cellSource(state.key, cellId!).toString()) {
+      if (text instanceof Y.Text && offset !== undefined) {
+        const projected = state.project.cellSource(state.key, cellId!).toString(); const confirmed = text.toString();
         const anchor = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(editor!.selection.anchor));
         const active = state.editor.canonicalOffsetForDocument(cell.document, cell.document.offsetAt(editor!.selection.active));
-        fields = { path: state.key, epoch: state.epoch, cellId, activeLineAnchor: encodeRelativeOffset(text, offset), ...(anchor !== undefined && active !== undefined ? { cursor: createSharedCursorPosition(text, anchor, active) } : {}) };
+        const linePosition = mapTextOffset(projected, confirmed, offset); const anchorPosition = anchor !== undefined ? mapTextOffset(projected, confirmed, anchor) : undefined; const activePosition = active !== undefined ? mapTextOffset(projected, confirmed, active) : undefined;
+        if (linePosition !== undefined) fields = { path: state.key, epoch: state.epoch, cellId, activeLineAnchor: encodeRelativeOffset(text, linePosition), ...(anchorPosition !== undefined && activePosition !== undefined ? { cursor: createSharedCursorPosition(text, anchorPosition, activePosition) } : {}) };
+        else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
       }
       else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
     }

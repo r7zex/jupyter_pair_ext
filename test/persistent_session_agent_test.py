@@ -446,6 +446,25 @@ class AgentProtocolTests(unittest.TestCase):
             self.make_agent(FakeTransport())
         self.assertFalse(agent.closed)
 
+    def test_unchanged_snapshot_avoids_rewriting_but_restores_modified_content_and_permissions(self):
+        public = self.root / "public"
+        public.mkdir()
+        files = [{"path": "data.txt", "content": "aGVsbG8=", "version": 8}]
+        first = agent_module.install_snapshot(public, files)
+        files[0]["version"] = 9
+        with patch.object(agent_module.os, "fsync", wraps=os.fsync) as sync:
+            second = agent_module.install_snapshot(public, files, first)
+            self.assertEqual(sync.call_count, 0)
+        self.assertEqual(second["data.txt"]["version"], 9)
+        self.assertEqual(second["data.txt"]["sha256"], first["data.txt"]["sha256"])
+        target = public / "data.txt"
+        target.write_text("HELLO")
+        agent_module.install_snapshot(public, files, second)
+        self.assertEqual(target.read_text(), "hello")
+        target.chmod(0o644)
+        agent_module.install_snapshot(public, files, second)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
     def test_snapshot_and_artifact_exclude_host_private_files(self):
         public = self.root / "public"
         public.mkdir()

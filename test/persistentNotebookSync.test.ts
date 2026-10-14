@@ -7,11 +7,13 @@ import * as Y from 'yjs';
 import type * as vscode from 'vscode';
 import { editSharedNotebook, sharedNotebook, type NotebookSyncReply } from '../src/vps/persistentNotebookCrdt';
 import { rebaseTextChanges } from '../src/core/textChanges';
+import { resolveSharedCursorPosition } from '../src/core/cursorPosition';
 import { createEditorVscodeBoundary } from './editorVscodeBoundary';
 import type { PersistentLiveEvent } from '../src/vps/persistentLive';
 import { PersistentHttpError } from '../src/vps/persistentClient';
 
 const { vscodeBoundary: boundary, fakeCell, fakeNotebook } = createEditorVscodeBoundary();
+boundary.Position = class { constructor(public readonly line: number, public readonly character: number) {} };
 boundary.workspace.onDidCloseNotebookDocument = () => ({ dispose() {} });
 Object.assign(boundary.window, { state: { focused: false }, onDidChangeTextEditorSelection: () => ({ dispose() {} }), onDidChangeActiveTextEditor: () => ({ dispose() {} }), onDidChangeWindowState: () => ({ dispose() {} }), onDidChangeVisibleTextEditors: () => ({ dispose() {} }) });
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
@@ -71,6 +73,17 @@ describe('Persistent adapter through the existing production editor', () => {
     for (let n = 0; n < 100 && cell.document.text !== 'remote base'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(cell.document.text, 'remote base');
   });
+  it('ignores a late stream callback from a replaced connection', async () => {
+    await sync.flush(notebook); const oldReceive = push!;
+    connection = { ...connection }; await sync.flush(notebook);
+    const shared = sharedNotebook(doc); shared.cells[0]!.source = 'current stream'; editSharedNotebook(doc, shared);
+    const event: PersistentLiveEvent = { kind: 'notebook', path: 'book.ipynb', epoch, revision: 2, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') };
+    oldReceive(event); await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(cell.document.text, 'base');
+    push!(event);
+    for (let n = 0; n < 100 && cell.document.text !== 'current stream'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(cell.document.text, 'current stream');
+  });
   it('does not roll back fast local deletion when its own earlier publication arrives', async () => {
     await sync.flush(notebook);
     const delayed = pause(); change(4, 0, '!'); await delayed.reached;
@@ -100,6 +113,25 @@ describe('Persistent adapter through the existing production editor', () => {
     assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-run');
     assert.equal(calls.filter((operation) => operation === 'notebookSync').length, 1);
     assert.equal(calls.includes('read'), false);
+  });
+  for (const scenario of [
+    { name: 'newline', offset: 0, remove: 0, insert: 'new\n', line: 1, active: 8 },
+    { name: 'replacement boundary', offset: 3, remove: 1, insert: 'X', line: 0, active: 4 },
+  ]) it(`publishes and renders relative cursors through a pending ${scenario.name} before its acknowledgement`, async () => {
+    await sync.flush(notebook); const delayed = pause(); change(scenario.offset, scenario.remove, scenario.insert); await delayed.reached;
+    const previous = boundary.window.activeTextEditor; let published: any;
+    const original = connection.client.call;
+    connection.client.call = async (operation: string, input: any) => { if (operation === 'presence') published = input; return original(operation, input); };
+    cell.document.offsetAt = (position: any) => cell.document.text.split('\n').slice(0, position.line).reduce((length: number, line: string) => length + line.length + 1, 0) + position.character;
+    boundary.window.activeTextEditor = { document: cell.document, selection: { anchor: { line: scenario.line, character: 4 }, active: { line: scenario.line, character: 4 } } };
+    try {
+      await (sync as any).publishPresence(); assert.ok(published?.cursor, 'Cursor renewal must not wait for the text ACK');
+      const text = doc.getMap<Y.Map<unknown>>('cells').get('stable')!.get('source') as Y.Text;
+      assert.equal(resolveSharedCursorPosition(text, published.cursor)?.active, scenario.active);
+      const rendered = (sync as any).renderer.runtime.resolvePresenceCursor({ activeFile: 'book.ipynb', activeNotebookCellId: 'stable', cursor: published.cursor });
+      assert.equal(rendered.active, scenario.active, 'A confirmed relative cursor must map through local pending text into the visible editor');
+    } finally { boundary.window.activeTextEditor = previous; delayed.release(); }
+    await sync.flush(notebook);
   });
   it('coalesces a fast typing and deletion burst behind one immutable in-flight request', async () => {
     await sync.flush(notebook);
@@ -136,6 +168,13 @@ describe('Persistent adapter through the existing production editor', () => {
     assert.equal(sharedNotebook(doc).cells[0]!.source, 'public'); assert.equal(cell.document.text, 'base');
     const files = await readdir(path.join(root, 'persistent-replicas')); const archive = files.find((file) => file.includes('conflict')); assert.ok(archive);
     const recovered = JSON.parse(await readFile(path.join(root, 'persistent-replicas', archive), 'utf8')); assert.equal(recovered.displayed[0].source, 'base');
+  });
+  it('does not enqueue native execution renders for empty serializer summaries during text editing', async () => {
+    sync.dispose(); cell.executionSummary = {}; let renders = 0;
+    sync = new Sync({ globalStorageUri: { fsPath: root } } as vscode.ExtensionContext, () => connection, { appendLine() {} }, undefined, undefined,
+      { isManagingCellState: () => false, renderRemoteCellState: async () => { renders++; } });
+    await sync.flush(notebook); change(4, 0, '-local'); await sync.flush(notebook);
+    assert.equal(cell.document.text, 'base-local'); assert.equal(renders, 0);
   });
   it('renders durable server outputs and clears them through the existing cell renderer after a privacy reload', async () => {
     sync.dispose(); const renderer = { isManagingCellState: () => false, renderRemoteCellState: async (target: any, request: any) => { target.outputs = [...request.outputs]; } };

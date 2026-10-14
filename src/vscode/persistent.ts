@@ -226,6 +226,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private readonly cellMirrors = new Map<vscode.NotebookCell, MirroredCellState>();
   private readonly managedRuns = new WeakMap<vscode.NotebookCell, PersistentExecution>();
   private readonly selectedNotebooks = new Set<vscode.NotebookDocument>();
+  private readonly latestExecutions = new Map<string, { connection: ActiveConnection; execution: PersistentExecution }>();
 
   public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel) {
     this.notebook = vscode.notebooks.createNotebookController('pair-notebook-persistent', 'jupyter-notebook', 'Pair Notebook • Persistent VPS', (cells, notebook) => this.execute(cells, notebook));
@@ -239,7 +240,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.notebookSync = new PersistentNotebookSynchronizer(context, () => this.connection, log, () => {
       void this.files.refresh().catch(() => undefined);
       void this.mirrorActiveExecutions().catch((error) => log.appendLine(`[debug] Live execution discovery: ${error instanceof Error ? error.message : 'Unavailable.'}`));
-    }, (event) => { this.notifyExecution(event.id); void this.mirrorExecution(event.id).catch((error) => log.appendLine(`[debug] Live execution mirror: ${error instanceof Error ? error.message : 'Unavailable.'}`)); }, {
+    }, (event) => { this.notifyExecution(event.id, event.execution); void this.mirrorExecution(event.id).catch((error) => log.appendLine(`[debug] Live execution mirror: ${error instanceof Error ? error.message : 'Unavailable.'}`)); }, {
       isManagingCellState: (cell) => this.managesCell(cell),
       renderRemoteCellState: async (cell, request) => { if (this.selectedNotebooks.has(cell.notebook) && !this.managesCell(cell)) await renderNotebookCellState(this.notebook, this.cellMirrors, cell, request); },
     });
@@ -796,7 +797,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
           const currentOutput = (!this.view || this.view.generation === completed.generation)
             && (!completed.sourceHash || completed.sourceHash === createHash('sha256').update(cell.document.getText()).digest('hex'));
           execution.end(currentOutput ? completed.state === 'completed' : undefined, Date.now());
-          await this.files.refresh();
+          void this.files.refresh().catch((error) => this.log.appendLine(`[debug] Execution workspace refresh: ${error instanceof Error ? error.message : 'Unavailable.'}`));
         } catch (error) {
           await execution.appendOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(new Error(`${error instanceof Error ? error.message : 'Execution failed.'} Recovery request ID: ${requestId}`))]));
           execution.end(false, Date.now());
@@ -821,9 +822,9 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (this.mirroredRuns.has(id) || [...this.executions.values()].some((run) => run.id === id)) return Promise.resolve();
     const connection = this.connection; if (!connection) return Promise.resolve();
     const work = Promise.resolve().then(async () => {
-      const run = await connection.client.call<PersistentExecution>('execution', { sessionId: connection.sessionId, executionId: id });
+      const run = this.latestExecution(id, connection) ?? await connection.client.call<PersistentExecution>('execution', { sessionId: connection.sessionId, executionId: id });
       if (connection !== this.connection || this.disposed) return;
-      await this.files.refresh(); if (connection !== this.connection) return;
+      if (this.files.visibilityOf(run.notebook) === undefined) await this.files.refresh(); if (connection !== this.connection) return;
       if (this.files.visibilityOf(run.notebook) !== (run.scope ?? 'public') || (this.view && this.view.generation !== run.generation)) return;
       const notebook = vscode.workspace.notebookDocuments.find((item) => item.uri.scheme === SCHEME && item.uri.authority === connection.sessionId && item.uri.path.slice(1) === run.notebook);
       const cell = notebook?.getCells().find((item) => (item.metadata.pairNotebookCellId ?? item.metadata.id) === run.cellId);
@@ -840,7 +841,17 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     void work.finally(() => { if (this.mirroredRuns.get(id) === work) this.mirroredRuns.delete(id); }).catch(() => undefined);
     return work;
   }
-  private notifyExecution(id: string): void {
+  private latestExecution(id: string, connection: ActiveConnection): PersistentExecution | undefined {
+    const cached = this.latestExecutions?.get(id);
+    return cached && cached.connection === connection ? cached.execution : undefined;
+  }
+  private notifyExecution(id: string, execution?: PersistentExecution): void {
+    const previous = this.latestExecution(id, this.connection!);
+    if (execution?.id === id && this.connection && this.latestExecutions
+      && (!previous || (execution.events.length >= previous.events.length && (['queued', 'running'].includes(previous.state) || !['queued', 'running'].includes(execution.state))))) {
+      this.latestExecutions.set(id, { connection: this.connection, execution });
+      if (this.latestExecutions.size > 256) { const oldest = this.latestExecutions.keys().next().value; if (oldest) this.latestExecutions.delete(oldest); }
+    }
     this.executionChanges.set(id, (this.executionChanges.get(id) ?? 0) + 1);
     if (this.executionChanges.size > 256) { const oldest = this.executionChanges.keys().next().value; if (oldest) this.executionChanges.delete(oldest); }
     this.executionWaiters.get(id)?.forEach((resolve) => resolve());
@@ -883,7 +894,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
       await this.waitForExecutionUpdate(result.id, version);
       version = this.executionChanges?.get(result.id) ?? 0;
-      result = await connection.client.call<PersistentExecution>('execution', { sessionId: connection.sessionId, executionId: result.id });
+      const pushed = this.latestExecution(result.id, connection);
+      const advances = pushed && pushed.events.length >= result.events.length
+        && (pushed.events.length > result.events.length || (result.state === 'queued' && pushed.state !== 'queued') || (result.state === 'running' && !['queued', 'running'].includes(pushed.state)));
+      result = advances ? pushed : await connection.client.call<PersistentExecution>('execution', { sessionId: connection.sessionId, executionId: result.id });
     }
     throw new Error(`Execution observation ended; run ${result.id} remains recoverable on the server.`);
   }

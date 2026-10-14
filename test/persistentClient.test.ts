@@ -81,7 +81,10 @@ const boundary = {
   FileType: { File: 1, Directory: 2 },
   NotebookCellKind: { Code: 2 },
   NotebookCellOutput: class { public constructor(public items: unknown[]) {} },
-  NotebookCellOutputItem: { error: (error: Error) => ({ mime: 'application/vnd.code.notebook.error', data: Buffer.from(error.message) }) },
+  NotebookCellOutputItem: {
+    error: (error: Error) => ({ mime: 'application/vnd.code.notebook.error', data: Buffer.from(error.message) }),
+    stdout: (text: string) => ({ mime: 'application/vnd.code.notebook.stdout', data: Buffer.from(text) }),
+  },
   FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
   FileSystemError: { Unavailable: (message: string) => new Error(message), NoPermissions: (message: string) => new Error(message) },
   window: {
@@ -135,6 +138,20 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  it('renders a pushed execution without another round trip and fences cached runs to their connection', async () => {
+    const controller = Object.create(PersistentSessionController.prototype) as any;
+    let reads = 0; const connection = { client: { call: async () => { reads++; throw new Error('Unexpected execution poll'); } } };
+    controller.connection = connection; controller.disposed = false;
+    controller.executionChanges = new Map(); controller.executionWaiters = new Map(); controller.latestExecutions = new Map();
+    const run = { id: 'inline-run', state: 'running', events: [] };
+    const observing = controller.observe(run, undefined, connection, false);
+    const completed = { ...run, state: 'completed', events: [{ type: 'iopub', messageType: 'stream', content: { name: 'stdout', text: 'pushed' } }] };
+    controller.notifyExecution(run.id, completed);
+    assert.equal(await observing, completed); assert.equal(reads, 0);
+    controller.notifyExecution(run.id, run);
+    assert.equal(controller.latestExecution(run.id, connection), completed, 'A delayed running event must not replace completion');
+    assert.equal(controller.latestExecution(run.id, { ...connection }), undefined, 'A replacement connection cannot use an old run');
+  });
   it('wakes a running observer on its authenticated live update before the polling fallback', async () => {
     const controller = Object.create(PersistentSessionController.prototype) as any;
     const run = { id: 'live-run', state: 'running', events: [] };
