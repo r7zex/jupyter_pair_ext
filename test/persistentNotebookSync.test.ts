@@ -48,7 +48,7 @@ describe('Persistent adapter through the existing production editor', () => {
         for (const change of rebaseTextChanges(intent.baseline, text.toString(), intent.changes).sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); }
         sequences.set(intent.actor, intent.sequence);
       }
-      const reply: NotebookSyncReply = { epoch, revision: 1, acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
+      const reply: NotebookSyncReply = { epoch, revision: 1, identity: '0123456789abcdef0123456789abcdef', acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
       const blocked = gate; gate = undefined; if (blocked) await blocked();
       if (lostAck && input.intent) { lostAck = false; throw new Error('Acknowledgement lost after server commit'); }
       return reply;
@@ -87,6 +87,19 @@ describe('Persistent adapter through the existing production editor', () => {
     await sync.flush(notebook, true); assert.equal(saves, 0);
     change(4, 0, '-local'); await sync.flush(notebook, true); assert.equal(saves, 0);
     assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local');
+  });
+  it('prepares execution from acknowledged live source without redundant reads or queries', async () => {
+    await sync.flush(notebook);
+    const calls: string[] = []; const original = connection.client.call;
+    connection.client.call = async (operation: string, input: any) => { calls.push(operation); return original(operation, input); };
+    const unchanged = await sync.prepareExecution(notebook);
+    assert.equal(unchanged?.identity, '0123456789abcdef0123456789abcdef');
+    assert.equal(calls.filter((operation) => operation !== 'presence').length, 0);
+    change(4, 0, '-run'); const prepared = await sync.prepareExecution(notebook);
+    assert.equal(prepared?.cells[0]?.source, 'base-run');
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-run');
+    assert.equal(calls.filter((operation) => operation === 'notebookSync').length, 1);
+    assert.equal(calls.includes('read'), false);
   });
   it('coalesces a fast typing and deletion burst behind one immutable in-flight request', async () => {
     await sync.flush(notebook);
