@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { CollaborativeProject } from '../../src/core/crdt';
+import { cellUserMetadata, nativeNotebookMetadata } from '../../src/core/notebookMetadata';
 import { normalizeNotebookMetadata } from '../../src/core/projectFiles';
 import { REMOTE_ORIGIN } from '../../src/core/types';
 import { EditorSynchronizer } from '../../src/vscode/sync';
@@ -152,10 +153,23 @@ suite('Pair Notebook — real VS Code NotebookDocument boundary', () => {
       const stableId = harness.project.notebookSnapshot(harness.key).cells[0]?.id;
       assert.ok(stableId);
       harness.project.setCellMetadata(harness.key, stableId, { role: 'remote' }, REMOTE_ORIGIN);
-      await waitFor(() => harness.notebook.cellAt(0).metadata.role === 'remote', 3_000, 'remote cell metadata projection');
+      await waitFor(
+        () => cellUserMetadata(harness.notebook.cellAt(0).metadata, nativeNotebookMetadata(harness.notebook.metadata)).role === 'remote',
+        3_000,
+        'remote cell metadata projection',
+      );
       assert.equal(harness.notebook.cellAt(0), cell);
       assert.equal(cell.document.getText(), 'value = 1');
       assert.equal(cell.metadata.pairNotebookCellId, stableId);
+      assert.equal(await harness.notebook.save(), true);
+      const saved = JSON.parse(await readFile(harness.notebook.uri.fsPath, 'utf8')) as {
+        cells: Array<{ id: string; metadata: Record<string, unknown>; source: string | string[] }>;
+      };
+      assert.equal(saved.cells.length, 1);
+      assert.equal(saved.cells[0]?.id, stableId);
+      assert.deepEqual(saved.cells[0]?.metadata, { role: 'remote' });
+      const savedSource = saved.cells[0]?.source;
+      assert.equal(Array.isArray(savedSource) ? savedSource.join('') : savedSource, 'value = 1');
     } finally {
       await harness.dispose();
     }
