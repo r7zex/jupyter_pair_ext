@@ -66,24 +66,14 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
       assert.deepEqual((await member.call<{ executions: any[] }>('executions', { sessionId: owner.sessionId })).executions, []);
     } finally { stream.dispose(); }
   });
-  it('enforces the original occupied-line guard on the VPS and permits another line of the same cell', async () => {
+  it('allows concurrent edits on the same selected row and returns durable actor receipts', async () => {
     const start = await liveNotebook(); await linePresence(start, 0);
-    const intent = { actor: 'B'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: 'denied' }] };
-    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
-    intent.changes = [{ offset: 6, deleteCount: 0, insertText: 'allowed ' }];
-    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(result.cells[0]!.source, 'owner\nallowed member');
-    const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(result.update, 'base64')); const update = sharedNotebook(doc); update.cells[0]!.source = 'overwrite\nallowed member'; editSharedNotebook(doc, update);
-    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }), /occupied/); doc.destroy();
-    await rpc('presence'); intent.sequence = 2; intent.baseline = result.cells[0]!.source; intent.changes = [{ offset: 1, deleteCount: 0, insertText: 'free' }];
-    const freed = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(freed.cells[0]!.source, 'ofreewner\nallowed member');
-  });
-  it('acquires the edited row even when the first cursor packet has not arrived', async () => {
-    const start = await liveNotebook();
-    await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'H'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '!' }] } });
-    const intent = { actor: 'I'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'o!wner\nmember', changes: [{ offset: 2, deleteCount: 0, insertText: 'denied' }] };
-    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
-    intent.changes = [{ offset: 7, deleteCount: 0, insertText: 'allowed ' }];
-    assert.equal((await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent })).cells[0]!.source, 'o!wner\nallowed member');
+    const ownerActor = 'B'.repeat(36); const memberActor = 'C'.repeat(36);
+    await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor: ownerActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '!' }] } });
+    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: memberActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '?' }] } });
+    assert.equal(result.cells[0]!.source, 'o!?wner\nmember'); assert.equal(result.acknowledgedSequence, 1);
+    assert.equal((await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb', actor: ownerActor })).acknowledgedSequence, 1);
+    assert.equal((await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb', actor: memberActor })).acknowledgedSequence, 0);
   });
   it('admits an unchanged cell while another cell is edited, and fences a full file replacement', async () => {
     const initial = await liveNotebook('print(7)'); const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(initial.update, 'base64'));
@@ -100,14 +90,6 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
     await rpc('write', { path: 'book.ipynb', content: encoded(JSON.stringify(raw)), expectedRevision: replacement.revision });
     await assert.rejects(rpc('execute', { ...fields, requestId: 'after-replacement', expectedRevision: (await rpc<any>('snapshot')).revision }), /changed/);
     const renewed = await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb' }); assert.notEqual(renewed.identity, acknowledged.identity); assert.notEqual(renewed.epoch, initial.epoch); assert.equal(renewed.cells[1]!.source, 'b = 2'); doc.destroy();
-  });
-  it('keeps the occupied row anchored when a different row inserts a newline', async () => {
-    const start = await liveNotebook(); await linePresence(start, 6);
-    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: 'G'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 5, deleteCount: 1, insertText: '' }] } }), /occupied/);
-    const intent = { actor: 'C'.repeat(36), sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 0, deleteCount: 0, insertText: 'new\n' }] };
-    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }); assert.equal(result.cells[0]!.source, 'new\nowner\nmember');
-    intent.sequence = 2; intent.baseline = result.cells[0]!.source; intent.changes = [{ offset: 11, deleteCount: 0, insertText: 'denied' }];
-    await assert.rejects(member.call('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent }), /occupied/);
   });
   it('releases the row after a disconnected stream and after its real presence timeout', async () => {
     const start = await liveNotebook(); const events: PersistentLiveEvent[] = [];

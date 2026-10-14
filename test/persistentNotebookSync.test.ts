@@ -9,7 +9,6 @@ import { editSharedNotebook, sharedNotebook, type NotebookSyncReply } from '../s
 import { rebaseTextChanges } from '../src/core/textChanges';
 import { createEditorVscodeBoundary } from './editorVscodeBoundary';
 import type { PersistentLiveEvent } from '../src/vps/persistentLive';
-import { encodeRelativeOffset } from '../src/core/cursorPosition';
 import { PersistentHttpError } from '../src/vps/persistentClient';
 
 const { vscodeBoundary: boundary, fakeCell, fakeNotebook } = createEditorVscodeBoundary();
@@ -28,27 +27,28 @@ try {
 
 describe('Persistent adapter through the existing production editor', () => {
   let root: string; let doc: Y.Doc; let sync: InstanceType<typeof Sync>; let connection: any; let notebook: any; let cell: any;
-  let gate: (() => Promise<void>) | undefined; let lostAck: boolean; let denyNext: boolean; let epoch: string; let push: ((event: PersistentLiveEvent) => void) | undefined;
+  let gate: (() => Promise<void>) | undefined; let lostAck: boolean; let epoch: string; let push: ((event: PersistentLiveEvent) => void) | undefined;
   const sequences = new Map<string, number>();
   let rawOutputs: unknown[];
+  let intentCalls: number;
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), 'pair-editor-replica-')); cell = fakeCell('base', 'stable'); notebook = fakeNotebook(root, [cell]);
     notebook.uri = { scheme: 'pair-vps', authority: 'session', path: '/book.ipynb', toString: () => 'pair-vps://session/book.ipynb' };
     boundary.__reset(notebook); doc = new Y.Doc(); editSharedNotebook(doc, { metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'base', metadata: {} }] });
-    gate = undefined; lostAck = false; denyNext = false; epoch = 'epoch'; rawOutputs = []; sequences.clear();
+    gate = undefined; lostAck = false; epoch = 'epoch'; rawOutputs = []; sequences.clear(); intentCalls = 0;
     const client = { subscribe: (_id: string, receive: (event: PersistentLiveEvent) => void) => { push = receive; return { dispose() { push = undefined; } }; }, call: async (operation: string, input: any): Promise<any> => {
       if (operation === 'presence') return { states: [] };
       if (operation === 'read') return { content: Buffer.from(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: sharedNotebook(doc).cells.map((item) => ({ ...item, outputs: rawOutputs, execution_count: null })) })).toString('base64') };
       if (input.epoch !== undefined && input.epoch !== epoch) throw new PersistentHttpError(409);
-      if (input.intent && denyNext) { denyNext = false; const blocked = gate; gate = undefined; if (blocked) await blocked(); throw new PersistentHttpError(423); }
       if (input.update) Y.applyUpdate(doc, Buffer.from(input.update, 'base64'));
       if (input.snapshot) editSharedNotebook(doc, input.snapshot);
+      if (input.intent) intentCalls++;
       if (input.intent && (sequences.get(input.intent.actor) ?? 0) < input.intent.sequence) {
         const intent = input.intent; const text = doc.getMap<Y.Map<unknown>>('cells').get(intent.cellId)!.get('source') as Y.Text;
         for (const change of rebaseTextChanges(intent.baseline, text.toString(), intent.changes).sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); }
         sequences.set(intent.actor, intent.sequence);
       }
-      const reply: NotebookSyncReply = { epoch, revision: 1, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
+      const reply: NotebookSyncReply = { epoch, revision: 1, acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
       const blocked = gate; gate = undefined; if (blocked) await blocked();
       if (lostAck && input.intent) { lostAck = false; throw new Error('Acknowledgement lost after server commit'); }
       return reply;
@@ -71,34 +71,45 @@ describe('Persistent adapter through the existing production editor', () => {
     for (let n = 0; n < 100 && cell.document.text !== 'remote base'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(cell.document.text, 'remote base');
   });
+  it('does not roll back fast local deletion when its own earlier publication arrives', async () => {
+    await sync.flush(notebook);
+    const delayed = pause(); change(4, 0, '!'); await delayed.reached;
+    change(0, 5, '');
+    const actor = [...sequences.keys()][0]!;
+    push!({ kind: 'notebook', path: 'book.ipynb', epoch, revision: 2, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), acknowledgement: { actor, sequence: 1 } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(cell.document.text, '', 'An unacknowledged deletion must stay visible');
+    delayed.release(); await sync.flush(notebook);
+    assert.equal(cell.document.text, ''); assert.equal(sharedNotebook(doc).cells[0]!.source, '');
+  });
+  it('coalesces a fast typing and deletion burst behind one immutable in-flight request', async () => {
+    await sync.flush(notebook);
+    const delayed = pause(); change(4, 0, '!'); await delayed.reached;
+    for (let index = 0; index < 150; index++) change(cell.document.text.length, 0, String(index % 10));
+    for (let index = 0; index < 150; index++) change(cell.document.text.length - 1, 1, '');
+    change(0, cell.document.text.length, 'first\nsecond');
+    assert.equal(cell.document.text, 'first\nsecond');
+    delayed.release(); await sync.flush(notebook);
+    assert.equal(cell.document.text, 'first\nsecond'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'first\nsecond');
+    assert.equal(intentCalls, 2, '301 later edits must not require 301 serial network round trips');
+  });
+  it('preserves a remote insertion while newer local text awaits acknowledgement', async () => {
+    await sync.flush(notebook);
+    const delayed = pause(); change(4, 0, '!'); await delayed.reached; change(5, 0, '-local');
+    const actor = [...sequences.keys()][0]!;
+    push!({ kind: 'notebook', path: 'book.ipynb', epoch, revision: 2, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), acknowledgement: { actor, sequence: 1 } });
+    const shared = sharedNotebook(doc); shared.cells[0]!.source = 'peer-' + shared.cells[0]!.source; editSharedNotebook(doc, shared);
+    push!({ kind: 'notebook', path: 'book.ipynb', epoch, revision: 3, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') });
+    await new Promise((resolve) => setTimeout(resolve, 30)); assert.equal(cell.document.text, 'peer-base!-local');
+    delayed.release(); await sync.flush(notebook);
+    assert.equal(cell.document.text, 'peer-base!-local'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'peer-base!-local');
+  });
   it('journals accepted input before a lost ACK and replays its identity once', async () => {
     await sync.flush(notebook); lostAck = true; change(4, 0, '-offline'); await assert.rejects(sync.flush(notebook), /Acknowledgement/);
     const files = await readdir(path.join(root, 'persistent-replicas')); const saved = JSON.parse(await readFile(path.join(root, 'persistent-replicas', files.find((name) => name.endsWith('.json'))!), 'utf8'));
     assert.equal(saved.intents.length, 1); assert.equal(saved.intents[0].changes[0].insertText, '-offline');
     await sync.flush(notebook); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-offline');
     const late = pause(); const pending = sync.flush(notebook); await late.reached; connection = { ...connection, memberId: 'replacement' }; late.release(); await assert.rejects(pending, /connection changed/);
-  });
-  it('restores occupied-row input locally while allowing another row of the same native cell', async () => {
-    const shared = sharedNotebook(doc); shared.cells[0]!.source = 'base\nfree'; editSharedNotebook(doc, shared); cell.document.text = 'base\nfree';
-    notebook.metadata = { nbformat: 4, nbformat_minor: 5, cells: [], metadata: { kernelspec: { name: 'python3' } } };
-    cell.metadata = { id: 'stable', metadata: { tags: ['retained'] } };
-    await sync.flush(notebook);
-    const text = doc.getMap<Y.Map<unknown>>('cells').get('stable')!.get('source') as Y.Text;
-    push!({ kind: 'presence', states: [{ peer: { peerId: 'other', displayName: 'Other', joinOrder: 0 }, epoch: 'epoch', readOnly: false, activeFile: 'book.ipynb', activeNotebookCellId: 'stable', activeLine: 0, activeLineAnchor: encodeRelativeOffset(text, 0), shareCursor: true, cursorColor: '#4FC3F7', kernelStatus: 'Idle' }] });
-    change(0, 0, 'denied ');
-    for (let n = 0; n < 100 && cell.document.text !== 'base\nfree'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(cell.document.text, 'base\nfree'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base\nfree');
-    change(5, 0, 'kept '); await sync.flush(notebook); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base\nkept free');
-    assert.equal(Array.isArray(notebook.metadata.cells), true); assert.equal(notebook.metadata.cells.length, 0); assert.equal(cell.metadata.id, 'stable');
-    assert.equal(JSON.stringify(notebook.metadata).includes('pair_crdt'), false);
-  });
-  it('preserves later free-row typing after a server line-occupation race without consuming a new actor', async () => {
-    const shared = sharedNotebook(doc); shared.cells[0]!.source = 'base\nfree'; editSharedNotebook(doc, shared); cell.document.text = 'base\nfree'; await sync.flush(notebook);
-    denyNext = true; const denied = pause(); change(0, 0, 'denied '); const pending = sync.flush(notebook); await denied.reached;
-    change(cell.document.text.indexOf('\n') + 1, 0, 'kept '); denied.release(); await pending; await sync.flush(notebook);
-    assert.equal(cell.document.text, 'base\nkept free'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base\nkept free');
-    assert.equal(sequences.size, 1); assert.equal([...sequences.values()][0], 1);
-    assert.ok((await readdir(path.join(root, 'persistent-replicas'))).some((file) => file.includes('occupied-line')));
   });
   it('archives and blocks old-epoch input until an explicit reload after a privacy change', async () => {
     await sync.flush(notebook); epoch = 'public-epoch'; doc.destroy(); doc = new Y.Doc(); editSharedNotebook(doc, { metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'public', metadata: {} }] });

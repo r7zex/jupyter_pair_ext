@@ -133,6 +133,21 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  it('keeps a managed notebook save stamp stable across its live durable publications', async () => {
+    const provider = new PersistentFileSystem(); let revision = 1; let managed = false;
+    const snapshot = () => ({ revision, entries: [{ path: 'book.ipynb', type: 'file' as const, size: 12 + revision, mtime: revision, version: revision, visibility: 'public' as const }] });
+    const client = { call: async (operation: string) => operation === 'read' ? { content: Buffer.from('{}').toString('base64'), revision } : snapshot() };
+    provider.setConnection({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Test', client } as unknown as Parameters<typeof provider.setConnection>[0]);
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/book.ipynb' } as vscode.Uri;
+    provider.notebookManaged = () => managed; provider.accept(snapshot()); await provider.readFile(uri);
+    managed = true; revision = 5; provider.accept(snapshot());
+    assert.equal((await provider.stat(uri)).mtime, 1);
+    let saved = false; provider.notebookSave = async () => { saved = true; return true; };
+    await provider.writeFile(uri, Buffer.from('saved native notebook'), { create: true, overwrite: true });
+    assert.equal(saved, true); assert.equal((await provider.stat(uri)).mtime, 1);
+    assert.equal((await provider.stat(uri)).size, Buffer.byteLength('saved native notebook'));
+    managed = false; provider.release(uri); assert.equal((await provider.stat(uri)).mtime, 5); provider.dispose();
+  });
   it('rejects a delayed read from a disconnected session without poisoning the new editing baseline', async () => {
     const provider = new PersistentFileSystem();
     let resolveRead!: (value: { content: string; revision: number }) => void;

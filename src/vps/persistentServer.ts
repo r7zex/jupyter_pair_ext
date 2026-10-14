@@ -12,10 +12,8 @@ import * as Y from 'yjs';
 import { loadNotebookCrdt, saveNotebookCrdt, sharedNotebook } from './persistentNotebookCrdt';
 import { persistentNotebookOutputs } from './persistentNotebookOutputs';
 import { PersistentLive, type PersistentPresence } from './persistentLive';
-import { lineLockMessage } from '../core/lineLock';
 import { createSharedCursorPosition, encodeRelativeOffset, resolveRelativeOffset, resolveSharedCursorPosition, type SharedCursorPosition } from '../core/cursorPosition';
 import { rebaseTextChanges } from '../core/textChanges';
-import { diffChars } from 'diff';
 import type { TextChange } from '../core/crdt';
 import { editSharedNotebook, type NotebookSyncReply } from './persistentNotebookCrdt';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
@@ -425,13 +423,6 @@ export class PersistentSessionHost {
         if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced. Preserve offline edits and reopen it.');
         const before = Buffer.from(Y.encodeStateAsUpdate(doc));
         const previous = sharedNotebook(doc);
-        const states = session.live.states().filter((state) => !state.readOnly && state.activeFile === filename && state.epoch === epoch);
-        const offsets = new Map(states.map((state) => { const text = doc.getMap<Y.Map<unknown>>('cells').get(state.activeNotebookCellId ?? '')?.get('source'); return [state.peer.peerId, resolveRelativeOffset(text instanceof Y.Text ? text : undefined, state.activeLineAnchor, undefined)] as const; }));
-        const guard = (cellId: string, changes: readonly TextChange[], source: string): void => {
-          const message = lineLockMessage(states, member.id, filename, cellId, changes.map((change) => ({ rangeOffset: change.offset, rangeLength: change.deleteCount })), source,
-            (state) => offsets.get(state.peer.peerId));
-          if (message) throw new SessionError(423, message);
-        };
         let intentApplied = false;
         let implicitPresence: PersistentPresence | undefined;
         if (body.intent !== undefined) {
@@ -450,7 +441,7 @@ export class PersistentSessionHost {
           if (!last || intent.sequence > last.sequence) {
             if (intent.sequence !== (last?.sequence ?? 0) + 1 || (!last && Object.keys(ledger).length >= 64)) throw new SessionError(409, 'Text intent sequence is unavailable.');
             const cell = previous.cells.find((item) => item.id === intent.cellId); if (!cell) throw new SessionError(409, 'Cell was removed.');
-            const changes = rebaseTextChanges(intent.baseline, cell.source, intent.changes); guard(cell.id, changes, cell.source);
+            const changes = rebaseTextChanges(intent.baseline, cell.source, intent.changes);
             const text = doc.getMap<Y.Map<unknown>>('cells').get(cell.id)!.get('source') as Y.Text;
             doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
             const offset = Math.min(text.length, (changes[0]?.offset ?? 0) + (changes[0]?.insertText.length ?? 0));
@@ -474,37 +465,24 @@ export class PersistentSessionHost {
           if (!snapshot || !Array.isArray(snapshot.cells) || snapshot.cells.some((cell) => previous.cells.some((old) => old.id === cell.id && old.source !== cell.source))) throw new SessionError(409, 'Reload notebook text before changing its structure.');
           try { editSharedNotebook(doc, snapshot); } catch { throw new SessionError(400, 'Invalid notebook structure.'); }
         }
-        if (body.update !== undefined || body.snapshot !== undefined) {
-          const after = sharedNotebook(doc);
-          for (const old of previous.cells) {
-            const next = after.cells.find((cell) => cell.id === old.id);
-            if (!next && states.some((state) => state.activeNotebookCellId === old.id && state.peer.peerId !== member.id)) throw new SessionError(423, 'Cell contains another participant\'s selected line.');
-            if (next && next.source !== old.source) {
-              const parts = diffChars(old.source, next.source, { timeout: 25 }); if (!parts) throw new SessionError(409, 'Text reconciliation exceeds its limit.');
-              let offset = 0; const changes: TextChange[] = [];
-              for (const part of parts) { if (part.added) changes.push({ offset, deleteCount: 0, insertText: part.value }); else { if (part.removed) changes.push({ offset, deleteCount: part.value.length, insertText: '' }); offset += part.value.length; } }
-              guard(old.id, changes, old.source);
-            }
-          }
-        }
         if (member.readOnly && !Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw new SessionError(403, 'This invitation grants read access only.');
         let content: string;
         try { content = saveNotebookCrdt(doc, epoch, template); } catch { throw new SessionError(400, 'Invalid or oversized notebook CRDT.'); }
         const revision = content === file.content && !intentApplied ? file.revision : (await session.workspace.write(filename, content, file.revision, owner, undefined, false, true)).revision;
-        if (revision !== file.revision) session.live.broadcast({ kind: 'notebook', path: filename, epoch, revision, update: Buffer.from(Y.encodeStateAsUpdate(doc, Y.encodeStateVectorFromUpdate(before))).toString('base64') });
+        const actor = body.intent ? (body.intent as { actor: string }).actor : typeof body.actor === 'string' ? body.actor : undefined;
+        const receipt = actor ? template.metadata?.pair_crdt?.intents?.[actor] : undefined;
+        const acknowledgedSequence = receipt?.member === member.id ? receipt.sequence : 0;
+        if (revision !== file.revision) session.live.broadcast({ kind: 'notebook', path: filename, epoch, revision, update: Buffer.from(Y.encodeStateAsUpdate(doc, Y.encodeStateVectorFromUpdate(before))).toString('base64'), ...(actor && acknowledgedSequence ? { acknowledgement: { actor, sequence: acknowledgedSequence } } : {}) });
         if (implicitPresence) session.live.update(member.id, implicitPresence);
         const vector = typeof body.stateVector === 'string' && body.stateVector.length <= 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
         let update: string;
         try { update = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); } catch { throw new SessionError(400, 'Invalid CRDT state vector.'); }
-        return { epoch, revision, update, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
+        return { epoch, revision, update, acknowledgedSequence, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
       } finally { doc.destroy(); }
     }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);
     if (body.operation === 'read') return session.workspace.read(this.string(body, 'path'), owner);
     if (body.operation === 'write') {
-      const filename = this.string(body, 'path');
-      if (filename.endsWith('.ipynb') && session.workspace.snapshot(owner).entries.some((entry) => entry.path === filename)
-        && session.live.states().some((state) => state.activeFile === filename && state.peer.peerId !== member.id && !state.readOnly)) throw new SessionError(423, 'Notebook contains another participant\'s selected line.');
       if (body.visibility !== undefined && (!owner || body.visibility !== 'private')) throw new SessionError(403, 'Only the owner can create a Private file.');
       return session.workspace.write(this.string(body, 'path'), this.string(body, 'content'), this.revision(body), owner, undefined, body.visibility === 'private');
     }

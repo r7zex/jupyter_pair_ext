@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 export interface SharedCell { id: string; cell_type: string; source: string; metadata: Record<string, unknown> }
 export interface SharedNotebook { cells: SharedCell[]; metadata: Record<string, unknown> }
-export interface NotebookSyncReply { epoch: string; update: string; revision: number; identity?: string; cells: SharedCell[]; metadata: Record<string, unknown> }
+export interface NotebookSyncReply { epoch: string; update: string; revision: number; identity?: string; acknowledgedSequence?: number; cells: SharedCell[]; metadata: Record<string, unknown> }
 const validId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 export function sharedNotebook(doc: Y.Doc): SharedNotebook {
   const order = doc.getArray<string>('order').toArray(); const cells = doc.getMap<Y.Map<unknown>>('cells');
