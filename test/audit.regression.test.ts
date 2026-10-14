@@ -97,7 +97,9 @@ describe('audit regressions', () => {
       assert.match(publishJob, /GH_REPO:\s+\$\{\{ github\.repository \}\}/);
       assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
       assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
-      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}" "pair-notebook-complete-\$\{RELEASE_VERSION\}\.zip"\)/);
+      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}" "pair-notebook-complete-\$\{RELEASE_VERSION\}\.zip" "pair-notebook-server-persistent\.tar\.gz" "pair-notebook-server-persistent\.tar\.gz\.sha256"\)/);
+      assert.match(verifyJob, /npm run package:persistent-server\s+ npm run test:persistent:server/);
+      assert.match(verifyJob, /sha256sum --check pair-notebook-server-persistent\.tar\.gz\.sha256/);
       assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
       assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
       assert.match(releaseNotesScript, /pair-notebook-complete-\$\{version\}\.zip/);

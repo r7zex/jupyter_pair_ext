@@ -1,6 +1,6 @@
-# Persistent research runs — 0.5.39
+# Persistent research runs — 0.6.3
 
-The editor session, each network connection, and each accepted compute job have separate lifetimes. Use **Pair Notebook: Run Python on VPS Compute** for unattended training. Interactive notebook kernels and the shared host shell still belong to the VS Code Extension Host. They have no training-duration deadline, but cannot survive termination of that process or its machine.
+The editor session, each network connection, and each accepted compute job have separate lifetimes. Use **Pair Notebook: Run Python on VPS Compute** for unattended training. In human-host peer sessions, interactive notebook kernels and the shared host shell belong to the VS Code Extension Host. Server-owned persistent sessions instead use independent isolated interactive agents; see [their operating guide](PERSISTENT_VPS.md). They have no training-duration deadline, but cannot survive termination of that process or its machine.
 
 ## Execution ownership and recovery
 
@@ -64,21 +64,19 @@ Each interactive execution has its own opaque generation, including the preparin
 
 The UI guarantees an empty input and exact text validation. The authenticated API proves scoped authority and challenge use; it cannot prove that an arbitrary modified client physically typed the letters. It is not protection against the OS owner or trusted Python deliberately terminating a process.
 
-## Research reference and verification
+## Infrastructure verification
 
-[The synthetic anti-fraud reference](../examples/anti_fraud_reference/README.md) contains dataset preparation, chronological evaluation, training, resume, retained atomic checkpoints, saved metrics, model export and generated paper tables. Its measurements validate infrastructure with synthetic data. They are not results for the researchers' real fraud model.
 
-Use the commands and evidence in the version-specific audit. Loopback broker/agent tests, substituted VS Code boundaries, real Extension Host CI, external VPS, Windows, physical GPU and an actually elapsed multi-hour run are separate results. A running soak is not a completed multi-hour test.
+Use the [source-specific acceptance record](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) and retain separate evidence for each run. Loopback broker/agent tests, substituted VS Code boundaries, real Extension Host CI, external VPS, Windows, physical GPU and an actually elapsed multi-hour run are separate results. A running soak is not a completed multi-hour test.
 
-The reference pipeline permits one train/resume writer per experiment directory. A second writer fails without modifying checkpoints; the OS releases the lock when its process exits, including a crash. Resume checks the original run provenance, and retained fallback cannot silently select a different experiment's checkpoint.
 
 For an independently observed Linux CPU soak after compiling the broker:
 
 ```bash
-python3 scripts/persistent-soak.py start --state /srv/pair-validation/soak-0.5.39
-python3 scripts/persistent-soak.py status --state /srv/pair-validation/soak-0.5.39
-python3 scripts/persistent-soak.py observe --state /srv/pair-validation/soak-0.5.39
-python3 scripts/persistent-soak.py cancel --state /srv/pair-validation/soak-0.5.39
+python3 scripts/persistent-soak.py start --state /srv/pair-validation/soak-0.6.3
+python3 scripts/persistent-soak.py status --state /srv/pair-validation/soak-0.6.3
+python3 scripts/persistent-soak.py observe --state /srv/pair-validation/soak-0.6.3
+python3 scripts/persistent-soak.py cancel --state /srv/pair-validation/soak-0.6.3
 ```
 
 Use a new state directory for `start`; `observe` reattaches a crashed observer to the same accepted run. The default explicitly configured workload is 14,400 steps with at least one second per step, without a computation deadline. The observer, agent, compiled broker and required transport dependency are copied and hashed before launch. Observer recovery adopts services by Linux boot/process-start identity and pidfd; it does not relaunch training. Status marks stale observation and reports actual elapsed time. Completion writes `verification.json` for one launch, steps, checkpoint integrity, source hashes and recorded outages. `cancel` obtains a fresh scoped challenge and asks for exact `CONFIRM`; it never accepts a command-line boolean as consent. This harness requires Linux pidfd/lock support and storage/machine lifetime independent of the editor; it cannot keep a terminated cloud environment alive.

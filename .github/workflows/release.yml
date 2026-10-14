@@ -92,19 +92,22 @@ jobs:
       - name: Validate production dependencies
         run: npm audit --omit=dev
 
+      - name: Prepare the real non-root Linux sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Build and verify release artifacts
         run: |
           npm run lint
           npm run compile
           node node_modules/mocha/bin/mocha.js --timeout 20000 --forbid-pending --exit 'out/test/**/*.test.js'
           python -W error::ResourceWarning test/vps_agent_audit.py -q
-          if test -f test/anti_fraud_reference_test.py; then
-            python -W error::ResourceWarning test/anti_fraud_reference_test.py -q
-            python -W error::ResourceWarning test/persistent_reference_integration_test.py -q
-          fi
-          if test -f scripts/release-series.test.mjs; then
-            node scripts/release-series.test.mjs
-          fi
+          npm run package:persistent-server
+          npm run test:persistent:server
           node scripts/make-artifacts.mjs --preflight-only
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
@@ -128,6 +131,9 @@ jobs:
           SOURCE_ZIP="pair-notebook-complete-${VERSION}.zip"
           test -f "${VERSIONED_VSIX}"
           test -f "${SOURCE_ZIP}"
+          cp artifacts/pair-notebook-server-persistent.tar.gz .
+          cp artifacts/pair-notebook-server-persistent.tar.gz.sha256 .
+          sha256sum --check pair-notebook-server-persistent.tar.gz.sha256
 
           node scripts/create-release-notes.mjs "${VERSION}" release-notes.md
 
@@ -145,6 +151,8 @@ jobs:
           path: |
             ${{ steps.release.outputs.versioned_vsix }}
             ${{ steps.release.outputs.source_zip }}
+            pair-notebook-server-persistent.tar.gz
+            pair-notebook-server-persistent.tar.gz.sha256
             release-notes.md
 
   publish:
@@ -190,7 +198,7 @@ jobs:
             RELEASE_FLAGS=(--prerelease)
           fi
 
-          ASSETS=("${VERSIONED_VSIX}" "pair-notebook-complete-${RELEASE_VERSION}.zip")
+          ASSETS=("${VERSIONED_VSIX}" "pair-notebook-complete-${RELEASE_VERSION}.zip" "pair-notebook-server-persistent.tar.gz" "pair-notebook-server-persistent.tar.gz.sha256")
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             EXISTING_NAMES="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
             MISSING_ASSETS=()

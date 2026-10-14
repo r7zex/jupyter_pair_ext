@@ -34,10 +34,9 @@ try {
     'scripts/persistent-session-soak.py',
     'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
-    'docs/PERSISTENT_VPS_VALIDATION.md', 'LICENSE',
-    'docs/PERSISTENT_VPS_REVIEW_0.6.1.md',
-    'docs/PERSISTENT_VPS_REVIEW_0.6.2.md',
-    'docs/PERSISTENT_VPS_REVIEW_0.6.3.md',
+    'docs/PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md',
+    'docs/evidence/persistent-0.6.3/target-continuation-2026-10-14.json',
+    'LICENSE',
   ];
   for (const relative of files) {
     const destination = path.join(server, relative);

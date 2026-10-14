@@ -1,8 +1,8 @@
 # Target acceptance continuation — 14 October 2026
 
-Runtime source: `7b93d81fb073ea85d17eeb4f0a89365183f19def`, version 0.6.3. Base: `2537e62d28d1bba4858ec0b513863058b7cbacb7`. Branch: `codex/acceptance-vps-0.6.3`, [draft PR26](https://github.com/r7zex/jupyter_pair_ext/pull/26), stacked on PR25. Recorded UTC: 2026-10-14T19:58:54.624346+00:00.
+Runtime source: `7b93d81fb073ea85d17eeb4f0a89365183f19def`, version 0.6.3. Base: `2537e62d28d1bba4858ec0b513863058b7cbacb7`. Integration history: [PR26](https://github.com/r7zex/jupyter_pair_ext/pull/26), originally stacked on PR25. Recorded UTC: 2026-10-14T19:58:54.624346+00:00.
 
-The existing repairs were requalified without changing runtime code or the pinned VPS environment. The adapter still reuses `EditorSynchronizer`, `EditorTextReplica`, `PresenceRenderer` and the existing Jupyter lifecycle. Real Git tags `v0.5.18` and `v0.5.30` were verified. Row presence is advisory; same-line editing is permitted. No merge, release, dependency or configuration change was made.
+The existing repairs were requalified without changing runtime code or the pinned VPS environment. The adapter still reuses `EditorSynchronizer`, `EditorTextReplica`, `PresenceRenderer` and the existing Jupyter lifecycle. Real Git tags `v0.5.18` and `v0.5.30` were verified. Row presence is advisory; same-line editing is permitted. This observation checkpoint preceded release integration and cleanup. Its evidence remains bound to runtime source `7b93d81f`; later release packaging does not change that provenance.
 
 The [sanitized observations](evidence/persistent-0.6.3/target-continuation-2026-10-14.json) identify exact methods, backend, source and limits. Raw evidence is retained under the authorized local `acceptance/logs/`, outside Git; credentials, journals and recovery remain protected under `acceptance/private/`.
 

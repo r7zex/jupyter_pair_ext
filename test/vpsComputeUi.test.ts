@@ -405,7 +405,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
 
   for (const text of [undefined, '', 'confirm', 'Confirm', ' CONFIRM', 'CONFIRM ', 'CONFIRM\n']) {
     it(`does not send stop intent for input ${JSON.stringify(text) ?? 'dialog dismissed'}`, async () => {
-      await client.submit({ id: 'protected-stop', agentId: 'pc', title: 'anti-fraud baseline', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
+      await client.submit({ id: 'protected-stop', agentId: 'pc', title: 'Background training job', device: 'cpu', entrypoint: 'train.py', files: { 'train.py': '' }, args: [] });
       inputText = text;
       await controller.cancel('protected-stop');
       assert.equal((await client.job('protected-stop')).cancelRequested, false);
@@ -413,7 +413,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       assert.equal(inputOptions.length, 1);
       assert.equal(inputOptions[0].value, '');
       assert.match(inputOptions[0].prompt, /protected-stop/);
-      assert.match(inputOptions[0].prompt, /anti-fraud baseline/);
+      assert.match(inputOptions[0].prompt, /Background training job/);
       assert.match(inputOptions[0].prompt, /executor: pc \(cpu\)/);
       assert.match(inputOptions[0].prompt, /elapsed: not started/);
       assert.match(inputOptions[0].prompt, /last checkpoint: not reported/);
