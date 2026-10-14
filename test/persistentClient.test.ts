@@ -119,6 +119,18 @@ function loadPersistentUi(): typeof import('../src/vscode/persistent') {
   }
 }
 const { PersistentFileSystem, PersistentSessionController } = loadPersistentUi();
+it('renders another participant\'s input request without prompting or replying on their behalf', async () => {
+  let prompts = 0; let replies = 0; const originalInput = boundary.window.showInputBox;
+  boundary.window.showInputBox = async () => { prompts++; return 'unexpected'; };
+  const connection = { sessionId: 'session', client: { call: async () => { replies++; return {}; } } };
+  const ui = Object.assign(Object.create(PersistentSessionController.prototype), { connection, disposed: false, view: { generation: 1 } }) as {
+    observe: (run: PersistentExecution, handle: vscode.NotebookCellExecution | undefined, connection: unknown, interactive: boolean) => Promise<PersistentExecution>;
+  };
+  try {
+    const run: PersistentExecution = { id: 'other-run', notebook: 'book.ipynb', cellIndex: 0, requesterId: 'other', deviceId: 'vps', generation: 1, state: 'completed', events: [{ type: 'inputRequest', content: { prompt: 'Other participant input:' } }] };
+    assert.equal(await ui.observe(run, undefined, connection, false), run); assert.equal(prompts, 0); assert.equal(replies, 0);
+  } finally { boundary.window.showInputBox = originalInput; }
+});
 
 describe('Persistent server file save conflicts', () => {
   it('rejects a delayed read from a disconnected session without poisoning the new editing baseline', async () => {

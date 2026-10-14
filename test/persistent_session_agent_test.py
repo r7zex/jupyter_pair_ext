@@ -373,7 +373,7 @@ class AgentProtocolTests(unittest.TestCase):
                         raise urllib.error.HTTPError("https://vps/register", status, "Authority unavailable", {}, None)
                     return original_request(operation, **body)
                 transport.request = lost_heartbeat
-                agent.last_registration = 0
+                agent.last_registration = None
                 agent.tick()
                 bridge = FakeBridge.instances[-1]
                 self.assertFalse(bridge.closed)
@@ -397,6 +397,14 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertFalse(any(operation == "claim" for operation, _ in transport.calls))
             registration = next(body for operation, body in transport.calls if operation == "registerDevice")
             self.assertFalse(registration["device"]["enabled"])
+
+    def test_initial_registration_does_not_wait_for_ten_seconds_of_machine_uptime(self):
+        transport = FakeTransport([])
+        agent = self.make_agent(transport, share=False)
+        with patch.object(agent_module.time, "monotonic", return_value=0):
+            agent.tick()
+            agent.tick()
+        self.assertEqual(sum(operation == "registerDevice" for operation, _ in transport.calls), 1)
 
     def test_heartbeat_does_not_reenable_revoked_sharing(self):
         transport = FakeTransport()
@@ -481,6 +489,20 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertFalse(sandbox.ready)
         self.assertIn("non-root", sandbox.reason)
 
+    def test_wsl_gpu_device_is_bound_only_for_a_selected_single_gpu(self):
+        sandbox = agent_module.Sandbox.__new__(agent_module.Sandbox)
+        sandbox.bwrap, sandbox.python, sandbox.bridge = "/usr/bin/bwrap", "/opt/python/bin/python", ROOT / "media/jupyter_kernel_bridge.py"
+        identity = "GPU-12345678-1234-1234-1234-123456789abc"
+        sandbox.roots, sandbox.gpus = [Path("/opt/python")], [{"uuid": identity, "index": 0}]
+        exists = Path.exists
+        with patch.object(Path, "exists", lambda path: str(path) == "/dev/dxg" or exists(path)):
+            self.assertNotIn("/dev/dxg", sandbox.command(self.root, None))
+            args = sandbox.command(self.root, identity)
+            self.assertIn(["--dev-bind", "/dev/dxg", "/dev/dxg"], [args[index:index + 3] for index in range(len(args) - 2)])
+            sandbox.gpus.append({"uuid": "GPU-22345678-1234-1234-1234-123456789abc", "index": 1})
+            with self.assertRaisesRegex(agent_module.AgentError, "exactly one"):
+                sandbox.command(self.root, identity)
+
     def test_transport_rejects_public_http_and_redirects(self):
         token = self.root / "token"
         token.write_text("a" * 32)
@@ -520,9 +542,12 @@ class RealRuntimeTests(unittest.TestCase):
                         "assert torch.ones(4).sum().item()==4.0")
                 bridge.send({"command": "execute", "requestId": "sandbox-cpu", "codeBase64": base64.b64encode(
                     code.encode()).decode()})
-                deadline = time.monotonic() + 20
+                deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
-                    event = bridge.events.get(timeout=5)
+                    try:
+                        event = bridge.events.get(timeout=5)
+                    except queue.Empty:
+                        continue
                     if event.get("type") == "complete":
                         self.assertTrue(event["success"])
                         return

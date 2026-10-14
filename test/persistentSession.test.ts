@@ -4,6 +4,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import * as Y from 'yjs';
+import { editSharedNotebook, sharedNotebook } from '../src/vps/persistentNotebookCrdt';
 import { VpsServer, type VpsServerOptions } from '../src/vps/server';
 import type { PersistentMembership } from '../src/vps/persistentProtocol';
 
@@ -275,6 +277,58 @@ describe('Persistent VPS Session Host', () => {
     const saved = JSON.parse(Buffer.from((await call('read', { path: 'work.ipynb' })).data.content, 'base64').toString('utf8'));
     assert.equal(saved.cells[0].execution_count, 3);
     assert.deepEqual(saved.cells[0].outputs, [{ output_type: 'display_data', data: { 'text/html': '<b>after</b>' }, metadata: { expanded: true } }]);
+  });
+
+  for (const recovery of ['same cell', 'another cell', 'server restart', 'interrupted output publication', 'live edit in another cell']) it(`retains queued notebook outputs after ${recovery}`, async () => {
+    await registerVps();
+    const cells = ['first-cell', 'second-cell'].map((id) => ({ id, cell_type: 'code', source: 'print(42)', metadata: {}, execution_count: null, outputs: [] }));
+    const snapshot = (await call('write', { path: 'queue.ipynb', content: encoded(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells })), expectedRevision: 0 })).data;
+    const secondIndex = recovery === 'same cell' || recovery === 'live edit in another cell' ? 0 : 1;
+    for (const [index, cellIndex] of [0, secondIndex].entries()) {
+      assert.equal((await call('execute', { notebook: 'queue.ipynb', cellIndex, expectedRevision: snapshot.revision, requestId: `queue-${index}` })).status, 200);
+    }
+    const report = (command: any, text: string, count: number): Record<string, unknown> => ({ deviceId: 'vps', executionId: command.executionId, commandId: command.id, generation: command.generation, offset: 0, state: 'completed', events: [
+      { type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text } },
+      { type: 'complete', requestId: command.id, executionCount: count },
+    ] });
+    const first = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    if (recovery === 'live edit in another cell') {
+      const initial = (await call('notebookSync', { path: 'queue.ipynb' })).data;
+      const changed = new Y.Doc(); Y.applyUpdate(changed, Buffer.from(initial.update, 'base64')); const value = sharedNotebook(changed); value.cells[1]!.source = 'print(99)'; editSharedNotebook(changed, value);
+      assert.equal((await call('notebookSync', { path: 'queue.ipynb', epoch: initial.epoch, update: Buffer.from(Y.encodeStateAsUpdate(changed)).toString('base64') })).status, 200); changed.destroy();
+    }
+    if (recovery === 'interrupted output publication') (server as any).persistent.saveResults = async () => { throw new Error('Crash after notebook output publication'); };
+    assert.equal((await call('report', report(first, 'first\n', 1), agent)).status, recovery === 'interrupted output publication' ? 500 : 200);
+    const second = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    if (recovery === 'server restart' || recovery === 'interrupted output publication') {
+      await server.stop(); server = new VpsServer(options); endpoint = `http://127.0.0.1:${await server.start()}`; await registerVps();
+      assert.equal((await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command.id, second.id);
+    }
+    assert.notEqual(first.executionId, second.executionId);
+    assert.equal((await call('report', report(second, 'second\n', 2), agent)).status, 200);
+    const saved = JSON.parse(Buffer.from((await call('read', { path: 'queue.ipynb' })).data.content, 'base64').toString());
+    if (secondIndex === 1) assert.equal(saved.cells[0].outputs[0].text, 'first\n');
+    assert.equal(saved.cells[secondIndex].outputs[0]?.text, 'second\n');
+    assert.equal(saved.cells[secondIndex].execution_count, 2);
+  });
+
+  it('preserves an authoritative notebook replacement between queued outputs', async () => {
+    await registerVps();
+    const snapshot = (await call('write', { path: 'queue.ipynb', content: notebook('print(42)'), expectedRevision: 0 })).data;
+    for (let index = 0; index < 2; index++) assert.equal((await call('execute', { notebook: 'queue.ipynb', cellIndex: 0, expectedRevision: snapshot.revision, requestId: `replacement-${index}` })).status, 200);
+    const first = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    const report = (command: any, text: string): Record<string, unknown> => ({ deviceId: 'vps', executionId: command.executionId, commandId: command.id, generation: command.generation, offset: 0, state: 'completed', events: [
+      { type: 'iopub', requestId: command.id, messageType: 'stream', content: { name: 'stdout', text } },
+    ] });
+    assert.equal((await call('report', report(first, 'first output'), agent)).status, 200);
+    const current = (await call('read', { path: 'queue.ipynb' })).data;
+    const replacement = JSON.parse(Buffer.from(current.content, 'base64').toString());
+    replacement.cells[0].outputs = [{ output_type: 'stream', name: 'stdout', text: 'user replacement' }];
+    assert.equal((await call('write', { path: 'queue.ipynb', content: encoded(JSON.stringify(replacement)), expectedRevision: current.revision })).status, 200);
+    const second = (await rpc({ operation: 'claim', deviceId: 'vps' }, agent)).data.command;
+    assert.equal((await call('report', report(second, 'late queued output'), agent)).status, 200);
+    const saved = JSON.parse(Buffer.from((await call('read', { path: 'queue.ipynb' })).data.content, 'base64').toString());
+    assert.equal(saved.cells[0].outputs[0].text, 'user replacement');
   });
 
   it('retains accepted running results across server restart without replaying queued work', async () => {

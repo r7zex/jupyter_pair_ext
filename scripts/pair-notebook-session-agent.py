@@ -388,6 +388,11 @@ class Sandbox:
             gpu = next((item for item in self.gpus if item["uuid"] == gpu_uuid), None)
             if not gpu or not GPU_ID.fullmatch(gpu_uuid):
                 raise AgentError("Selected NVIDIA GPU is no longer available.")
+            if Path("/dev/dxg").exists():
+                # WSL exposes one shared GPU device rather than per-GPU nodes.
+                if len(self.gpus) != 1:
+                    raise AgentError("WSL GPU isolation requires exactly one available NVIDIA GPU.")
+                args += ["--dev-bind", "/dev/dxg", "/dev/dxg"]
             for device in (f"/dev/nvidia{gpu['index']}", "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"):
                 if Path(device).exists():
                     args += ["--dev-bind", device, device]
@@ -649,7 +654,7 @@ class SessionAgent:
             self.sandbox.recover()
         self.kernels = {}
         self.active = None
-        self.last_registration = 0
+        self.last_registration = None
         self.initial_share_applied = False
         self.closed = False
         self.credentials_revoked = False
@@ -941,7 +946,7 @@ class SessionAgent:
                     return
         if self.credentials_revoked or self.session_deleted:
             return
-        if time.monotonic() - self.last_registration >= 10:
+        if self.last_registration is None or time.monotonic() - self.last_registration >= 10:
             self.register()
         if not self.args.share or not self.sandbox.ready:
             return

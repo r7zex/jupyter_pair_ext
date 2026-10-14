@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { createRuntimeProxyAgent } from '../runtime/proxyWebSocket';
 import { normalizeVpsUrl } from './protocol';
+import type { PersistentLiveEvent } from './persistentLive';
 
 export type PersistentCredential = { kind: 'anonymous' } | { kind: 'admin' | 'membership'; token: string };
 
@@ -9,6 +10,7 @@ export class PersistentHttpError extends Error {
   public constructor(public readonly status: number) {
     super(status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
       : status === 401 ? 'Your session credentials expired or were revoked. Connect again.'
+        : status === 423 ? 'This line is occupied by another participant.'
         : status === 403 ? 'The server denied this operation for your session identity.'
           : status === 404 ? 'The session, file or execution is unavailable.'
             : status === 429 ? 'Too many requests. Wait before trying again.'
@@ -75,5 +77,36 @@ export class PersistentClient {
       request.on('error', () => finish(new Error('Cannot reach the VPS. Check its address, TLS certificate and network connection.')));
       request.end(bytes);
     });
+  }
+
+  public subscribe(sessionId: string, receive: (event: PersistentLiveEvent) => void, disconnected: () => void): { dispose(): void } {
+    if (this.credential.kind !== 'membership') throw new Error('Join a persistent session before subscribing.');
+    const url = new URL(`${this.endpoint}/v1/sessions/rpc`);
+    const bytes = Buffer.from(JSON.stringify({ operation: 'subscribe', sessionId }));
+    let closed = false; let connected = false;
+    const request = (url.protocol === 'https:' ? https : http).request(url, {
+      method: 'POST', agent: createRuntimeProxyAgent(url.toString()),
+      headers: { 'content-type': 'application/json', 'content-length': bytes.length, authorization: `Bearer ${this.credential.token}` },
+    }, (response) => {
+      clearTimeout(deadline);
+      if (response.statusCode !== 200) { request.destroy(); finish(); return; }
+      connected = true; response.setEncoding('utf8'); let pending = '';
+      response.setTimeout(10_000, () => { response.destroy(); finish(); });
+      response.on('data', (chunk: string) => {
+        pending += chunk;
+        if (Buffer.byteLength(pending) > 512 * 1024) { response.destroy(); finish(); return; }
+        let boundary: number;
+        while ((boundary = pending.indexOf('\n\n')) >= 0) {
+          const packet = pending.slice(0, boundary); pending = pending.slice(boundary + 2);
+          if (!packet.startsWith('data: ')) continue;
+          try { receive(JSON.parse(packet.slice(6)) as PersistentLiveEvent); } catch { response.destroy(); finish(); return; }
+        }
+      });
+      response.on('end', finish); response.on('error', finish); response.on('close', finish);
+    });
+    const finish = (): void => { clearTimeout(deadline); if (!closed) { closed = true; disconnected(); } };
+    const deadline = setTimeout(() => { if (!connected) request.destroy(); finish(); }, this.deadlineMs); deadline.unref();
+    request.on('error', finish); request.end(bytes);
+    return { dispose: () => { closed = true; clearTimeout(deadline); request.destroy(); } };
   }
 }

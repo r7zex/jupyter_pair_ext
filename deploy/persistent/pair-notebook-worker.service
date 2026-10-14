@@ -14,6 +14,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 ExecStart=/usr/bin/python3 /opt/pair-notebook/server/scripts/pair-notebook-session-agent.py --url http://127.0.0.1:8787 --id vps --token-file /etc/pair-notebook/interactive-vps.token --python /opt/pair-notebook-worker-venv/bin/python --bridge /opt/pair-notebook/server/media/jupyter_kernel_bridge.py --state /var/lib/pair-notebook-worker --max-kernels 1 --share
+ExecStartPre=/usr/bin/python3 /opt/pair-notebook/server/scripts/pair-notebook-session-agent.py --python /opt/pair-notebook-worker-venv/bin/python --bridge /opt/pair-notebook/server/media/jupyter_kernel_bridge.py --check-isolation
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -27,7 +28,8 @@ ProtectHome=true
 PrivateTmp=true
 # This is the CPU-only VPS service. A GPU device needs a separate reviewed unit.
 PrivateDevices=true
-ProtectKernelTunables=true
+# Bubblewrap needs an unmasked /proc to mount its own private procfs.
+ProtectKernelTunables=false
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
