@@ -138,6 +138,37 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  it('presents a completed peer execution once and keeps it protected until its compute generation changes', async () => {
+    const previous = boundary.workspace.notebookDocuments; let presentations = 0;
+    const run = { id: 'completed-peer', state: 'completed', notebook: 'peer.ipynb', cellId: 'peer-cell', generation: 1, events: [] };
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'session', path: '/peer.ipynb' }, getCells: () => [cell] };
+    const cell = { notebook, metadata: { id: 'peer-cell' }, document: { isClosed: false, getText: () => 'print(7)' } };
+    const connection = { sessionId: 'session', client: { call: async () => run } };
+    const controller = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, disposed: false, view: { generation: 1 }, executions: new Map(), mirroredRuns: new Map(), latestExecutions: new Map(),
+      managedRuns: new WeakMap(), localRunning: new Set(), selectedNotebooks: new Set([notebook]),
+      files: { visibilityOf: () => 'public' }, observe: async () => run,
+      notebook: { createNotebookCellExecution: () => { presentations++; return { start() {}, end() {} }; } },
+    }) as any;
+    boundary.workspace.notebookDocuments = [notebook] as any;
+    try {
+      await controller.mirrorExecution(run.id); await controller.mirrorExecution(run.id);
+      assert.equal(presentations, 1); assert.equal(controller.managesCell(cell), true);
+      controller.view.generation = 2; assert.equal(controller.managesCell(cell), false);
+    } finally { boundary.workspace.notebookDocuments = previous; }
+  });
+  it('waits for native completion metadata before returning from Run so an immediate Save captures the final version', async () => {
+    const previous = (boundary.workspace as any).onDidChangeNotebookDocument; let changed: ((event: any) => void) | undefined;
+    (boundary.workspace as any).onDidChangeNotebookDocument = (listener: (event: any) => void) => { changed = listener; return { dispose() { changed = undefined; } }; };
+    const notebook = {}; const cell = { notebook, document: { isClosed: false }, executionSummary: undefined } as any;
+    const controller = Object.create(PersistentSessionController.prototype) as any;
+    try {
+      let resolved = false; let complete!: () => void;
+      const pending = controller.endExecution({ end: (success: boolean, endTime: number) => { complete = () => { cell.executionSummary = { success, timing: { endTime } }; changed?.({ notebook }); }; } }, cell, true).then(() => { resolved = true; });
+      await Promise.resolve(); assert.equal(resolved, false);
+      complete(); await pending; assert.equal(cell.executionSummary.success, true); assert.equal(changed, undefined);
+    } finally { (boundary.workspace as any).onDidChangeNotebookDocument = previous; }
+  });
   it('renders a pushed execution without another round trip and fences cached runs to their connection', async () => {
     const controller = Object.create(PersistentSessionController.prototype) as any;
     let reads = 0; const connection = { client: { call: async () => { reads++; throw new Error('Unexpected execution poll'); } } };
