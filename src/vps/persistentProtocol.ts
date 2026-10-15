@@ -36,6 +36,11 @@ export interface PersistentSessionView {
   memberId: string; allowMemberSwitch: boolean; members: PersistentMember[];
   devices: PersistentDevice[]; target: PersistentTarget; generation: number;
   consents: PersistentConsent[]; revision: number;
+  mode?: 'persistent' | 'temporary';
+  projectRoot?: string;
+  resources?: import('./sessionSettings').SessionResources;
+  bannedNames?: string[];
+  host?: { cpu: string; memoryTotalBytes: number; memoryFreeBytes: number; diskTotalBytes: number; diskFreeBytes: number };
 }
 export interface PersistentMembership { sessionId: string; memberId: string; token: string; name: string }
 export interface PersistentExecution {

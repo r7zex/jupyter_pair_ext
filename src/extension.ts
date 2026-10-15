@@ -105,6 +105,7 @@ let workspaceSessionRestore: Promise<void> | undefined;
 let localSessionExit: Promise<void> | undefined;
 let lifecycleWatchdog: NodeJS.Timeout | undefined;
 let lifecycleReadyRuntime: SessionRuntime | undefined;
+let persistentController: PersistentSessionController | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
@@ -118,8 +119,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
-  const vpsCompute = new VpsComputeController(context, () => runtime);
-  context.subscriptions.push(new PersistentSessionController(context, output));
+  const vpsCompute = new VpsComputeController(context, () => runtime, false);
+  const persistent = new PersistentSessionController(context, output, (state) => dashboard?.setVpsState(state), () => !!runtime);
+  persistentController = persistent;
+  context.subscriptions.push(persistent);
   const sharedTerminal = new SharedTerminalController(() => runtime);
   context.subscriptions.push(sharedTerminal);
   register(context, 'pairNotebook.openSharedTerminal', () => sharedTerminal.open());
@@ -265,6 +268,7 @@ export function deactivate(): Thenable<void> | undefined {
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
+  if (persistentController?.active) throw new Error('Leave the current VPS session before starting or joining another session.');
   if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
@@ -348,6 +352,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
 }
 
 async function joinSession(context: vscode.ExtensionContext): Promise<void> {
+  if (persistentController?.active) throw new Error('Leave the current VPS session before starting or joining another session.');
   if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
@@ -360,6 +365,10 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     ignoreFocusOut: true,
   });
   if (!raw) return;
+  if (/^https?:\/\//i.test(raw) && raw.includes('#pair-invite=')) {
+    await vscode.commands.executeCommand('pairNotebook.joinVpsInvitation', raw);
+    return;
+  }
   const invite = parseInvite(raw);
   let nickname = await promptDisplayName(
     displayName(),

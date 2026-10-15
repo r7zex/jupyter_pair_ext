@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent VPS workspaces and controlled remote Python execution.",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -256,6 +256,30 @@
       {
         "command": "pairNotebook.startComputeSession",
         "title": "Pair Notebook: Start New Standalone Compute Session"
+      },
+      {
+        "command": "pairNotebook.createTemporaryVpsSession",
+        "title": "Pair Notebook: Create Temporary VPS Session"
+      },
+      {
+        "command": "pairNotebook.manageVpsServer",
+        "title": "Pair Notebook: VPS Administration"
+      },
+      {
+        "command": "pairNotebook.copyVpsInvite",
+        "title": "Pair Notebook: Copy VPS Session Invitation"
+      },
+      {
+        "command": "pairNotebook.stopPersistentVpsSession",
+        "title": "Pair Notebook: End VPS Session"
+      },
+      {
+        "command": "pairNotebook.joinVpsInvitation",
+        "title": "Pair Notebook: Join VPS Session Invitation"
+      },
+      {
+        "command": "pairNotebook.showVpsDiagnostics",
+        "title": "Pair Notebook: VPS Diagnostics"
       }
     ],
     "viewsContainers": {
@@ -275,12 +299,8 @@
           "type": "webview"
         },
         {
-          "id": "pairNotebook.vpsCompute",
-          "name": "VPS Compute"
-        },
-        {
           "id": "pairNotebook.persistentSessions",
-          "name": "Persistent VPS Sessions"
+          "name": "VPS"
         }
       ]
     },
@@ -306,44 +326,9 @@
       ],
       "view/title": [
         {
-          "command": "pairNotebook.connectVpsCompute",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@0"
-        },
-        {
-          "command": "pairNotebook.connectVps",
-          "when": "view == pairNotebook.persistentSessions",
-          "group": "navigation@0"
-        },
-        {
-          "command": "pairNotebook.createVpsSession",
-          "when": "view == pairNotebook.persistentSessions",
-          "group": "navigation@1"
-        },
-        {
           "command": "pairNotebook.refreshVpsSession",
           "when": "view == pairNotebook.persistentSessions",
           "group": "navigation@2"
-        },
-        {
-          "command": "pairNotebook.runVpsJob",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@1"
-        },
-        {
-          "command": "pairNotebook.showVpsJobs",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@2"
-        },
-        {
-          "command": "pairNotebook.cancelVpsJob",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@3"
-        },
-        {
-          "command": "pairNotebook.refreshVpsJobs",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@4"
         }
       ]
     },

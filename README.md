@@ -1,5 +1,7 @@
 # Pair Notebook
 
+The 0.6.4 update unifies the VPS dashboard and administration. See [VPS session administration](docs/VPS_ADMINISTRATION.md) for folder isolation, temporary sessions and resource-limit semantics.
+
 Pair Notebook 0.6.3 supports encrypted peer sessions, [persistent VPS workspaces](docs/PERSISTENT_VPS.md), and independent [background compute jobs](docs/PERSISTENT_RESEARCH.md). Persistent notebooks use durable Yjs replicas, optimistic local input, shared cursors and unrestricted same-line editing. Public and owner-only Private execution use separate isolated kernels and results.
 
 See the [current documentation](docs/README.md) and [measured acceptance results](docs/PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md). Native two-client API editing, target HTTPS/VPS execution and a Windows WSL/CUDA pipeline have evidence; physical keyboard/pixel acceptance, macOS compute and the completed 24-hour soak remain separate requirements. The running soak is pinned to its recorded source and does not automatically qualify a later release commit.

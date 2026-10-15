@@ -65,6 +65,39 @@ describe('Persistent session transport and credential boundaries', () => {
     const endpoint = await serve((_request, response) => { response.writeHead(200); response.write('{'); });
     await assert.rejects(new PersistentClient(endpoint, { kind: 'membership', token: 'm'.repeat(32) }, 60).call('execution'), /timed out/);
   });
+  it('reuses the verified saved owner for password and invitation joins without creating a guest identity', async () => {
+    const operations: string[] = [];
+    const token = 'o'.repeat(40);
+    let memberId = 'owner';
+    const endpoint = await serve((request, response) => {
+      let text = '';
+      request.on('data', (chunk: Buffer) => { text += chunk.toString(); });
+      request.on('end', () => {
+        const body = JSON.parse(text) as { operation: string };
+        operations.push(body.operation);
+        if (body.operation === 'discover') response.end(JSON.stringify({ sessions: [{ id: 'session', name: 'Research' }] }));
+        else if (body.operation === 'view') {
+          assert.equal(request.headers.authorization, `Bearer ${token}`);
+          response.end(JSON.stringify({ id: 'session', memberId, ownerId: 'owner' }));
+        } else { response.statusCode = 400; response.end('{}'); }
+      });
+    });
+    const saved = { endpoint, sessionId: 'session', memberId: 'owner', name: 'Research' };
+    const attached: unknown[] = [];
+    const controller = Object.assign(Object.create(PersistentSessionController.prototype), {
+      context: { globalState: { get: () => [saved] }, secrets: { get: async () => token } },
+      connectionAttempt: 1, disposed: false, log: { appendLine() {} },
+      endpoint: async () => endpoint, password: async () => 'shared session password',
+      attach: async (identity: unknown, credential: string) => { assert.equal(credential, token); attached.push(identity); },
+    }) as any;
+    await controller.join();
+    await controller.joinInvitation(`${endpoint}/#pair-invite=session.${'i'.repeat(40)}`);
+    assert.deepEqual(operations, ['discover', 'view', 'view']);
+    assert.deepEqual(attached, [saved, saved]);
+    memberId = 'guest';
+    assert.equal(await controller.restoreOwner(endpoint, 'session'), false, 'a member token must never acquire the owner role');
+    assert.equal(attached.length, 2);
+  });
 });
 
 let warningChoice: string | undefined;

@@ -35,10 +35,19 @@ export class PersistentWorkspace {
   private readonly blobDirectory: string;
   private readonly manifestPath: string;
   private readonly markerPath: string;
-  private readonly limits: PersistentStorageLimits;
+  private limits: PersistentStorageLimits;
   private readonly privatePaths = new WeakMap<Manifest, Set<string>>();
   private manifest: Manifest | undefined;
   private pending: Promise<void> = Promise.resolve();
+
+  public configureLimits(limits: Partial<PersistentStorageLimits>): void {
+    const next = { ...this.limits, ...limits };
+    if (Object.values(next).some((value) => !Number.isSafeInteger(value) || value <= 0)) invalid('Invalid storage allocation.');
+    const entries = this.manifest?.entries ?? [];
+    if (entries.reduce((size, entry) => size + entry.size, 0) > next.maxProjectBytes || entries.length > next.maxEntries
+      || entries.some((entry) => entry.size > next.maxFileBytes)) quota();
+    this.limits = next;
+  }
 
   constructor(root: string, limits: Partial<PersistentStorageLimits> = {}) {
     this.root = path.resolve(root);

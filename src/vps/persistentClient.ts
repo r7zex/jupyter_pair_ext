@@ -7,8 +7,10 @@ import type { PersistentLiveEvent } from './persistentLive';
 export type PersistentCredential = { kind: 'anonymous' } | { kind: 'admin' | 'membership'; token: string };
 
 export class PersistentHttpError extends Error {
-  public constructor(public readonly status: number) {
-    super(status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
+  public constructor(public readonly status: number, code?: string) {
+    super(code === 'PROJECT_ROOT_OVERLAP' ? 'Session folders must not overlap. Choose a separate folder outside other session roots.'
+      : code === 'EXECUTION_ALLOCATION_FULL' ? 'This session has reached its execution allocation. Wait for accepted work or change its resource allocation.'
+      : status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
       : status === 401 ? 'Your session credentials expired or were revoked. Connect again.'
         : status === 423 ? 'This line is occupied by another participant.'
         : status === 403 ? 'The server denied this operation for your session identity.'
@@ -29,10 +31,10 @@ export class PersistentClient {
   }
 
   public call<T>(operation: string, input: Record<string, unknown> = {}): Promise<T> {
-    if (['create', 'list'].includes(operation) && this.credential.kind !== 'admin') {
+    if (['create', 'list', 'adminSession'].includes(operation) && this.credential.kind !== 'admin') {
       return Promise.reject(new Error('This action requires a VPS administrative credential.'));
     }
-    if (!['create', 'list', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
+    if (!['create', 'list', 'adminSession', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
       return Promise.reject(new Error('Join a persistent session before using its API.'));
     }
     const url = new URL(`${this.endpoint}/v1/sessions/rpc`);
@@ -64,7 +66,11 @@ export class PersistentClient {
         });
         response.on('error', () => finish(new Error('Persistent VPS response was interrupted.')));
         response.on('end', () => {
-          if (response.statusCode !== 200) { finish(new PersistentHttpError(response.statusCode ?? 0)); return; }
+          if (response.statusCode !== 200) {
+            let code: string | undefined;
+            try { const error = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { code?: unknown }; if (typeof error?.code === 'string') code = error.code; } catch { /* A proxy may return a non-JSON error page. */ }
+            finish(new PersistentHttpError(response.statusCode ?? 0, code)); return;
+          }
           try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8')) as T); }
           catch { finish(new Error('Persistent VPS returned invalid JSON.')); }
         });

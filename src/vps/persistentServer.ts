@@ -3,6 +3,9 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
+import { statfs } from 'node:fs/promises';
+import { participantNameKey, projectRootsOverlap, sessionProjectRoot, sessionResources, type SessionResources } from './sessionSettings';
 import { atomicWriteFile } from '../core/atomicFile';
 import { portableRelativePath } from '../core/projectPath';
 import { PersistentWorkspace, PersistentStorageError } from './persistentStorage';
@@ -32,7 +35,7 @@ const sha = (value: string): string => createHash('sha256').update(value).digest
 const token = (): string => randomBytes(32).toString('base64url');
 
 class SessionError extends Error {
-  public constructor(public readonly status: number, message: string) { super(message); }
+  public constructor(public readonly status: number, message: string, public readonly code?: string) { super(message); }
 }
 interface MemberRecord { id: string; name: string; role: PersistentMember['role']; tokenHash: string; revoked: boolean; invitationId?: string; expiresAt?: number; readOnly?: boolean }
 interface Invitation { id: string; tokenHash: string; expiresAt: number; readOnly: boolean; revoked: boolean }
@@ -51,6 +54,10 @@ interface SessionRecord {
   executions: ExecutionRecord[];
   aclEpoch: number;
   invitations?: Invitation[];
+  mode?: 'persistent' | 'temporary';
+  projectRoot?: string;
+  resources?: SessionResources;
+  bannedNames?: string[];
 }
 interface Session { record: SessionRecord; workspace: PersistentWorkspace; policy: PersistentComputePolicy; seen: Map<string, number>; history: PersistentHistory; live: PersistentLive }
 interface NotebookCell { id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown[]; execution_count?: number | null }
@@ -65,6 +72,8 @@ export class PersistentSessionHost {
   private sweep: NodeJS.Timeout | undefined;
   private vpsInventory: PersistentDevice | undefined;
   private closing = false;
+  private hostResources: PersistentSessionView['host'];
+  private hostResourceTime = 0;
   public constructor(private readonly options: PersistentHostOptions) {}
 
   public async start(): Promise<void> {
@@ -77,7 +86,9 @@ export class PersistentSessionHost {
       if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('Invalid saved session directory.');
       const record = JSON.parse(await this.readMetadata(path.join(this.options.directory, directory.name, 'session.json'), 40 * 1024 * 1024)) as SessionRecord;
       this.validateRecord(record, directory.name);
-      const workspace = new PersistentWorkspace(path.join(this.options.directory, record.id, 'workspace'));
+      this.checkProjectRoot(record.projectRoot ?? record.id);
+      const resources = sessionResources(record.resources);
+      const workspace = new PersistentWorkspace(this.workspaceDirectory(record), { maxProjectBytes: resources.storageMb * 1024 ** 2 });
       await workspace.init();
       const policy = new PersistentComputePolicy(record.id, record.ownerId, record.policy);
       const session: Session = { record, workspace, policy, seen: new Map(), history: new PersistentHistory(this.directory(record.id)), live: new PersistentLive() };
@@ -96,6 +107,8 @@ export class PersistentSessionHost {
     this.sweep = setInterval(() => {
       void this.enqueue(async () => {
         for (const session of this.sessions.values()) {
+          if (session.record.mode === 'temporary' && session.record.state === 'running' && (session.seen.get(session.record.ownerId) ?? 0) < Date.now() - 60_000) await this.lifecycle(session, session.record.members.find((member) => member.id === session.record.ownerId)!, 'stop');
+          if (session.record.mode === 'temporary' && session.record.state === 'stopped' && !session.record.executions.some((run) => run.execution.state === 'queued' || run.execution.state === 'running')) { await this.lifecycle(session, session.record.members.find((member) => member.id === session.record.ownerId)!, 'delete'); continue; }
           const before = JSON.stringify(session.policy.serialize());
           const states = session.record.executions.map((run) => run.execution.state).join(',');
           session.policy.setMembers(this.members(session));
@@ -131,6 +144,7 @@ export class PersistentSessionHost {
       let body: PersistentRpcRequest;
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as PersistentRpcRequest; } catch { throw new SessionError(400, 'Invalid JSON.'); }
       if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.operation !== 'string') throw new SessionError(400, 'Invalid session operation.');
+      if (['view', 'heartbeat', 'adminSession'].includes(body.operation)) await this.refreshHostResources();
       const auth = request.headers.authorization;
       const credential = typeof auth === 'string' && /^Bearer [A-Za-z0-9_-]{32,256}$/.test(auth) ? auth.slice(7) : '';
       if (body.operation === 'subscribe') {
@@ -157,12 +171,28 @@ export class PersistentSessionHost {
       const policyStatus = (error as { status?: unknown }).status;
       if (typeof policyStatus === 'number' && policyStatus >= 400 && policyStatus < 500) status = policyStatus;
       response.statusCode = status;
-      response.end(JSON.stringify({ error: status < 500 ? (error as Error).message : 'Persistent session operation failed.' }));
+      response.end(JSON.stringify({ error: status < 500 ? (error as Error).message : 'Persistent session operation failed.', ...(error instanceof SessionError && error.code ? { code: error.code } : {}) }));
     } finally { clearTimeout(deadline); }
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.serial.then(operation); this.serial = result.catch(() => undefined); return result;
+  }
+  private async refreshHostResources(): Promise<void> {
+    if (Date.now() - this.hostResourceTime < 5000) return;
+    const disk = await statfs(this.options.directory);
+    this.hostResources = { cpu: os.cpus()[0]?.model ?? 'VPS CPU', memoryTotalBytes: os.totalmem(), memoryFreeBytes: os.freemem(),
+      diskTotalBytes: disk.blocks * disk.bsize, diskFreeBytes: disk.bavail * disk.bsize };
+    this.hostResourceTime = Date.now();
+  }
+  private workspaceDirectory(record: Pick<SessionRecord, 'id' | 'projectRoot'>): string {
+    return record.projectRoot === undefined ? path.join(this.directory(record.id), 'workspace') : path.join(this.options.directory, '.projects', record.projectRoot);
+  }
+  private checkProjectRoot(root: string): void {
+    try { sessionProjectRoot(root); } catch (error) { throw new SessionError(400, (error as Error).message); }
+    if ([...this.sessions.values()].some(({ record }) => projectRootsOverlap(record.projectRoot ?? record.id, root))) {
+      throw new SessionError(409, 'The project folder overlaps another session. Choose a separate folder, not its parent or child.', 'PROJECT_ROOT_OVERLAP');
+    }
   }
   private directory(id: string): string { return path.join(this.options.directory, id); }
   private async persist(session: Session): Promise<void> {
@@ -212,6 +242,10 @@ export class PersistentSessionHost {
       || (record.invitations !== undefined && (!Array.isArray(record.invitations) || record.invitations.length > 64 || record.invitations.some((invite) => !invite || !VPS_ID.test(invite.id) || !/^[a-f0-9]{64}$/.test(invite.tokenHash) || !Number.isSafeInteger(invite.expiresAt) || typeof invite.readOnly !== 'boolean' || typeof invite.revoked !== 'boolean')))
       || !Number.isSafeInteger(record.aclEpoch) || record.aclEpoch < 1
       || !Array.isArray(record.executions) || record.executions.length > MAX_EXECUTIONS) throw new Error('Invalid saved session authority.');
+    if (record.mode !== undefined && !['persistent', 'temporary'].includes(record.mode)) throw new Error('Invalid saved session mode.');
+    if (record.projectRoot !== undefined) sessionProjectRoot(record.projectRoot);
+    sessionResources(record.resources);
+    if (record.bannedNames !== undefined && (!Array.isArray(record.bannedNames) || record.bannedNames.length > 128 || record.bannedNames.some((name) => typeof name !== 'string' || !visibleVpsText(name, 120)))) throw new Error('Invalid blocked participants.');
     for (const run of record.executions) {
       if (!run || !run.execution || !VPS_ID.test(run.execution.id) || !VPS_ID.test(run.commandId) || !VPS_ID.test(run.requestId)
         || !safeJobPath(run.execution.notebook) || !Number.isSafeInteger(run.execution.generation) || run.execution.generation < 1
@@ -279,6 +313,8 @@ export class PersistentSessionHost {
     const devices = policy.devices.map((device) => ({ ...device, usingMemberIds: [...new Set(session.record.executions
       .filter((run) => (member.id === session.record.ownerId || run.execution.scope !== 'private') && run.execution.state === 'running' && run.execution.deviceId === device.id).map((run) => run.execution.requesterId))] }));
     return { id: session.record.id, name: session.record.name, state: session.record.state, ownerId: session.record.ownerId,
+      mode: session.record.mode ?? 'persistent', projectRoot: session.record.projectRoot ?? session.record.id, resources: sessionResources(session.record.resources),
+      ...(member.id === session.record.ownerId ? { bannedNames: session.record.bannedNames ?? [] } : {}), ...(this.hostResources ? { host: this.hostResources } : {}),
       memberId: member.id, members: this.members(session), revision: session.workspace.snapshot(member.id === session.record.ownerId).revision,
       allowMemberSwitch: policy.allowMemberSwitch, devices, target: policy.target, generation: policy.generation,
       consents: policy.consents.filter((consent) => member.id === session.record.ownerId || consent.requesterId === member.id || policy.devices.some((device) => device.id === consent.deviceId && device.ownerId === member.id)) };
@@ -309,8 +345,11 @@ export class PersistentSessionHost {
       if (this.sessions.size >= MAX_SESSIONS) throw new SessionError(409, 'Session limit reached.');
       const name = this.string(body, 'name'); if (!visibleVpsText(name, 120)) throw new SessionError(400, 'Invalid session name.');
       const password = await this.password(body.password); const id = randomUUID(); const memberId = randomUUID(); const secret = token();
-      const policy = new PersistentComputePolicy(id, memberId); const workspace = new PersistentWorkspace(path.join(this.directory(id), 'workspace')); await workspace.init();
-      const session: Session = { record: { version: 1, id, name, state: 'running', ownerId: memberId, password,
+      const mode = body.mode ?? 'persistent'; if (mode !== 'persistent' && mode !== 'temporary') throw new SessionError(400, 'Invalid session mode.');
+      const projectRoot = body.projectRoot ?? id; this.checkProjectRoot(projectRoot as string);
+      let resources: SessionResources; try { resources = sessionResources(body.resources); } catch (error) { throw new SessionError(400, (error as Error).message); }
+      const policy = new PersistentComputePolicy(id, memberId); const workspace = new PersistentWorkspace(this.workspaceDirectory({ id, projectRoot: projectRoot as string }), { maxProjectBytes: resources.storageMb * 1024 ** 2 }); await workspace.init();
+      const session: Session = { record: { version: 1, id, name, state: 'running', ownerId: memberId, password, mode, projectRoot: projectRoot as string, resources,
         members: [{ id: memberId, name: typeof body.memberName === 'string' && visibleVpsText(body.memberName, 120) ? body.memberName : 'Owner', role: 'owner', tokenHash: sha(secret), revoked: false }], policy: policy.serialize(), executions: [], aclEpoch: 1 }, workspace, policy, seen: new Map([[memberId, Date.now()]]), history: new PersistentHistory(this.directory(id)), live: new PersistentLive() };
       policy.setMembers(this.members(session)); if (this.vpsInventory) policy.registerVps(this.vpsInventory);
       await this.persist(session); this.sessions.set(id, session);
@@ -318,7 +357,7 @@ export class PersistentSessionHost {
     }
     if (body.operation === 'list') {
       if (!this.administrative(credential)) throw new SessionError(401, 'An administrative credential is required.');
-      return { sessions: [...this.sessions.values()].map(({ record }) => ({ id: record.id, name: record.name, state: record.state })) };
+      return { capabilities: { sessionAdministration: 1 }, sessions: [...this.sessions.values()].map(({ record }) => ({ id: record.id, name: record.name, state: record.state, mode: record.mode ?? 'persistent', projectRoot: record.projectRoot ?? record.id })) };
     }
     if ((body.operation === 'registerDevice' || body.operation === 'claim') && !body.sessionId) {
       if (!this.agent(credential) || (body.deviceId !== 'vps' && (body.device as { id?: unknown } | undefined)?.id !== 'vps')) throw new SessionError(403, 'Only the configured VPS agent can act across sessions.');
@@ -340,6 +379,10 @@ export class PersistentSessionHost {
     }
     const id = this.string(body, 'sessionId'); if (!VPS_ID.test(id)) throw new SessionError(400, 'Invalid session ID.');
     const session = this.sessions.get(id); if (!session) throw new SessionError(404, 'Session does not exist.');
+    if (body.operation === 'adminSession') {
+      if (!this.administrative(credential)) throw new SessionError(401, 'A VPS administrative credential is required.');
+      return this.adminSession(session, body);
+    }
     if (body.operation === 'join') return this.join(session, body, address);
     if ((body.operation === 'registerDevice' || body.operation === 'claim' || body.operation === 'report') && body.deviceId === 'vps') {
       if (!this.agent(credential)) throw new SessionError(403, 'The configured VPS agent credential is required.');
@@ -370,13 +413,18 @@ export class PersistentSessionHost {
       session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return { revoked: true };
     }
     if (body.operation === 'view' || body.operation === 'heartbeat') { await this.persist(session); return this.view(session, member); }
-    if (body.operation === 'leave') { session.live.remove(member.id); session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
+    if (body.operation === 'leave') {
+      if (owner && session.record.mode === 'temporary') await this.lifecycle(session, member, 'stop');
+      session.live.remove(member.id); session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
     if (body.operation === 'lifecycle') return this.lifecycle(session, member, this.string(body, 'action'));
     if (body.operation === 'password') {
       this.owner(session, member); session.record.password = await this.password(body.password);
       session.record.invitations = [];
       for (const guest of session.record.members) if (guest.id !== member.id) { guest.revoked = true; session.seen.delete(guest.id); }
       session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return this.view(session, member);
+    }
+    if (body.operation === 'manageResources' || body.operation === 'ban' || body.operation === 'unban' || body.operation === 'kick') {
+      this.owner(session, member); return this.adminSession(session, { ...body, action: body.operation });
     }
     if (body.operation === 'revoke' || body.operation === 'role') {
       this.owner(session, member); const target = session.record.members.find((candidate) => candidate.id === body.memberId && !candidate.revoked);
@@ -564,6 +612,8 @@ export class PersistentSessionHost {
 
   private async addMember(session: Session, body: PersistentRpcRequest, invite?: Invitation): Promise<PersistentMembership> {
     const name = this.string(body, 'name'); if (!visibleVpsText(name, 120)) throw new SessionError(400, 'Invalid participant name.');
+    if (session.record.bannedNames?.some((blocked) => participantNameKey(blocked) === participantNameKey(name))) throw new SessionError(403, 'This participant is blocked from the session.');
+    if (session.record.members.some((member) => this.validMember(session, member) && member.id === session.record.ownerId && participantNameKey(member.name) === participantNameKey(name))) throw new SessionError(409, 'The owner name is reserved. Reconnect using your saved owner credential.');
     session.record.members = session.record.members.filter((member) => this.validMember(session, member));
     session.policy.setMembers(this.members(session)); session.policy.pruneRetiredDevices(session.record.executions.filter((run) => run.execution.state === 'queued' || run.execution.state === 'running').map((run) => run.execution.deviceId));
     if (session.record.members.length >= 128) throw new SessionError(409, 'Active membership limit reached.');
@@ -572,10 +622,39 @@ export class PersistentSessionHost {
     return { sessionId: session.record.id, memberId, token: secret, name: session.record.name };
   }
 
+  private async adminSession(session: Session, body: PersistentRpcRequest): Promise<unknown> {
+    const owner = session.record.members.find((member) => member.id === session.record.ownerId)!;
+    if (body.action === 'view') return this.view(session, owner);
+    if (body.action === 'lifecycle') return this.lifecycle(session, owner, this.string(body, 'lifecycle'));
+    if (body.action === 'manageResources') {
+      let resources: SessionResources;
+      try { resources = sessionResources(body.resources); } catch (error) { throw new SessionError(400, (error as Error).message); }
+      session.workspace.configureLimits({ maxProjectBytes: resources.storageMb * 1024 ** 2 });
+      session.record.resources = resources;
+    } else if (body.action === 'unban') {
+      const name = this.string(body, 'name');
+      session.record.bannedNames = (session.record.bannedNames ?? []).filter((blocked) => participantNameKey(blocked) !== participantNameKey(name));
+    } else if (body.action === 'kick' || body.action === 'ban') {
+      const member = session.record.members.find((entry) => entry.id === body.memberId && entry.id !== owner.id && !entry.revoked);
+      if (!member) throw new SessionError(400, 'Choose a participant other than the owner.');
+      if (body.action === 'ban') {
+        const blocked = session.record.bannedNames ?? [];
+        if (blocked.length >= 128) throw new SessionError(409, 'Blocked participant limit reached.');
+        if (!blocked.some((name) => participantNameKey(name) === participantNameKey(member.name))) blocked.push(member.name);
+        session.record.bannedNames = blocked;
+      }
+      for (const candidate of session.record.members) if (candidate.id === member.id || (body.action === 'ban' && candidate.id !== owner.id && participantNameKey(candidate.name) === participantNameKey(member.name))) {
+        candidate.revoked = true; session.seen.delete(candidate.id); session.live.remove(candidate.id);
+      }
+      session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session);
+    } else throw new SessionError(400, 'Unknown administration action.');
+    await this.persist(session); session.live.invalidate(); return this.view(session, owner);
+  }
+
   private async lifecycle(session: Session, member: MemberRecord, action: string): Promise<unknown> {
     this.administrator(member);
     if (!['start', 'stop', 'restart', 'delete'].includes(action)) throw new SessionError(400, 'Invalid lifecycle action.');
-    if (action === 'delete') { session.record.state = 'stopped'; await this.persist(session); await rm(this.directory(session.record.id), { recursive: true }); session.live.close(); this.sessions.delete(session.record.id); return { deleted: true }; }
+    if (action === 'delete') { session.record.state = 'stopped'; await this.persist(session); await rm(this.directory(session.record.id), { recursive: true }); if (session.record.projectRoot !== undefined) await rm(this.workspaceDirectory(session.record), { recursive: true, force: true }); session.live.close(); this.sessions.delete(session.record.id); return { deleted: true }; }
     if (action === 'stop' || action === 'restart') {
       session.record.state = 'stopped';
       for (const run of session.record.executions) if (run.execution.state === 'queued') { run.execution.state = 'interrupted'; run.execution.error = 'Session stopped before execution was claimed.'; }
@@ -608,6 +687,7 @@ export class PersistentSessionHost {
     }
     await this.trimHistory(session, true);
     if (session.record.executions.filter((run) => run.execution.state === 'queued' || run.execution.state === 'running').length >= 4) throw new SessionError(409, 'Four executions are already pending in this session. Wait for one to finish.');
+    if (body.operation !== 'kernel' && session.record.executions.filter((run) => run.execution.state === 'queued' || run.execution.state === 'running').length >= sessionResources(session.record.resources).activeExecutions) throw new SessionError(409, 'Session execution allocation is full. Wait for accepted work or increase its allocation.', 'EXECUTION_ALLOCATION_FULL');
     const notebookPath = this.string(body, 'notebook'); if (!notebookPath.endsWith('.ipynb')) throw new SessionError(400, 'Select a notebook.');
     const file = await session.workspace.read(notebookPath, member.id === session.record.ownerId);
     const snapshot = session.workspace.snapshot(member.id === session.record.ownerId);
