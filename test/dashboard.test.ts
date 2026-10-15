@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import Module from 'node:module';
+import vm from 'node:vm';
 
 describe('dashboard webview startup', () => {
   it('registers its message receiver before loading HTML and always ships a visible fallback', async () => {
@@ -74,7 +75,7 @@ describe('dashboard webview startup', () => {
     assert.match(assignedHtml, /Начать сессию/);
     assert.match(assignedHtml, /Подключиться/);
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
-    assert.match(assignedHtml, /command:pairNotebook\.connectVps">Постоянная VPS-сессия/);
+    assert.match(assignedHtml, /command:pairNotebook\.connectVps">Подключиться к постоянному VPS/);
     assert.doesNotMatch(assignedHtml, /command:pairNotebook\.connectVpsCompute/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
@@ -116,6 +117,33 @@ describe('dashboard webview startup', () => {
     assert.equal(posted.length, 2, 'the ready handshake requests a fresh state in case the first post raced');
     assert.deepEqual(executed, ['pairNotebook.joinSession', 'pairNotebook.connectVps']);
     assert.deepEqual(errors, ['Pair Notebook panel error: synthetic failure']);
+    const elements = new Map<string, { innerHTML: string; disabled: boolean; open: boolean; focus: () => void }>();
+    const element = (id: string) => {
+      if (!elements.has(id)) elements.set(id, { innerHTML: '', disabled: false, open: false, focus: () => undefined });
+      return elements.get(id)!;
+    };
+    let messageListener: ((event: unknown) => void) | undefined;
+    const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(assignedHtml)?.[1];
+    assert.ok(script);
+    vm.runInNewContext(script, {
+      acquireVsCodeApi: () => ({ postMessage: () => undefined }),
+      document: { getElementById: element, activeElement: null },
+      window: { addEventListener: (_event: string, callback: typeof messageListener) => { messageListener = callback; } },
+    });
+    assert.match(element('content').innerHTML, /id="start"/);
+    const vpsState = { live: true, persistent: true, isHost: true, hostName: 'VPS', projectName: 'Research',
+      mode: 'Persistent VPS', runtimeState: 'ready', hostDetails: 'RAM: 0.5 / 1 GiB', participants: [], compute: {} };
+    messageListener?.({ data: { type: 'state', patch: vpsState, replace: true } });
+    assert.doesNotMatch(element('content').innerHTML, /id="start"|id="join"|id="vps"/);
+    assert.match(element('content').innerHTML, /RAM: 0.5 \/ 1 GiB/);
+    assert.match(element('content').innerHTML, /id="manage"/);
+    assert.doesNotMatch(element('content').innerHTML, /id="transfer"|id="shell"/);
+    provider.setVpsState(vpsState);
+    receive?.({ command: 'leave' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(executed.at(-1), 'pairNotebook.leaveVpsSession');
+    messageListener?.({ data: { type: 'state', patch: { live: false }, replace: true } });
+    assert.match(element('content').innerHTML, /id="start"/);
     provider.dispose();
   });
 });

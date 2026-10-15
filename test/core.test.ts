@@ -2237,8 +2237,9 @@ describe('protocol and notebook compatibility', () => {
     assert.equal(manifest.capabilities.virtualWorkspaces.supported, true);
     const connectionCommands = manifest.contributes.commands.filter((command: { command: string }) => ['pairNotebook.connectVps', 'pairNotebook.connectVpsCompute'].includes(command.command));
     assert.equal(connectionCommands.length, 2, 'Persistent session and broker compute connections remain separate commands.');
-    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVps' && item.when === 'view == pairNotebook.persistentSessions'));
-    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVpsCompute' && item.when === 'view == pairNotebook.vpsCompute'));
+    assert.equal(manifest.contributes.menus['view/title'].some((item: { command: string }) => item.command === 'pairNotebook.connectVps'), false);
+    assert.equal(manifest.contributes.views.pairNotebook.filter((view: { name: string }) => view.name === 'VPS').length, 1);
+    assert.equal(manifest.contributes.views.pairNotebook.some((view: { id: string }) => view.id === 'pairNotebook.vpsCompute'), false);
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'], undefined);

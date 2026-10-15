@@ -3,6 +3,10 @@ import { constants as fsConstants } from 'node:fs';
 import { open, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import * as vscode from 'vscode';
+import type { DashboardState } from './dashboard';
+import { vpsDashboardState } from './vpsDashboard';
+import { administrativeToken, manageVpsServer, resourceAllocation } from './vpsAdministration';
+import { sessionProjectRoot } from '../vps/sessionSettings';
 import type { JupyterKernelEvent } from '../core/pythonKernel';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
 import { mergePersistentNotebookOutputs } from '../vps/persistentNotebookMerge';
@@ -228,7 +232,11 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private readonly selectedNotebooks = new Set<vscode.NotebookDocument>();
   private readonly latestExecutions = new Map<string, { connection: ActiveConnection; execution: PersistentExecution }>();
 
-  public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel) {
+  private connectedAt = 0;
+  public get active(): boolean { return !!this.connection; }
+  public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
+    private readonly dashboardState?: (state: DashboardState | undefined) => void,
+    private readonly peerActive?: () => boolean) {
     this.notebook = vscode.notebooks.createNotebookController('pair-notebook-persistent', 'jupyter-notebook', 'Pair Notebook • Persistent VPS', (cells, notebook) => this.execute(cells, notebook));
     this.notebook.supportedLanguages = ['python'];
     this.notebook.supportsExecutionOrder = true;
@@ -268,6 +276,12 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const commands: Record<string, (...args: never[]) => unknown> = {
       'pairNotebook.connectVps': () => this.connect(),
       'pairNotebook.createVpsSession': () => this.create(),
+      'pairNotebook.createTemporaryVpsSession': () => this.create('temporary'),
+      'pairNotebook.manageVpsServer': () => this.manageServer(),
+      'pairNotebook.showVpsDiagnostics': () => this.diagnostics(),
+      'pairNotebook.copyVpsInvite': () => this.copyInvite(),
+      'pairNotebook.stopPersistentVpsSession': () => this.stopSession(),
+      'pairNotebook.joinVpsInvitation': (value: string) => this.joinInvitation(value),
       'pairNotebook.joinVpsSession': () => this.join(),
       'pairNotebook.manageVpsSession': () => this.manage(),
       'pairNotebook.leaveVpsSession': () => this.leave(),
@@ -310,20 +324,48 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     return names.length ? `In use by ${names.join(', ')}` : 'Idle';
   }
   public getChildren(): PersistentItem[] {
-    if (!this.connection || !this.view) return [new PersistentItem('Connect to VPS', 'pairNotebook.connectVps'), new PersistentItem('Create persistent session', 'pairNotebook.createVpsSession'), new PersistentItem('Join persistent session', 'pairNotebook.joinVpsSession')];
-    const target = this.view.devices.find((device) => device.id === this.view!.target.deviceId);
-    const member = this.view.members.find((member) => member.id === this.view!.memberId);
-    return [
-      new PersistentItem(this.view.name, 'pairNotebook.manageVpsSession', `${this.view.state} · ${member?.role ?? 'member'}`),
-      new PersistentItem('Compute device', 'pairNotebook.selectVpsCompute', `${target?.name ?? this.view.target.deviceId} · ${this.view.target.gpuUuid ? 'GPU' : 'CPU'} · ${target?.online ? 'online' : 'offline'} · ${this.deviceUsage(target)}`),
-      new PersistentItem('Upload files / folder', 'pairNotebook.uploadVpsFolder'),
-      new PersistentItem('Share / stop sharing my computer', 'pairNotebook.shareVpsComputer'),
+    const actions = [new PersistentItem('Create persistent VPS session', 'pairNotebook.createVpsSession'),
+      new PersistentItem('Create temporary VPS session', 'pairNotebook.createTemporaryVpsSession'),
+      new PersistentItem('VPS administration', 'pairNotebook.manageVpsServer')];
+    if (!this.connection || !this.view) return actions;
+    const view = this.view;
+    return [new PersistentItem(view.name, 'pairNotebook.manageVpsSession', `${view.mode ?? 'persistent'} · ${view.state}`),
+      new PersistentItem('Session administration', 'pairNotebook.manageVpsSession'),
+      new PersistentItem('Choose compute device', 'pairNotebook.selectVpsCompute'),
       new PersistentItem('Restart active notebook kernel', 'pairNotebook.restartVpsKernel'),
       new PersistentItem('Release active notebook kernel', 'pairNotebook.releaseVpsKernel'),
-      new PersistentItem('Recover execution result', 'pairNotebook.recoverVpsExecution'),
-      new PersistentItem('Leave session', 'pairNotebook.leaveVpsSession'),
-      ...this.view.members.map((member) => new PersistentItem(member.name, undefined, `${member.role} · ${member.online ? 'online' : 'offline'}`)),
-    ];
+      new PersistentItem('Recover execution result', 'pairNotebook.recoverVpsExecution'), ...actions];
+  }
+  private assertNoPeer(): void {
+    if (this.peerActive?.()) throw new Error('Leave the current peer session before connecting to a VPS session.');
+  }
+  public async diagnostics(): Promise<void> {
+    await this.refresh();
+    if (!this.view) return;
+    const view = this.view;
+    this.log.appendLine(JSON.stringify({ session: view.name, state: view.state, mode: view.mode ?? 'persistent',
+      host: view.host ?? 'Telemetry not provided by this server', resources: view.resources,
+      compute: view.target, generation: view.generation, participantsOnline: view.members.filter((member) => member.online).length }, null, 2));
+    this.log.show(true);
+  }
+  public async manageServer(): Promise<void> {
+    const endpoint = await this.endpoint();
+    if (endpoint) await manageVpsServer(this.context, endpoint);
+    await this.poll();
+  }
+  public async copyInvite(): Promise<void> {
+    const connection = this.requireConnection();
+    const invite = await this.rpcFor<{ sessionId: string; invitationToken: string }>(connection, 'createInvitation', { lifetimeSeconds: 86400, readOnly: false });
+    this.assertConnection(connection);
+    await vscode.env.clipboard.writeText(`${connection.endpoint}/#pair-invite=${invite.sessionId}.${invite.invitationToken}`);
+    await vscode.window.showInformationMessage('Invitation copied. Participants can paste it into Join Session.');
+  }
+  public async stopSession(): Promise<void> {
+    const connection = this.requireConnection();
+    const confirmed = await vscode.window.showWarningMessage('End this VPS session for all participants? Accepted work is retained on its executor.', { modal: true }, 'End session');
+    if (confirmed !== 'End session') return;
+    await this.rpcFor(connection, 'lifecycle', { action: 'stop' });
+    await this.leave(false);
   }
   private requireConnection(): ActiveConnection {
     if (!this.connection) throw new Error('Connect to a persistent VPS session first.');
@@ -352,11 +394,11 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     return endpoint;
   }
   public async connect(): Promise<void> {
+    this.assertNoPeer();
     const saved = this.context.globalState.get<SavedConnection[]>(CONNECTIONS_KEY, []);
     const selection = await vscode.window.showQuickPick([
       { label: 'Join a persistent session', action: 'join' },
       { label: 'Join using an invitation link', action: 'invitation' },
-      { label: 'Create a persistent session', action: 'create' },
       { label: 'Import existing owner / member credential', action: 'import' },
       ...saved.map((connection) => ({ label: `Reconnect: ${connection.name}`, description: connection.endpoint, action: 'resume', connection })),
     ], { title: 'Persistent VPS sessions' });
@@ -392,26 +434,34 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const endpoint = normalizeVpsUrl(raw.endpoint);
     const view = await new PersistentClient(endpoint, { kind: 'membership', token: raw.token }).call<PersistentSessionView>('view', { sessionId: raw.sessionId });
     if (view.memberId !== raw.memberId || view.id !== raw.sessionId) throw new Error('The credential identity does not match the server session.');
-    const name = view.members.find((member) => member.id === view.memberId)?.name ?? view.name;
+    const name = view.name;
     await this.attach({ endpoint, sessionId: view.id, memberId: view.memberId, name }, raw.token);
   }
   private async password(title: string): Promise<string | undefined> {
     return vscode.window.showInputBox({ title, password: true, ignoreFocusOut: true, prompt: 'Session password (at least 12 characters)', validateInput: (value) => value.length >= 12 ? undefined : 'Use at least 12 characters.' });
   }
-  public async create(): Promise<void> {
+  public async create(mode: 'persistent' | 'temporary' = 'persistent'): Promise<void> {
+    this.assertNoPeer();
     const endpoint = await this.endpoint();
     if (!endpoint) return;
-    const admin = await vscode.window.showInputBox({ title: 'VPS administrator', prompt: 'Administrative Team token — kept separate from participant credentials', password: true, ignoreFocusOut: true,
-      validateInput: (value) => /^[A-Za-z0-9_-]{32,256}$/.test(value) ? undefined : 'Enter your configured administrative token.' });
-    if (admin === undefined) return;
-    const name = await vscode.window.showInputBox({ title: 'Persistent session name', ignoreFocusOut: true, validateInput: (value) => value.trim() ? undefined : 'Enter a name.' });
+    const admin = await administrativeToken(this.context, endpoint);
+    if (!admin) return;
+    const name = await vscode.window.showInputBox({ title: mode === 'temporary' ? 'Temporary VPS session name' : 'Persistent VPS session name', ignoreFocusOut: true, validateInput: (value) => value.trim() ? undefined : 'Enter a name.' });
     if (name === undefined) return;
+    const projectRoot = await vscode.window.showInputBox({ title: 'Separate VPS project folder', ignoreFocusOut: true,
+      prompt: 'Relative folder in Pair storage. It must not equal, contain, or be inside another session folder.',
+      validateInput: (value) => { try { sessionProjectRoot(value); return undefined; } catch (error) { return (error as Error).message; } } });
+    if (projectRoot === undefined) return;
+    const resources = await resourceAllocation();
+    if (!resources) return;
     const password = await this.password('Set session password');
     if (password === undefined) return;
-    const membership = await new PersistentClient(endpoint, { kind: 'admin', token: admin }).call<PersistentMembership>('create', { name: name.trim(), password });
+    const memberName = vscode.workspace.getConfiguration('pairNotebook').get<string>('displayName', '').trim() || 'Owner';
+    const membership = await new PersistentClient(endpoint, { kind: 'admin', token: admin }).call<PersistentMembership>('create', { name: name.trim(), password, mode, projectRoot, resources, memberName });
     await this.attach({ endpoint, ...membership }, membership.token);
   }
   public async join(): Promise<void> {
+    this.assertNoPeer();
     const attempt = this.connectionAttempt;
     const endpoint = await this.endpoint();
     if (!endpoint) return;
@@ -421,6 +471,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const discovery = await client.call<{ sessions: { id: string; name: string }[] }>('discover', { password });
     const selected = discovery.sessions.length === 1 ? discovery.sessions[0] : await vscode.window.showQuickPick(discovery.sessions.map((session) => ({ label: session.name, description: session.id, ...session })), { title: 'Select a session' });
     if (!selected) return;
+    if (await this.restoreOwner(endpoint, selected.id)) return;
     const name = await vscode.window.showInputBox({ title: 'Participant name', value: vscode.workspace.getConfiguration('pairNotebook').get<string>('displayName', ''), ignoreFocusOut: true, validateInput: (value) => value.trim() ? undefined : 'Enter your name.' });
     if (name === undefined) return;
     if (attempt !== this.connectionAttempt || this.disposed) throw new Error('The persistent connection changed during join.');
@@ -428,13 +479,33 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (attempt !== this.connectionAttempt || this.disposed) throw new Error('The persistent connection changed during join.');
     await this.attach({ endpoint, ...membership }, membership.token);
   }
-  private async joinInvitation(): Promise<void> {
+  private async restoreOwner(endpoint: string, sessionId: string): Promise<boolean> {
+    for (const saved of this.context.globalState.get<SavedConnection[]>(CONNECTIONS_KEY, []).filter((entry) => entry.endpoint === endpoint && entry.sessionId === sessionId)) {
+      const token = await this.context.secrets.get(membershipKey(saved));
+      if (!token) continue;
+      let view: PersistentSessionView;
+      try {
+        view = await new PersistentClient(endpoint, { kind: 'membership', token }).call<PersistentSessionView>('view', { sessionId });
+      } catch (error) {
+        if (!(error instanceof PersistentHttpError) || ![401, 403, 404].includes(error.status)) throw error;
+        this.log.appendLine('[debug] Saved owner identity is no longer authorized.');
+        continue;
+      }
+      if (view.id === saved.sessionId && view.memberId === saved.memberId && view.memberId === view.ownerId) {
+        await this.attach(saved, token); return true;
+      }
+    }
+    return false;
+  }
+  private async joinInvitation(raw?: string): Promise<void> {
+    this.assertNoPeer();
     const attempt = this.connectionAttempt;
-    const value = await vscode.window.showInputBox({ title: 'Join invitation', prompt: 'Paste the HTTPS invitation link', ignoreFocusOut: true });
+    const value = raw ?? await vscode.window.showInputBox({ title: 'Join invitation', prompt: 'Paste the HTTPS invitation link', ignoreFocusOut: true });
     if (!value) return;
     const url = new URL(value); const match = /^#pair-invite=([A-Za-z0-9_-]{1,128})\.([A-Za-z0-9_-]{32,256})$/.exec(url.hash);
     if (!match) throw new Error('Invalid invitation link.');
     url.hash = ''; const endpoint = normalizeVpsUrl(url.toString());
+    if (await this.restoreOwner(endpoint, match[1]!)) return;
     const name = await vscode.window.showInputBox({ title: 'Participant name', ignoreFocusOut: true });
     if (!name?.trim()) return;
     if (attempt !== this.connectionAttempt || this.disposed) throw new Error('The persistent connection changed during join.');
@@ -443,6 +514,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     await this.attach({ endpoint, ...membership }, membership.token);
   }
   private async attach(saved: SavedConnection, token: string): Promise<void> {
+    this.assertNoPeer();
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before connecting to VPS.');
     const attempt = this.connectionAttempt = (this.connectionAttempt ?? 0) + 1;
     const current = (): void => {
@@ -463,6 +535,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.credentialWrites = save.catch(() => undefined);
     await save; current();
     this.connection = connection;
+    this.connectedAt = Date.now();
     const folder = this.context.globalState.get<{ localRoot: string; remoteRoot: string }>(`pairNotebook.folderSync.${connection.sessionId}.${connection.memberId}`);
     if (folder && typeof folder.localRoot === 'string' && typeof folder.remoteRoot === 'string') this.folderSync = this.makeFolderSync(connection, folder.localRoot, folder.remoteRoot);
     this.view = view;
@@ -479,7 +552,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     }
     for (const notebook of vscode.workspace.notebookDocuments) this.claim(notebook);
     this.updateUi();
-    void vscode.window.showInformationMessage('Persistent VPS connected. Notebook edits and participant presence synchronize live. Closing VS Code leaves the server session running.');
+    void vscode.window.showInformationMessage(view.mode === 'temporary' ? 'Temporary VPS session connected. It ends when its owner leaves or is offline for 60 seconds; accepted work is not relaunched.' : 'Persistent VPS connected. Notebook edits and participant presence synchronize live. Closing VS Code leaves the server session running.');
   }
   private claim(notebook: vscode.NotebookDocument): void {
     if (notebook.uri.scheme === SCHEME && notebook.uri.authority === this.connection?.sessionId) {
@@ -499,6 +572,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         this.notebookSync?.reset();
         this.connection = undefined;
         this.view = undefined;
+        this.dashboardState?.(undefined);
         this.files.setConnection(undefined);
         this.status.hide();
         this.changed.fire(undefined);
@@ -511,6 +585,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   }
   private updateUi(): void {
     if (!this.view) return;
+    this.dashboardState?.(vpsDashboardState(this.view, this.connectedAt));
     const target = this.view.devices.find((device) => device.id === this.view!.target.deviceId);
     this.status.text = `$(server) VPS ${this.view.state} · ${target?.name ?? this.view.target.deviceId} ${this.view.target.gpuUuid ? 'GPU' : 'CPU'}`;
     this.status.tooltip = `Session ${this.view.id} · kernel generation ${this.view.generation} · ${target?.online ? 'online' : 'offline'} · continuous notebook and folder synchronization`;
@@ -542,6 +617,12 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
     } catch (error) {
       if (connection === this.connection) {
+        if (error instanceof PersistentHttpError && (error.status === 401 || error.status === 403 || error.status === 404)) {
+          await this.leave(false);
+          void vscode.window.showErrorMessage('VPS session access is unavailable. Reconnect with an authorized identity.');
+          return;
+        }
+        this.dashboardState?.(this.view ? vpsDashboardState(this.view, this.connectedAt, true) : undefined);
         this.status.text = '$(warning) VPS disconnected — reconnecting';
         this.status.tooltip = error instanceof Error ? error.message : 'Connection unavailable';
       }
@@ -693,10 +774,31 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const admin = owner || member?.role === 'admin';
     const actions = [{ label: 'Synchronize a local folder continuously', action: 'folderSync' }, { label: 'Stop local folder synchronization', action: 'stopFolderSync' }, { label: 'Copy session connection details', action: 'invite' }, { label: 'Choose compute device', action: 'compute' }];
     if (admin) actions.push({ label: 'Stop session', action: 'stop' }, { label: 'Start session', action: 'start' }, { label: 'Restart session', action: 'restart' }, { label: 'Delete session permanently', action: 'delete' });
-    if (owner) actions.push({ label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
+    if (owner) actions.push({ label: 'Session resource allocation', action: 'resources' }, { label: 'Kick participant', action: 'kick' }, { label: 'Block participant', action: 'ban' }, { label: 'Unblock participant', action: 'unban' }, { label: 'Configure available folders', action: 'folders' }, { label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
     const action = await vscode.window.showQuickPick(actions, { title: `${view.name} · ${view.id}` });
     if (!action) return;
     this.assertConnection(connection);
+    if (action.action === 'resources') {
+      const resources = await resourceAllocation(view.resources);
+      if (resources) await this.rpcFor(connection, 'manageResources', { resources });
+      await this.poll(); return;
+    }
+    if (action.action === 'kick' || action.action === 'ban') {
+      const member = await vscode.window.showQuickPick(view.members.filter((entry) => entry.id !== view.ownerId).map((entry) => ({ label: entry.name, memberId: entry.id })), { title: action.action === 'ban' ? 'Block identity and participant name; rotate the password to deny new identities' : 'Kick participant; joining again remains possible' });
+      if (member) await this.rpcFor(connection, action.action, { memberId: member.memberId });
+      await this.poll(); return;
+    }
+    if (action.action === 'unban') {
+      const name = await vscode.window.showQuickPick(view.bannedNames ?? [], { title: 'Unblock participant' });
+      if (name) await this.rpcFor(connection, 'unban', { name });
+      await this.poll(); return;
+    }
+    if (action.action === 'folders') {
+      const snapshot = await this.rpcFor<PersistentSnapshot>(connection, 'snapshot');
+      const folder = await vscode.window.showQuickPick(snapshot.entries.filter((entry) => entry.type === 'directory').map((entry) => ({ label: entry.path, description: entry.visibility, entry })), { title: 'Available folders · Public is shared, Private is owner-only' });
+      if (folder) await this.files.setVisibility(this.files.uri(folder.entry.path), folder.entry.visibility === 'private' ? 'public' : 'private');
+      await this.poll(); return;
+    }
     if (action.action === 'folderSync') { await this.synchronizeFolder(); return; }
     if (action.action === 'stopFolderSync') { this.folderSync = undefined; await this.context.globalState.update(`pairNotebook.folderSync.${connection.sessionId}.${connection.memberId}`, undefined); return; }
     if (action.action === 'invite') { await vscode.env.clipboard.writeText(`${connection.endpoint}\nSession ID: ${view.id}`); return; }

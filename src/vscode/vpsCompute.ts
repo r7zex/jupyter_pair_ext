@@ -53,7 +53,7 @@ class ComputeItem extends vscode.TreeItem {
 export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem>, vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<ComputeItem | undefined>();
   public readonly onDidChangeTreeData = this.changed.event;
-  private readonly view: vscode.TreeView<ComputeItem>;
+  private readonly view: vscode.TreeView<ComputeItem> | undefined;
   private readonly output = vscode.window.createOutputChannel('Pair Notebook VPS Jobs');
   private readonly refreshTimer: NodeJS.Timeout;
   private logTimer: NodeJS.Timeout | undefined;
@@ -65,15 +65,15 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private readonly pending: PendingSubmissionStore;
   private readonly clientConnections = new WeakMap<VpsClient, VpsRelayConnection>();
 
-  public constructor(private readonly context: vscode.ExtensionContext, private readonly currentRuntime: () => SessionRuntime | undefined) {
-    this.view = vscode.window.createTreeView('pairNotebook.vpsCompute', { treeDataProvider: this });
+  public constructor(private readonly context: vscode.ExtensionContext, private readonly currentRuntime: () => SessionRuntime | undefined, showTree = true) {
+    this.view = showTree ? vscode.window.createTreeView('pairNotebook.vpsCompute', { treeDataProvider: this }) : undefined;
     this.pending = new PendingSubmissionStore(path.join(context.globalStorageUri.fsPath, 'pending-vps-jobs'));
     this.settingsSubscription = vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration('pairNotebook.vpsUrl')) return;
       this.stopWatching();
       this.refresh();
     });
-    this.refreshTimer = setInterval(() => { if (this.view.visible) this.refresh(); }, 10_000);
+    this.refreshTimer = setInterval(() => { if (this.view?.visible) this.refresh(); }, 10_000);
     this.refreshTimer.unref();
     setImmediate(() => { void this.restoreObservation().catch(() => undefined); }).unref();
   }
@@ -84,7 +84,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     if (this.logTimer) clearTimeout(this.logTimer);
     this.changed.dispose();
     this.settingsSubscription.dispose();
-    this.view.dispose();
+    this.view?.dispose();
     this.output.dispose();
   }
   public refresh(): void { if (!this.disposed) this.changed.fire(undefined); }

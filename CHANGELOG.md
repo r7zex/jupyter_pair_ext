@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4 - 2026-10-15 (unified VPS sessions)
+
+- Shows connected VPS projects in the existing live-session dashboard, with server CPU, available/total RAM and disk capacity, and a separate authenticated owner role.
+- Replaces the two VPS sidebar views with one VPS view for persistent and temporary sessions and administration. Temporary session invitations work through Join Session; a temporary session ends after its owner leaves or misses its 60-second presence lease.
+- Adds server-enforced non-overlapping project roots, independent passwords, content quotas, execution admission allocations, participant removal and blocked names. Keeps existing persistent storage layouts and peer synchronization compatible.
+- Requires the matching server capabilities for administrative creation so older servers cannot silently ignore folder/resource settings. Existing owner credentials retain their role on reconnect.
+- Uses documentation-only addresses in deployment templates and tests.
+
+
 
 ## 0.6.3 - 2026-10-14 (persistent VPS notebooks)
 
