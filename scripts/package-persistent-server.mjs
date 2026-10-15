@@ -34,6 +34,7 @@ try {
     'scripts/persistent-session-soak.py',
     'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
+    'docs/REPAIR_VERIFICATION_2026_10_15.md',
     'docs/PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md',
     'docs/evidence/persistent-0.6.3/target-continuation-2026-10-14.json',
     'LICENSE',

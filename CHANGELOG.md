@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4 - 2026-10-15 (synchronization and recovery repairs)
+
+- Preserves character identities during concurrent notebook edits and merges structural deltas with unseen typing. Adds live ordinary-file synchronization and flushes unsaved modules before Run.
+- Recovers transient bootstrap/observation failures and malformed journals. Archives replaced replicas and automatically reconnects without republishing old private content. Checks the matching server protocol before editing.
+- Streams immutable input snapshots and large model artifacts in verified chunks; aligns project limits to 128 MiB/4096 entries. Preserves Markdown attachments and vendor cell fields. Retains ordinary rename/deletion kernel state, stops batches after failure and supports queued cancellation.
+- Projects source pushes narrowly and caches folder contents by version. Displays explicit output-limit diagnostics and accepts terminal receipts after overflow. Recovers partial artifact chunks and interrupted publication; reclaims abandoned uploads.
+- Awaits editor shutdown cleanup: the P2P host ends the shared session, a guest leaves individually, and VPS work remains server-owned. Journals unsent edits, closes HTTP requests and awaits local kernel teardown.
+- Documents each repaired audit finding and the verification scope in [the repair record](docs/REPAIR_VERIFICATION_2026_10_15.md).
+
 
 ## 0.6.3 - 2026-10-14 (persistent VPS notebooks)
 

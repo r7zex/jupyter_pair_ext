@@ -33,18 +33,19 @@ import uuid
 
 ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 GPU_ID = re.compile(r"^GPU-[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$")
-MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
-MAX_FILES = 256
-MAX_EVENT_BYTES = 256 * 1024
-# The server retains at most 1 MiB per execution. Reserve room for array
+MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
+MAX_FILES = 4096
+MAX_ARTIFACT_FILES = 256
+MAX_EVENT_BYTES = 4 * 1024 * 1024
+# The server retains at most 8 MiB per execution. Reserve room for array
 # punctuation, a final completion and an explicit output-limit diagnostic.
-MAX_JOURNAL_BYTES = 1024 * 1024 - 32 * 1024
-# The host admits a 16 MiB command; recovery adds bounded live controls.
+MAX_JOURNAL_BYTES = 8 * 1024 * 1024 - 32 * 1024
+# The host admits a 64 MiB command; recovery adds bounded live controls.
 # A smaller response bound can strand an accepted global VPS claim forever.
-MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+MAX_RESPONSE_BYTES = 80 * 1024 * 1024
 MAX_BRIDGE_BYTES = 32 * 1024 * 1024
 MAX_KERNELS = 2
-MAX_ARTIFACT_ENTRIES = 2048
+MAX_ARTIFACT_ENTRIES = 8192
 MAX_ARTIFACT_DEPTH = 16
 
 
@@ -115,12 +116,12 @@ def read_workspace_file(root, relative):
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise AgentError("Workspace contains a symlink, hardlink or special file.")
         if info.st_size > MAX_SNAPSHOT_BYTES:
-            raise AgentError("Generated artifact exceeds the 4 MiB transport limit.")
+            raise AgentError("Generated artifact exceeds the 128 MiB project limit.")
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = None
             data = stream.read(MAX_SNAPSHOT_BYTES + 1)
         if len(data) > MAX_SNAPSHOT_BYTES:
-            raise AgentError("Generated artifact exceeds the 4 MiB transport limit.")
+            raise AgentError("Generated artifact exceeds the 128 MiB project limit.")
         return data
     finally:
         if descriptor is not None:
@@ -142,7 +143,7 @@ def workspace_path(root, relative, create=False):
     return target / relative.split("/")[-1]
 
 
-def install_snapshot(root, files, previous=()):
+def install_snapshot(root, files, previous=(), fetch=None):
     if not isinstance(files, list) or len(files) > MAX_FILES:
         raise AgentError("Public compute snapshot exceeds the file limit.")
     decoded, total, seen = [], 0, set()
@@ -152,6 +153,15 @@ def install_snapshot(root, files, previous=()):
             raise AgentError("Invalid or conflicting snapshot paths.")
         seen.add(name.casefold())
         content = item.get("content")
+        if content is None and fetch is not None:
+            size, digest = item.get("size"), item.get("sha256")
+            if not isinstance(size, int) or size < 0 or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise AgentError("Invalid streamed input descriptor.")
+            total += size
+            if total > MAX_SNAPSHOT_BYTES:
+                raise AgentError("Public compute snapshot exceeds the byte limit.")
+            decoded.append((name, None, item.get("version", 0), item))
+            continue
         if not isinstance(content, str) or len(content) > MAX_SNAPSHOT_BYTES * 4 // 3 + 4:
             raise AgentError("Public compute snapshot exceeds the byte limit.")
         try:
@@ -161,9 +171,11 @@ def install_snapshot(root, files, previous=()):
         total += len(data)
         if total > MAX_SNAPSHOT_BYTES:
             raise AgentError("Public compute snapshot exceeds the byte limit.")
-        decoded.append((name, data, item.get("version", 0)))
+        decoded.append((name, data, item.get("version", 0), item))
     baseline = {}
-    for name, data, version in decoded:
+    for name, data, version, item in decoded:
+        size = len(data) if data is not None else item["size"]
+        digest = hashlib.sha256(data).hexdigest() if data is not None else item["sha256"]
         parent = workspace_directory(root, name, create=True)
         target = name.split("/")[-1]
         temporary = ".pair-" + uuid.uuid4().hex
@@ -174,25 +186,36 @@ def install_snapshot(root, files, previous=()):
                     raise AgentError("Workspace snapshot target is unsafe.")
             except FileNotFoundError:
                 info = None
-            if info is not None and info.st_size == len(data) and stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid():
+            if info is not None and info.st_size == size and stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid():
                 descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
                 with os.fdopen(descriptor, "rb") as current:
                     actual = os.fstat(current.fileno())
                     if not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1:
                         raise AgentError("Workspace snapshot target is unsafe.")
-                    if actual.st_uid == os.geteuid() and stat.S_IMODE(actual.st_mode) == 0o600 and current.read(len(data) + 1) == data:
-                        baseline[name] = {"sha256": hashlib.sha256(data).hexdigest(), "version": version}
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: current.read(256 * 1024), b""):
+                        hasher.update(chunk)
+                    actual_hash = hasher.hexdigest()
+                    if actual.st_uid == os.geteuid() and stat.S_IMODE(actual.st_mode) == 0o600 and actual_hash == digest:
+                        baseline[name] = {"sha256": digest, "version": version}
                         continue
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
             with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
+                copied, actual_hash = 0, hashlib.sha256()
+                for chunk in ([data] if data is not None else fetch(item)):
+                    copied += len(chunk)
+                    if copied > size:
+                        raise AgentError("Streamed input exceeds its pinned size.")
+                    stream.write(chunk); actual_hash.update(chunk)
+                if copied != size or actual_hash.hexdigest() != digest:
+                    raise AgentError("Streamed input checksum differs from the accepted snapshot.")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target, src_dir_fd=parent, dst_dir_fd=parent)
             os.fsync(parent)
         finally:
             os.close(parent)
-        baseline[name] = {"sha256": hashlib.sha256(data).hexdigest(), "version": version}
+        baseline[name] = {"sha256": digest, "version": version}
     for name in previous:
         if name not in baseline:
             try:
@@ -206,7 +229,7 @@ def install_snapshot(root, files, previous=()):
     return baseline
 
 
-def collect_changes(root, baseline):
+def collect_changes(root, baseline, staging=None):
     changes, warnings, present, total, visited = [], set(), set(), 0, 0
     stack = [""]
     truncated = False
@@ -236,11 +259,45 @@ def collect_changes(root, baseline):
                             warnings.add("An unsupported generated path was excluded from synchronization.")
                             continue
                         try:
+                            if staging is not None and info.st_size > 256 * 1024:
+                                if info.st_size > MAX_SNAPSHOT_BYTES or total + info.st_size > MAX_SNAPSHOT_BYTES or len(changes) >= MAX_ARTIFACT_FILES:
+                                    warnings.add("Generated artifacts exceed the project transfer limit."); continue
+                                staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+                                local_name = hashlib.sha256(relative.encode()).hexdigest()
+                                target = staging / local_name
+                                parent = workspace_directory(root, relative)
+                                try:
+                                    source_fd = os.open(relative.split("/")[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                                finally:
+                                    os.close(parent)
+                                digest, copied = hashlib.sha256(), 0
+                                with os.fdopen(source_fd, "rb") as source, target.open("wb") as destination:
+                                    actual = os.fstat(source.fileno())
+                                    if not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1 or actual.st_size != info.st_size:
+                                        raise AgentError("Generated artifact changed before staging.")
+                                    while True:
+                                        chunk = source.read(256 * 1024)
+                                        if not chunk:
+                                            break
+                                        copied += len(chunk)
+                                        if copied > MAX_SNAPSHOT_BYTES:
+                                            raise AgentError("Generated artifact grew beyond the project limit.")
+                                        destination.write(chunk); digest.update(chunk)
+                                    destination.flush(); os.fsync(destination.fileno())
+                                if copied != info.st_size:
+                                    raise AgentError("Generated artifact changed during staging.")
+                                original = baseline.get(relative); checksum = digest.hexdigest()
+                                if original and checksum == original["sha256"]:
+                                    target.unlink(); continue
+                                total += copied
+                                changes.append({"path": relative, "localFile": local_name, "sha256": checksum, "size": copied,
+                                                "version": original["version"] if original else 0})
+                                continue
                             data = read_workspace_file(root, relative)
                             original = baseline.get(relative)
                             if original and hashlib.sha256(data).hexdigest() == original["sha256"]:
                                 continue
-                            if len(changes) >= MAX_FILES or total + len(data) > MAX_SNAPSHOT_BYTES:
+                            if len(changes) >= MAX_ARTIFACT_FILES or total + len(data) > MAX_SNAPSHOT_BYTES:
                                 warnings.add("Generated artifacts exceed the bounded transport limit.")
                                 continue
                             total += len(data)
@@ -775,7 +832,7 @@ class SessionAgent:
                     raise AgentError("Live notebook kernel limit reached. Switch execution device or restart the interactive agent to release kernels; existing variables were retained.")
                 workspace = self.state / "kernels" / hashlib.sha256(json.dumps(key).encode()).hexdigest() / command.get("scope", "public")
                 workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-                baseline = install_snapshot(workspace, command["files"])
+                baseline = install_snapshot(workspace, command["files"], fetch=lambda item: self._download(command, item))
                 bridge = self.bridge_factory(self.sandbox, workspace, command.get("gpuUuid"))
                 bridge.baseline = baseline
                 self.active["bridge"] = bridge
@@ -785,7 +842,7 @@ class SessionAgent:
                               "message": "A fresh Python kernel was started; variables from other devices or generations are unavailable.",
                               "generation": command["generation"], "pythonExecutable": ready.get("pythonExecutable")})
             else:
-                bridge.baseline = install_snapshot(bridge.workspace, command["files"], bridge.baseline)
+                bridge.baseline = install_snapshot(bridge.workspace, command["files"], bridge.baseline, fetch=lambda item: self._download(command, item))
             self.active["bridge"] = bridge
             if self.active["commandKind"] == "restart":
                 self._append({"type": "kernelState", "requestId": self.active["requestId"],
@@ -804,9 +861,21 @@ class SessionAgent:
     def _persist(self):
         atomic_json(self.active["directory"] / "receipt.json", self.active["receipt"])
 
+    def _download(self, command, item):
+        offset = 0
+        while offset < item["size"]:
+            reply = self.transport.request("readChunk", sessionId=command["sessionId"], deviceId=command["deviceId"],
+                                           executionId=command["executionId"], commandId=command["id"], generation=command["generation"],
+                                           path=item["path"], offset=offset)
+            chunk = base64.b64decode(reply["content"], validate=True)
+            if not chunk or reply.get("offset") != offset + len(chunk) or reply.get("sha256") != item["sha256"]:
+                raise AgentError("Server returned an invalid pinned input chunk.")
+            offset += len(chunk)
+            yield chunk
+
     def _append(self, event):
         receipt = self.active["receipt"]
-        encoded_size = len(json.dumps(event, separators=(",", ":")).encode())
+        encoded_size = len(json.dumps(event, separators=(",", ":")).encode()) + 1
         if event.get("type") == "complete":
             if encoded_size > 16 * 1024:
                 event = {"type": "complete", "requestId": event.get("requestId", ""), "success": False,
@@ -852,10 +921,13 @@ class SessionAgent:
             completed = kind == "complete" or (kind == "commandResult" and self.active.get("commandKind") in ("restart", "interrupt"))
             if completed and event.get("requestId") == self.active.get("requestId"):
                 receipt["state"] = "failed" if kind == "complete" and not event.get("success") else "completed"
-                changes, removed, warnings = collect_changes(bridge.workspace, bridge.baseline)
+                changes, removed, warnings = collect_changes(bridge.workspace, bridge.baseline, self.active["directory"] / "artifacts")
                 receipt["files"], receipt["removedFiles"] = changes, removed
                 for warning in warnings:
                     self._append({"type": "channelError", "requestId": self.active["requestId"], "channel": "files", "message": warning})
+                if warnings:
+                    receipt["state"] = "failed"
+                    receipt["error"] = "Code finished, but one or more generated files could not be synchronized; originals remain on this device."
                 break
             if kind == "commandError" and event.get("requestId") == self.active.get("requestId"):
                 receipt["state"] = "failed"
@@ -871,6 +943,36 @@ class SessionAgent:
                 self._retain_unreportable_result()
             return
         identity = receipt["identity"]
+        for index, artifact in enumerate(receipt.get("files", [])):
+            if "localFile" not in artifact:
+                continue
+            upload_id = hashlib.sha256((artifact["path"] + "\0" + artifact["sha256"]).encode()).hexdigest()
+            try:
+                with (self.active["directory"] / "artifacts" / artifact["localFile"]).open("rb") as source:
+                    offset = 0
+                    while True:
+                        chunk = source.read(256 * 1024)
+                        if not chunk:
+                            break
+                        reply = self.transport.request("artifactChunk", sessionId=identity["sessionId"], deviceId=identity["deviceId"],
+                            executionId=identity["executionId"], commandId=identity["id"], generation=identity["generation"],
+                            path=artifact["path"], uploadId=upload_id, size=artifact["size"], sha256=artifact["sha256"],
+                            version=artifact["version"], offset=offset, content=base64.b64encode(chunk).decode("ascii"))
+                        offset += len(chunk)
+                        if reply.get("offset") != offset:
+                            raise AgentError("Server acknowledged an invalid artifact offset.")
+                receipt["files"][index] = {key: value for key, value in artifact.items() if key != "localFile"}
+                receipt["files"][index]["uploadId"] = upload_id
+                self._persist()
+            except urllib.error.HTTPError as error:
+                if error.code not in (400, 409, 413):
+                    raise
+                error.close()
+                receipt["state"] = "failed"
+                receipt["error"] = "Artifact transfer was rejected; its verified local copy is retained for recovery."
+                receipt["files"] = [item for item in receipt["files"] if "localFile" not in item]
+                self._persist()
+                break
         offset = receipt["offset"]
         body = receipt.get("pendingReport")
         if body is None:

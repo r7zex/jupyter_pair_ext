@@ -216,11 +216,11 @@ class AgentProtocolTests(unittest.TestCase):
         transport = FakeTransport([command("a", source="wait")])
         agent = self.make_agent(transport)
         agent.tick()
-        for index in range(20):
+        for index in range(agent_module.MAX_JOURNAL_BYTES // (128 * 1024) + 4):
             agent._append({"type": "iopub", "requestId": "a", "content": {"text": "x" * (128 * 1024)}})
         agent._append({"type": "complete", "requestId": "a", "success": True, "content": {"status": "ok"}})
         events = agent.active["receipt"]["events"]
-        self.assertLess(len(json.dumps(events).encode()), 1024 * 1024)
+        self.assertLess(len(json.dumps(events).encode()), 8 * 1024 * 1024)
         self.assertEqual(events[-1]["type"], "complete")
         self.assertTrue(any(event["type"] == "channelError" and "limit" in event["message"] for event in events))
 

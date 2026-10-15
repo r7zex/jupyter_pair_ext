@@ -2116,12 +2116,12 @@ describe('compute launch and recent projects', () => {
     const source = await readFile(path.join(process.cwd(), 'src', 'extension.ts'), 'utf8');
     const activateSource = source.slice(
       source.indexOf('export async function activate'),
-      source.indexOf('export function deactivate'),
+      source.indexOf('export async function deactivate'),
     );
     assert.match(activateSource, /offerWorkspaceSessionRestore\(context\)/);
     assert.doesNotMatch(activateSource, /startWorkspaceSessionRestore\(context\)/);
     const deactivateSource = source.slice(
-      source.indexOf('export function deactivate'),
+      source.indexOf('export async function deactivate'),
       source.indexOf('async function startSession'),
     );
     assert.match(deactivateSource, /establishedSessionRuntime\(runtime, lifecycleReadyRuntime\)/);

@@ -57,7 +57,7 @@ export class PersistentHistory {
     this.executions = path.join(this.root, 'executions');
     this.outputs = path.join(this.root, 'outputs');
     this.archiveLimit = limits.maxArchiveBytes ?? 128 * 1024 * 1024;
-    this.outputLimit = limits.maxOutputBytes ?? 8 * 1024 * 1024;
+    this.outputLimit = limits.maxOutputBytes ?? 9 * 1024 * 1024;
     if (!Number.isSafeInteger(this.archiveLimit) || this.archiveLimit < 0
       || !Number.isSafeInteger(this.outputLimit) || this.outputLimit < 1024) throw new Error('Invalid execution history limits.');
   }

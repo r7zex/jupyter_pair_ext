@@ -90,6 +90,7 @@ let runtime: SessionRuntime | undefined;
 let synchronizer: EditorSynchronizer | undefined;
 let presence: PresenceRenderer | undefined;
 let notebookController: PairNotebookController;
+let persistentController: PersistentSessionController | undefined;
 let dashboard: DashboardProvider;
 let status: vscode.StatusBarItem;
 let statusTimer: NodeJS.Timeout | undefined;
@@ -119,7 +120,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
   const vpsCompute = new VpsComputeController(context, () => runtime);
-  context.subscriptions.push(new PersistentSessionController(context, output));
+  persistentController = new PersistentSessionController(context, output);
+  context.subscriptions.push(persistentController);
   const sharedTerminal = new SharedTerminalController(() => runtime);
   context.subscriptions.push(sharedTerminal);
   register(context, 'pairNotebook.openSharedTerminal', () => sharedTerminal.open());
@@ -248,20 +250,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   offerWorkspaceSessionRestore(context);
 }
 
-export function deactivate(): Thenable<void> | undefined {
+export async function deactivate(): Promise<void> {
   const establishedRuntime = establishedSessionRuntime(runtime, lifecycleReadyRuntime);
   if (statusTimer) clearInterval(statusTimer);
   if (lifecycleWatchdog) clearInterval(lifecycleWatchdog);
   lifecycleWatchdog = undefined;
-  synchronizer?.dispose();
-  presence?.dispose();
-  notebookController?.dispose();
   const context = activationContext;
-  const exit = context && establishedRuntime
-    ? leaveActiveSession(context, Date.now(), 'extension-deactivated', establishedRuntime)
-    : undefined;
-  lifecycleReadyRuntime = undefined;
-  return exit;
+  try {
+    await Promise.allSettled([
+      establishedRuntime?.shutdownForEditorExit() ?? runtime?.shutdownForEditorExit(),
+      persistentController?.shutdown(),
+    ]);
+    if (context && establishedRuntime) await forgetWorkspaceSession(context, establishedRuntime.descriptor);
+  } finally {
+    lifecycleReadyRuntime = undefined; runtime = undefined;
+    synchronizer?.dispose(); presence?.dispose(); notebookController?.dispose();
+    persistentController?.dispose(); persistentController = undefined;
+  }
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {

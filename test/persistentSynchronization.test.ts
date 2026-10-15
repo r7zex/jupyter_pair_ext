@@ -85,8 +85,13 @@ describe('Persistent continuous synchronization over actual HTTP', () => {
   it('allows concurrent edits on the same selected row and returns durable actor receipts', async () => {
     const start = await liveNotebook(); await linePresence(start, 0);
     const ownerActor = 'B'.repeat(36); const memberActor = 'C'.repeat(36);
-    await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor: ownerActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '!' }] } });
-    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: memberActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '?' }] } });
+    const update = (value: string, clientId: number): string => {
+      const doc = new Y.Doc(); Y.applyUpdate(doc, Buffer.from(start.update, 'base64')); doc.clientID = clientId;
+      const vector = Y.encodeStateVector(doc); (doc.getMap<Y.Map<unknown>>('cells').get('stable')!.get('source') as Y.Text).insert(1, value);
+      const bytes = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); doc.destroy(); return bytes;
+    };
+    await rpc('notebookSync', { path: 'book.ipynb', epoch: start.epoch, intent: { actor: ownerActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '!' }], update: update('!', 101) } });
+    const result = await member.call<NotebookSyncReply>('notebookSync', { sessionId: owner.sessionId, path: 'book.ipynb', epoch: start.epoch, intent: { actor: memberActor, sequence: 1, cellId: 'stable', baseline: 'owner\nmember', changes: [{ offset: 1, deleteCount: 0, insertText: '?' }], update: update('?', 102) } });
     assert.equal(result.cells[0]!.source, 'o!?wner\nmember'); assert.equal(result.acknowledgedSequence, 1);
     assert.equal((await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb', actor: ownerActor })).acknowledgedSequence, 1);
     assert.equal((await rpc<NotebookSyncReply>('notebookSync', { path: 'book.ipynb', actor: memberActor })).acknowledgedSequence, 0);

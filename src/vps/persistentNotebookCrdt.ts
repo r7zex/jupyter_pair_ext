@@ -3,8 +3,9 @@ import * as Y from 'yjs';
 
 export interface SharedCell { id: string; cell_type: string; source: string; metadata: Record<string, unknown> }
 export interface SharedNotebook { cells: SharedCell[]; metadata: Record<string, unknown> }
-export interface NotebookSyncReply { epoch: string; update: string; revision: number; identity?: string; acknowledgedSequence?: number; cells: SharedCell[]; metadata: Record<string, unknown> }
+export interface NotebookSyncReply { epoch: string; update: string; revision: number; textProtocol?: 'yjs-intents-v1'; identity?: string; acknowledgedSequence?: number; cells: SharedCell[]; metadata: Record<string, unknown> }
 const validId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+const MAX_REPLICA_BYTES = 64 * 1024 * 1024;
 export function sharedNotebook(doc: Y.Doc): SharedNotebook {
   const order = doc.getArray<string>('order').toArray(); const cells = doc.getMap<Y.Map<unknown>>('cells');
   if (order.length > 10000 || cells.size > 20000 || order.some((id) => !validId(id))) throw new Error('Invalid CRDT cell order.');
@@ -51,17 +52,25 @@ export function loadNotebookCrdt(content: string): { doc: Y.Doc; epoch: string; 
   const doc = new Y.Doc(); const state = template.metadata?.pair_crdt;
   const epoch = typeof state?.epoch === 'string' && validId(state.epoch) ? state.epoch : randomUUID();
   if (state) {
-    if (typeof state.update !== 'string' || Buffer.byteLength(state.update) > 6 * 1024 * 1024) throw new Error('Invalid stored CRDT.');
+    if (typeof state.update !== 'string' || Buffer.byteLength(state.update) > MAX_REPLICA_BYTES) throw new Error('Invalid stored CRDT.');
     Y.applyUpdate(doc, Buffer.from(state.update, 'base64')); sharedNotebook(doc);
-  } else editSharedNotebook(doc, { metadata: template.metadata ?? {}, cells: template.cells.map((cell: any) => ({ id: validId(cell.id) ? cell.id : randomUUID(), cell_type: cell.cell_type, source: Array.isArray(cell.source) ? cell.source.join('') : cell.source, metadata: cell.metadata ?? {} })) });
+  } else {
+    // Older notebooks have no cell IDs. Assign them in the template too, so
+    // attachment/vendor fields can still be matched during the first save.
+    template.cells = template.cells.map((cell: any) => ({ ...cell, id: validId(cell.id) ? cell.id : randomUUID() }));
+    editSharedNotebook(doc, { metadata: template.metadata ?? {}, cells: template.cells.map((cell: any) => ({ id: cell.id, cell_type: cell.cell_type, source: Array.isArray(cell.source) ? cell.source.join('') : cell.source, metadata: cell.metadata ?? {} })) });
+  }
   return { doc, epoch, template };
 }
 export function saveNotebookCrdt(doc: Y.Doc, epoch: string, template: Record<string, any>): string {
   const state = sharedNotebook(doc); const update = Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64');
-  if (Buffer.byteLength(update) > 6 * 1024 * 1024) throw new Error('CRDT retention limit reached. Export and reopen the notebook explicitly.');
+  if (Buffer.byteLength(update) > MAX_REPLICA_BYTES) throw new Error('Notebook replica exceeds its bounded storage budget.');
   const old = new Map<string, any>(template.cells.map((cell: any) => [cell.id, cell]));
   return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update, ...(template.metadata?.pair_crdt?.intents ? { intents: template.metadata.pair_crdt.intents } : {}) } }, cells: state.cells.map((cell) => {
     const before = old.get(cell.id);
-    return { ...cell, ...(cell.cell_type === 'code' ? { outputs: before?.cell_type === 'code' ? before.outputs ?? [] : [], execution_count: before?.cell_type === 'code' ? before.execution_count ?? null : null } : {}) };
+    const result = { ...before, ...cell, ...(cell.cell_type === 'code' ? { outputs: before?.cell_type === 'code' ? before.outputs ?? [] : [], execution_count: before?.cell_type === 'code' ? before.execution_count ?? null : null } : {}) };
+    if (cell.cell_type !== 'code') { delete result.outputs; delete result.execution_count; }
+    if (cell.cell_type !== 'markdown') delete result.attachments;
+    return result;
   }) })).toString('base64');
 }

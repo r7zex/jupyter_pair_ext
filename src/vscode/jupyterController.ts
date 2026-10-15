@@ -243,14 +243,16 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         if (!cell) continue;
         if (cell.kind !== vscode.NotebookCellKind.Code) continue;
         this.activeExecutions.add(cell);
-        try { await this.executeCell(runtime, notebookKey!, cell); }
+        let success = false;
+        try { success = await this.executeCell(runtime, notebookKey!, cell); }
         finally { this.activeExecutions.delete(cell); }
+        if (!success) break;
       }
     });
     } finally { runtime.project.off('documentRenamed', onRename); }
   }
 
-  private async executeCell(runtime: SessionRuntime, notebookKey: string, cell: vscode.NotebookCell): Promise<void> {
+  private async executeCell(runtime: SessionRuntime, notebookKey: string, cell: vscode.NotebookCell): Promise<boolean> {
     const onRename = (from: string, to: string) => { if (notebookKey === from) notebookKey = to; };
     runtime.project.on('documentRenamed', onRename);
     try {
@@ -267,7 +269,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         vscode.NotebookCellOutputItem.error(new Error('Cell collaboration ID is unavailable.')),
       ], { outputType: 'error' }));
       execution.end(false, Date.now());
-      return;
+      return false;
     }
     this.activeExecutionHandles.set(cell, execution);
     const authoritativePublisher = runtime.computeForNotebook(notebookKey).executorId
@@ -405,6 +407,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       // WeakMap keeps this bounded by the lifetime of the NotebookCell; the
       // next remote execution simply replaces the stored request ID.
     }
+    return success;
     } finally { runtime.project.off('documentRenamed', onRename); }
   }
 

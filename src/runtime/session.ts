@@ -2308,6 +2308,26 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     await this.disposeAsync('explicit-leave');
   }
 
+  /** Closing/uninstalling the editor is itself an explicit local lifecycle exit.
+   * It cannot depend on an interactive CONFIRM dialog or a running cell ending.
+   */
+  public async shutdownForEditorExit(): Promise<void> {
+    if (this.closed) return;
+    const host = this.coordinator.isCurrentHost();
+    try {
+      if (host) {
+        this.endingSession = true;
+        await writeSessionTermination(this.descriptor, this.token, this.descriptor.localPeer);
+        this.transport.broadcast('sessionEnded', {});
+        await this.transport.awaitDrainAll(0, 1500);
+      }
+    } catch (error) {
+      this.log.appendLine(`[error] Editor exit notification: ${formatError(error)}`);
+    } finally {
+      await this.disposeAsync(host ? 'session-ended' : 'explicit-leave');
+    }
+  }
+
   /** Saves the authoritative copy and closes the session for every participant. */
   public async endSession(): Promise<void> {
     if (this.closed) return;
@@ -2476,7 +2496,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     this.executionOwners.clear();
     this.kernelCommandWindows.clear();
-    for (const kernel of this.kernels.values()) kernel.stop();
+    const stoppingKernels = [...this.kernels.values()].map((kernel) => {
+      try { return typeof kernel.stopConfirmed === 'function' ? kernel.stopConfirmed() : Promise.resolve(kernel.stop()); }
+      catch (error) { return Promise.reject(error); }
+    });
     this.kernels.clear();
     this.kernelLastUsed.clear();
     // Every teardown step runs to completion even when an earlier one fails.
@@ -2491,6 +2514,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         failures.push(error);
       }
     };
+    await step(async () => {
+      const settled = await Promise.allSettled(stoppingKernels);
+      for (const result of settled) if (result.status === 'rejected') failures.push(result.reason);
+    });
     await step(() => {
       if (this.awareness.getLocalState() !== null) this.awareness.setLocalState(null);
     });

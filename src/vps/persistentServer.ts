@@ -1,10 +1,11 @@
 import { createHash, randomBytes, randomUUID, scrypt as deriveKey, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, rename, rm, utimes } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { atomicWriteFile } from '../core/atomicFile';
 import { portableRelativePath } from '../core/projectPath';
+import { classifyFile } from '../core/projectFiles';
 import { PersistentWorkspace, PersistentStorageError } from './persistentStorage';
 import { PersistentComputePolicy, type PersistentComputeState, type PersistentDeviceInput } from './persistentCompute';
 import { PersistentHistory } from './persistentHistory';
@@ -13,7 +14,6 @@ import { loadNotebookCrdt, saveNotebookCrdt, sharedNotebook } from './persistent
 import { persistentNotebookOutputs } from './persistentNotebookOutputs';
 import { PersistentLive, type PersistentPresence } from './persistentLive';
 import { createSharedCursorPosition, encodeRelativeOffset, resolveRelativeOffset, resolveSharedCursorPosition, type SharedCursorPosition } from '../core/cursorPosition';
-import { rebaseTextChanges } from '../core/textChanges';
 import type { TextChange } from '../core/crdt';
 import { editSharedNotebook, type NotebookSyncReply } from './persistentNotebookCrdt';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
@@ -24,7 +24,8 @@ const scrypt = (value: string, salt: string): Promise<Buffer> => new Promise((re
 });
 const PRESENCE_MS = 20_000;
 const MAX_RPC_BYTES = 12 * 1024 * 1024;
-const MAX_EVENTS_BYTES = 1024 * 1024;
+const MAX_EVENTS_BYTES = 8 * 1024 * 1024;
+const MAX_COMMAND_BYTES = 64 * 1024 * 1024;
 const MAX_CONTROL_BYTES = 256 * 1024;
 const MAX_EXECUTIONS = 32;
 const MAX_SESSIONS = 16;
@@ -171,7 +172,7 @@ export class PersistentSessionHost {
   }
   private async trimHistory(session: Session, capacity = false, reserveBytes = 0, excludedId = ''): Promise<void> {
     const bytes = (): number => session.record.executions.reduce((total, run) => total + Buffer.byteLength(JSON.stringify(run.execution.events)), 0);
-    while ((capacity && session.record.executions.length >= MAX_EXECUTIONS) || bytes() + reserveBytes > 4 * 1024 * 1024) {
+    while ((capacity && session.record.executions.length >= MAX_EXECUTIONS) || bytes() + reserveBytes > 32 * 1024 * 1024) {
       const index = session.record.executions.findIndex((run) => !run.mergePending && !this.hasOutputDependents(session, run) && run.execution.id !== excludedId && run.execution.state !== 'queued' && run.execution.state !== 'running');
       if (index < 0) break;
       const run = session.record.executions[index]!;
@@ -179,6 +180,8 @@ export class PersistentSessionHost {
       try { await lstat(artifact); run.execution.error = `${run.execution.error ? run.execution.error + ' ' : ''}Returned artifact transport retention expired; merged project files remain on VPS.`; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       await session.history.archive(run); session.record.executions.splice(index, 1); await this.persist(session);
       await rm(path.join(this.directory(session.record.id), 'commands', `${run.commandId}.json`), { force: true }); await rm(artifact, { force: true });
+      await rm(path.join(this.directory(session.record.id), 'command-files', run.commandId), { recursive: true, force: true });
+      await rm(path.join(this.directory(session.record.id), 'uploads', run.execution.id), { recursive: true, force: true });
     }
   }
   private async safeDirectories(directory: string): Promise<void> {
@@ -340,6 +343,15 @@ export class PersistentSessionHost {
     }
     const id = this.string(body, 'sessionId'); if (!VPS_ID.test(id)) throw new SessionError(400, 'Invalid session ID.');
     const session = this.sessions.get(id); if (!session) throw new SessionError(404, 'Session does not exist.');
+    if (body.operation === 'readChunk' || body.operation === 'artifactChunk') {
+      const deviceId = this.string(body, 'deviceId');
+      if (deviceId === 'vps') { if (!this.agent(credential)) throw new SessionError(403, 'Agent credential required.'); }
+      else { const member = this.membership(session, credential); if (!session.policy.view().devices.some((device) => device.id === deviceId && device.ownerId === member.id)) throw new SessionError(403, 'Device owner required.'); }
+      const run = session.record.executions.find((item) => item.execution.id === body.executionId);
+      if (!run || run.commandId !== body.commandId || run.execution.deviceId !== deviceId || run.execution.generation !== body.generation
+        || run.execution.state !== 'running' || run.aclEpoch !== session.record.aclEpoch) throw new SessionError(403, 'Transfer does not match active execution authority.');
+      return this.transferChunk(session, run, body);
+    }
     if (body.operation === 'join') return this.join(session, body, address);
     if ((body.operation === 'registerDevice' || body.operation === 'claim' || body.operation === 'report') && body.deviceId === 'vps') {
       if (!this.agent(credential)) throw new SessionError(403, 'The configured VPS agent credential is required.');
@@ -351,7 +363,27 @@ export class PersistentSessionHost {
     if (!['leave', 'claim', 'report', 'registerDevice', 'share'].includes(body.operation)) session.seen.set(member.id, Date.now());
     session.policy.setMembers(this.members(session));
     const owner = member.id === session.record.ownerId;
-    if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'executions', 'artifacts', 'notebookSync', 'presence'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
+    if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'executions', 'artifacts', 'notebookSync', 'textSync', 'presence'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
+    if (['uploadChunk', 'commitUpload', 'discardUpload'].includes(body.operation)) {
+      const uploadId = this.string(body, 'uploadId'); if (!/^[a-f0-9]{64}$/.test(uploadId)) throw new SessionError(400, 'Invalid upload identifier.');
+      const directory = path.join(this.directory(id), 'uploads', 'member-' + member.id);
+      if (body.operation === 'uploadChunk') return this.transferChunk(session, undefined, { ...body, operation: 'artifactChunk' }, directory);
+      const metadata = path.join(directory, uploadId + '.json'); const filename = path.join(directory, uploadId + '.bin');
+      if (body.operation === 'discardUpload') { await rm(metadata, { force: true }); await rm(filename, { force: true }); return { discarded: true }; }
+      const name = this.string(body, 'path'); if (!safeJobPath(name)) throw new SessionError(400, 'Invalid upload path.');
+      const publication = uploadId + ':write:0';
+      if (session.workspace.hasPublication(publication)) { await session.workspace.read(name, owner); return session.workspace.snapshot(owner); }
+      const saved = JSON.parse(await this.readMetadata(metadata, 4096)) as { path: string; sha256: string; size: number };
+      if (saved.path !== name || saved.sha256 !== body.sha256) throw new SessionError(409, 'Upload identity changed.');
+      if (body.visibility !== undefined && (!owner || body.visibility !== 'private')) throw new SessionError(403, 'Only the owner can create a Private file.');
+      let snapshot;
+      if (name.endsWith('.ipynb')) {
+        const content = await this.readMetadata(filename, 32 * 1024 * 1024);
+        if (sha(content) !== saved.sha256) throw new SessionError(400, 'Uploaded notebook checksum differs.');
+        snapshot = await session.workspace.write(name, Buffer.from(content).toString('base64'), this.revision(body), owner, publication, body.visibility === 'private');
+      } else snapshot = await session.workspace.writeStaged(name, filename, saved.size, saved.sha256, this.revision(body), owner, publication, body.visibility === 'private');
+      session.live.invalidate(); return snapshot;
+    }
     if (body.operation === 'invitations') { this.owner(session, member); return { invitations: (session.record.invitations ?? []).map((invite) => ({ id: invite.id, expiresAt: invite.expiresAt, readOnly: invite.readOnly, revoked: invite.revoked })) }; }
     if (body.operation === 'createInvitation') {
       this.owner(session, member);
@@ -417,6 +449,52 @@ export class PersistentSessionHost {
       }
       return { states: session.live.states((filename) => session.workspace.snapshot(owner).entries.some((entry) => entry.path === filename && entry.type === 'file')) };
     }
+    if (body.operation === 'textSync') {
+      const filename = this.string(body, 'path');
+      const file = await session.workspace.read(filename, owner);
+      const bytes = Buffer.from(file.content, 'base64');
+      if (classifyFile(filename, bytes.length) !== 'text' || !Buffer.from(bytes.toString('utf8')).equals(bytes)) throw new SessionError(400, 'Select a UTF-8 text file.');
+      const stateFile = path.join(this.directory(id), 'text-replicas', sha(filename) + '.json');
+      type Replica = { epoch: string; hash: string; update: string; aclEpoch: number };
+      type Saved = Replica & { previous?: Replica };
+      let saved: Saved | undefined;
+      try {
+        saved = JSON.parse(await this.readMetadata(stateFile, 25 * 1024 * 1024)) as Saved;
+        if (!saved || typeof saved.epoch !== 'string' || typeof saved.update !== 'string' || typeof saved.hash !== 'string') throw new SyntaxError('Invalid text replica.');
+        const probe = new Y.Doc();
+        try { Y.applyUpdate(probe, Buffer.from(saved.update, 'base64')); if (sha(probe.getText('content').toString()) !== saved.hash) throw new SyntaxError('Text replica checksum differs.'); }
+        finally { probe.destroy(); }
+      }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          if ((error as NodeJS.ErrnoException).code) throw error;
+          await rename(stateFile, stateFile + '.invalid-' + randomUUID());
+        }
+        saved = undefined;
+      }
+      if (saved?.aclEpoch !== session.record.aclEpoch) saved = undefined;
+      const hash = sha(bytes.toString('utf8')); if (saved?.hash !== hash) saved = saved?.previous?.hash === hash ? saved.previous : undefined;
+      const doc = new Y.Doc(); const epoch = saved?.epoch ?? randomUUID();
+      try {
+        if (saved) Y.applyUpdate(doc, Buffer.from(saved.update, 'base64')); else doc.getText('content').insert(0, bytes.toString('utf8'));
+        if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Text file was replaced.');
+        const vector = Y.encodeStateVector(doc);
+        if (body.update !== undefined) {
+          if (member.readOnly) throw new SessionError(403, 'This invitation grants read access only.');
+          const update = this.string(body, 'update'); if (update.length > 12 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(update)) throw new SessionError(413, 'Text update exceeds limits.');
+          try { Y.applyUpdate(doc, Buffer.from(update, 'base64')); } catch { throw new SessionError(400, 'Invalid text update.'); }
+        }
+        const content = doc.getText('content').toString();
+        const record: Saved = { epoch, hash: sha(content), aclEpoch: session.record.aclEpoch, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...(saved ? { previous: { epoch: saved.epoch, hash: saved.hash, aclEpoch: saved.aclEpoch, update: saved.update } } : {}) };
+        if (Buffer.byteLength(record.update) > 12 * 1024 * 1024) throw new SessionError(413, 'Text replica exceeds limits.');
+        // Write ahead: after an uncertain file commit either hash selects its exact replica.
+        await this.writeMetadata(stateFile, JSON.stringify(record));
+        const revision = content === bytes.toString('utf8') ? file.revision : (await session.workspace.write(filename, Buffer.from(content).toString('base64'), file.revision, owner)).revision;
+        if (revision !== file.revision) session.live.broadcast({ kind: 'text', path: filename, epoch, revision, update: Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64') });
+        const requestedVector = typeof body.stateVector === 'string' && body.stateVector.length < 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
+        return { epoch, revision, update: Buffer.from(Y.encodeStateAsUpdate(doc, requestedVector)).toString('base64') };
+      } finally { doc.destroy(); }
+    }
     if (body.operation === 'notebookSync') {
       const filename = this.string(body, 'path');
       if (!filename.endsWith('.ipynb')) throw new SessionError(400, 'Select a notebook.');
@@ -430,7 +508,7 @@ export class PersistentSessionHost {
         let implicitPresence: PersistentPresence | undefined;
         if (body.intent !== undefined) {
           if (member.readOnly) throw new SessionError(403, 'This invitation grants read access only.');
-          const intent = body.intent as { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[] };
+          const intent = body.intent as { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[]; update?: string };
           if (!intent || !/^[A-Za-z0-9_-]{32,64}$/.test(intent.actor) || !Number.isSafeInteger(intent.sequence) || intent.sequence < 1
             || typeof intent.baseline !== 'string' || Buffer.byteLength(intent.baseline) > 2 * 1024 * 1024 || !Array.isArray(intent.changes) || !intent.changes.length || intent.changes.length > 100) throw new SessionError(400, 'Invalid text intent.');
           let end = 0;
@@ -442,18 +520,33 @@ export class PersistentSessionHost {
           const last = ledger[intent.actor]; const digest = sha(JSON.stringify(intent));
           if (last && (last.member !== member.id || (last.sequence === intent.sequence && last.digest !== digest))) throw new SessionError(409, 'Text intent identity was reused.');
           if (!last || intent.sequence > last.sequence) {
-            if (intent.sequence !== (last?.sequence ?? 0) + 1 || (!last && Object.keys(ledger).length >= 64)) throw new SessionError(409, 'Text intent sequence is unavailable.');
+            if (intent.sequence !== (last?.sequence ?? 0) + 1 && !intent.update) throw new SessionError(409, 'Text intent sequence is unavailable.');
             const cell = previous.cells.find((item) => item.id === intent.cellId); if (!cell) throw new SessionError(409, 'Cell was removed.');
-            const changes = rebaseTextChanges(intent.baseline, cell.source, intent.changes);
+            const changes = intent.changes;
             const text = doc.getMap<Y.Map<unknown>>('cells').get(cell.id)!.get('source') as Y.Text;
-            doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
+            if (intent.update) {
+              if (intent.update.length > 2 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(intent.update)) throw new SessionError(413, 'Text update exceeds limits.');
+              try { Y.applyUpdate(doc, Buffer.from(intent.update, 'base64')); } catch { throw new SessionError(400, 'Invalid text update.'); }
+              const after = sharedNotebook(doc);
+              if (JSON.stringify(after.metadata) !== JSON.stringify(previous.metadata)
+                || after.cells.length !== previous.cells.length || after.cells.some((item, index) => {
+                  const old = previous.cells[index]!; return item.id !== old.id || item.cell_type !== old.cell_type
+                    || JSON.stringify(item.metadata) !== JSON.stringify(old.metadata) || (item.id !== cell.id && item.source !== old.source);
+                })) throw new SessionError(400, 'Text update changed another notebook field.');
+            } else {
+              // Old clients do not send character identities. Never guess the
+              // identity of repeated text after concurrent edits.
+              if (intent.baseline !== cell.source) throw new SessionError(409, 'Refresh the legacy text baseline before editing.');
+              doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
+            }
             const offset = Math.min(text.length, (changes[0]?.offset ?? 0) + (changes[0]?.insertText.length ?? 0));
             const start = offset <= 0 ? 0 : text.toString().lastIndexOf('\n', offset - 1) + 1;
-            implicitPresence = { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) }, epoch, readOnly: false,
+            if (!intent.update) implicitPresence = { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) }, epoch, readOnly: false,
               kernelStatus: 'Idle', activeFile: filename, activeNotebookCellId: cell.id, activeLineAnchor: encodeRelativeOffset(text, start),
               activeLine: text.toString().slice(0, start).split('\n').length - 1, cursor: createSharedCursorPosition(text, offset, offset), shareCursor: true, cursorColor: '#4FC3F7' };
             template.metadata ??= {};
-            template.metadata.pair_crdt = { ...template.metadata.pair_crdt, intents: { ...ledger, [intent.actor]: { member: member.id, sequence: intent.sequence, digest } } }; intentApplied = true;
+            const retained = Object.fromEntries(Object.entries(ledger).filter(([actor]) => actor !== intent.actor).slice(-63));
+            template.metadata.pair_crdt = { ...template.metadata.pair_crdt, intents: { ...retained, [intent.actor]: { member: member.id, sequence: intent.sequence, digest } } }; intentApplied = true;
           }
         }
         if (body.update !== undefined) {
@@ -480,7 +573,7 @@ export class PersistentSessionHost {
         const vector = typeof body.stateVector === 'string' && body.stateVector.length <= 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
         let update: string;
         try { update = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); } catch { throw new SessionError(400, 'Invalid CRDT state vector.'); }
-        return { epoch, revision, update, acknowledgedSequence, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
+        return { epoch, revision, update, textProtocol: 'yjs-intents-v1', acknowledgedSequence, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
       } finally { doc.destroy(); }
     }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);
@@ -499,14 +592,17 @@ export class PersistentSessionHost {
       const entries = session.workspace.snapshot(owner).entries;
       const hidesPublicFiles = owner && entries.some((entry) => entry.visibility === 'public' && (entry.path === source || entry.path.startsWith(`${source}/`)))
         && entries.some((entry) => entry.visibility === 'private' && entry.type === 'directory' && target.startsWith(`${entry.path}/`));
-      const movesNotebook = entries.some((entry) => entry.type === 'file' && entry.path.endsWith('.ipynb')
-        && (entry.path === source || entry.path.startsWith(`${source}/`)));
       return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session)
-        : movesNotebook ? async () => { session.policy.invalidateKernels(); await this.persist(session); } : undefined);
+        : undefined).then(async (snapshot) => {
+          for (const run of session.record.executions) if (['queued', 'running'].includes(run.execution.state)
+            && (run.execution.notebook === source || run.execution.notebook.startsWith(`${source}/`))) {
+            run.execution.notebook = target + run.execution.notebook.slice(source.length);
+          }
+          await this.persist(session); return snapshot;
+        });
     }
     if (body.operation === 'remove') {
-      // Deletion retires kernels holding the old public snapshot.
-      return session.workspace.remove(this.string(body, 'path'), this.revision(body), owner, () => this.privacyBarrier(session));
+      return session.workspace.remove(this.string(body, 'path'), this.revision(body), owner);
     }
     if (body.operation === 'visibility') {
       this.owner(session, member); if (body.visibility !== 'public' && body.visibility !== 'private') throw new SessionError(400, 'Invalid visibility.');
@@ -642,11 +738,11 @@ export class PersistentSessionHost {
     }
     const execution: PersistentExecution = { id, notebook: notebookPath, cellIndex: index as number, requesterId: member.id, deviceId: target.deviceId,
       ...(target.gpuUuid ? { gpuUuid: target.gpuUuid } : {}), generation, state: 'queued', events: [], scope, cellId: cellIdentity, sourceHash: sha(source), admittedRevision: file.revision };
-    const files = await session.workspace.publicSnapshot(undefined, privateExecution);
-    const command: PersistentCommand = { id: commandId, executionId: id, sessionId: session.record.id, kernelId: `${session.record.id}:${scope}:${generation}:${notebookPath}`, scope,
+    const files = await session.workspace.computeSnapshot(path.join(this.directory(session.record.id), 'command-files', commandId), privateExecution);
+    const command: PersistentCommand = { id: commandId, executionId: id, sessionId: session.record.id, kernelId: `${session.record.id}:${scope}:${generation}:${notebookIdentity}`, scope,
       generation, deviceId: target.deviceId, ...(target.gpuUuid ? { gpuUuid: target.gpuUuid } : {}),
       files: files.map((item) => ({ ...item, version: snapshot.entries.find((entry) => entry.path === item.path)?.version ?? 0 })), command: raw };
-    if (Buffer.byteLength(JSON.stringify(command)) > 16 * 1024 * 1024) throw new SessionError(413, 'Public compute snapshot exceeds the 16 MiB transport limit.');
+    if (Buffer.byteLength(JSON.stringify(command)) > MAX_COMMAND_BYTES) throw new SessionError(413, 'Compute command exceeds limits.');
     await this.writeMetadata(path.join(this.directory(session.record.id), 'commands', `${commandId}.json`), JSON.stringify(command));
     const run: ExecutionRecord = { execution, requestId, commandId, sourceHash: sha(source), cellIdentity, notebookIdentity, notebookVersion: snapshot.entries.find((entry) => entry.path === notebookPath)!.version, offset: 0, reports: [], aclEpoch: session.record.aclEpoch, controls: [],
       ...(body.operation === 'kernel' ? { kernelCommand: body.command as 'restart' | 'release' } : {}) };
@@ -662,13 +758,18 @@ export class PersistentSessionHost {
   }
 
   private async kernelControl(session: Session, member: MemberRecord, body: PersistentRpcRequest): Promise<PersistentExecution> {
-    const run = [...session.record.executions].reverse().find((candidate) => candidate.execution.state === 'running' && (candidate.execution.id === body.executionId || candidate.execution.notebook === body.notebook));
+    const run = [...session.record.executions].reverse().find((candidate) => ['queued', 'running'].includes(candidate.execution.state) && (candidate.execution.id === body.executionId || candidate.execution.notebook === body.notebook));
     if (!run || (run.execution.scope === 'private' && member.id !== session.record.ownerId)) throw new SessionError(409, 'No running kernel execution matches this control.');
     if (run.aclEpoch !== session.record.aclEpoch && member.id !== session.record.ownerId) throw new SessionError(403, 'Kernel execution predates a privacy change.');
     await session.workspace.read(run.execution.notebook, member.id === session.record.ownerId);
     if (run.execution.requesterId !== member.id && member.role === 'member') throw new SessionError(403, 'Only the execution requester or an administrator can control it.');
     const input = body.operation === 'kernelControl' ? body.command as Record<string, unknown> : { command: body.command, value: body.value };
     if (!input || (input.command !== 'interrupt' && input.command !== 'inputReply')) throw new SessionError(400, 'Invalid active kernel control.');
+    if (run.execution.state === 'queued') {
+      if (input.command !== 'interrupt') throw new SessionError(409, 'Kernel has not started.');
+      run.execution.state = 'interrupted'; run.execution.error = 'Cancelled before kernel execution.';
+      await this.persist(session); this.publishExecution(session, run); return run.execution;
+    }
     if (input.command === 'inputReply' && (typeof input.value !== 'string' || input.value.length > 65536)) throw new SessionError(400, 'Invalid kernel input.');
     if (run.controls.length >= 128) throw new SessionError(409, 'Kernel control limit reached.');
     const id = randomUUID();
@@ -683,7 +784,7 @@ export class PersistentSessionHost {
     session.policy.heartbeatDevice(deviceId);
     const running = session.record.executions.find((run) => run.execution.deviceId === deviceId && run.execution.state === 'running');
     if (running) {
-      const command = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${running.commandId}.json`), 16 * 1024 * 1024)) as PersistentCommand;
+      const command = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${running.commandId}.json`), MAX_COMMAND_BYTES)) as PersistentCommand;
       return { command: { ...command, files: [], command: {} }, controls: running.controls, recoverOnly: true };
     }
     this.active(session);
@@ -700,7 +801,7 @@ export class PersistentSessionHost {
       }
       catch { run.execution.state = 'failed'; run.execution.error = 'Execution authority or public notebook access was revoked before launch.'; await this.persist(session); continue; }
       run.execution.state = 'running'; await this.persist(session); this.publishExecution(session, run);
-      return { command: JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${run.commandId}.json`), 16 * 1024 * 1024)) as PersistentCommand };
+      return { command: JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', `${run.commandId}.json`), MAX_COMMAND_BYTES)) as PersistentCommand };
     }
     return { command: null };
   }
@@ -718,23 +819,92 @@ export class PersistentSessionHost {
     const previous = run.reports.find((report) => report.offset === body.offset && report.digest === digest);
     if (previous) { if (run.mergePending) await this.finishResultMerge(session, run); return { offset: previous.end }; }
     if (run.execution.state !== 'running' || run.offset !== body.offset) throw new SessionError(409, 'Execution report offset or state is stale.');
-    if (run.reports.length >= 4096 || Buffer.byteLength(JSON.stringify([...run.execution.events, ...body.events])) > MAX_EVENTS_BYTES) throw new SessionError(413, 'Execution output limit reached.');
     const events = body.events as Record<string, unknown>[];
+    const combined = [...run.execution.events, ...events];
+    const outputLimited = Buffer.byteLength(JSON.stringify(combined)) > MAX_EVENTS_BYTES;
+    let retained = combined;
+    if (outputLimited) {
+      // Bound retained output without rejecting the terminal receipt forever.
+      retained = []; let size = 2;
+      for (const event of combined) { const bytes = Buffer.byteLength(JSON.stringify(event)) + 1; if (size + bytes > MAX_EVENTS_BYTES - 32 * 1024) break; retained.push(event); size += bytes; }
+      retained.push({ type: 'channelError', channel: 'output', message: 'Kernel output exceeded the server retention limit; some output was omitted.' });
+    }
     await this.trimHistory(session, false, Buffer.byteLength(JSON.stringify(events)), run.execution.id);
     if (events.some((event) => event.requestId !== undefined && event.requestId !== run.commandId && !run.controls.some((control) => control.id === event.requestId))) throw new SessionError(403, 'Event belongs to another command.');
     const terminalMerge = body.state === 'completed' || body.state === 'failed';
     if (terminalMerge || body.files !== undefined || body.removedFiles !== undefined) await this.writeMetadata(path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`), JSON.stringify({ files: body.files ?? [], removedFiles: body.removedFiles ?? [] }));
     const before = { ...run, mergePending: run.mergePending };
-    run.execution = { ...run.execution, events: [...run.execution.events, ...events], state: body.state as PersistentExecution['state'],
-      ...(body.error !== undefined ? { error: body.error as string } : {}) };
+    run.execution = { ...run.execution, events: retained, state: body.state as PersistentExecution['state'],
+      ...(body.error !== undefined ? { error: body.error as string } : outputLimited ? { error: 'Kernel output exceeded the server retention limit; some output was omitted.' } : {}) };
     run.offset += events.length;
     run.mergePending = terminalMerge;
     if (body.state !== 'running') run.controls = [];
-    run.reports = [...run.reports, { offset: body.offset as number, digest, end: run.offset }];
+    run.reports = [...run.reports.slice(-4095), { offset: body.offset as number, digest, end: run.offset }];
     try { await this.persist(session); }
     catch (error) { Object.assign(run, before); throw error; }
     if (run.mergePending) await this.finishResultMerge(session, run);
     await this.trimHistory(session); await this.persist(session); this.publishExecution(session, run); return { offset: run.offset };
+  }
+
+  private async transferChunk(session: Session, run: ExecutionRecord | undefined, body: PersistentRpcRequest, memberDirectory?: string): Promise<unknown> {
+    const name = this.string(body, 'path'); if (!safeJobPath(name)) throw new SessionError(400, 'Invalid transfer path.');
+    const offset = body.offset; if (!Number.isSafeInteger(offset) || (offset as number) < 0) throw new SessionError(400, 'Invalid chunk offset.');
+    if (body.operation === 'readChunk') {
+      if (!run) throw new SessionError(403, 'An active execution is required.');
+      const command = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'commands', run.commandId + '.json'), MAX_COMMAND_BYTES)) as PersistentCommand;
+      const file = command.files.find((item) => item.path === name); if (!file || file.content !== undefined || !file.sha256 || file.size === undefined || (offset as number) > file.size) throw new SessionError(404, 'Pinned input unavailable.');
+      const filename = path.join(this.directory(session.record.id), 'command-files', run.commandId, sha(name)); await this.safeDirectories(path.dirname(filename));
+      const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const info = await handle.stat(); if (!info.isFile() || info.nlink !== 1 || info.size !== file.size) throw new SessionError(409, 'Pinned input changed.');
+        const buffer = Buffer.alloc(Math.min(256 * 1024, file.size - (offset as number)));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset as number);
+        return { content: buffer.subarray(0, bytesRead).toString('base64'), offset: (offset as number) + bytesRead, size: file.size, sha256: file.sha256 };
+      } finally { await handle.close(); }
+    }
+    const uploadId = this.string(body, 'uploadId'); const hash = this.string(body, 'sha256'); const size = body.size;
+    if (!/^[a-f0-9]{64}$/.test(uploadId) || !/^[a-f0-9]{64}$/.test(hash) || !Number.isSafeInteger(size) || (size as number) < 0 || (size as number) > 128 * 1024 * 1024 || (!memberDirectory && name.endsWith('.ipynb'))) throw new SessionError(400, 'Invalid artifact identity.');
+    const content = this.string(body, 'content'); if (content.length > 350_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content)) throw new SessionError(413, 'Artifact chunk exceeds limits.');
+    const bytes = Buffer.from(content, 'base64'); if ((offset as number) + bytes.length > (size as number)) throw new SessionError(400, 'Artifact chunk exceeds size.');
+    const directory = memberDirectory ?? path.join(this.directory(session.record.id), 'uploads', run!.execution.id); await mkdir(directory, { recursive: true, mode: 0o700 }); await this.safeDirectories(directory);
+    if (memberDirectory) {
+      // Interrupted editor processes cannot leave the upload quota occupied indefinitely.
+      for (const entry of await readdir(directory)) {
+        if (!/^[a-f0-9]{64}\.json$/.test(entry) || entry === uploadId + '.json') continue;
+        const filename = path.join(directory, entry); const info = await lstat(filename);
+        if (info.isFile() && info.nlink === 1 && Date.now() - info.mtimeMs > 10 * 60_000) {
+          await rm(filename); await rm(path.join(directory, entry.slice(0, -5) + '.bin'), { force: true });
+        }
+      }
+    }
+    const metadata = path.join(directory, uploadId + '.json');
+    const identity = { path: name, sha256: hash, size, version: body.version };
+    try { if (await this.readMetadata(metadata, 4096) !== JSON.stringify(identity)) throw new SessionError(409, 'Artifact upload identity changed.'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const entries = (await readdir(directory)).filter((entry) => entry.endsWith('.json'));
+      let total = size as number;
+      for (const entry of entries) total += (JSON.parse(await this.readMetadata(path.join(directory, entry), 4096)) as { size: number }).size;
+      if (entries.length >= 256 || total > 128 * 1024 * 1024) throw new SessionError(413, 'Artifact transfer quota exceeded.');
+      await this.writeMetadata(metadata, JSON.stringify(identity));
+    }
+    const target = path.join(directory, uploadId + '.bin'); const handle = await open(target, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    try {
+      const info = await handle.stat(); if (!info.isFile() || info.nlink !== 1 || info.size < (offset as number)) throw new SessionError(409, 'Artifact chunk is out of order.');
+      let written = Math.min(bytes.length, info.size - (offset as number));
+      if (written) {
+        const existing = Buffer.alloc(written); const read = await handle.read(existing, 0, existing.length, offset as number);
+        if (read.bytesRead !== written || !existing.equals(bytes.subarray(0, written))) throw new SessionError(409, 'Artifact retry changed bytes.');
+      }
+      while (written < bytes.length) {
+        const result = await handle.write(bytes, written, bytes.length - written, (offset as number) + written);
+        if (!result.bytesWritten) throw new Error('Artifact chunk write made no progress.');
+        written += result.bytesWritten;
+      }
+      await handle.sync();
+      if (memberDirectory) { const now = new Date(); await utimes(metadata, now, now); }
+      return { offset: (offset as number) + bytes.length };
+    } finally { await handle.close(); }
   }
 
   private async finishResultMerge(session: Session, run: ExecutionRecord): Promise<void> {
@@ -744,6 +914,7 @@ export class PersistentSessionHost {
       const result = JSON.parse(await this.readMetadata(path.join(this.directory(session.record.id), 'results', `${run.execution.id}.json`), 8 * 1024 * 1024)) as { files?: unknown; removedFiles?: unknown };
       await this.saveOutputs(session, run);
       await this.saveResults(session, run, result.files, result.removedFiles);
+      if (run.execution.error && run.execution.state === 'completed') run.execution.state = 'failed';
     }
     run.mergePending = false;
     try { await this.persist(session); }
@@ -803,13 +974,18 @@ export class PersistentSessionHost {
   private async saveResults(session: Session, run: ExecutionRecord, value: unknown, removed: unknown): Promise<void> {
     const privateExecution = run.execution.scope === 'private';
     if (value !== undefined && (!Array.isArray(value) || value.length > 256)) { run.execution.error = 'Returned files exceed result limits.'; return; }
-    for (const [index, item] of ((value ?? []) as { path?: unknown; content?: unknown; version?: unknown }[]).entries()) {
-      if (!item || !safeJobPath(item.path) || typeof item.content !== 'string' || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
+    for (const [index, item] of ((value ?? []) as { path?: unknown; content?: unknown; version?: unknown; uploadId?: unknown; size?: unknown; sha256?: unknown }[]).entries()) {
+      if (!item || !safeJobPath(item.path) || (typeof item.content !== 'string' && typeof item.uploadId !== 'string') || !Number.isSafeInteger(item.version) || item.path.endsWith('.ipynb')) continue;
       const snapshot = session.workspace.snapshot(privateExecution); const current = snapshot.entries.find((entry) => entry.path === item.path);
       if (privateExecution && current && current.visibility !== 'private') continue;
       const publicationId = `${run.execution.id}:write:${index}`;
+      const matches = async (): Promise<boolean> => {
+        if (current?.type !== 'file') return false;
+        const content = (await session.workspace.read(item.path as string, privateExecution)).content;
+        return typeof item.content === 'string' ? content === item.content : typeof item.sha256 === 'string' && createHash('sha256').update(Buffer.from(content, 'base64')).digest('hex') === item.sha256;
+      };
       if (session.workspace.hasPublication(publicationId)) {
-        if (current?.type !== 'file' || (await session.workspace.read(item.path, privateExecution)).content !== item.content) {
+        if (!await matches()) {
           run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.';
         }
         continue;
@@ -817,12 +993,21 @@ export class PersistentSessionHost {
       if ((current?.version ?? 0) !== item.version) {
         // A previous merge may have published this exact content before a
         // crash. Acknowledge it without overwriting a subsequent different edit.
-        if (current?.type === 'file' && (await session.workspace.read(item.path, privateExecution)).content === item.content) continue;
+        if (await matches()) continue;
         run.execution.error = 'Returned file conflicts with a newer server version; execution events remain available.'; continue;
       }
-      try { await session.workspace.write(item.path, item.content, snapshot.revision, privateExecution, publicationId, privateExecution); }
+      try {
+        if (typeof item.uploadId === 'string' && /^[a-f0-9]{64}$/.test(item.uploadId) && typeof item.sha256 === 'string' && Number.isSafeInteger(item.size)) {
+          const directory = path.join(this.directory(session.record.id), 'uploads', run.execution.id); await this.safeDirectories(directory);
+          const identity = JSON.parse(await this.readMetadata(path.join(directory, item.uploadId + '.json'), 4096)) as { path: string; sha256: string; size: number; version: number };
+          if (identity.path !== item.path || identity.sha256 !== item.sha256 || identity.size !== item.size || identity.version !== item.version) throw new SessionError(400, 'Artifact receipt differs from upload.');
+          await session.workspace.writeStaged(item.path, path.join(directory, item.uploadId + '.bin'), item.size as number, item.sha256, snapshot.revision, privateExecution, publicationId, privateExecution);
+        } else if (typeof item.content === 'string') await session.workspace.write(item.path, item.content, snapshot.revision, privateExecution, publicationId, privateExecution);
+        else throw new SessionError(400, 'Invalid artifact receipt.');
+      }
       catch (error) {
-        if (!(error instanceof PersistentStorageError) || error.code === 'CORRUPT_STORAGE') throw error;
+        if (error instanceof PersistentStorageError ? error.code === 'CORRUPT_STORAGE'
+          : !(error instanceof SessionError && [400, 404, 409, 413].includes(error.status)) && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         run.execution.error = 'A returned file could not be merged safely; execution events remain available.';
       }
     }

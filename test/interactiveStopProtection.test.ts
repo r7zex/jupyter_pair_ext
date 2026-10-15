@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { JupyterKernel } from '../src/core/pythonKernel';
 import { SharedTerminal } from '../src/core/sharedTerminal';
+import { readSessionTermination } from '../src/core/sessionTermination';
 import type { SessionDescriptor } from '../src/core/types';
 
 // Substitute the VS Code host API only. Restore the module cache so this
@@ -81,6 +82,21 @@ function reserve(host: any, runId = 'run-a', owner = 'host'): { stops: () => num
 }
 
 describe('interactive executor-issued CONFIRM protection', () => {
+  for (const role of ['host', 'guest'] as const) it(`cleans an editor exit with accepted work and ends only the ${role === 'host' ? 'host' : 'guest'} scope`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-editor-exit-'));
+    const active = runtime(root, role); const sent: string[] = []; let stopped = 0;
+    active.transport.broadcast = (type: string) => { sent.push(type); };
+    active.transport.awaitDrainAll = async () => undefined;
+    active.kernels.set('train.ipynb', { stopConfirmed: async () => { stopped++; }, stop() {} });
+    active.executionOwners.set('accepted', { peerId: role, notebookKey: 'train.ipynb', accepted: true, startedAt: Date.now() });
+    try {
+      await active.shutdownForEditorExit(); await active.shutdownForEditorExit();
+      assert.equal(stopped, 1); assert.equal(active.kernels.size, 0); assert.equal(active.executionOwners.size, 0);
+      assert.equal(sent.includes('sessionEnded'), role === 'host');
+      const marker = await readSessionTermination(active.descriptor, 'interactive-stop-token-that-is-long-enough');
+      assert.equal(!!marker, role === 'host');
+    } finally { await active.disposeAsync(); await rm(root, { recursive: true, force: true }); }
+  });
   it('leaves running work untouched on empty, wrong-case, extra-character and dismissed dialogs', async () => {
     const host = runtime('/tmp/interactive-confirm-ui'); const operation = reserve(host);
     try {

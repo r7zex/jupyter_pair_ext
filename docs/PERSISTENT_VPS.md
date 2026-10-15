@@ -59,15 +59,21 @@ Owners control invitations, membership revocation, visibility and device policy.
 
 ## Notebook editing and saving
 
-Typing, paste and deletion use optimistic local replicas. Same-line concurrent editing is allowed; presence does not lock a row. Pending intents remain until actor acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application; it is not a promise of zero delay.
+Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension, server and session agent together to 0.6.4; the extension checks the server's text protocol before editing.
 
 Native Save persists source, user metadata, outputs and execution counts. Editing an executed cell retains previous output. Results from a changed source/cell identity/generation remain fenced. Save immediately after Run settles the native execution lifecycle; a save racing with a later remote document version can require a further save. Reopen and verify the stored notebook when qualifying a new build.
 
-**Synchronize a local folder continuously** uses durable three-way baselines, revision checks and ACL-preserving renames. Reload/offline conflicts retain copies for explicit choice. `.git` and conflict scratch directories are excluded; links/special files are rejected. Notebook live editing does not establish live character synchronization for ordinary text files. Physical folder/offline/rename acceptance remains separately identified in the evidence.
+Open ordinary UTF-8 project files also synchronize characters live. Run flushes unsaved Python modules before taking its input snapshot. Native Save is available independently. Replaced notebooks/files reconnect automatically after archiving the old replica in extension storage; dirty text from an old privacy scope is not republished into the new one. Malformed local journals are archived and rebuilt.
+
+**Synchronize a local folder continuously** uses durable three-way baselines, revision checks and ACL-preserving renames. Ambiguous offline file conflicts retain copies for explicit choice. `.git` and conflict scratch directories are excluded; links/special files are rejected. Unchanged remote contents are cached by file version. Physical folder/offline/rename acceptance remains separately identified in the evidence.
 
 ## Compute, consent and isolation
 
-The selected device runs independent stateful Jupyter kernels. Select the active device to request personal execution consent without switching it. Server policy rechecks machine-owner consent, sharing and membership. Revocation prevents subsequent unauthorized work. Changing device or renaming a Public notebook advances kernel generation; accepted work finishes on its original target, and subsequent execution uses a fresh namespace. Save Python objects to files explicitly if needed: files transfer, RAM does not.
+The selected device runs independent stateful Jupyter kernels. Select the active device to request personal execution consent without switching it. Server policy rechecks machine-owner consent, sharing and membership. Revocation prevents subsequent unauthorized work. Changing device or privacy scope advances kernel generation. Ordinary rename and unrelated file deletion preserve the notebook kernel and its variables. Save Python objects to files explicitly when changing devices: files transfer, RAM does not.
+
+Accepted inputs are immutable snapshots. Large files transfer in checked 256 KiB chunks; returned models publish atomically after checksum and version checks. The default project budget is 128 MiB and 4096 entries, with up to 256 changed artifacts per cell. Retained output is bounded to 8 MiB per execution, with an explicit diagnostic on overflow; overflow still accepts a final status and releases the queue. Run All stops after a failed cell, including failed artifact publication. Interrupt also cancels a run that has not reached its worker.
+
+Closing or uninstalling the extension ends a P2P session when performed by its host; a guest leaves only its own connection. In VPS mode the editor leaves membership presence, journals local edits and closes its requests. Server sessions and accepted independent work continue. A forced process kill cannot execute extension cleanup; remote peers then rely on heartbeat expiry.
 
 Verify the actual Linux runtime before registration:
 

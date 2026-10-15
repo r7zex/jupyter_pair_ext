@@ -199,6 +199,16 @@ describe('Persistent server file save conflicts', () => {
       assert.equal(result.state, 'completed'); assert.equal(reads, 1); assert.equal(controller.executionWaiters.size, 0);
     } finally { clearTimeout(timer); }
   });
+  it('resumes observation of the same accepted execution after a temporary route failure', async () => {
+    const controller = Object.create(PersistentSessionController.prototype) as any;
+    const run = { id: 'accepted-before-outage', state: 'running', events: [] }; let polls = 0;
+    const connection = { sessionId: 'session', client: { call: async (operation: string, fields: any) => {
+      assert.equal(operation, 'execution'); assert.equal(fields.executionId, run.id);
+      if (++polls === 1) throw new Error('temporary route failure'); return { ...run, state: 'completed' };
+    } } };
+    Object.assign(controller, { connection, disposed: false, executionChanges: new Map(), executionWaiters: new Map(), waitForExecutionUpdate: async () => undefined });
+    assert.equal((await controller.observe(run, undefined, connection, false)).state, 'completed'); assert.equal(polls, 2);
+  });
   it('keeps a managed notebook save stamp stable across its live durable publications', async () => {
     const provider = new PersistentFileSystem(); let revision = 1; let managed = false;
     const snapshot = () => ({ revision, entries: [{ path: 'book.ipynb', type: 'file' as const, size: 12 + revision, mtime: revision, version: revision, visibility: 'public' as const }] });
@@ -338,6 +348,21 @@ describe('Persistent notebook execution connection ownership', () => {
   });
 
   type ExecutionUi = { execute: (cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument) => Promise<void>; connection: unknown };
+  for (const outcome of ['failed', 'preparation-error']) it(`stops a batch after ${outcome} and permits a later independent Run`, async () => {
+    let admitted = 0; let importsFlushed = 0; let preparationFails = outcome === 'preparation-error'; const ended: unknown[] = [];
+    const connection = { sessionId: 'original', client: { call: async () => { admitted++; return { id: 'run', state: 'running', events: [] }; } } };
+    const handle = { start() {}, clearOutput: async () => undefined, appendOutput: async () => undefined, end: (success: unknown) => { ended.push(success); } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, notebookQueues: new Map(), executions: new Map(), disposed: false, files: { revision: 1, refresh: async () => undefined },
+      context: { globalState: { update: async () => undefined } }, notebook: { createNotebookCellExecution: () => handle },
+      notebookSync: { prepareExecution: async () => { if (preparationFails) { preparationFails = false; throw new Error('prepare failed'); } return undefined; } },
+      textSync: { flushAll: async () => { importsFlushed++; } }, observe: async () => ({ state: 'failed', events: [] }),
+    }) as ExecutionUi;
+    const cells = [0, 1].map((index) => ({ index, kind: 2, document: { languageId: 'python', getText: () => 'print(1)' } }) as unknown as vscode.NotebookCell);
+    const notebook = { uri: { scheme: 'pair-vps', authority: 'original', path: '/work.ipynb' } } as vscode.NotebookDocument;
+    await ui.execute(cells, notebook); assert.equal(admitted, outcome === 'failed' ? 1 : 0); assert.deepEqual(ended, [false]);
+    await ui.execute([cells[1]!], notebook); assert.equal(admitted, outcome === 'failed' ? 2 : 1); assert.ok(importsFlushed >= 1);
+  });
   for (const phase of ['queue']) it(`does not submit old notebook cells to a new session after waiting for ${phase}`, async () => {
     let unblock!: () => void;
     const wait = new Promise<void>((resolve) => { unblock = resolve; });

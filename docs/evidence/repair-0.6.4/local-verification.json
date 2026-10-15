@@ -1,0 +1,46 @@
+{
+  "version": "0.6.4",
+  "verificationDate": "2026-10-15",
+  "baseCommit": "75cf437ad7e6c9eb39fa40b023863d913b147a5b",
+  "scope": "Local validation of fixes before release publication; release commit is checked separately by GitHub Actions.",
+  "mocha": {
+    "passed": 4970,
+    "skipped": 3,
+    "failed": 0
+  },
+  "python": {
+    "tests": 43,
+    "passed": 41,
+    "skipped": 2,
+    "failed": 0
+  },
+  "typeScript": "passed",
+  "eslint": "passed",
+  "packagedVsixAndSourceZip": "passed",
+  "standaloneServerSmokeGroups": 12,
+  "localLatency": {
+    "scope": "Loopback server commit to authenticated SSE receipt; includes local filesystem writes; excludes VS Code UI and WAN latency.",
+    "results": [
+      {
+        "cells": 20,
+        "updates": 20,
+        "medianMs": 4.75,
+        "p95Ms": 8.47,
+        "maxMs": 9.15
+      },
+      {
+        "cells": 1000,
+        "updates": 20,
+        "medianMs": 28.52,
+        "p95Ms": 37.09,
+        "maxMs": 49.94
+      }
+    ]
+  },
+  "unverified": [
+    "native VS Code UI",
+    "CUDA",
+    "production bubblewrap: uid map read-only",
+    "24-hour soak for this build"
+  ]
+}

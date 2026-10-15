@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir as makeDirectory, open, readdir, rename as moveFile, unlink } from 'node:fs/promises';
+import { copyFile, lstat, mkdir as makeDirectory, open, readdir, rename as moveFile, unlink } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { portablePathComparisonKey, safeRelativePath } from '../core/projectPath';
@@ -8,7 +8,7 @@ import type { PersistentFileEntry, PersistentSnapshot } from './persistentProtoc
 
 export interface PersistentStorageLimits { maxFileBytes: number; maxProjectBytes: number; maxEntries: number }
 export const PERSISTENT_STORAGE_LIMITS: Readonly<PersistentStorageLimits> = {
-  maxFileBytes: 8 * 1024 * 1024, maxProjectBytes: 128 * 1024 * 1024, maxEntries: 4096,
+  maxFileBytes: 128 * 1024 * 1024, maxProjectBytes: 128 * 1024 * 1024, maxEntries: 4096,
 };
 
 export class PersistentStorageError extends Error {
@@ -154,6 +154,52 @@ export class PersistentWorkspace {
   }
 
   hasPublication(id: string): boolean { return this.current().publications?.includes(id) === true; }
+  /** Pin immutable inputs outside the live blob GC; command JSON stays small. */
+  computeSnapshot(directory: string, privateExecution: boolean): Promise<{ path: string; content?: string; size: number; sha256: string; version: number }[]> {
+    return this.enqueue(async () => {
+      await assertDirectoryChain(directory, true); await makeDirectory(directory, { recursive: true, mode: 0o700 }); await assertDirectoryChain(directory);
+      const files = this.current().entries.filter((entry) => entry.type === 'file' && (privateExecution || this.visibility(entry.path, this.current()) === 'public'));
+      const result: { path: string; content?: string; size: number; sha256: string; version: number }[] = [];
+      let inlineBytes = 0;
+      for (const entry of files) {
+        const common = { path: entry.path, size: entry.size, sha256: entry.blob!, version: entry.version };
+        if (inlineBytes + entry.size <= 256 * 1024) { inlineBytes += entry.size; result.push({ ...common, content: (await this.readBlob(entry)).toString('base64') }); }
+        else {
+          const source = path.join(this.blobDirectory, entry.blob!); await assertRegularFile(source);
+          const destination = path.join(directory, createHash('sha256').update(entry.path).digest('hex'));
+          await copyFile(source, destination, constants.COPYFILE_EXCL);
+          if (await hashRegularFile(destination, this.limits.maxFileBytes) !== entry.blob) corrupt();
+          const handle = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW); try { await handle.sync(); } finally { await handle.close(); }
+          result.push(common);
+        }
+      }
+      await syncDirectory(directory); return result;
+    });
+  }
+
+  /** Publish a verified, privately staged binary without allocating its Base64. */
+  writeStaged(value: string, filename: string, size: number, hash: string, expectedRevision: number, owner: boolean, publicationId: string, privateResult: boolean): Promise<PersistentSnapshot> {
+    return this.mutate(expectedRevision, owner, async (next) => {
+      const name = normalizePath(value); this.authorize(name, owner, next);
+      if (name.endsWith('.ipynb') || !BLOB_NAME.test(hash) || !Number.isSafeInteger(size) || size < 0 || size > this.limits.maxFileBytes) invalid('Invalid staged file.');
+      const existing = next.entries.find((entry) => entry.path === name);
+      if (existing?.type === 'directory') invalid('Cannot replace a directory.');
+      if (privateResult && (!owner || (existing && this.visibility(name, next) !== 'private'))) throw new PersistentStorageError('FORBIDDEN', 'Private results cannot replace Public files.');
+      const info = await lstat(filename); if (info.size !== size || await hashRegularFile(filename, this.limits.maxFileBytes) !== hash) invalid('Staged file checksum disagrees.');
+      const parents = privateResult ? new Set(next.entries.map((entry) => entry.path)) : undefined; this.ensureParents(name, next);
+      if (parents) for (const entry of next.entries) if (entry.type === 'directory' && !parents.has(entry.path)) entry.visibility = 'private';
+      next.entries = next.entries.filter((entry) => entry.path !== name);
+      next.entries.push({ path: name, type: 'file', size, mtime: Date.now(), version: next.revision, blob: hash,
+        ...(privateResult ? { visibility: 'private' as const } : existing?.visibility ? { visibility: existing.visibility } : {}) });
+      this.validateEntries(next);
+      const destination = path.join(this.blobDirectory, hash);
+      try { await copyFile(filename, destination, constants.COPYFILE_EXCL); }
+      catch (error) { if (!hasCode(error, 'EEXIST')) throw error; }
+      if (await hashRegularFile(destination, this.limits.maxFileBytes) !== hash) corrupt();
+      const handle = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW); try { await handle.sync(); } finally { await handle.close(); }
+      await syncDirectory(this.blobDirectory);
+    }, undefined, publicationId);
+  }
   notebookIdentity(value: string, owner: boolean): string {
     const name = normalizePath(value); const manifest = this.current(); this.authorize(name, owner, manifest);
     const entry = manifest.entries.find((item) => item.path === name); if (!entry || entry.type !== 'file' || !name.endsWith('.ipynb')) missing();
@@ -468,6 +514,16 @@ export class PersistentWorkspace {
     }
     if (removed) await syncDirectory(this.blobDirectory);
   }
+}
+
+async function hashRegularFile(filename: string, maximum: number): Promise<string> {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await handle.stat(); if (!info.isFile() || info.nlink !== 1 || info.size > maximum) corrupt();
+    const hash = createHash('sha256'); const buffer = Buffer.alloc(1024 * 1024); let offset = 0;
+    for (;;) { const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset); if (!bytesRead) break; offset += bytesRead; if (offset > maximum) quota(); hash.update(buffer.subarray(0, bytesRead)); }
+    if (offset !== info.size) corrupt(); return hash.digest('hex');
+  } finally { await handle.close(); }
 }
 
 function normalizePath(value: string): string {

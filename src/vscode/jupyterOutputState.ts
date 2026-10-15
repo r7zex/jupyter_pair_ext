@@ -46,6 +46,12 @@ export function applyJupyterEventToState(
   event: JupyterKernelEvent,
 ): JupyterEventStateUpdate {
   const operations: JupyterOutputOperation[] = [];
+  if (event.type === 'channelError') {
+    const output = streamOutput({ name: 'stderr', text: `Pair Notebook: ${event.message ?? 'A kernel output or artifact could not be delivered.'}\n` });
+    const appended = appendBoundedOutput(state, output);
+    if (appended) operations.push({ type: 'append', output: appended });
+    return { operations, outputsChanged: operations.length > 0 };
+  }
   if (event.type !== 'iopub') return { operations, outputsChanged: false };
   const content = event.content ?? {};
 

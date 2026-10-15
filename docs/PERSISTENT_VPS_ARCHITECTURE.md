@@ -21,7 +21,7 @@ The server is the permanent Session Host. Editors may disconnect without transfe
 
 Stable cell IDs, order, source, metadata and Yjs state are persisted together. Own-save reconciliation avoids replacing the editor with an older file snapshot. Source changes retain previous outputs/execution counts, as an ordinary local notebook does. The controller owns native execution handles and records their end before Save after Run settles. A save concurrent with a later incoming version can require another save; a successful earlier save cannot include future changes.
 
-Ordinary files use revision checks and continuous folder reconciliation with durable baselines. Ambiguous offline rename/edit conflicts retain both copies for explicit resolution. This is distinct from live character editing of notebook sources. Epoch changes after replacement or privacy transitions reject old replicas and preserve recoverable local work.
+Open ordinary UTF-8 files use `PersistentTextSynchronizer` with Yjs updates and a write-ahead server replica. Run flushes unsaved modules before admission. Folder reconciliation uses durable baselines and versioned remote content caches. Ambiguous offline rename/edit conflicts retain both copies for explicit resolution. Epoch changes after replacement or privacy transitions archive old replicas and reconnect automatically. Native notebook intents carry Yjs character identities; structure deltas merge with unseen concurrent text rather than using snapshot CAS.
 
 ## Execution and privacy
 
@@ -29,7 +29,7 @@ Admission binds the acknowledged source hash, cell identity, privacy scope, targ
 
 Public and owner-only Private notebooks use separate snapshots, kernels, result namespaces and authorization. Member requests and live events cannot read Private files, outputs or execution identities. Declassification clears the appropriate namespace. Consent, sharing, membership and target eligibility are checked on the server.
 
-Changing the device or generation creates a fresh Python namespace. Files can transfer to the executor; Python RAM does not migrate. Delayed output from an old source/identity/generation cannot publish into a replacement cell. Ordinary source edits preserving past output do not relax those fences.
+Changing the device or generation creates a fresh Python namespace. Notebook kernels are keyed by stable notebook identity, so ordinary rename and unrelated removal preserve RAM. Files can transfer to the executor; Python RAM does not migrate. Inputs outside a 256 KiB inline budget are copied to immutable command storage and downloaded in checked chunks. Large artifacts use private staging, chunk retry verification and atomic content-addressed publication. Delayed output from an old source/identity/generation cannot publish into a replacement cell. Ordinary source edits preserving past output do not relax those fences.
 
 ## Recovery and isolation
 

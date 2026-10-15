@@ -204,7 +204,7 @@ server.start().then((port) => console.log(JSON.stringify({port}))).catch((error)
         self.assertEqual(len(self.agent.kernels), 1)
         self.assertTrue(any(event.get("type") == "kernelState" for event in public["events"]))
 
-    def test_notebook_rename_retires_old_namespace_and_reuses_single_kernel_capacity(self):
+    def test_notebook_rename_preserves_namespace_and_single_kernel_capacity(self):
         self.owner = self.rpc("create", ADMIN_TOKEN, name="Notebook rename", password=PASSWORD)
         self.agent = AGENT.SessionAgent(argparse.Namespace(
             id="vps", session=None, url=self.endpoint, token_file=str(self.token_file), python=self.python,
@@ -226,12 +226,12 @@ server.start().then((port) => console.log(JSON.stringify({port}))).catch((error)
         self.pump(lambda: self.agent.active is None)
         result = self.owner_rpc("execution", executionId=second["id"])
         self.assertEqual(result["state"], "completed", str(result))
-        self.assertGreater(result["generation"], first["generation"])
+        self.assertEqual(result["generation"], first["generation"])
         self.assertEqual(len(self.agent.kernels), 1)
         saved = self.owner_rpc("read", path="renamed.ipynb")
         outputs = json.loads(base64.b64decode(saved["content"]))["cells"][0]["outputs"]
-        self.assertEqual(outputs[0]["text"], "1\n")
-        self.assertTrue(any(event["type"] == "kernelState" and "fresh" in event["message"] for event in result["events"]))
+        self.assertEqual(outputs[0]["text"], "2\n")
+        self.assertFalse(any(event["type"] == "kernelState" and "fresh" in event["message"] for event in result["events"]))
 
     def test_actual_http_transport_receives_large_admitted_command_without_wedging_worker(self):
         """Wire-limit regression only: no kernel, sandbox or GPU execution claimed."""
@@ -248,9 +248,10 @@ server.start().then((port) => console.log(JSON.stringify({port}))).catch((error)
         transport = AGENT.Transport(self.endpoint, token_file=self.token_file)
         response = transport.request("claim", deviceId="vps")
         command = response["command"]
-        self.assertGreater(len(json.dumps(response).encode()), 10 * 1024 * 1024)
+        self.assertLess(len(json.dumps(response).encode()), 8 * 1024 * 1024)
         self.assertEqual(command["executionId"], execution["id"])
         self.assertEqual(base64.b64decode(command["command"]["codeBase64"]).decode(), source)
+        self.assertNotIn("content", command["files"][0])
         # Deliberately do not execute this transport fixture. Release accepted
         # authority explicitly, proving the shared worker can accept other work.
         transport.request("report", sessionId=self.owner["sessionId"], deviceId="vps",
@@ -258,6 +259,45 @@ server.start().then((port) => console.log(JSON.stringify({port}))).catch((error)
                           generation=command["generation"], offset=0, state="interrupted", events=[],
                           error="Transport-only regression: no kernel execution attempted")
         self.assertIsNone(transport.request("claim", deviceId="vps")["command"])
+
+    def test_actual_eda_plot_model_transfer_and_unrelated_delete_preserve_python_state(self):
+        available = subprocess.run([self.python, "-I", "-c", "import pandas,numpy,sklearn,joblib,PIL"], capture_output=True)
+        if available.returncode:
+            self.skipTest("Selected CPU Python requires pandas/numpy/scikit-learn/joblib/Pillow for the EDA regression")
+        self.owner = self.rpc("create", ADMIN_TOKEN, name="EDA to model regression", password=PASSWORD)
+        self.agent = AGENT.SessionAgent(argparse.Namespace(id="vps", session=None, url=self.endpoint,
+            token_file=str(self.token_file), python=self.python, bridge=str(ROOT / "media/jupyter_kernel_bridge.py"),
+            state=str(self.directory / "agent"), name="Actual CPU", share=True, max_kernels=2),
+            sandbox=DirectSandbox(self.python, self.directory / "direct-test-home"))
+        self.agent.tick()
+        sources = [
+            "import numpy as np,pandas as pd,joblib\nfrom pathlib import Path\nfrom sklearn.linear_model import LinearRegression\n"
+            "df=pd.DataFrame({'x':np.arange(1000,dtype=float)})\ndf['y']=2*df.x+3\nmodel=LinearRegression().fit(df[['x']],df.y)\nprint(df.describe())",
+            "from IPython.display import display,Image\nfrom PIL import Image as PilImage\nimport io\n"
+            "buf=io.BytesIO()\nPilImage.fromarray(np.random.default_rng(42).integers(0,256,(320,320,3),dtype=np.uint8)).save(buf,format='PNG')\n"
+            "assert len(buf.getvalue())>256*1024\ndisplay(Image(data=buf.getvalue()))",
+            "joblib.dump({'model':model,'weights':np.zeros(600000)},'model.joblib')\nassert Path('model.joblib').stat().st_size>4*1024*1024",
+            "assert abs(model.predict(pd.DataFrame({'x':[10.]}))[0]-23)<1e-6\nassert joblib.load('model.joblib')['weights'].shape==(600000,)\nprint('STATE_AND_MODEL_RETAINED')",
+        ]
+        book = {"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": [{"id": "eda-"+str(i), "cell_type": "code", "source": source, "metadata": {}, "outputs": [], "execution_count": None} for i, source in enumerate(sources)]}
+        encode = lambda value: base64.b64encode(value).decode()
+        self.owner_rpc("write", path="work.ipynb", content=encode(json.dumps(book).encode()), expectedRevision=0)
+        self.finish(0, "eda-prepare")
+        plot = self.finish(1, "eda-image")
+        self.assertTrue(any("image/png" in event.get("content", {}).get("data", {}) for event in plot["events"]))
+        self.assertFalse(any(event["type"] == "channelError" for event in plot["events"]))
+        self.finish(2, "eda-model")
+        saved_model = self.owner_rpc("read", path="model.joblib")
+        self.assertGreater(len(base64.b64decode(saved_model["content"])), 4*1024*1024)
+        snap = self.owner_rpc("snapshot")
+        snap = self.owner_rpc("write", path="unused.txt", content=encode(b"unused"), expectedRevision=snap["revision"])
+        self.owner_rpc("remove", path="unused.txt", expectedRevision=snap["revision"])
+        retained = self.finish(3, "eda-retained")
+        self.assertTrue(any("STATE_AND_MODEL_RETAINED" in event.get("content", {}).get("text", "") for event in retained["events"]))
+        snap = self.owner_rpc("snapshot")
+        # A dataset beyond the old 4 MiB aggregate limit must execute through chunks.
+        self.owner_rpc("write", path="dataset.bin", content=encode(b"x"*(4*1024*1024+1)), expectedRevision=snap["revision"])
+        self.finish(3, "eda-large-input")
 
     def test_real_selected_python_pytorch_cpu_tensor_output_is_saved(self):
         installed = subprocess.run([self.python, "-I", "-c",

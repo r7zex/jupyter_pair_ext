@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { createHash, randomUUID } from 'node:crypto';
 import { createRuntimeProxyAgent } from '../runtime/proxyWebSocket';
 import { normalizeVpsUrl } from './protocol';
 import type { PersistentLiveEvent } from './persistentLive';
@@ -20,6 +21,7 @@ export class PersistentHttpError extends Error {
 
 /** Session credentials are deliberately confined to the persistent RPC endpoint. */
 export class PersistentClient {
+  private readonly requests = new Set<http.ClientRequest>();
   public readonly endpoint: string;
   public constructor(endpoint: string, private readonly credential: PersistentCredential, private readonly deadlineMs = 15_000) {
     this.endpoint = normalizeVpsUrl(endpoint);
@@ -35,6 +37,7 @@ export class PersistentClient {
     if (!['create', 'list', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
       return Promise.reject(new Error('Join a persistent session before using its API.'));
     }
+    if (operation === 'write' && typeof input.content === 'string' && input.content.length > 350_000) return this.writeLarge<T>(input);
     const url = new URL(`${this.endpoint}/v1/sessions/rpc`);
     const bytes = Buffer.from(JSON.stringify({ ...input, operation }));
     let agent: http.Agent | undefined;
@@ -46,6 +49,7 @@ export class PersistentClient {
         if (settled) return;
         settled = true;
         clearTimeout(deadline);
+        this.requests.delete(request);
         if (error) reject(error); else resolve(value!);
       };
       const request = (url.protocol === 'https:' ? https : http).request(url, {
@@ -59,7 +63,7 @@ export class PersistentClient {
         let length = 0;
         response.on('data', (chunk: Buffer) => {
           length += chunk.length;
-          if (length > 24 * 1024 * 1024) { finish(new Error('Persistent VPS response is too large.')); request.destroy(); return; }
+          if (length > 192 * 1024 * 1024) { finish(new Error('Persistent VPS response is too large.')); request.destroy(); return; }
           chunks.push(chunk);
         });
         response.on('error', () => finish(new Error('Persistent VPS response was interrupted.')));
@@ -74,9 +78,28 @@ export class PersistentClient {
         request.destroy();
       }, this.deadlineMs);
       deadline.unref();
+      this.requests.add(request);
       request.on('error', () => finish(new Error('Cannot reach the VPS. Check its address, TLS certificate and network connection.')));
       request.end(bytes);
     });
+  }
+  public dispose(): void { for (const request of this.requests) request.destroy(); this.requests.clear(); }
+
+  private async writeLarge<T>(input: Record<string, unknown>): Promise<T> {
+    const bytes = Buffer.from(input.content as string, 'base64');
+    if (bytes.length > 128 * 1024 * 1024) throw new Error('File exceeds the 128 MiB project limit.');
+    const uploadId = createHash('sha256').update(randomUUID()).digest('hex'); const hash = createHash('sha256').update(bytes).digest('hex');
+    try {
+      for (let offset = 0; offset < bytes.length; offset += 256 * 1024) {
+        const chunk = bytes.subarray(offset, offset + 256 * 1024);
+        const reply = await this.call<{ offset: number }>('uploadChunk', { sessionId: input.sessionId, path: input.path, uploadId,
+          sha256: hash, size: bytes.length, version: input.expectedRevision, offset, content: chunk.toString('base64') });
+        if (reply.offset !== offset + chunk.length) throw new Error('VPS acknowledged an invalid upload offset.');
+      }
+      const commit = { sessionId: input.sessionId, path: input.path, uploadId, sha256: hash, expectedRevision: input.expectedRevision, ...(input.visibility ? { visibility: input.visibility } : {}) };
+      try { return await this.call<T>('commitUpload', commit); }
+      catch (error) { if (error instanceof PersistentHttpError) throw error; return await this.call<T>('commitUpload', commit); }
+    } finally { await this.call('discardUpload', { sessionId: input.sessionId, uploadId }).catch(() => undefined); }
   }
 
   public subscribe(sessionId: string, receive: (event: PersistentLiveEvent) => void, disconnected: () => void): { dispose(): void } {

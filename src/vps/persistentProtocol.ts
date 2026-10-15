@@ -49,7 +49,7 @@ export interface PersistentExecution {
 export interface PersistentCommand {
   id: string; executionId: string; sessionId: string; kernelId: string;
   generation: number; deviceId: string; gpuUuid?: string;
-  files: { path: string; content: string }[];
+  files: { path: string; content?: string; size?: number; sha256?: string; version?: number }[];
   command: Record<string, unknown>;
   scope?: 'public' | 'private';
 }

@@ -6,6 +6,7 @@ import { assertNotebookGrowth, storedCellBytes, storedValueBytes } from './noteb
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN, newId } from './types';
 
 export type DocumentKind = 'text' | 'notebook';
+const notebookMembership = new WeakMap<Y.Doc, Set<unknown>>();
 
 export interface TextChange {
   offset: number;
@@ -246,7 +247,7 @@ export class CollaborativeProject extends EventEmitter {
         kind,
         update,
         origin: scoped.origin,
-        scope: origin === REMOTE_ORIGIN ? this.applyingRemoteScope : scoped.scope,
+        scope: scoped.scope ?? (scoped.origin === REMOTE_ORIGIN ? this.applyingRemoteScope : undefined),
       } satisfies ProjectUpdate);
     });
     this.emit('documentAdded', key, kind);
@@ -487,7 +488,14 @@ export class CollaborativeProject extends EventEmitter {
     const entry = this.documents.get(key);
     if (!entry || entry.kind !== 'notebook') return false;
     if (!entry.doc.getMap<unknown>('cellData').has(cellId)) return false;
-    return entry.doc.getArray<unknown>('cells').toArray().includes(cellId);
+    let ids = notebookMembership.get(entry.doc);
+    if (!ids) {
+      const order = entry.doc.getArray<unknown>('cells');
+      ids = new Set(order.toArray()); notebookMembership.set(entry.doc, ids);
+      const membership = ids;
+      order.observe(() => { membership.clear(); for (const id of order.toArray()) membership.add(id); });
+    }
+    return ids.has(cellId);
   }
 
   public notebookSnapshot(key: string): NotebookSnapshot {
@@ -688,7 +696,11 @@ export class CollaborativeProject extends EventEmitter {
 }
 
 function withScope(origin: unknown, scope: ProjectUpdate['scope']): unknown {
-  return origin === REMOTE_ORIGIN ? origin : { pairNotebookOrigin: origin, pairNotebookScope: scope };
+  return { pairNotebookOrigin: origin, pairNotebookScope: scope };
+}
+
+export function isRemoteProjectOrigin(origin: unknown): boolean {
+  return scopedOrigin(origin).origin === REMOTE_ORIGIN;
 }
 
 function scopedOrigin(origin: unknown): { origin: unknown; scope?: ProjectUpdate['scope'] } {

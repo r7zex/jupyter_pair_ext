@@ -18,6 +18,7 @@ export class PersistentFolderSync {
   private state: FolderSyncState = { format: 1, baseline: {} };
   private loaded = false;
   private pending: Promise<unknown> = Promise.resolve();
+  private readonly remoteFiles = new Map<string, { version: number; content: string; hash: string }>();
   constructor(private readonly options: { localRoot: string; remoteRoot: string; journal: string; sessionId: string; client: PersistentClient;
     current: () => boolean; conflict: (conflict: FolderSyncConflict) => Promise<'local' | 'remote' | 'later'> }) {
     if (!safeJobPath(options.remoteRoot) || path.resolve(options.localRoot) === path.parse(path.resolve(options.localRoot)).root) throw new Error('Select a dedicated project folder.');
@@ -40,7 +41,7 @@ export class PersistentFolderSync {
   }
   private async bytes(name: string): Promise<Buffer> {
     const handle = await open(await this.safeLocal(name), constants.O_RDONLY | constants.O_NOFOLLOW);
-    try { const info = await handle.stat(); if (!info.isFile() || info.nlink !== 1 || info.size > 8 * 1024 * 1024) throw new Error('Unsafe or oversized sync file.'); const bytes = await handle.readFile(); if (bytes.length > 8 * 1024 * 1024) throw new Error('Sync file grew beyond limit.'); return bytes; }
+    try { const info = await handle.stat(); if (!info.isFile() || info.nlink !== 1 || info.size > 128 * 1024 * 1024) throw new Error('Unsafe or oversized sync file.'); const bytes = await handle.readFile(); if (bytes.length > 128 * 1024 * 1024) throw new Error('Sync file grew beyond limit.'); return bytes; }
     finally { await handle.close(); }
   }
   private async local(): Promise<Record<string, Entry>> {
@@ -67,11 +68,18 @@ export class PersistentFolderSync {
       if (!safeJobPath(name) || name.split('/').some(excluded)) continue;
       if (entry.type === 'directory') entries[name] = { type: 'directory', hash: '', visibility: entry.visibility };
       else {
+        const cached = this.remoteFiles.get(entry.path);
+        if (cached?.version === entry.version) {
+          contents[name] = cached.content; entries[name] = { type: 'file', hash: cached.hash, visibility: entry.visibility }; continue;
+        }
         const file = await this.options.client.call<{ content: string; revision: number }>('read', { sessionId: this.options.sessionId, path: entry.path }); this.current();
         if (file.revision !== snapshot.revision) throw new Error('Server changed while reading sync snapshot; retrying next cycle.');
         contents[name] = file.content; entries[name] = { type: 'file', hash: digest(Buffer.from(file.content, 'base64')), visibility: entry.visibility };
+        this.remoteFiles.set(entry.path, { version: entry.version, content: file.content, hash: entries[name]!.hash });
       }
     }
+    const visible = new Set(snapshot.entries.map((entry) => entry.path));
+    for (const name of this.remoteFiles.keys()) if (!visible.has(name)) this.remoteFiles.delete(name);
     return { entries, contents, revision: snapshot.revision };
   }
   cycle(): Promise<void> {
@@ -118,9 +126,15 @@ export class PersistentFolderSync {
       await this.save();
     }
     for (const name of names) {
-      this.current(); local = await this.local(); remote = await this.remote();
+      this.current();
       const left = local[name]; const right = remote.entries[name]; const base = this.state.baseline[name];
-      if (same(left, right)) { this.state.privateCandidates = this.state.privateCandidates?.filter((candidate) => candidate !== name) ?? []; if (right) this.state.baseline[name] = right; else delete this.state.baseline[name]; await this.save(); continue; }
+      if (same(left, right)) {
+        if (JSON.stringify(base) !== JSON.stringify(right) || this.state.privateCandidates?.includes(name)) {
+          this.state.privateCandidates = this.state.privateCandidates?.filter((candidate) => candidate !== name) ?? [];
+          if (right) this.state.baseline[name] = right; else delete this.state.baseline[name]; await this.save();
+        }
+        continue;
+      }
       const localChanged = !same(left, base); const remoteChanged = !same(right, base);
       let direction: 'local' | 'remote' | 'later' = localChanged && remoteChanged ? 'later' : localChanged ? 'local' : 'remote';
       if (localChanged && remoteChanged) direction = await this.options.conflict({ path: name, ...(left ? { local: left } : {}), ...(right ? { remote: right } : {}) });
@@ -146,6 +160,7 @@ export class PersistentFolderSync {
         else { if (left?.type === 'directory') throw new Error('File/directory conflict requires a manual rename.'); await atomicWriteFile(target, Buffer.from(remote.contents[name]!, 'base64')); }
       }
       this.current(); const afterLocal = await this.local(); const afterRemote = await this.remote();
+      local = afterLocal; remote = afterRemote;
       if (same(afterLocal[name], afterRemote.entries[name])) { if (afterRemote.entries[name]) this.state.baseline[name] = afterRemote.entries[name]!; else delete this.state.baseline[name]; await this.save(); }
     }
   }

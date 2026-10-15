@@ -22,7 +22,7 @@ import { EditorSynchronizer, type EditorTextIntentRequest, type NotebookCellStat
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
 interface Connection { sessionId: string; memberId: string; endpoint: string; client: PersistentClient }
-interface Intent { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[] }
+interface Intent { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[]; update?: string }
 function applyChanges(source: string, changes: readonly TextChange[]): string {
   for (const change of [...changes].sort((a, b) => b.offset - a.offset)) source = source.slice(0, change.offset) + change.insertText + source.slice(change.offset + change.deleteCount);
   return source;
@@ -57,12 +57,18 @@ interface State {
   conflictPrompted?: boolean;
   savedCells?: Map<string, CellSnapshot>;
   structural: number; closed: boolean; blocked: boolean;
+  structureUpdate?: string;
+  dirtyCells: Set<string>;
+  structureChanged: boolean;
+  initialized: boolean;
   initial: Map<string, string>;
 }
 
 /** VPS transport adapter for the EditorSynchronizer/EditorTextReplica used by a human host. */
 export class PersistentNotebookSynchronizer implements vscode.Disposable {
+  public fileEvent: ((event: PersistentLiveEvent) => void) | undefined;
   private readonly states = new Map<vscode.NotebookDocument, State>();
+  private readonly remoteBootstrap = new WeakSet<vscode.NotebookDocument>();
   private readonly presenceEvents = new EventEmitter();
   private presence: PersistentPresence[] = [];
   private stream: { dispose(): void } | undefined;
@@ -86,31 +92,39 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     this.heartbeat = setInterval(() => { this.ensureStream(); this.schedulePresence(); }, 1000); this.heartbeat.unref();
   }
   dispose(): void { clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose(); this.reset(); }
-  reset(): void {
+  async shutdown(): Promise<void> {
+    clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose();
+    await Promise.all([...this.states.values()].filter((state) => state.initialized && !state.closed)
+      .map((state) => this.journal(state).catch((error) => this.report(error))));
+    this.reset(false);
+  }
+  reset(preserve = true): void {
     this.stream?.dispose(); this.stream = undefined; this.streamConnection = undefined;
     if (this.reconnect) clearTimeout(this.reconnect); this.reconnect = undefined;
-    for (const state of [...this.states.values()]) this.closeState(state);
+    for (const state of [...this.states.values()]) { if (preserve && state.initialized && !state.blocked) void this.journal(state).catch((error) => this.report(error)); this.closeState(state); }
     this.renderer?.dispose(); this.renderer = undefined; this.presence = []; this.presenceEvents.emit('presence');
     this.lastPresence = undefined;
   }
-  private closeState(state: State): void { state.closed = true; state.editor?.dispose(); state.project.destroy(); state.doc.destroy(); this.states.delete(state.notebook); this.schedulePresence(); }
+  private closeState(state: State): void { if (state.closed) return; state.closed = true; state.editor?.dispose(); state.project.destroy(); state.doc.destroy(); this.states.delete(state.notebook); this.schedulePresence(); }
   private current(state: State): void {
     if (state.closed || this.connection() !== state.connection) throw new Error('Notebook synchronization connection changed.');
-    if (state.blocked) throw new Error('Offline notebook replica is preserved; reload the notebook after reviewing its conflict.');
+    if (state.blocked) throw new Error('Notebook synchronization is recovering a replaced or rejected replica.');
   }
   private report(error: unknown): void {
     this.log.appendLine(`[error] Persistent notebook synchronization: ${error instanceof Error ? error.message : 'Operation failed.'}`);
     if (Date.now() - this.lastWarning > 10_000) { this.lastWarning = Date.now(); void vscode.window.showWarningMessage(`Pair Notebook VPS: ${error instanceof Error ? error.message : 'Synchronization failed.'}`); }
   }
-  private async conflict(state: State): Promise<void> {
+  private async conflict(state: State, rejected = false): Promise<void> {
     if (state.conflictPrompted || state.closed) return; state.conflictPrompted = true; state.blocked = true;
-    await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
-    await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), intents: state.intents,
-      displayed: state.notebook.getCells().map((cell) => ({ id: state.ids.knownId(cell), source: cell.document.getText(), metadata: cell.metadata })) }));
-    const answer = await vscode.window.showWarningMessage('This notebook was replaced or its privacy changed. Local edits were archived. Reload the server version?', 'Preserve replica and reload');
-    if (answer !== 'Preserve replica and reload' || state.closed || this.connection() !== state.connection) return;
-    try { await rename(state.file, `${state.file}.conflict-journal-${randomUUID()}.json`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    this.closeState(state); await this.flush(state.notebook);
+    try {
+      await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
+      await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), intents: state.intents,
+        displayed: state.notebook.getCells().map((cell) => ({ id: state.ids.knownId(cell), source: cell.document.getText(), metadata: cell.metadata })) }));
+      if (state.closed || this.connection() !== state.connection) return;
+      void vscode.window.showWarningMessage(rejected ? 'The server could not accept this edit. Local edits were archived for recovery; reconnecting to the saved version.' : 'The notebook was replaced or its access changed. Local edits were archived for recovery; reconnecting to the current version.');
+      try { await rename(state.file, `${state.file}.conflict-journal-${randomUUID()}.json`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      this.remoteBootstrap.add(state.notebook); this.closeState(state); await this.flush(state.notebook);
+    } finally { delete state.conflictPrompted; }
   }
   private ensureStream(): void {
     const connection = this.connection(); if (!connection || this.reconnect || this.streamConnection === connection) return;
@@ -139,6 +153,8 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     }
   }
   private receive(event: PersistentLiveEvent): void {
+    this.fileEvent?.(event);
+    if (event.kind === 'text') return;
     if (event.kind === 'execution') { this.execution(event); return; }
     if (event.kind === 'presence') { this.presence = event.states; this.presenceEvents.emit('presence'); return; }
     if (event.kind === 'ready' || event.kind === 'invalidate') {
@@ -196,24 +212,40 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (this.connection() === connection) { this.lastPresence = fields; this.lastPresenceAt = Date.now(); this.presence = reply.states; this.presenceEvents.emit('presence'); }
   }
   private async journal(state: State): Promise<void> {
+    // Capture before any await: disconnect/dispose may destroy the live docs
+    // while an earlier disk write is still queued.
+    const bytes = JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), actor: state.actor, sequence: state.sequence, intents: state.intents, structureUpdate: state.structureUpdate, ...(state.structural ? { snapshot: this.outbound(state) } : {}) });
     const write = (state.journalTail ?? Promise.resolve()).catch(() => undefined).then(async () => {
-      await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 }); this.current(state);
-      await atomicWriteFile(state.file, JSON.stringify({ epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64'), actor: state.actor, sequence: state.sequence, intents: state.intents, ...(state.structural ? { snapshot: this.outbound(state) } : {}) }));
+      await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
+      await atomicWriteFile(state.file, bytes);
     });
     state.journalTail = write; return write;
   }
   private async initialize(state: State): Promise<void> {
-    let saved: { epoch: string; update: string; actor?: string; sequence?: number; intents?: Intent[]; snapshot?: SharedNotebook } | undefined;
-    try { saved = JSON.parse(await readFile(state.file, 'utf8')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    let saved: { epoch: string; update: string; actor?: string; sequence?: number; intents?: Intent[]; snapshot?: SharedNotebook; structureUpdate?: string } | undefined;
+    try {
+      saved = JSON.parse(await readFile(state.file, 'utf8'));
+      if (!saved || typeof saved.epoch !== 'string' || typeof saved.update !== 'string' || (saved.intents !== undefined && !Array.isArray(saved.intents))) throw new SyntaxError('Invalid replica journal.');
+      const probe = new Y.Doc(); try { Y.applyUpdate(probe, Buffer.from(saved.update, 'base64')); } finally { probe.destroy(); }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code) throw error;
+        await rename(state.file, `${state.file}.invalid-${randomUUID()}.json`); saved = undefined;
+        this.log.appendLine('[warn] Invalid notebook replica journal archived; reconnecting from the server and current editor buffer.');
+      }
+    }
     this.current(state);
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
     const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
+    if (reply.textProtocol !== 'yjs-intents-v1') throw new Error('The VPS server needs an update before live editing can connect safely.');
     state.acknowledgedSequence = reply.acknowledgedSequence ?? 0;
     Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.epoch = reply.epoch; state.revision = reply.revision; state.identity = reply.identity;
     const vector = Y.encodeStateVector(state.doc);
     if (saved) {
       if (saved.epoch !== reply.epoch) { await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify(saved)); state.blocked = true; throw new PersistentHttpError(409); }
       Y.applyUpdate(state.doc, Buffer.from(saved.update, 'base64'));
+      if (saved.structureUpdate) { state.structureUpdate = saved.structureUpdate; state.structural = 1; }
+      else if (saved.snapshot) { editSharedNotebook(state.doc, saved.snapshot); state.structureUpdate = Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64'); state.structural = 1; }
     }
     let shared = sharedNotebook(state.doc);
     await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
@@ -223,23 +255,37 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     const cleaned = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64') }); this.current(state);
     Y.applyUpdate(state.doc, Buffer.from(cleaned.update, 'base64')); state.revision = cleaned.revision; state.identity = cleaned.identity;
     state.acknowledgedSequence = Math.max(state.acknowledgedSequence, cleaned.acknowledgedSequence ?? 0);
-    await this.readSavedCells(state); state.project.ensureNotebook(state.key, this.projectedSnapshot(state));
+    await this.readSavedCells(state);
+    if (state.project.has(state.key)) state.project.reconcileNotebook(state.key, this.projectedSnapshot(state), REMOTE_ORIGIN);
+    else state.project.ensureNotebook(state.key, this.projectedSnapshot(state));
     if (saved?.snapshot) { state.project.reconcileNotebook(state.key, { metadata: normalizeNotebookMetadata(saved.snapshot.metadata), cells: saved.snapshot.cells.map((cell) => ({ id: cell.id, source: cell.source, kind: cell.cell_type === 'code' ? 2 : 1, language: cell.cell_type === 'code' ? 'python' : 'markdown', metadata: cell.metadata, outputs: [] })) }, REMOTE_ORIGIN); state.structural = 1; }
     state.notebook.getCells().forEach((cell) => { const id = typeof cell.metadata.id === 'string' ? cell.metadata.id : cell.metadata.pairNotebookCellId; if (id) state.ids.seed(cell, undefined, id); });
-    state.project.on('update', (event) => { if (event.origin !== REMOTE_ORIGIN && event.scope?.type !== 'cellText' && event.scope?.type !== 'cellState') { state.structural++; void this.send(state).catch((error) => this.report(error)); } });
+    state.project.on('update', (event) => {
+      if (event.origin === REMOTE_ORIGIN || !event.scope || ['cellText', 'cellOutputs', 'cellExecution'].includes(event.scope.type)) return;
+      const vector = Y.encodeStateVector(state.doc);
+      const next = this.outbound(state);
+      // Source edits already live in this Y.Doc. Preserve raw cell types.
+      for (const cell of next.cells) { const old = state.doc.getMap<Y.Map<unknown>>('cells').get(cell.id); if (old?.get('cell_type') === 'raw' && cell.cell_type === 'markdown') cell.cell_type = 'raw'; }
+      editSharedNotebook(state.doc, next);
+      const update = Y.encodeStateAsUpdate(state.doc, vector);
+      state.structureUpdate = Buffer.from(state.structureUpdate ? Y.mergeUpdates([Buffer.from(state.structureUpdate, 'base64'), update]) : update).toString('base64');
+      state.structural++; void this.send(state).catch((error) => this.report(error));
+    });
     const renderer = this.cellStateRenderer && { ...this.cellStateRenderer,
       // Live runs use the controller's observer; fields read from disk are completed snapshots.
       renderRemoteCellState: (cell: vscode.NotebookCell, request: Parameters<NotebookCellStateRenderer['renderRemoteCellState']>[1]) => this.cellStateRenderer!.renderRemoteCellState(cell, { ...request, executionMode: 'snapshot' as const }) };
+    const preserveInput = !this.remoteBootstrap.has(state.notebook); if (!preserveInput) state.initial.clear();
     state.editor = new EditorSynchronizer(state.project, '', this.log, state.ids, renderer,
       (request) => this.stage(state, request),
-      (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined);
-    await state.editor.whenNotebookReady(state.notebook); state.initial.clear(); await this.journal(state); this.schedulePresence();
+      (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined, preserveInput);
+    await state.editor.whenNotebookReady(state.notebook); this.remoteBootstrap.delete(state.notebook); state.initial.clear(); state.initialized = true; await this.journal(state); this.schedulePresence();
   }
   private projectSnapshot(state: State): NotebookSnapshot {
     const shared = sharedNotebook(state.doc);
+    const localCells = new Map(state.notebook.getCells().map((cell) => [state.ids.knownId(cell) ?? cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell]));
     return { metadata: normalizeNotebookMetadata(notebookUserMetadata(shared.metadata)), cells: shared.cells.map((cell) => {
       const previous = state.project.has(state.key) ? state.project.notebookCellSnapshot(state.key, cell.id) : undefined;
-      const local = state.notebook.getCells().find((candidate) => candidate.metadata.id === cell.id || candidate.metadata.pairNotebookCellId === cell.id);
+      const local = localCells.get(cell.id);
       const saved = state.savedCells?.get(cell.id); const managing = !!local && this.cellStateRenderer?.isManagingCellState?.(local);
       const outputs = saved && !managing && saved.source === cell.source ? saved.outputs : previous?.outputs ?? local?.outputs.map((output) => ({ metadata: output.metadata, items: output.items.map((item) => ({ mime: item.mime, dataBase64: Buffer.from(item.data).toString('base64') })) })) ?? [];
       const execution = managing || (saved && saved.source !== cell.source) || (previous?.execution?.executionOrder === saved?.execution?.executionOrder && JSON.stringify(previous?.outputs) === JSON.stringify(outputs)) ? previous?.execution : saved?.source === cell.source ? saved.execution : undefined;
@@ -251,15 +297,27 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     const file = await state.connection.client.call<{ content: string }>('read', { sessionId: state.connection.sessionId, path: state.key }); this.current(state);
     if (typeof file.content === 'string') state.savedCells = new Map(parseIpynb(Buffer.from(file.content, 'base64').toString('utf8')).cells.map((cell) => [cell.id, cell]));
   }
-  private applyCanonical(state: State): void {
+  private applyCanonical(state: State, rich = false): void {
+    if (state.editor && state.initialized && !rich && !state.structureChanged && !state.structural) {
+      for (const id of state.dirtyCells) {
+        const cell = state.doc.getMap<Y.Map<unknown>>('cells').get(id);
+        const source = cell?.get('source');
+        if (!(source instanceof Y.Text) || !state.project.hasNotebookCell(state.key, id)) continue;
+        const current = state.project.cellSource(state.key, id).toString(); const target = source.toString();
+        if (current !== target) state.project.applyCellTextChanges(state.key, id, changesBetween(current, target) ?? [{ offset: 0, deleteCount: current.length, insertText: target }], REMOTE_ORIGIN);
+        const metadata = cell?.get('metadata'); if (metadata) state.project.setCellMetadata(state.key, id, metadata as Record<string, unknown>, REMOTE_ORIGIN);
+      }
+      state.dirtyCells.clear(); return;
+    }
     if (!state.editor) return; const next = this.projectedSnapshot(state); const previous = state.project.notebookSnapshot(state.key);
+    state.dirtyCells.clear(); state.structureChanged = false;
     if (!state.structural && (previous.cells.length !== next.cells.length || previous.cells.some((cell, index) => cell.id !== next.cells[index]?.id || cell.kind !== next.cells[index]?.kind))) { state.project.reconcileNotebook(state.key, next, REMOTE_ORIGIN); return; }
     this.applyCells(state, next, previous);
   }
   private projectedSnapshot(state: State): NotebookSnapshot {
     const next = this.projectSnapshot(state);
     // Keep newer local input visible while projecting an earlier server commit.
-    for (const intent of state.intents) if (intent.sequence > state.acknowledgedSequence) {
+    for (const intent of state.intents) if (!intent.update && intent.sequence > state.acknowledgedSequence) {
       const cell = next.cells.find((item) => item.id === intent.cellId);
       if (cell) cell.source = applyChanges(cell.source, rebaseTextChanges(intent.baseline, cell.source, intent.changes));
     }
@@ -287,37 +345,55 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   }
   private stage(state: State, request: EditorTextIntentRequest): boolean {
     this.current(state); if (!request.cellId) return false;
-    const baseline = request.baseline; let changes = [...request.changes]; const initial = state.initial.get(request.cellId);
+    const baseline = request.baseline; let changes = [...(request.canonicalChanges ?? request.changes)]; const initial = state.initial.get(request.cellId);
     if (initial !== undefined && baseline !== initial) {
       let start = 0; let end = 0; while (start < Math.min(initial.length, request.result.length) && initial[start] === request.result[start]) start++;
       while (end < Math.min(initial.length, request.result.length) - start && initial[initial.length - end - 1] === request.result[request.result.length - end - 1]) end++;
       changes = rebaseInitialTextChanges(initial, baseline, [{ offset: start, deleteCount: initial.length - start - end, insertText: request.result.slice(start, request.result.length - end) }]);
     }
     state.initial.delete(request.cellId);
-    if (!changes.some((change) => change.deleteCount || change.insertText)) return true;
+    if (!changes.some((change) => change.deleteCount || change.insertText)) return false;
+    const text = state.doc.getMap<Y.Map<unknown>>('cells').get(request.cellId)?.get('source');
+    if (!(text instanceof Y.Text)) throw new Error('The edited cell no longer exists.');
+    const vector = Y.encodeStateVector(state.doc);
+    state.doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
+    const update = Y.encodeStateAsUpdate(state.doc, vector);
     const tail = state.intents.at(-1);
     const merged = tail && tail !== state.activeIntent && tail.cellId === request.cellId && applyChanges(tail.baseline, tail.changes) === baseline ? changesBetween(tail.baseline, request.result) : undefined;
-    if (tail && merged) state.intents[state.intents.length - 1] = { ...tail, changes: merged };
-    else state.intents.push({ actor: state.actor, sequence: ++state.sequence, cellId: request.cellId, baseline, changes });
-    void this.send(state).catch((error) => this.report(error)); return true;
+    if (tail && merged && tail.update) state.intents[state.intents.length - 1] = { ...tail, changes: merged, update: Buffer.from(Y.mergeUpdates([Buffer.from(tail.update, 'base64'), update])).toString('base64') };
+    else state.intents.push({ actor: state.actor, sequence: ++state.sequence, cellId: request.cellId, baseline, changes, update: Buffer.from(update).toString('base64') });
+    void this.send(state).catch((error) => this.report(error)); return false;
   }
   private send(state: State): Promise<void> {
     if (state.sending) return state.sending;
     const work = Promise.resolve().then(async () => {
       await state.ready; this.current(state);
       while (state.intents.length || state.structural) {
-        if (state.intents[0]) state.activeIntent = state.intents[0]; else delete state.activeIntent;
+        if (!state.structural && state.intents[0]) state.activeIntent = state.intents[0]; else delete state.activeIntent;
         await this.journal(state); this.current(state);
         const intent = state.activeIntent; let snapshot: SharedNotebook | undefined;
         const structuralVersion = state.structural;
+        // A structural clock can depend on earlier local text which has not
+        // reached the server yet. Commit that causal closure atomically.
+        const structuralIntents = !intent && state.structureUpdate ? state.intents.filter((pending) => pending.update) : [];
+        const structureUpdate = state.structureUpdate && Buffer.from(Y.mergeUpdates([Buffer.from(state.structureUpdate, 'base64'),
+          ...structuralIntents.map((pending) => Buffer.from(pending.update!, 'base64'))])).toString('base64');
+        const wireIntent = intent?.update ? { ...intent, baseline: '', changes: [{ offset: 0, deleteCount: 0, insertText: '' }] } : intent;
         if (!intent) snapshot = this.outbound(state);
         try {
-          const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64'), ...(intent ? { intent } : { snapshot, snapshotStateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') }) }); this.current(state);
+          const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64'), ...(intent ? { intent: wireIntent } : structureUpdate ? { update: structureUpdate } : { snapshot, snapshotStateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') }) }); this.current(state);
           Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity;
-          if (intent) { state.acknowledgedSequence = Math.max(state.acknowledgedSequence, intent.sequence); state.intents.shift(); } else if (state.structural === structuralVersion) state.structural = 0;
+          if (intent) { state.acknowledgedSequence = Math.max(state.acknowledgedSequence, intent.sequence); state.intents.shift(); }
+          else {
+            // An edit coalesced while this request was in flight has a new
+            // object identity; retain it even if it reused the tail sequence.
+            state.intents = state.intents.filter((pending) => !structuralIntents.includes(pending));
+            for (const pending of structuralIntents) state.acknowledgedSequence = Math.max(state.acknowledgedSequence, pending.sequence);
+            if (state.structural === structuralVersion) { state.structural = 0; delete state.structureUpdate; }
+          }
           this.applyCanonical(state); this.schedulePresence(); await this.journal(state);
         } catch (error) {
-          if (error instanceof PersistentHttpError && error.status === 409) { await atomicWriteFile(`${state.file}.conflict-${randomUUID()}.json`, JSON.stringify({ epoch: state.epoch, intents: state.intents, snapshot })); state.blocked = true; void this.conflict(state).catch((failure) => this.report(failure)); }
+          if (error instanceof PersistentHttpError && [400, 409, 413].includes(error.status)) { state.blocked = true; void this.conflict(state, error.status !== 409).catch((failure) => this.report(failure)); }
           throw error;
         }
       }
@@ -335,18 +411,32 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (capture && notebook.isClosed) throw new Error('Cannot save a closed notebook.');
     const connection = this.connection(); if (!connection || notebook.uri.scheme !== 'pair-vps' || notebook.uri.authority !== connection.sessionId) return undefined;
     this.ensureStream(); let state = this.states.get(notebook);
+    if (state?.blocked) { await this.conflict(state); state = this.states.get(notebook); }
     if (!state) {
       state = { connection, notebook, key: notebook.uri.path.slice(1), file: path.join(this.context.globalStorageUri.fsPath, 'persistent-replicas', createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId, notebook.uri.path])).digest('hex') + '.json'),
         doc: new Y.Doc(), project: new CollaborativeProject(), ids: new StableCellIdRegistry(), epoch: '', revision: 0, actor: randomUUID(), sequence: 0, acknowledgedSequence: 0, intents: [], ready: Promise.resolve(), structural: 0, closed: false, blocked: false,
-        initial: new Map(notebook.getCells().map((cell) => [cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell.document.getText()])) };
+        initial: new Map(notebook.getCells().map((cell) => [cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell.document.getText()])), dirtyCells: new Set(), structureChanged: false, initialized: false };
+      const observedState = state;
+      state.doc.getMap<Y.Map<unknown>>('cells').observeDeep((events) => { for (const event of events) { const id = event.path[0]; if (typeof id === 'string') observedState.dirtyCells.add(id); else observedState.structureChanged = true; } });
+      state.doc.getArray('order').observe(() => { observedState.structureChanged = true; });
+      state.doc.getMap('notebook').observe(() => { observedState.structureChanged = true; });
       this.states.set(notebook, state); state.ready = this.initialize(state);
     }
     try { await state.ready; this.current(state); if (capture) await state.editor?.prepareWorkingCopy(false); await this.send(state); }
-    catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
+    catch (error) {
+      if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state);
+      else if (!state.initialized && !state.closed) {
+        // A rejected bootstrap promise must never poison all subsequent retries.
+        state.editor?.dispose(); delete state.editor;
+        state.project.removeAllListeners('update');
+        state.ready = this.initialize(state); void state.ready.catch(() => undefined);
+      }
+      throw error;
+    }
     if (!refresh) return { epoch: state.epoch, revision: state.revision, ...(state.identity ? { identity: state.identity } : {}), update: '', ...sharedNotebook(state.doc) };
     try {
       const reply = await connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, compact: true, stateVector: Buffer.from(Y.encodeStateVector(state.doc)).toString('base64') });
-      this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity; state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state);
+      this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity; state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state, true);
       await state.editor?.prepareWorkingCopy(false); await this.journal(state);
       return { ...reply, revision: state.revision, ...sharedNotebook(state.doc) };
     } catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }

@@ -47,10 +47,11 @@ describe('Persistent adapter through the existing production editor', () => {
       if (input.intent) intentCalls++;
       if (input.intent && (sequences.get(input.intent.actor) ?? 0) < input.intent.sequence) {
         const intent = input.intent; const text = doc.getMap<Y.Map<unknown>>('cells').get(intent.cellId)!.get('source') as Y.Text;
-        for (const change of rebaseTextChanges(intent.baseline, text.toString(), intent.changes).sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); }
+        if (intent.update) Y.applyUpdate(doc, Buffer.from(intent.update, 'base64'));
+        else for (const change of rebaseTextChanges(intent.baseline, text.toString(), intent.changes).sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); }
         sequences.set(intent.actor, intent.sequence);
       }
-      const reply: NotebookSyncReply = { epoch, revision: 1, identity: '0123456789abcdef0123456789abcdef', acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
+      const reply: NotebookSyncReply = { epoch, revision: 1, textProtocol: 'yjs-intents-v1', identity: '0123456789abcdef0123456789abcdef', acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
       const blocked = gate; gate = undefined; if (blocked) await blocked();
       if (lostAck && input.intent) { lostAck = false; throw new Error('Acknowledgement lost after server commit'); }
       return reply;
@@ -58,7 +59,7 @@ describe('Persistent adapter through the existing production editor', () => {
     connection = { endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', client };
     sync = new Sync({ globalStorageUri: { fsPath: root } } as vscode.ExtensionContext, () => connection);
   });
-  afterEach(async () => { sync.dispose(); doc.destroy(); await rm(root, { recursive: true, force: true }); });
+  afterEach(async () => { await sync.shutdown(); doc.destroy(); await rm(root, { recursive: true, force: true }); });
   const change = (offset: number, length: number, insert: string): void => { const document = cell.document; document.text = document.text.slice(0, offset) + insert + document.text.slice(offset + length); document.isDirty = true; boundary.__fireTextChange(document, [{ rangeOffset: offset, rangeLength: length, text: insert }]); };
   const pause = (): { reached: Promise<void>; release(): void } => { let release!: () => void; let arrived!: () => void; const reached = new Promise<void>((resolve) => { arrived = resolve; }); const waiting = new Promise<void>((resolve) => { release = resolve; }); gate = async () => { arrived(); await waiting; }; return { reached, release }; };
   it('retains genuine input during the handshake and an older response', async () => {
@@ -66,6 +67,45 @@ describe('Persistent adapter through the existing production editor', () => {
     assert.equal(cell.document.text, 'base-local'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local');
     const late = pause(); const pending = sync.flush(notebook); await late.reached; change(cell.document.text.length, 0, '!'); late.release(); await pending; await sync.flush(notebook);
     assert.equal(cell.document.text, 'base-local!'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local!');
+  });
+  it('recovers a rejected bootstrap promise after a transient connection error', async () => {
+    const original = connection.client.call; let fail = true;
+    connection.client.call = async (operation: string, input: any) => {
+      if (operation === 'notebookSync' && fail) { fail = false; throw new Error('temporary outage'); }
+      return original(operation, input);
+    };
+    await assert.rejects(sync.flush(notebook), /temporary outage/);
+    await sync.flush(notebook); change(4, 0, '-recovered'); await sync.flush(notebook);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-recovered');
+  });
+  it('archives a corrupt local journal and initializes a usable replica', async () => {
+    await sync.flush(notebook);
+    const filename = (sync as any).states.get(notebook).file;
+    await sync.shutdown();
+    const { writeFile } = await import('node:fs/promises'); await writeFile(filename, '{corrupt');
+    sync = new Sync({ globalStorageUri: { fsPath: root } } as vscode.ExtensionContext, () => connection);
+    await sync.flush(notebook); change(4, 0, '!'); await sync.flush(notebook);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base!');
+    assert.ok((await readdir(path.dirname(filename))).some((name) => name.includes('.invalid-')));
+  });
+  it('archives a permanently rejected update and allows subsequent valid typing', async () => {
+    await sync.flush(notebook); const call = connection.client.call; let rejected = false;
+    connection.client.call = async (operation: string, input: any) => { if (!rejected && input.intent) { rejected = true; throw new PersistentHttpError(413); } return call(operation, input); };
+    change(4, 0, '-too-large'); await assert.rejects(sync.flush(notebook));
+    for (let n = 0; n < 100 && cell.document.text !== 'base'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
+    await sync.flush(notebook); assert.equal(cell.document.text, 'base'); change(4, 0, '!'); await sync.flush(notebook);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base!');
+    assert.ok((await readdir(path.join(root, 'persistent-replicas'))).some((name) => name.includes('.conflict-')));
+  });
+  it('projects a one-cell source push without snapshotting unrelated rich cell state', async () => {
+    await sync.flush(notebook); const state = (sync as any).states.get(notebook);
+    (sync as any).applyCanonical(state); // Finish the bootstrap structure projection.
+    const stacks: string[] = []; const snapshot = state.project.notebookSnapshot.bind(state.project);
+    state.project.notebookSnapshot = (...args: unknown[]) => { stacks.push(new Error().stack ?? 'snapshot'); return snapshot(...args); };
+    const shared = sharedNotebook(doc); shared.cells[0]!.source = 'peer'; editSharedNotebook(doc, shared);
+    push!({ kind: 'notebook', path: 'book.ipynb', epoch, revision: 2, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') });
+    for (let n = 0; n < 100 && cell.document.text !== 'peer'; n++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(cell.document.text, 'peer'); assert.equal(stacks.length, 0, stacks.join('\n'));
   });
   it('uses a push update immediately without waiting for poll or save', async () => {
     await sync.flush(notebook); const shared = sharedNotebook(doc); shared.cells[0]!.source = 'remote base'; editSharedNotebook(doc, shared);
@@ -158,6 +198,18 @@ describe('Persistent adapter through the existing production editor', () => {
     assert.equal(cell.document.text, 'first\nsecond'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'first\nsecond');
     assert.equal(intentCalls, 2, '301 later edits must not require 301 serial network round trips');
   });
+  it('commits structure together with its unsent text dependencies while newer input continues', async () => {
+    await sync.flush(notebook); const first = pause(); change(4, 0, '!'); await first.reached;
+    change(5, 0, '?'); const added = fakeCell('print(7)', 'added'); added.notebook = notebook; added.index = 1; notebook.cells.push(added);
+    boundary.__fireNotebookChange(notebook, true);
+    let arrived!: () => void; let release!: () => void; const structural = new Promise<void>((resolve) => { arrived = resolve; }); const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const call = connection.client.call; let committed: any;
+    connection.client.call = async (operation: string, input: any) => { const result = await call(operation, input); if (input.update && !committed) { committed = result; arrived(); await waiting; } return result; };
+    first.release(); await structural;
+    assert.equal(committed.cells.length, 2, 'Structure must not remain pending behind an unsent text clock');
+    assert.equal(committed.cells[0].source, 'base!?'); change(6, 0, '+'); release(); await sync.flush(notebook);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'base!?+'); assert.equal(sharedNotebook(doc).cells.length, 2);
+  });
   it('preserves a remote insertion while newer local text awaits acknowledgement', async () => {
     await sync.flush(notebook);
     const delayed = pause(); change(4, 0, '!'); await delayed.reached; change(5, 0, '-local');
@@ -176,10 +228,10 @@ describe('Persistent adapter through the existing production editor', () => {
     await sync.flush(notebook); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-offline');
     const late = pause(); const pending = sync.flush(notebook); await late.reached; connection = { ...connection, memberId: 'replacement' }; late.release(); await assert.rejects(pending, /connection changed/);
   });
-  it('archives and blocks old-epoch input until an explicit reload after a privacy change', async () => {
+  it('archives old-epoch input and automatically reconnects after a privacy change', async () => {
     await sync.flush(notebook); epoch = 'public-epoch'; doc.destroy(); doc = new Y.Doc(); editSharedNotebook(doc, { metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'public', metadata: {} }] });
-    await assert.rejects(sync.flush(notebook), /changed/); await assert.rejects(sync.flush(notebook), /preserved/);
-    assert.equal(sharedNotebook(doc).cells[0]!.source, 'public'); assert.equal(cell.document.text, 'base');
+    await assert.rejects(sync.flush(notebook), /changed/); await sync.flush(notebook);
+    assert.equal(sharedNotebook(doc).cells[0]!.source, 'public'); assert.equal(cell.document.text, 'public');
     const files = await readdir(path.join(root, 'persistent-replicas')); const archive = files.find((file) => file.includes('conflict')); assert.ok(archive);
     const recovered = JSON.parse(await readFile(path.join(root, 'persistent-replicas', archive), 'utf8')); assert.equal(recovered.displayed[0].source, 'base');
   });

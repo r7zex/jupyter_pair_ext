@@ -5,6 +5,7 @@ import {
   CellExecutionSnapshot,
   CellSnapshot,
   CollaborativeProject,
+  isRemoteProjectOrigin,
   MAX_CELL_OUTPUT_JSON_BYTES,
   MAX_CELL_OUTPUTS,
   MAX_NOTEBOOK_CELLS,
@@ -57,6 +58,8 @@ export interface EditorTextIntentRequest {
   readonly cellId: string | undefined;
   readonly baseline: string;
   readonly changes: readonly TextChange[];
+  /** Positions in the canonical replica, retaining the displayed Yjs identities. */
+  readonly canonicalChanges?: readonly TextChange[];
   readonly result: string;
 }
 
@@ -107,6 +110,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly cellStateRenderer?: NotebookCellStateRenderer,
     private readonly textIntentPublisher?: EditorTextIntentPublisher,
     private readonly uriKey?: (uri: vscode.Uri) => string | undefined,
+    private readonly preserveInitialInput = true,
   ) {
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
@@ -820,7 +824,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     }
     if (this.textObservers.has(key)) return;
     const observer = (event: Y.YTextEvent) => {
-      if (event.transaction.origin !== REMOTE_ORIGIN) return;
+      if (!isRemoteProjectOrigin(event.transaction.origin)) return;
       this.enqueueTextApply(key, async () => {
         const open = vscode.workspace.textDocuments.find((candidate) => this.keyForUri(candidate.uri) === key);
         if (open) await this.applyText(open, this.project.text(key).toString());
@@ -993,7 +997,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const replica = new EditorTextReplica(this.project, key, cellId);
     this.replaceTextReplica(uri, replica);
     if (replica.source() === document.getText()) return;
-    if (document.isDirty) {
+    if (document.isDirty && this.preserveInitialInput) {
       // An already edited buffer is local work, not a stale saved projection.
       this.publishPostApplyText(document, replica, document.getText());
     } else {
@@ -1109,7 +1113,8 @@ export class EditorSynchronizer implements vscode.Disposable {
     const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
     const baseline = replica?.source() ?? canonical.toString();
     const result = applyBufferedTextChanges(baseline, changes);
-    if (result !== undefined && this.textIntentPublisher?.({ key, cellId, baseline, changes: [...changes], result })) {
+    if (result !== undefined && this.textIntentPublisher?.({ key, cellId, baseline, changes: [...changes],
+      canonicalChanges: replica?.canonicalChanges(changes) ?? changes, result })) {
       if (!replica) {
         this.rememberText(document, key, cellId);
         replica = this.textReplicas.get(uri);
