@@ -1,3 +1,5 @@
+import { LineCommentController, peerCommentBackend } from './vscode/lineComments';
+import { editParticipantPermissions } from './vscode/permissions';
 import { lstat, mkdir, open, rm } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
 import os from 'node:os';
@@ -122,6 +124,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const vpsCompute = new VpsComputeController(context, () => runtime);
   persistentController = new PersistentSessionController(context, output);
   context.subscriptions.push(persistentController);
+  context.subscriptions.push(new LineCommentController((document) => persistentController?.commentBackend(document) ?? (runtime ? peerCommentBackend(runtime, document) : undefined)));
+  register(context, 'pairNotebook.managePermissions', async () => {
+    const active = runtime;
+    if (!active) { await persistentController?.managePermissions(); return; }
+    if (!active.coordinator.isCurrentHost()) throw new Error('Only the Session Host can change participant permissions.');
+    const target = await vscode.window.showQuickPick((active.descriptor.knownPeers ?? []).filter((peer) => peer.peerId !== active.coordinator.clock.hostId).map((peer) => ({ label: peer.displayName, peer })), { title: 'Права участника' });
+    if (!target) return;
+    const entries = [...new Set([...active.project.keys(), ...Object.keys(active.descriptor.fileStates ?? {})])].map((key) => ({ path: key, directory: active.descriptor.fileStates?.[key]?.kind === 'directory' }));
+    const permissions = await editParticipantPermissions(target.peer.displayName, active.permissionsFor(target.peer.peerId), entries);
+    if (permissions) await active.setParticipantPermissions(target.peer.peerId, permissions);
+  });
   const sharedTerminal = new SharedTerminalController(() => runtime);
   context.subscriptions.push(sharedTerminal);
   register(context, 'pairNotebook.openSharedTerminal', () => sharedTerminal.open());
@@ -551,12 +564,14 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
       }
     });
     if (runtime !== startupRuntime) throw new SessionStartCancelledError();
+    const editingRuntime = runtime;
     synchronizer = new EditorSynchronizer(
       runtime.project,
       descriptor.workingFolder,
       output,
       runtime.notebookCellIds,
       notebookController,
+      undefined, undefined, true, (key) => editingRuntime.canEdit(key),
     );
     runtime.setEditorLineAnchorResolver(
       (document, offset) => synchronizer?.canonicalOffsetForDocument(document, offset),
@@ -1940,6 +1955,9 @@ function normalizeSessionDescriptor(value: unknown, workspaceFolder: string): Se
     fileStates: raw.fileStates,
     fileRevisionCounter: raw.fileRevisionCounter,
     binaryVersions: raw.binaryVersions,
+    ...(raw.participantPermissions ? { participantPermissions: raw.participantPermissions } : {}),
+    ...(raw.lineComments ? { lineComments: raw.lineComments } : {}),
+    ...(raw.collaborationRevision !== undefined ? { collaborationRevision: raw.collaborationRevision } : {}),
   };
 }
 

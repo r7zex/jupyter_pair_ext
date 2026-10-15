@@ -172,6 +172,7 @@ const commandMap: Record<string, string> = {
   backingFolder: 'pairNotebook.selectBackingFolder',
   compute: 'pairNotebook.changeCompute',
   shell: 'pairNotebook.openSharedTerminal',
+  permissions: 'pairNotebook.managePermissions',
   hardware: 'pairNotebook.refreshHardware',
   recent: 'pairNotebook.openRecentProject',
 };
@@ -502,8 +503,8 @@ function html(): string {
         section('compute','ВЫЧИСЛЕНИЯ',computeCard,'section-compute')+
         section('network','СЕТЬ',networkCard)+
         section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
-        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+transferAction+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
-      for (const name of ['backingFolder','shell','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
+        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+transferAction+action('permissions','Права участников','НАСТРОИТЬ',{disabled:!state.isHost})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
+      for (const name of ['permissions','backingFolder','shell','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
       }

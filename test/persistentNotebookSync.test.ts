@@ -15,6 +15,7 @@ import { PersistentHttpError } from '../src/vps/persistentClient';
 const { vscodeBoundary: boundary, fakeCell, fakeNotebook } = createEditorVscodeBoundary();
 boundary.Position = class { constructor(public readonly line: number, public readonly character: number) {} };
 boundary.workspace.onDidCloseNotebookDocument = () => ({ dispose() {} });
+boundary.workspace.getConfiguration = () => ({ get: (_key: string, fallback: unknown) => fallback });
 Object.assign(boundary.window, { state: { focused: false }, onDidChangeTextEditorSelection: () => ({ dispose() {} }), onDidChangeActiveTextEditor: () => ({ dispose() {} }), onDidChangeWindowState: () => ({ dispose() {} }), onDidChangeVisibleTextEditors: () => ({ dispose() {} }) });
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
 const originalLoad = loader._load; const before = new Set(Object.keys(require.cache));

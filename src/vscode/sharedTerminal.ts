@@ -32,6 +32,11 @@ export class SharedTerminalController implements vscode.Disposable {
     if (view.reset) this.writeRoleNotice();
   };
   private readonly ended = (): void => { this.terminal?.dispose(); this.unbind(); };
+  private readonly permissionsChanged = (): void => {
+    this.clearInput();
+    if (this.bound?.permissionsFor?.().terminal === 'none') { this.ended(); return; }
+    this.writeRoleNotice();
+  };
   private readonly changedHost = (): void => {
     this.clearInput();
     this.write.fire('\r\n[Хост изменился. Команды вводит только текущий хост.]\r\n');
@@ -56,6 +61,7 @@ export class SharedTerminalController implements vscode.Disposable {
   public open(): void {
     const runtime = this.currentRuntime();
     if (!runtime || !vscode.workspace.isTrusted) throw new Error('Join a trusted Pair Notebook session before opening its terminal.');
+    if (runtime.permissionsFor?.().terminal === 'none') throw new Error('The host has disabled shared terminal access for you.');
     if (runtime === this.bound && this.terminal) { this.terminal.show(); return; }
     this.terminal?.dispose();
     this.unbind();
@@ -66,6 +72,7 @@ export class SharedTerminalController implements vscode.Disposable {
     runtime.on('terminal', this.ended);
     runtime.on('hostChanged', this.changedHost);
     runtime.on('state', this.changedState);
+    runtime.on('collaborationChanged', this.permissionsChanged);
     const pty: vscode.Pseudoterminal = {
       onDidWrite: this.write.event, onDidClose: this.closeEvent.event,
       open: () => {
@@ -75,12 +82,13 @@ export class SharedTerminalController implements vscode.Disposable {
       },
       close: () => { if (this.bound === runtime && this.binding === binding) this.unbind(); },
       handleInput: (data) => {
-        if (this.bound !== runtime || this.binding !== binding || this.currentRuntime() !== runtime || !runtime.coordinator.isCurrentHost() || data.includes('\x1b')) return;
+        if (this.bound !== runtime || this.binding !== binding || this.currentRuntime() !== runtime || (!runtime.coordinator.isCurrentHost() && runtime.permissionsFor?.().terminal !== 'write') || data.includes('\x1b')) return;
         if (this.confirmingStop) return;
         for (const character of data) {
           if (this.confirmingStop) break;
           if (character === '\x03') {
             this.clearInput();
+            if (!runtime.coordinator.isCurrentHost()) { this.write.fire('\r\n[Остановку общей оболочки подтверждает хост.]\r\n'); continue; }
             if (this.confirmingStop) continue;
             this.confirmingStop = true;
             void runtime.confirmOperation('terminal-interrupt').catch((error: unknown) => {
@@ -118,7 +126,7 @@ export class SharedTerminalController implements vscode.Disposable {
   private writeRoleNotice(): void {
     this.write.fire(this.bound?.coordinator.isCurrentHost()
       ? '\r\n[Терминал хоста: вводите команды; Ctrl+C запрашивает CONFIRM перед остановкой оболочки и её процессов.]\r\n'
-      : '\r\n[Терминал хоста: только просмотр. Команды вводит текущий хост.]\r\n');
+      : this.bound?.permissionsFor?.().terminal === 'write' ? '\r\n[Хост разрешил ввод команд в общую оболочку.]\r\n' : '\r\n[Терминал хоста: только просмотр. Команды вводит текущий хост.]\r\n');
   }
   private clearInput(): void { this.input = ''; this.inputOverflow = false; }
   private unbind(): void {
@@ -127,6 +135,7 @@ export class SharedTerminalController implements vscode.Disposable {
     this.bound?.off('terminal', this.ended);
     this.bound?.off('hostChanged', this.changedHost);
     this.bound?.off('state', this.changedState);
+    this.bound?.off('collaborationChanged', this.permissionsChanged);
     this.bound = undefined;
     this.terminal = undefined;
     this.lastRuntimeState = undefined;

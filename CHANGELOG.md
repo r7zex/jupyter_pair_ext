@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.5 - 2026-10-15 (participant permissions and line comments)
+
+- Adds host/owner-managed participant permissions: exact editable files or directory subtrees, read-only mode, code execution, and line comments. P2P shared terminals support no access, viewing, or explicitly granted command input; queued work rechecks authority before launch.
+- Adds right-click line comments to ordinary files and notebook cells, with author-colored highlights, a comment badge, hover text, and author/host resolution. Yjs anchors track inserted lines; VPS comments persist and respect Private visibility.
+- Persists participant policies across reconnects, server restarts and host transfer. Enforces permissions at incoming file, CRDT, upload, execution and terminal boundaries. Broader executable-code access remains a separate explicit permission.
+- Uses peer protocol v8: update every P2P participant to 0.6.5. Update the persistent VPS server with the matching archive to use permission management and comments. See [usage and boundaries](docs/PARTICIPANT_PERMISSIONS_AND_COMMENTS.md).
+
 ## 0.6.4 - 2026-10-15 (synchronization and recovery repairs)
 
 - Preserves character identities during concurrent notebook edits and merges structural deltas with unseen typing. Adds live ordinary-file synchronization and flushes unsaved modules before Run.

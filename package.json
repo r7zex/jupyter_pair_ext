@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent VPS workspaces and controlled remote Python execution.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -256,6 +256,18 @@
       {
         "command": "pairNotebook.startComputeSession",
         "title": "Pair Notebook: Start New Standalone Compute Session"
+      },
+      {
+        "command": "pairNotebook.managePermissions",
+        "title": "Pair Notebook: Права участников"
+      },
+      {
+        "command": "pairNotebook.addLineComment",
+        "title": "Pair Notebook: Комментарий к строкам"
+      },
+      {
+        "command": "pairNotebook.resolveLineComment",
+        "title": "Pair Notebook: Закрыть комментарий"
       }
     ],
     "viewsContainers": {
@@ -345,6 +357,18 @@
           "when": "view == pairNotebook.vpsCompute",
           "group": "navigation@4"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "pairNotebook.addLineComment",
+          "when": "(pairNotebook.inSession || pairNotebook.inVpsSession) && (resourceScheme == file || resourceScheme == pair-vps || resourceScheme == vscode-notebook-cell)",
+          "group": "pairNotebook@1"
+        },
+        {
+          "command": "pairNotebook.resolveLineComment",
+          "when": "pairNotebook.inSession || pairNotebook.inVpsSession",
+          "group": "pairNotebook@2"
+        }
       ]
     },
     "configuration": {
@@ -422,6 +446,12 @@
           "scope": "machine",
           "restricted": true,
           "description": "HTTPS endpoint of your own Pair Notebook VPS relay and durable compute service. Run Connect to VPS Compute to store its team token securely. Persistent session participants instead use Connect to VPS with their session password."
+        },
+        "pairNotebook.cursorColor": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(|#[0-9a-fA-F]{6})$",
+          "description": "Cursor and line comment color. Empty selects a stable participant color."
         }
       }
     }

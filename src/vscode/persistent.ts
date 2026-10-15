@@ -13,6 +13,10 @@ import { PersistentNotebookSynchronizer } from './persistentNotebookSync';
 import { PersistentTextSynchronizer } from './persistentTextSync';
 import { renderNotebookCellState, type MirroredCellState } from './notebookCellStateRenderer';
 import { applyJupyterEventToState, createJupyterRenderState } from './jupyterOutputState';
+import { defaultPermissions, mayEdit } from '../core/permissions';
+import type { LineComment } from '../core/lineComments';
+import type { LineCommentBackend, CommentLocation } from './lineComments';
+import { editParticipantPermissions } from './permissions';
 
 const SCHEME = 'pair-vps';
 const CONNECTIONS_KEY = 'pairNotebook.persistentConnections';
@@ -43,6 +47,7 @@ function sameEntries(left: PersistentSnapshot, right: PersistentSnapshot): vscod
 
 /** Server authoritative files. Stale saves fail and leave the editor's dirty changes intact. */
 export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.Disposable {
+  public canEdit: ((key: string) => boolean) | undefined;
   private readonly changed = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
   public readonly onDidChangeFile = this.changed.event;
   private snapshot: PersistentSnapshot = { revision: 0, entries: [] };
@@ -90,12 +95,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     await this.refresh();
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!entry) throw vscode.FileSystemError.FileNotFound(uri);
-    const current = { type: entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
+    const current: vscode.FileStat = { type: entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
     if (this.notebookManaged?.(uri) || this.textManaged?.(uri)) {
       if (!this.notebookStats.has(key)) this.notebookStats.set(key, current);
-      return this.notebookStats.get(key)!;
+      return { ...this.notebookStats.get(key)!, ...(this.canEdit?.(key) === false ? { permissions: vscode.FilePermission.Readonly } : {}) };
     }
-    return current;
+    return { ...current, ...(this.canEdit?.(key) === false ? { permissions: vscode.FilePermission.Readonly } : {}) };
   }
   public async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
     const key = this.check(uri);
@@ -220,6 +225,40 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 79);
   private connection: ActiveConnection | undefined;
   private view: PersistentSessionView | undefined;
+  private comments: LineComment[] = [];
+  private commentsRevision: number | undefined;
+  public canEdit(key: string): boolean {
+    const view = this.view;
+    return !!view && (view.memberId === view.ownerId || mayEdit(view.members.find((member) => member.id === view.memberId)?.permissions ?? defaultPermissions(), key));
+  }
+  public commentBackend(document: vscode.TextDocument): LineCommentBackend | undefined {
+    const connection = this.connection;
+    if (!connection) return undefined;
+    const cell = vscode.workspace.notebookDocuments.flatMap((notebook) => notebook.getCells()).find((cell) => cell.document === document && cell.notebook.uri.scheme === SCHEME && cell.notebook.uri.authority === connection.sessionId);
+    const uri = cell?.notebook.uri ?? document.uri;
+    if (uri.scheme !== SCHEME || uri.authority !== connection.sessionId) return undefined;
+    const locate = (): CommentLocation | undefined => {
+      const cellId = cell ? this.notebookSync.commentCellId(cell) : undefined;
+      return cell && !cellId ? undefined : { path: filePath(uri), ...(cellId ? { cellId } : {}) };
+    };
+    return { localId: connection.memberId, location: () => locate(), comments: () => this.comments,
+      anchors: async (_location, start, end) => cell ? this.notebookSync.commentAnchors(cell, start, end) : this.textSync.commentAnchors(document, start, end),
+      resolve: (comment) => comment.cellId ? this.notebookSync.resolveComment(comment) : this.textSync.resolveComment(comment),
+      change: async (input) => {
+        await this.rpcFor(connection, typeof input === 'string' ? 'removeComment' : 'addComment', typeof input === 'string' ? { commentId: input } : { comment: input });
+        const reply = await this.rpcFor<{ comments: LineComment[] }>(connection, 'comments'); this.assertConnection(connection); this.comments = reply.comments;
+      } };
+  }
+  public async managePermissions(): Promise<void> {
+    const connection = this.requireConnection(); await this.poll(); this.assertConnection(connection);
+    const view = this.view; if (!view || view.memberId !== view.ownerId) throw new Error('Only the VPS session owner can change participant permissions.');
+    const target = await vscode.window.showQuickPick(view.members.filter((member) => member.id !== view.ownerId).map((member) => ({ label: member.name, description: member.online ? 'В сети' : 'Не в сети', member })), { title: 'Права участника VPS' });
+    if (!target) return;
+    const snapshot = await this.rpcFor<PersistentSnapshot>(connection, 'snapshot');
+    const permissions = await editParticipantPermissions(target.member.name, target.member.permissions ?? defaultPermissions(), snapshot.entries.map((entry) => ({ path: entry.path, directory: entry.type === 'directory' })), false);
+    if (!permissions) return;
+    await this.rpcFor(connection, 'permissions', { memberId: target.member.id, permissions }); await this.poll();
+  }
   private polling = false;
   private folderSync: PersistentFolderSync | undefined;
   private disposed = false;
@@ -246,6 +285,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const timer = setInterval(() => { void this.poll(); }, 2_000);
     timer.unref();
     this.textSync = new PersistentTextSynchronizer(context, () => this.connection, log);
+    this.textSync.canEdit = (key) => this.canEdit(key); this.files.canEdit = (key) => this.canEdit(key);
     this.notebookSync = new PersistentNotebookSynchronizer(context, () => this.connection, log, () => {
       void this.files.refresh().catch(() => undefined);
       void this.mirrorActiveExecutions().catch((error) => log.appendLine(`[debug] Live execution discovery: ${error instanceof Error ? error.message : 'Unavailable.'}`));
@@ -254,6 +294,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       renderRemoteCellState: async (cell, request) => { if (this.selectedNotebooks.has(cell.notebook) && !this.managesCell(cell)) await renderNotebookCellState(this.notebook, this.cellMirrors, cell, request); },
     });
     this.files.notebookManaged = (uri) => uri.scheme === SCHEME && uri.authority === this.connection?.sessionId && vscode.workspace.notebookDocuments.some((document) => !document.isClosed && document.uri.toString() === uri.toString());
+    this.notebookSync.canEdit = (key) => this.canEdit(key);
     this.notebookSync.fileEvent = (event) => this.textSync.receive(event);
     this.files.textManaged = (uri) => this.textSync.manages(uri);
     this.files.textSave = async (uri) => { if (!this.textSync.manages(uri)) return false; await this.textSync.flushAll(); await this.files.refresh(); return true; };
@@ -491,6 +532,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.credentialWrites = save.catch(() => undefined);
     await save; current();
     this.connection = connection;
+    this.comments = []; this.commentsRevision = undefined;
     const folder = this.context.globalState.get<{ localRoot: string; remoteRoot: string }>(`pairNotebook.folderSync.${connection.sessionId}.${connection.memberId}`);
     if (folder && typeof folder.localRoot === 'string' && typeof folder.remoteRoot === 'string') this.folderSync = this.makeFolderSync(connection, folder.localRoot, folder.remoteRoot);
     this.view = view;
@@ -526,8 +568,8 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         this.folderSync = undefined;
         this.notebookSync?.reset();
         this.textSync?.reset();
-        this.connection = undefined;
-        this.view = undefined;
+        this.connection = undefined; this.comments = []; this.commentsRevision = undefined;
+        this.view = undefined; this.comments = []; this.commentsRevision = undefined;
         this.files.setConnection(undefined);
         this.status.hide();
         this.changed.fire(undefined);
@@ -555,6 +597,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       if (connection !== this.connection) return;
       const generation = this.view?.generation;
       this.view = view;
+      if (view.collaborationRevision === undefined || this.commentsRevision !== view.collaborationRevision) {
+        const comments = await this.rpcFor<{ comments: LineComment[] }>(connection, 'comments');
+        this.assertConnection(connection); this.comments = comments.comments; this.commentsRevision = view.collaborationRevision;
+      }
       await this.files.refresh();
       const synchronized = await Promise.allSettled((vscode.workspace.notebookDocuments ?? []).map((notebook) => this.notebookSync?.flush(notebook)));
       for (const result of synchronized) if (result.status === 'rejected') this.log.appendLine(`[debug] Notebook will retry independently: ${result.reason instanceof Error ? result.reason.message : 'Unavailable.'}`);
@@ -724,11 +770,12 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const admin = owner || member?.role === 'admin';
     const actions = [{ label: 'Synchronize a local folder continuously', action: 'folderSync' }, { label: 'Stop local folder synchronization', action: 'stopFolderSync' }, { label: 'Copy session connection details', action: 'invite' }, { label: 'Choose compute device', action: 'compute' }];
     if (admin) actions.push({ label: 'Stop session', action: 'stop' }, { label: 'Start session', action: 'start' }, { label: 'Restart session', action: 'restart' }, { label: 'Delete session permanently', action: 'delete' });
-    if (owner) actions.push({ label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
+    if (owner) actions.push({ label: 'Права участников', action: 'permissions' }, { label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
     const action = await vscode.window.showQuickPick(actions, { title: `${view.name} · ${view.id}` });
     if (!action) return;
     this.assertConnection(connection);
     if (action.action === 'folderSync') { await this.synchronizeFolder(); return; }
+    if (action.action === 'permissions') { await this.managePermissions(); return; }
     if (action.action === 'stopFolderSync') { this.folderSync = undefined; await this.context.globalState.update(`pairNotebook.folderSync.${connection.sessionId}.${connection.memberId}`, undefined); return; }
     if (action.action === 'invite') { await vscode.env.clipboard.writeText(`${connection.endpoint}\nSession ID: ${view.id}`); return; }
     if (action.action === 'compute') { await this.selectCompute(); return; }
@@ -985,7 +1032,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const saved = await Promise.allSettled([this.notebookSync.shutdown(), this.textSync.shutdown()]);
     for (const result of saved) if (result.status === 'rejected') this.log.appendLine(`[error] Exit journal write failed: ${result.reason instanceof Error ? result.reason.message : 'Storage unavailable.'}`);
     this.disposed = true;
-    this.connection = undefined;
+    this.connection = undefined; this.comments = []; this.commentsRevision = undefined;
     if (connection) {
       let timer: NodeJS.Timeout | undefined;
       try { await Promise.race([connection.client.call('leave', { sessionId: connection.sessionId }), new Promise<void>((resolve) => { timer = setTimeout(resolve, 1000); timer.unref(); })]); }
@@ -997,7 +1044,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   public dispose(): void {
     this.disposed = true;
     const connection = this.connection;
-    this.connection = undefined;
+    this.connection = undefined; this.comments = []; this.commentsRevision = undefined;
     if (connection) void connection.client.call('leave', { sessionId: connection.sessionId }).catch(() => undefined);
     for (const disposable of this.disposables) disposable.dispose();
   }

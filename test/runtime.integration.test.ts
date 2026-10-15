@@ -9,6 +9,7 @@ import * as Y from 'yjs';
 import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { WebSocketServer } from 'ws';
 import { CollaborativeProject } from '../src/core/crdt';
+import { defaultPermissions } from '../src/core/permissions';
 import { formatInvite, parseInvite, REMOTE_ORIGIN } from '../src/core/types';
 import { generateIdentityCredentials } from '../src/core/identity';
 import { SessionStartCancelledError } from '../src/core/startupRecovery';
@@ -65,6 +66,58 @@ afterEach(() => {
   MeshTransport.setRoomFactoryForTesting(undefined);
   configureMeshNetwork({});
   resetInMemoryTrystero();
+});
+
+describe('host-authorized participant changes', () => {
+  it('rejects denied updates, filesystem states, forged policy and execution before processing payloads', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-permissions-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'permissions', role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: root, pythonPath: 'python3' }), 'permissions-token-that-is-long-enough', context(root), logger());
+    const replica = new CollaborativeProject(); const frames: any[] = [];
+    runtime.transport.sendTo = (_peer: string, type: string, meta: unknown) => frames.push({ type, meta });
+    runtime.transport.broadcast = () => undefined;
+    try {
+      runtime.descriptor.knownPeers = [{ peerId: 'guest', displayName: 'Guest', joinOrder: 1 }];
+      runtime.project.ensureText('blocked.py', 'original');
+      runtime.project.ensureText('allowed.py', 'allowed');
+      const permissions = { ...defaultPermissions(), edit: 'selected', paths: ['allowed.py'], execute: false, terminal: 'none' };
+      await runtime.setParticipantPermissions('guest', permissions);
+      const state = runtime.ensureLiveFileState('blocked.py', 'text');
+      replica.applyRemoteUpdate('blocked.py', 'text', runtime.project.encodeUpdate('blocked.py')); replica.replaceText('blocked.py', 'FORGED');
+      await runtime.onMessage({ type: 'projectUpdate', meta: { key: 'blocked.py', kind: 'text', fileState: state }, payload: replica.encodeUpdate('blocked.py') }, 'guest');
+      assert.equal(runtime.project.text('blocked.py').toString(), 'original');
+      assert.equal(await runtime.acceptFileState('blocked.py', { ...state, version: state.version + 1, deleted: true }, 'guest'), false);
+      assert.equal(runtime.canEdit('allowed.py', 'guest'), true); assert.equal(runtime.canEdit('blocked.py', 'guest'), false);
+      await assert.rejects(runtime.reconcileExecutionManifest({ documents: {}, binaries: {}, directories: ['forbidden'] }, 'guest'), /cannot create/);
+      const transferFile = path.join(root, 'revoked.part'); await writeFile(transferFile, 'FORGED');
+      runtime.binaryTransfers.set('guest\u0000revoked', { sourceId: 'guest', relativePath: 'blocked.py', temporaryPath: transferFile, idleTimer: setTimeout(() => undefined, 1000), handle: { close: async () => undefined } });
+      await runtime.finishBinary('guest', 'revoked');
+      await assert.rejects(readFile(transferFile), { code: 'ENOENT' });
+      assert.equal(runtime.project.text('blocked.py').toString(), 'original');
+      await runtime.onMessage({ type: 'collaborationState', meta: { clock: runtime.coordinator.clock, revision: 999 }, payload: Buffer.from(JSON.stringify({ permissions: {}, comments: [] })) }, 'guest');
+      assert.equal(runtime.permissionsFor('guest').execute, false);
+      await runtime.onMessage({ type: 'executeRequest', meta: { requestId: '00000000-0000-4000-a000-000000000001' }, payload: Buffer.alloc(0) }, 'guest');
+      assert.ok(frames.some((frame) => frame.type === 'executeResult'));
+      assert.equal(runtime.kernels.size, 0);
+    } finally { replica.destroy(); await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
+  it('keeps author-colored comments anchored after inserted lines and persists authority for host recovery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-host-comments-'));
+    const runtime = new SessionRuntime(descriptor({ sessionId: 'comments', role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: root, pythonPath: 'python3' }), 'comments-token-that-is-long-enough', context(root), logger());
+    const frames: any[] = []; runtime.transport.sendTo = (_peer: string, type: string, meta: unknown) => frames.push({ type, meta }); runtime.transport.broadcast = () => undefined;
+    try {
+      runtime.descriptor.knownPeers = [{ peerId: 'guest', displayName: 'Guest', joinOrder: 1 }, { peerId: 'other', displayName: 'Other', joinOrder: 2 }];
+      runtime.project.ensureText('main.py', 'first\nsecond');
+      const input = { path: 'main.py', startLine: 1, endLine: 1, ...runtime.commentAnchors('main.py', undefined, 6, 12), color: '#FFB74D', text: 'Review second' };
+      await runtime.applyComment(input, 'guest');
+      const comment = runtime.lineComments()[0]; assert.equal(comment.authorName, 'Guest'); assert.equal(comment.color, '#FFB74D');
+      runtime.project.applyTextChanges('main.py', [{ offset: 0, deleteCount: 0, insertText: 'new\n' }]);
+      assert.deepEqual(runtime.resolveComment(comment), { start: 10, end: 16 });
+      await assert.rejects(runtime.applyComment(comment.id, 'other'), /author or host/);
+      const marker = JSON.parse(await readFile(path.join(root, '.pair-notebook-session.json'), 'utf8'));
+      assert.equal(marker.lineComments[0].text, 'Review second');
+      await runtime.changeComment(comment.id); assert.deepEqual(runtime.lineComments(), []);
+    } finally { await runtime.leave(); await rm(root, { recursive: true, force: true }); }
+  });
 });
 
 describe('production SessionRuntime integration', () => {
@@ -3393,6 +3446,10 @@ describe('compute and lifecycle regression coverage', () => {
       peer = new SessionRuntime(peerDescriptor, token, context(extensionRoot), logger(), peerIdentity.privateKey);
       await peer.start();
       await waitFor(() => host.snapshot().peers.some((item: any) => item.peerId === 'peer-z' && item.online), 5000, 'transfer peer online');
+      const participantPolicy = { ...defaultPermissions(), edit: 'selected', paths: ['handoff.txt'], execute: false, terminal: 'none' };
+      await host.setParticipantPermissions('peer-z', participantPolicy);
+      await host.changeComment({ path: 'handoff.txt', startLine: 0, endLine: 0, ...host.commentAnchors('handoff.txt', undefined, 0, 19), text: 'Keep this comment through transfer', color: '#81C784' });
+      await waitFor(() => peer.descriptor.participantPermissions?.['peer-z']?.execute === false && peer.lineComments().length === 1, 3000, 'host collaboration state');
       await host.transferHost('peer-z');
       await waitFor(() => host.coordinator.clock.hostId === 'peer-z' && peer.coordinator.clock.hostId === 'peer-z', 5000, 'host transfer convergence');
       assert.equal(host.descriptor.role, 'peer');
@@ -3430,6 +3487,8 @@ describe('compute and lifecycle regression coverage', () => {
       await third.setBackingFolder(oldHostBacking, 'reuse-existing');
       await waitFor(() => [host, peer, third].every((item) => !item.snapshot().waitingForHostFolder), 3000, 'second transfer resume');
       assert.equal(third.descriptor.hostEpoch, 2);
+      assert.deepEqual(third.permissionsFor('peer-z'), participantPolicy);
+      assert.equal(third.lineComments()[0].text, 'Keep this comment through transfer');
     } finally {
       host.descriptor.mode = 'host-only';
       if (peer) peer.descriptor.mode = 'host-only';

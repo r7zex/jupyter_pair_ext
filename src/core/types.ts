@@ -1,5 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateIdentityPublicKey } from './identity';
+import type { ParticipantPermissions } from './permissions';
+import type { LineComment } from './lineComments';
 
 export type SessionMode = 'host-only' | 'resilient';
 export type ConnectionRoute = 'Direct' | 'Relay' | 'Unknown';
@@ -131,6 +133,9 @@ export function normalizeHostClock(value: unknown, expectedSessionEpoch?: number
 }
 
 export interface SessionDescriptor {
+  participantPermissions?: Record<string, ParticipantPermissions>;
+  lineComments?: LineComment[];
+  collaborationRevision?: number;
   sessionId: string;
   projectId: string;
   projectName: string;

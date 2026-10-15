@@ -10,6 +10,8 @@ import { REMOTE_ORIGIN } from '../core/types';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
 import type { PersistentLiveEvent } from '../vps/persistentLive';
 import { EditorSynchronizer } from './sync';
+import { encodeRelativeOffset, resolveRelativeOffset } from '../core/cursorPosition';
+import type { LineComment, LineCommentInput } from '../core/lineComments';
 
 interface Connection { endpoint: string; sessionId: string; memberId: string; client: PersistentClient }
 interface Reply { epoch: string; revision: number; update: string }
@@ -26,6 +28,20 @@ export class PersistentTextSynchronizer implements vscode.Disposable {
   private readonly listeners: vscode.Disposable[];
   private readonly timer: NodeJS.Timeout;
   private stopped = false;
+  public canEdit: ((key: string) => boolean) | undefined;
+  public async commentAnchors(document: vscode.TextDocument, start: number, end: number): Promise<Pick<LineCommentInput, 'startAnchor' | 'endAnchor' | 'epoch'>> {
+    const state = await this.ensure(document); if (!state) throw new Error('Wait for file synchronization.');
+    const text = state.project.text(state.key);
+    const first = state.editor?.canonicalOffsetForDocument(document, start), last = state.editor?.canonicalOffsetForDocument(document, end);
+    if (first === undefined || last === undefined) throw new Error('Wait for file synchronization.');
+    return { epoch: state.epoch, startAnchor: encodeRelativeOffset(text, first), endAnchor: encodeRelativeOffset(text, last) };
+  }
+  public resolveComment(comment: LineComment): { start: number; end: number } | undefined {
+    const state = [...this.states.values()].find((state) => state.key === comment.path && state.epoch === comment.epoch);
+    if (!state || state.document.getText() !== state.project.text(state.key).toString()) return undefined;
+    const text = state.project.text(state.key), start = resolveRelativeOffset(text, comment.startAnchor, undefined), end = resolveRelativeOffset(text, comment.endAnchor, undefined);
+    return start === undefined || end === undefined ? undefined : { start, end };
+  }
   constructor(private readonly context: vscode.ExtensionContext, private readonly connection: () => Connection | undefined,
     private readonly log: Pick<vscode.OutputChannel, 'appendLine'>) {
     this.listeners = [vscode.workspace.onDidOpenTextDocument((document) => { void this.ensure(document).catch((error) => this.report(error)); }),
@@ -78,6 +94,7 @@ export class PersistentTextSynchronizer implements vscode.Disposable {
         this.log.appendLine('[warn] Invalid text journal archived; reconnecting from the server and editor.');
       }
     }
+    if (saved && this.canEdit?.(state.key) === false) { await rename(state.file, `${state.file}.read-only-${Date.now()}.json`); saved = undefined; this.remoteBootstrap.add(state.document); }
     const reply = await state.connection.client.call<Reply>('textSync', { sessionId: state.connection.sessionId, path: state.key }); this.current(state);
     state.epoch = reply.epoch; state.project.applyRemoteUpdate(state.key, 'text', Buffer.from(reply.update, 'base64'));
     if (saved?.epoch === reply.epoch) {
@@ -94,7 +111,7 @@ export class PersistentTextSynchronizer implements vscode.Disposable {
       void this.send(state).catch((error) => this.report(error));
     });
     state.editor = new EditorSynchronizer(state.project, '', this.log, undefined, undefined, undefined,
-      (uri) => uri.toString() === state.document.uri.toString() ? state.key : undefined, !this.remoteBootstrap.has(state.document));
+      (uri) => uri.toString() === state.document.uri.toString() ? state.key : undefined, !this.remoteBootstrap.has(state.document), (key) => this.canEdit?.(key) !== false);
     this.remoteBootstrap.delete(state.document);
     await this.persist(state);
   }
@@ -113,7 +130,7 @@ export class PersistentTextSynchronizer implements vscode.Disposable {
         } catch (error) {
           state.pending = state.pending ? Y.mergeUpdates([update, state.pending]) : update; delete state.inFlight;
           await this.persist(state);
-          if (error instanceof PersistentHttpError && [400, 409, 413].includes(error.status)) {
+          if (error instanceof PersistentHttpError && [400, 403, 409, 413].includes(error.status)) {
             await this.recoverReplacement(state);
             if (error.status !== 409) void vscode.window.showWarningMessage('The server could not accept this edit. It was archived locally for recovery; reconnecting to the saved file.');
           }

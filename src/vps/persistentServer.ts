@@ -18,6 +18,8 @@ import type { TextChange } from '../core/crdt';
 import { editSharedNotebook, type NotebookSyncReply } from './persistentNotebookCrdt';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
 import { safeJobPath, VPS_ID, visibleVpsText } from './protocol';
+import { defaultPermissions, mayEdit, mayChangeTree, normalizePermissions, type ParticipantPermissions } from '../core/permissions';
+import { MAX_LINE_COMMENTS, normalizeCommentInput, normalizeLineComment, reanchorComment, commentColor, participantColor, type LineComment } from '../core/lineComments';
 
 const scrypt = (value: string, salt: string): Promise<Buffer> => new Promise((resolve, reject) => {
   deriveKey(value, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, key) => error ? reject(error) : resolve(key));
@@ -35,7 +37,7 @@ const token = (): string => randomBytes(32).toString('base64url');
 class SessionError extends Error {
   public constructor(public readonly status: number, message: string) { super(message); }
 }
-interface MemberRecord { id: string; name: string; role: PersistentMember['role']; tokenHash: string; revoked: boolean; invitationId?: string; expiresAt?: number; readOnly?: boolean }
+interface MemberRecord { id: string; name: string; role: PersistentMember['role']; tokenHash: string; revoked: boolean; invitationId?: string; expiresAt?: number; readOnly?: boolean; permissions?: ParticipantPermissions }
 interface Invitation { id: string; tokenHash: string; expiresAt: number; readOnly: boolean; revoked: boolean }
 interface ExecutionRecord {
   execution: PersistentExecution; requestId: string; commandId: string; cellIdentity: string;
@@ -52,6 +54,8 @@ interface SessionRecord {
   executions: ExecutionRecord[];
   aclEpoch: number;
   invitations?: Invitation[];
+  comments?: LineComment[];
+  commentRevision?: number;
 }
 interface Session { record: SessionRecord; workspace: PersistentWorkspace; policy: PersistentComputePolicy; seen: Map<string, number>; history: PersistentHistory; live: PersistentLive }
 interface NotebookCell { id?: string; cell_type?: string; source?: string | string[]; outputs?: unknown[]; execution_count?: number | null }
@@ -203,6 +207,11 @@ export class PersistentSessionHost {
     await atomicWriteFile(filename, content);
   }
   private validateRecord(record: SessionRecord, id: string): void {
+    for (const member of record.members ?? []) if (member.permissions !== undefined) normalizePermissions(member.permissions);
+    if (record.comments !== undefined) {
+      if (!Array.isArray(record.comments) || record.comments.length > MAX_LINE_COMMENTS) throw new Error('Invalid saved comments.');
+      record.comments = record.comments.map(normalizeLineComment);
+    }
     if (!record || record.version !== 1 || record.id !== id || !VPS_ID.test(record.ownerId) || !visibleVpsText(record.name, 120)
       || !['running', 'stopped'].includes(record.state) || !record.password || !/^[a-f0-9]{32}$/.test(record.password.salt)
       || !/^[a-f0-9]{128}$/.test(record.password.hash) || !Array.isArray(record.members) || record.members.length > 128
@@ -238,7 +247,7 @@ export class PersistentSessionHost {
   }
   private members(session: Session): PersistentMember[] {
     return session.record.members.filter((member) => this.validMember(session, member)).map((member) => ({ id: member.id, name: member.name, role: member.role,
-      online: (session.seen.get(member.id) ?? 0) > Date.now() - PRESENCE_MS }));
+      online: (session.seen.get(member.id) ?? 0) > Date.now() - PRESENCE_MS, permissions: this.permissions(member) }));
   }
   private validMember(session: Session, member: MemberRecord): boolean {
     return !member.revoked && (member.expiresAt === undefined || member.expiresAt > Date.now())
@@ -269,6 +278,14 @@ export class PersistentSessionHost {
     session.record.aclEpoch++; session.policy.invalidateKernels(); await this.persist(session);
   }
   private owner(session: Session, member: MemberRecord): void { if (member.id !== session.record.ownerId) throw new SessionError(403, 'Only the owner can change this authority.'); }
+  private permissions(member: MemberRecord): ParticipantPermissions {
+    return member.readOnly ? defaultPermissions(true) : member.permissions ?? defaultPermissions();
+  }
+  private requireEdit(session: Session, member: MemberRecord, filename: string, destination?: string): void {
+    if (portableRelativePath(filename) !== filename || (destination !== undefined && portableRelativePath(destination) !== destination)) throw new SessionError(400, 'Invalid project path.');
+    if (member.id === session.record.ownerId) return;
+    if (!mayChangeTree(this.permissions(member), filename, session.workspace.snapshot(false).entries.map((entry) => entry.path), destination)) throw new SessionError(403, 'You do not have permission to edit these project files.');
+  }
   private administrator(member: MemberRecord): void { if (member.role !== 'owner' && member.role !== 'admin') throw new SessionError(403, 'Session administration permission is required.'); }
   private string(body: PersistentRpcRequest, key: string): string { const value = body[key]; if (typeof value !== 'string') throw new SessionError(400, `Invalid ${key}.`); return value; }
   private revision(body: PersistentRpcRequest): number { const value = body.expectedRevision; if (!Number.isSafeInteger(value) || (value as number) < 0) throw new SessionError(400, 'Expected revision is required.'); return value as number; }
@@ -282,6 +299,7 @@ export class PersistentSessionHost {
     const devices = policy.devices.map((device) => ({ ...device, usingMemberIds: [...new Set(session.record.executions
       .filter((run) => (member.id === session.record.ownerId || run.execution.scope !== 'private') && run.execution.state === 'running' && run.execution.deviceId === device.id).map((run) => run.execution.requesterId))] }));
     return { id: session.record.id, name: session.record.name, state: session.record.state, ownerId: session.record.ownerId,
+      collaborationRevision: (session.record.commentRevision ?? 0) + session.record.aclEpoch,
       memberId: member.id, members: this.members(session), revision: session.workspace.snapshot(member.id === session.record.ownerId).revision,
       allowMemberSwitch: policy.allowMemberSwitch, devices, target: policy.target, generation: policy.generation,
       consents: policy.consents.filter((consent) => member.id === session.record.ownerId || consent.requesterId === member.id || policy.devices.some((device) => device.id === consent.deviceId && device.ownerId === member.id)) };
@@ -363,6 +381,64 @@ export class PersistentSessionHost {
     if (!['leave', 'claim', 'report', 'registerDevice', 'share'].includes(body.operation)) session.seen.set(member.id, Date.now());
     session.policy.setMembers(this.members(session));
     const owner = member.id === session.record.ownerId;
+    if (body.operation === 'permissions') {
+      this.owner(session, member);
+      const target = session.record.members.find((candidate) => candidate.id === body.memberId && this.validMember(session, candidate));
+      if (!target || target.id === session.record.ownerId) throw new SessionError(400, 'Select a non-owner participant.');
+      try { target.permissions = normalizePermissions(body.permissions); } catch (error) { throw new SessionError(400, (error as Error).message); }
+      target.readOnly = false;
+      await this.persist(session); session.live.invalidate(); return this.view(session, member);
+    }
+    if (['write', 'mkdir', 'rename', 'remove', 'commitUpload'].includes(body.operation)) this.requireEdit(session, member, this.string(body, 'path'), body.operation === 'rename' ? this.string(body, 'newPath') : undefined);
+    if (body.operation === 'uploadChunk') this.requireEdit(session, member, this.string(body, 'path'));
+    if (['execute', 'kernel', 'kernelControl', 'select'].includes(body.operation) && !owner && !this.permissions(member).execute) throw new SessionError(403, 'Code execution is disabled for this participant.');
+    if (body.operation === 'comments') {
+      const visible = new Set(session.workspace.snapshot(owner).entries.map((entry) => entry.path));
+      return { comments: (session.record.comments ?? []).filter((comment) => visible.has(comment.path)) };
+    }
+    if (body.operation === 'addComment' || body.operation === 'removeComment') {
+      this.active(session);
+      if (!owner && !this.permissions(member).comment) throw new SessionError(403, 'Comments are disabled for this participant.');
+      const comments = session.record.comments ??= [];
+      if (body.operation === 'removeComment') {
+        const comment = comments.find((entry) => entry.id === body.commentId);
+        if (!comment) throw new SessionError(404, 'Comment is unavailable.');
+        if (!owner) await session.workspace.read(comment.path, false);
+        if (!owner && comment.authorId !== member.id) throw new SessionError(403, 'Only the author or owner can remove a comment.');
+        session.record.comments = comments.filter((entry) => entry !== comment);
+      } else {
+        let input: ReturnType<typeof normalizeCommentInput>;
+        try { input = normalizeCommentInput(body.comment); } catch (error) { throw new SessionError(400, (error as Error).message); }
+        const file = await session.workspace.read(input.path, owner);
+        if (comments.length >= MAX_LINE_COMMENTS) throw new SessionError(409, 'Resolve an existing comment before adding more.');
+        if (input.cellId) {
+          const { doc, epoch } = loadNotebookCrdt(file.content);
+          try {
+            const cell = sharedNotebook(doc).cells.find((cell) => cell.id === input.cellId);
+            if (!cell || input.epoch !== epoch) throw new SessionError(409, 'Notebook cell changed. Select its lines again.');
+            const text = doc.getMap<Y.Map<unknown>>('cells').get(cell.id)?.get('source');
+            if (!(text instanceof Y.Text)) throw new SessionError(400, 'Invalid comment anchor.');
+            try { input = reanchorComment(input, text); } catch (error) { throw new SessionError(409, (error as Error).message); }
+          } finally { doc.destroy(); }
+        } else {
+          const source = Buffer.from(file.content, 'base64').toString('utf8');
+          type Replica = { epoch: string; hash: string; update: string; previous?: Replica };
+          let replica: Replica;
+          try { replica = JSON.parse(await this.readMetadata(path.join(this.directory(id), 'text-replicas', sha(input.path) + '.json'), 25 * 1024 * 1024)) as Replica; }
+          catch { throw new SessionError(409, 'Open and synchronize the text file before commenting.'); }
+          if (replica.hash !== sha(source) && replica.previous?.hash === sha(source)) replica = replica.previous;
+          if (replica.epoch !== input.epoch || replica.hash !== sha(source)) throw new SessionError(409, 'Text file changed. Select its lines again.');
+          const doc = new Y.Doc();
+          try {
+            Y.applyUpdate(doc, Buffer.from(replica.update, 'base64'));
+            input = reanchorComment(input, doc.getText('content'));
+          } catch (error) { throw new SessionError(409, (error as Error).message); } finally { doc.destroy(); }
+        }
+        comments.push({ ...input, id: randomUUID(), authorId: member.id, authorName: member.name, createdAt: Date.now() });
+      }
+      session.record.commentRevision = (session.record.commentRevision ?? 0) + 1;
+      await this.persist(session); session.live.invalidate(); return { saved: true };
+    }
     if (member.readOnly && !['view', 'heartbeat', 'leave', 'snapshot', 'read', 'execution', 'executions', 'artifacts', 'notebookSync', 'textSync', 'presence'].includes(body.operation)) throw new SessionError(403, 'This invitation grants read access only.');
     if (['uploadChunk', 'commitUpload', 'discardUpload'].includes(body.operation)) {
       const uploadId = this.string(body, 'uploadId'); if (!/^[a-f0-9]{64}$/.test(uploadId)) throw new SessionError(400, 'Invalid upload identifier.');
@@ -444,7 +520,7 @@ export class PersistentSessionHost {
           if (body.cursor !== undefined && !cursor) throw new SessionError(400, 'Invalid presence cursor.');
           session.live.update(member.id, { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) },
             epoch, readOnly: !!member.readOnly, kernelStatus: 'Idle', activeFile: filename, activeNotebookCellId: cellId,
-            activeLineAnchor: anchor, activeLine: text.toString().slice(0, offset).split('\n').length - 1, shareCursor: true, cursorColor: '#4FC3F7', ...(cursor ? { cursor: createSharedCursorPosition(text, cursor.anchor, cursor.active) } : {}) });
+            activeLineAnchor: anchor, activeLine: text.toString().slice(0, offset).split('\n').length - 1, shareCursor: true, cursorColor: typeof body.cursorColor === 'string' ? commentColor(body.cursorColor) : participantColor(member.id), ...(cursor ? { cursor: createSharedCursorPosition(text, cursor.anchor, cursor.active) } : {}) });
         } finally { doc.destroy(); }
       }
       return { states: session.live.states((filename) => session.workspace.snapshot(owner).entries.some((entry) => entry.path === filename && entry.type === 'file')) };
@@ -480,7 +556,7 @@ export class PersistentSessionHost {
         if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Text file was replaced.');
         const vector = Y.encodeStateVector(doc);
         if (body.update !== undefined) {
-          if (member.readOnly) throw new SessionError(403, 'This invitation grants read access only.');
+          if (!owner && !mayEdit(this.permissions(member), filename)) throw new SessionError(403, 'You do not have permission to edit this file.');
           const update = this.string(body, 'update'); if (update.length > 12 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(update)) throw new SessionError(413, 'Text update exceeds limits.');
           try { Y.applyUpdate(doc, Buffer.from(update, 'base64')); } catch { throw new SessionError(400, 'Invalid text update.'); }
         }
@@ -507,7 +583,7 @@ export class PersistentSessionHost {
         let intentApplied = false;
         let implicitPresence: PersistentPresence | undefined;
         if (body.intent !== undefined) {
-          if (member.readOnly) throw new SessionError(403, 'This invitation grants read access only.');
+          if (!owner && !mayEdit(this.permissions(member), filename)) throw new SessionError(403, 'You do not have permission to edit this file.');
           const intent = body.intent as { actor: string; sequence: number; cellId: string; baseline: string; changes: TextChange[]; update?: string };
           if (!intent || !/^[A-Za-z0-9_-]{32,64}$/.test(intent.actor) || !Number.isSafeInteger(intent.sequence) || intent.sequence < 1
             || typeof intent.baseline !== 'string' || Buffer.byteLength(intent.baseline) > 2 * 1024 * 1024 || !Array.isArray(intent.changes) || !intent.changes.length || intent.changes.length > 100) throw new SessionError(400, 'Invalid text intent.');
@@ -543,7 +619,7 @@ export class PersistentSessionHost {
             const start = offset <= 0 ? 0 : text.toString().lastIndexOf('\n', offset - 1) + 1;
             if (!intent.update) implicitPresence = { peer: { peerId: member.id, displayName: member.name, joinOrder: session.record.members.indexOf(member) }, epoch, readOnly: false,
               kernelStatus: 'Idle', activeFile: filename, activeNotebookCellId: cell.id, activeLineAnchor: encodeRelativeOffset(text, start),
-              activeLine: text.toString().slice(0, start).split('\n').length - 1, cursor: createSharedCursorPosition(text, offset, offset), shareCursor: true, cursorColor: '#4FC3F7' };
+              activeLine: text.toString().slice(0, start).split('\n').length - 1, cursor: createSharedCursorPosition(text, offset, offset), shareCursor: true, cursorColor: typeof body.cursorColor === 'string' ? commentColor(body.cursorColor) : participantColor(member.id) };
             template.metadata ??= {};
             const retained = Object.fromEntries(Object.entries(ledger).filter(([actor]) => actor !== intent.actor).slice(-63));
             template.metadata.pair_crdt = { ...template.metadata.pair_crdt, intents: { ...retained, [intent.actor]: { member: member.id, sequence: intent.sequence, digest } } }; intentApplied = true;
@@ -561,7 +637,7 @@ export class PersistentSessionHost {
           if (!snapshot || !Array.isArray(snapshot.cells) || snapshot.cells.some((cell) => previous.cells.some((old) => old.id === cell.id && old.source !== cell.source))) throw new SessionError(409, 'Reload notebook text before changing its structure.');
           try { editSharedNotebook(doc, snapshot); } catch { throw new SessionError(400, 'Invalid notebook structure.'); }
         }
-        if (member.readOnly && !Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw new SessionError(403, 'This invitation grants read access only.');
+        if (!owner && !mayEdit(this.permissions(member), filename) && !Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw new SessionError(403, 'You do not have permission to edit this file.');
         let content: string;
         try { content = saveNotebookCrdt(doc, epoch, template); } catch { throw new SessionError(400, 'Invalid or oversized notebook CRDT.'); }
         const revision = content === file.content && !intentApplied ? file.revision : (await session.workspace.write(filename, content, file.revision, owner, undefined, false, true)).revision;
@@ -594,6 +670,8 @@ export class PersistentSessionHost {
         && entries.some((entry) => entry.visibility === 'private' && entry.type === 'directory' && target.startsWith(`${entry.path}/`));
       return session.workspace.rename(source, target, this.revision(body), owner, hidesPublicFiles ? () => this.privacyBarrier(session)
         : undefined).then(async (snapshot) => {
+          for (const comment of session.record.comments ?? []) if (comment.path === source || comment.path.startsWith(source + '/')) comment.path = target + comment.path.slice(source.length);
+          session.record.commentRevision = (session.record.commentRevision ?? 0) + 1;
           for (const run of session.record.executions) if (['queued', 'running'].includes(run.execution.state)
             && (run.execution.notebook === source || run.execution.notebook.startsWith(`${source}/`))) {
             run.execution.notebook = target + run.execution.notebook.slice(source.length);
@@ -602,7 +680,11 @@ export class PersistentSessionHost {
         });
     }
     if (body.operation === 'remove') {
-      return session.workspace.remove(this.string(body, 'path'), this.revision(body), owner);
+      const filename = this.string(body, 'path');
+      const snapshot = await session.workspace.remove(filename, this.revision(body), owner);
+      session.record.comments = (session.record.comments ?? []).filter((comment) => comment.path !== filename && !comment.path.startsWith(filename + '/'));
+      session.record.commentRevision = (session.record.commentRevision ?? 0) + 1;
+      await this.persist(session); return snapshot;
     }
     if (body.operation === 'visibility') {
       this.owner(session, member); if (body.visibility !== 'public' && body.visibility !== 'private') throw new SessionError(400, 'Invalid visibility.');
@@ -794,6 +876,8 @@ export class PersistentSessionHost {
       if (run.execution.deviceId !== deviceId || run.execution.state !== 'queued') continue;
       try {
         const latest = session.policy.view();
+        const requester = session.record.members.find((member) => member.id === run.execution.requesterId);
+        if (!requester || !this.validMember(session, requester) || (requester.id !== session.record.ownerId && !this.permissions(requester).execute)) throw new SessionError(403, 'Execution permission revoked before launch.');
         if (latest.generation !== run.execution.generation || (run.execution.scope !== 'private' && (latest.target.deviceId !== deviceId || latest.target.gpuUuid !== run.execution.gpuUuid)) || run.aclEpoch !== session.record.aclEpoch) throw new SessionError(409, 'Queued execution selection changed.');
         if (run.execution.scope === 'private' && deviceId !== 'vps' && latest.devices.find((device) => device.id === deviceId)?.ownerId !== session.record.ownerId) throw new SessionError(403, 'Private execution requires the owner machine or VPS.');
         session.policy.assertExecutionTarget(run.execution.requesterId, { deviceId, ...(run.execution.gpuUuid ? { gpuUuid: run.execution.gpuUuid } : {}) }); const file = await session.workspace.read(run.execution.notebook, run.execution.scope === 'private');

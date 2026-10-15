@@ -18,6 +18,7 @@ import { editSharedNotebook, sharedNotebook, type NotebookSyncReply, type Shared
 import type { PersistentLiveEvent, PersistentPresence } from '../vps/persistentLive';
 import { cellUserMetadata, hasLegacyNotebookMetadata, notebookUserMetadata } from './persistentNotebookMetadata';
 import { PresenceRenderer, type PresenceSource } from './presence';
+import { participantColor, commentColor, type LineComment, type LineCommentInput } from '../core/lineComments';
 import { EditorSynchronizer, type EditorTextIntentRequest, type NotebookCellStateRenderer } from './sync';
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
@@ -66,6 +67,23 @@ interface State {
 
 /** VPS transport adapter for the EditorSynchronizer/EditorTextReplica used by a human host. */
 export class PersistentNotebookSynchronizer implements vscode.Disposable {
+  public canEdit: ((key: string) => boolean) | undefined;
+  public commentCellId(cell: vscode.NotebookCell): string | undefined { return this.states.get(cell.notebook)?.ids.knownId(cell); }
+  public async commentAnchors(cell: vscode.NotebookCell, start: number, end: number): Promise<Pick<LineCommentInput, 'startAnchor' | 'endAnchor' | 'epoch'>> {
+    await this.flush(cell.notebook);
+    const state = this.states.get(cell.notebook), id = state?.ids.knownId(cell);
+    const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(id ?? '')?.get('source');
+    if (!state || !id || !(text instanceof Y.Text) || text.toString() !== cell.document.getText()) throw new Error('Wait for notebook synchronization before commenting.');
+    return { epoch: state.epoch, startAnchor: encodeRelativeOffset(text, start), endAnchor: encodeRelativeOffset(text, end) };
+  }
+  public resolveComment(comment: LineComment): { start: number; end: number } | undefined {
+    const state = [...this.states.values()].find((state) => state.key === comment.path && state.epoch === comment.epoch);
+    const text = state?.doc.getMap<Y.Map<unknown>>('cells').get(comment.cellId ?? '')?.get('source');
+    if (!state || !(text instanceof Y.Text)) return undefined;
+    const start = resolveRelativeOffset(text, comment.startAnchor, undefined), end = resolveRelativeOffset(text, comment.endAnchor, undefined);
+    const first = start === undefined ? undefined : this.displayedOffset(state, comment.cellId!, start), last = end === undefined ? undefined : this.displayedOffset(state, comment.cellId!, end);
+    return first === undefined || last === undefined ? undefined : { start: first, end: last };
+  }
   public fileEvent: ((event: PersistentLiveEvent) => void) | undefined;
   private readonly states = new Map<vscode.NotebookDocument, State>();
   private readonly remoteBootstrap = new WeakSet<vscode.NotebookDocument>();
@@ -208,7 +226,8 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       else if (this.lastPresence?.path === state.key && this.lastPresence.cellId === cellId && this.lastPresence.epoch === state.epoch) fields = this.lastPresence;
     }
     if (this.lastPresence && JSON.stringify(fields) === JSON.stringify(this.lastPresence) && Date.now() - this.lastPresenceAt < 750) return;
-    const reply = await connection.client.call<{ states: PersistentPresence[] }>('presence', { sessionId: connection.sessionId, ...fields });
+    const configuredColor = vscode.workspace.getConfiguration('pairNotebook').get<string>('cursorColor', '');
+    const reply = await connection.client.call<{ states: PersistentPresence[] }>('presence', { sessionId: connection.sessionId, ...fields, cursorColor: configuredColor ? commentColor(configuredColor) : participantColor(connection.memberId) });
     if (this.connection() === connection) { this.lastPresence = fields; this.lastPresenceAt = Date.now(); this.presence = reply.states; this.presenceEvents.emit('presence'); }
   }
   private async journal(state: State): Promise<void> {
@@ -235,6 +254,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       }
     }
     this.current(state);
+    if (saved && this.canEdit?.(state.key) === false) { await rename(state.file, `${state.file}.read-only-${randomUUID()}.json`); saved = undefined; this.remoteBootstrap.add(state.notebook); }
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
     const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
     if (reply.textProtocol !== 'yjs-intents-v1') throw new Error('The VPS server needs an update before live editing can connect safely.');
@@ -247,6 +267,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       if (saved.structureUpdate) { state.structureUpdate = saved.structureUpdate; state.structural = 1; }
       else if (saved.snapshot) { editSharedNotebook(state.doc, saved.snapshot); state.structureUpdate = Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64'); state.structural = 1; }
     }
+    if (this.canEdit?.(state.key) !== false) {
     let shared = sharedNotebook(state.doc);
     await mkdir(path.dirname(state.file), { recursive: true, mode: 0o700 });
     if (hasLegacyNotebookMetadata(shared.metadata)) await atomicWriteFile(`${state.file}.legacy-metadata-${randomUUID()}.json`, JSON.stringify(saved ?? { epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc)).toString('base64') }));
@@ -255,6 +276,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     const cleaned = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: state.epoch, update: Buffer.from(Y.encodeStateAsUpdate(state.doc, vector)).toString('base64') }); this.current(state);
     Y.applyUpdate(state.doc, Buffer.from(cleaned.update, 'base64')); state.revision = cleaned.revision; state.identity = cleaned.identity;
     state.acknowledgedSequence = Math.max(state.acknowledgedSequence, cleaned.acknowledgedSequence ?? 0);
+    }
     await this.readSavedCells(state);
     if (state.project.has(state.key)) state.project.reconcileNotebook(state.key, this.projectedSnapshot(state), REMOTE_ORIGIN);
     else state.project.ensureNotebook(state.key, this.projectedSnapshot(state));
@@ -274,10 +296,10 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     const renderer = this.cellStateRenderer && { ...this.cellStateRenderer,
       // Live runs use the controller's observer; fields read from disk are completed snapshots.
       renderRemoteCellState: (cell: vscode.NotebookCell, request: Parameters<NotebookCellStateRenderer['renderRemoteCellState']>[1]) => this.cellStateRenderer!.renderRemoteCellState(cell, { ...request, executionMode: 'snapshot' as const }) };
-    const preserveInput = !this.remoteBootstrap.has(state.notebook); if (!preserveInput) state.initial.clear();
+    const preserveInput = !this.remoteBootstrap.has(state.notebook) && this.canEdit?.(state.key) !== false; if (!preserveInput) state.initial.clear();
     state.editor = new EditorSynchronizer(state.project, '', this.log, state.ids, renderer,
       (request) => this.stage(state, request),
-      (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined, preserveInput);
+      (uri) => uri.toString() === state.notebook.uri.toString() ? state.key : undefined, preserveInput, (key) => this.canEdit?.(key) !== false);
     await state.editor.whenNotebookReady(state.notebook); this.remoteBootstrap.delete(state.notebook); state.initial.clear(); state.initialized = true; await this.journal(state); this.schedulePresence();
   }
   private projectSnapshot(state: State): NotebookSnapshot {
@@ -359,7 +381,10 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     state.doc.transact(() => { for (const change of [...changes].sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); } });
     const update = Y.encodeStateAsUpdate(state.doc, vector);
     const tail = state.intents.at(-1);
-    const merged = tail && tail !== state.activeIntent && tail.cellId === request.cellId && applyChanges(tail.baseline, tail.changes) === baseline ? changesBetween(tail.baseline, request.result) : undefined;
+    // The merged Yjs update preserves character identities. A bounded diff
+    // timing out only needs a net-text bookkeeping fallback, not another RPC.
+    const merged = tail && tail !== state.activeIntent && tail.cellId === request.cellId && applyChanges(tail.baseline, tail.changes) === baseline
+      ? changesBetween(tail.baseline, request.result) ?? [{ offset: 0, deleteCount: tail.baseline.length, insertText: request.result }] : undefined;
     if (tail && merged && tail.update) state.intents[state.intents.length - 1] = { ...tail, changes: merged, update: Buffer.from(Y.mergeUpdates([Buffer.from(tail.update, 'base64'), update])).toString('base64') };
     else state.intents.push({ actor: state.actor, sequence: ++state.sequence, cellId: request.cellId, baseline, changes, update: Buffer.from(update).toString('base64') });
     void this.send(state).catch((error) => this.report(error)); return false;
@@ -393,7 +418,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
           }
           this.applyCanonical(state); this.schedulePresence(); await this.journal(state);
         } catch (error) {
-          if (error instanceof PersistentHttpError && [400, 409, 413].includes(error.status)) { state.blocked = true; void this.conflict(state, error.status !== 409).catch((failure) => this.report(failure)); }
+          if (error instanceof PersistentHttpError && [400, 403, 409, 413].includes(error.status)) { state.blocked = true; void this.conflict(state, error.status !== 409).catch((failure) => this.report(failure)); }
           throw error;
         }
       }

@@ -4,6 +4,7 @@ import { safeRelativePath } from '../core/persistence';
 import { shouldTrackProjectPath } from '../core/projectFiles';
 import type { PresenceState, SessionRuntime } from '../runtime/session';
 import type { ResolvedCursorPosition } from '../core/cursorPosition';
+import { commentColor } from '../core/lineComments';
 
 export interface PresenceSource {
   exactCursor?: boolean;
@@ -21,6 +22,7 @@ export interface PresenceSource {
 export class PresenceRenderer implements vscode.Disposable {
   private readonly decorations = new Map<string, vscode.TextEditorDecorationType>();
   private readonly cursors = new Map<string, vscode.TextEditorDecorationType>();
+  private readonly colors = new Map<string, string>();
   private readonly disposables: vscode.Disposable[];
   private signature = '';
   private readonly invalidPresenceSignatures = new Map<string, string>();
@@ -60,6 +62,7 @@ export class PresenceRenderer implements vscode.Disposable {
       activeLine: state.activeLine,
       activeLineAnchor: state.activeLineAnchor,
       cursor: state.cursor,
+      cursorColor: state.cursorColor,
     })).sort((left, right) => left.peerId.localeCompare(right.peerId)));
     if (!force && signature === this.signature) return;
     this.signature = signature;
@@ -79,7 +82,8 @@ export class PresenceRenderer implements vscode.Disposable {
         const line = this.renderedLine(state, editor.document);
         if (line === undefined) continue;
         const textLine = editor.document.lineAt(line);
-        editor.setDecorations(this.decorationFor(state.peer.peerId), [{
+        const color = commentColor(state.cursorColor);
+        editor.setDecorations(this.decorationFor(state.peer.peerId, color), [{
           // Keep the whole-line decoration from tracking mutable line contents across newline edits.
           range: new vscode.Range(textLine.range.start, textLine.range.start),
           hoverMessage: state.peer.displayName,
@@ -87,10 +91,10 @@ export class PresenceRenderer implements vscode.Disposable {
         const cursor = this.runtime.exactCursor ? this.runtime.resolvePresenceCursor?.(state) : undefined;
         if (cursor) {
           let decoration = this.cursors.get(state.peer.peerId);
-          if (!decoration) { decoration = vscode.window.createTextEditorDecorationType({ borderStyle: 'solid', borderWidth: '0 0 0 2px', borderColor: '#4FC3F7', rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen }); this.cursors.set(state.peer.peerId, decoration); }
+          if (!decoration) { decoration = vscode.window.createTextEditorDecorationType({ borderStyle: 'solid', borderWidth: '0 0 0 2px', borderColor: color, rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen }); this.cursors.set(state.peer.peerId, decoration); }
           const position = editor.document.positionAt(cursor.active);
           editor.setDecorations(decoration, [{ range: new vscode.Range(position, position), hoverMessage: state.peer.displayName,
-            renderOptions: { after: { contentText: state.peer.displayName, color: '#4FC3F7', margin: '0 0 0 4px', fontStyle: 'italic' } } }]);
+            renderOptions: { after: { contentText: state.peer.displayName, color, margin: '0 0 0 4px', fontStyle: 'italic' } } }]);
         }
       }
     }
@@ -126,20 +130,22 @@ export class PresenceRenderer implements vscode.Disposable {
       .sort((left, right) => left.peer.joinOrder - right.peer.joinOrder || left.peer.peerId.localeCompare(right.peer.peerId));
   }
 
-  private decorationFor(peerId: string): vscode.TextEditorDecorationType {
+  private decorationFor(peerId: string, color: string): vscode.TextEditorDecorationType {
+    if (this.colors.get(peerId) !== color) this.disposeDecoration(peerId);
     const existing = this.decorations.get(peerId);
     if (existing) return existing;
     const decoration = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
       borderStyle: 'solid',
       borderWidth: '0 0 0 2px',
-      borderColor: '#4FC3F7',
-      backgroundColor: '#4FC3F722',
-      overviewRulerColor: '#4FC3F7',
+      borderColor: color,
+      backgroundColor: color + '22',
+      overviewRulerColor: color,
       overviewRulerLane: vscode.OverviewRulerLane.Right,
       rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen,
     });
     this.decorations.set(peerId, decoration);
+    this.colors.set(peerId, color);
     return decoration;
   }
 
@@ -174,6 +180,7 @@ export class PresenceRenderer implements vscode.Disposable {
   }
 
   private disposeDecoration(peerId: string): void {
+    this.colors.delete(peerId);
     this.decorations.get(peerId)?.dispose();
     this.decorations.delete(peerId);
     this.cursors.get(peerId)?.dispose(); this.cursors.delete(peerId);

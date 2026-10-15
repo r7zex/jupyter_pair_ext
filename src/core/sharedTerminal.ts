@@ -20,13 +20,16 @@ export interface TerminalView { text: string; reset: boolean }
 interface TerminalAuthority {
   isHost(): boolean;
   hostId(): string;
+  canRead?(peer: string): boolean;
+  canWrite?(peer: string): boolean;
+  canEnter?(): boolean;
   available(): boolean;
   directory(): string;
   prepare(): Promise<void>;
   send(peer: string | undefined, type: string, meta: Record<string, unknown>, payload?: Uint8Array): void;
 }
 
-/** Only local host input reaches a shell. The network exposes output and snapshots. */
+/** Host-owned shell with authenticated, explicitly granted remote input. */
 export class SharedTerminal extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | undefined;
   private history = '';
@@ -49,6 +52,8 @@ export class SharedTerminal extends EventEmitter {
   private snapshotRequested = false;
   private snapshotTimer: NodeJS.Timeout | undefined;
   private readonly requests = new Map<string, number>();
+  private readonly inputRequests = new Map<string, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
+  private readonly admittedInputs = new Map<string, Promise<void>>();
 
   public constructor(private readonly authority: TerminalAuthority) { super(); }
   public view(): TerminalView { return { text: this.history, reset: true }; }
@@ -67,10 +72,26 @@ export class SharedTerminal extends EventEmitter {
     else if (peer === this.authority.hostId()) this.requestSnapshot(true);
   }
   public handle(frame: WireFrame, source: string): boolean {
-    if (!['shellSnapshotRequest', 'shellSnapshot', 'shellOutput', 'shellInput'].includes(frame.type)) return false;
+    if (!['shellSnapshotRequest', 'shellSnapshot', 'shellOutput', 'shellInput', 'shellInputResult'].includes(frame.type)) return false;
     if (this.closed) return true;
-    // Remote input is deliberately rejected, including frames forged by an invite holder.
-    if (frame.type === 'shellInput') return true;
+    if (frame.type === 'shellInput') {
+      if (!this.authority.isHost() || !this.authority.canWrite?.(source) || !terminalId(frame.meta.requestId) || typeof frame.meta.command !== 'string') return true;
+      const id = source + ':' + frame.meta.requestId;
+      let work = this.admittedInputs.get(id);
+      if (!work) {
+        if (this.admittedInputs.size >= 256) this.admittedInputs.delete(this.admittedInputs.keys().next().value!);
+        work = this.execute(frame.meta.command, source); this.admittedInputs.set(id, work);
+      }
+      void work.then(() => this.send(source, 'shellInputResult', { requestId: frame.meta.requestId }),
+        (error: Error) => this.send(source, 'shellInputResult', { requestId: frame.meta.requestId, error: error.message }));
+      return true;
+    }
+    if (frame.type === 'shellInputResult') {
+      if (source !== this.authority.hostId()) return true;
+      const id = String(frame.meta.requestId); const request = this.inputRequests.get(id);
+      if (request) { clearTimeout(request.timer); this.inputRequests.delete(id); if (frame.meta.error) request.reject(new Error(String(frame.meta.error))); else request.resolve(); }
+      return true;
+    }
     if (frame.type === 'shellSnapshotRequest') {
       const now = Date.now();
       if (this.authority.isHost() && now - (this.requests.get(source) ?? 0) >= 1000) {
@@ -154,10 +175,18 @@ export class SharedTerminal extends EventEmitter {
     return challenge;
   }
 
-  public async execute(command: string): Promise<void> {
-    if (this.closed || !this.authority.isHost() || !this.authority.available()) throw new Error('Only the active session host can enter terminal commands.');
+  public async execute(command: string, source?: string): Promise<void> {
+    if (this.closed || !this.authority.available() || (source ? !this.authority.canWrite?.(source) : !this.authority.isHost() && !this.authority.canEnter?.())) throw new Error('Only the active session host or an authorized participant can enter terminal commands.');
     if (!command || command.length > 8192 || /[\uD800-\uDFFF]/u.test(command)
       || [...command].some((character) => { const code = character.charCodeAt(0); return (code < 32 && code !== 9 && code !== 10) || code === 127; })) throw new Error('Enter a command of at most 8192 characters.');
+    if (!this.authority.isHost()) {
+      if (this.inputRequests.size >= 16) throw new Error('Terminal input queue is full.');
+      const requestId = randomUUID();
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { this.inputRequests.delete(requestId); reject(new Error('Host did not acknowledge the terminal command.')); }, 15_000); timer.unref();
+        this.inputRequests.set(requestId, { resolve, reject, timer }); this.send(this.authority.hostId(), 'shellInput', { requestId, command });
+      });
+    }
     if (this.queued >= 16) throw new Error('Terminal input queue is full.');
     this.admissionRevision++;
     this.queued++;
@@ -165,6 +194,7 @@ export class SharedTerminal extends EventEmitter {
     const commandGeneration = this.commandGeneration;
     const operation = this.queue.then(async () => {
       await this.authority.prepare();
+      if (source && !this.authority.canWrite?.(source)) throw new Error('Terminal input permission was revoked before launch.');
       if (this.closed || generation !== this.generation || commandGeneration !== this.commandGeneration || !this.authority.isHost() || !this.authority.available()) throw new Error('The terminal host changed or its queued command was cancelled before it could start.');
       const child = this.child ?? this.startShell();
       if (child.stdin.destroyed || child.stdin.writableLength > 64 * 1024) throw new Error('The host shell is not accepting input.');
@@ -233,6 +263,7 @@ export class SharedTerminal extends EventEmitter {
     this.emit('view', { text, reset: false } satisfies TerminalView);
   }
   private sendSnapshot(peer: string, requestId?: string): void {
+    if (this.authority.canRead?.(peer) === false) return;
     this.flushOutput();
     this.send(peer, 'shellSnapshot', { streamId: this.streamId, generation: this.generation, generationIndex: this.generationIndex, sequence: this.sequence,
       ...(requestId ? { requestId } : {}) }, Buffer.from(this.history));
@@ -242,6 +273,7 @@ export class SharedTerminal extends EventEmitter {
     catch { this.emit('deliveryDelayed'); } // Snapshot/reconnect restores output after route loss.
   }
   public reset(): void {
+    for (const request of this.inputRequests.values()) { clearTimeout(request.timer); request.reject(new Error('Terminal session changed.')); } this.inputRequests.clear();
     this.commandGeneration++;
     this.stopShell();
     if (this.timer) clearTimeout(this.timer);

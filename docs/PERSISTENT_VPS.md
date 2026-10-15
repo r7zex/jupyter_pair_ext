@@ -1,16 +1,20 @@
-# Persistent VPS sessions — 0.6.3
+# Persistent VPS sessions — 0.6.5
 
 Use **Pair Notebook: Connect to VPS** for server-owned collaborative projects. The VPS retains session authority, membership, files and execution receipts while editors are offline. **Connect to VPS Compute** is the separate team relay/background-job connection described in [VPS_COMPUTE.md](VPS_COMPUTE.md).
 
-Install the same 0.6.3 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/VPS, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
+Install the same 0.6.5 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/VPS, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
+
+## Participant permissions and comments
+
+The session owner can use **Manage Persistent VPS Session → Права участников** or **Pair Notebook: Права участников** to manage each member’s editable files, execution and comments. These policies and comments persist on the server. The existing VPS service has no shared operating-system shell; shared terminal permissions apply to P2P host terminals. See [instructions](PARTICIPANT_PERMISSIONS_AND_COMMENTS.md).
 
 ## Release files and requirements
 
-Download from [release v0.6.3](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.3):
+Download from [release v0.6.5](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.5):
 
-- `pair-notebook-0.6.3.vsix`: install on every editor, then reload VS Code.
+- `pair-notebook-0.6.5.vsix`: install on every editor, then reload VS Code.
 - `pair-notebook-server-persistent.tar.gz` and `.sha256`: bundled server, agent/bridge, operator guide and service templates. No npm install/build is needed on the VPS.
-- `pair-notebook-complete-0.6.3.zip`: matching source, tests and background agent.
+- `pair-notebook-complete-0.6.5.zip`: matching source, tests and background agent.
 
 The server needs Node.js 20 or newer, private durable storage and verified HTTPS. The Linux worker needs its own non-root account, Python environment with `jupyter_client`/`ipykernel`, and working bubblewrap/user namespaces or an isolated Linux-container runtime. Python dependencies and CUDA belong to the selected executor. Do not silently switch interpreters when readiness fails.
 

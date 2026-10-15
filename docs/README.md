@@ -1,5 +1,6 @@
-# Pair Notebook 0.6.3 documentation
+# Pair Notebook 0.6.5 documentation
 
+- [Participant permissions and line comments](PARTICIPANT_PERMISSIONS_AND_COMMENTS.md): file access, execution, shared terminal controls and right-click comments.
 - [Install and use the extension](../README.md): peer collaboration, network routes and host ownership.
 - [Persistent VPS sessions](PERSISTENT_VPS.md): matching release packages, HTTPS, administration, agents, upgrades and backups.
 - [Persistent session architecture](PERSISTENT_VPS_ARCHITECTURE.md): local editing, durable authority, privacy and execution recovery.

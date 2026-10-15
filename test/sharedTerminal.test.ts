@@ -13,6 +13,25 @@ async function until(check: () => boolean): Promise<void> {
 }
 
 describe('shared host command terminal', () => {
+  it('admits only explicitly authorized remote input and rechecks revocation after asynchronous preparation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-permission-'));
+    let granted = true; let finish!: () => void;
+    const prepared = new Promise<void>((resolve) => { finish = resolve; }); const frames: { peer: string | undefined; type: string; meta: Record<string, unknown> }[] = [];
+    const host = new SharedTerminal({ isHost: () => true, hostId: () => 'host', available: () => true, directory: () => root,
+      prepare: () => prepared, canRead: (peer) => peer !== 'denied', canWrite: (peer) => peer === 'writer' && granted,
+      send: (peer, type, meta) => { frames.push({ peer, type, meta }); } });
+    try {
+      host.handle({ type: 'shellSnapshotRequest', meta: { requestId: randomUUID() }, payload: Buffer.alloc(0) }, 'denied'); assert.equal(frames.length, 0);
+      host.handle({ type: 'shellInput', meta: { requestId: randomUUID(), command: 'echo DENIED' }, payload: Buffer.alloc(0) }, 'reader'); assert.equal(host.isRunning(), false);
+      const requestId = randomUUID(); host.handle({ type: 'shellInput', meta: { requestId, command: 'echo REVOKED' }, payload: Buffer.alloc(0) }, 'writer');
+      granted = false; finish();
+      await until(() => frames.some((frame) => frame.type === 'shellInputResult'));
+      assert.match(String(frames.find((frame) => frame.type === 'shellInputResult')!.meta.error), /revoked/); assert.equal(host.isRunning(), false);
+      granted = true;
+      host.handle({ type: 'shellInput', meta: { requestId: randomUUID(), command: 'echo ACCEPTED' }, payload: Buffer.alloc(0) }, 'writer');
+      await until(() => host.view().text.includes('ACCEPTED')); assert.equal(host.isRunning(), true);
+    } finally { host.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
   it('keeps the owner repository identity after cd and refreshes it when the shell resets', async function () {
     if (process.platform === 'win32') this.skip();
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-shell-owner-'));

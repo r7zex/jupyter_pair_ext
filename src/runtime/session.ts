@@ -50,6 +50,8 @@ import { SessionCoordinator } from '../core/election';
 import { CpuSnapshot, discoverHardware, HardwareInfo, ResourceSample, sampleResources } from '../core/hardware';
 import { JupyterExecutionResult, JupyterKernel, JupyterKernelEvent } from '../core/pythonKernel';
 import { SharedTerminal } from '../core/sharedTerminal';
+import { defaultPermissions, mayChangeTree, normalizePermissions, type ParticipantPermissions } from '../core/permissions';
+import { MAX_LINE_COMMENTS, normalizeCommentInput, normalizeLineComment, reanchorComment, participantColor, commentColor, type LineComment, type LineCommentInput } from '../core/lineComments';
 import { validateIdentityPublicKey } from '../core/identity';
 import { discoverPythonEnvironments, PythonEnvironment } from '../core/pythonEnvironments';
 import {
@@ -735,6 +737,75 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   };
   private readonly internalWorkingWrites = new Map<string, Array<{ hash: string; expiresAt: number }>>();
   private readonly assignedJoinOrders = new Map<string, number>();
+  private readonly commentRequests = new Map<string, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
+
+  public permissionsFor(peerId = this.descriptor.localPeer.peerId): ParticipantPermissions {
+    if (peerId === this.coordinator.clock.hostId) return { ...defaultPermissions(), terminal: 'write' };
+    const policies = this.descriptor.participantPermissions;
+    return policies && Object.hasOwn(policies, peerId) ? policies[peerId]! : defaultPermissions();
+  }
+  public canEdit(key: string, peerId = this.descriptor.localPeer.peerId, destination?: string): boolean {
+    return mayChangeTree(this.permissionsFor(peerId), key, [...this.project.keys(), ...this.binaryVersions.keys(), ...this.directories], destination);
+  }
+  public async setParticipantPermissions(peerId: string, permissions: ParticipantPermissions): Promise<void> {
+    if (!this.coordinator.isCurrentHost()) throw new Error('Only the Session Host can change participant permissions.');
+    if (peerId === this.coordinator.clock.hostId || !this.descriptor.knownPeers?.some((peer) => peer.peerId === peerId)) throw new Error('Select a connected participant.');
+    const policies = { ...this.descriptor.participantPermissions, [peerId]: normalizePermissions(permissions) };
+    if (Buffer.byteLength(JSON.stringify({ permissions: policies, comments: this.lineComments() })) > 8 * 1024 * 1024) throw new Error('Participant policies exceed the session metadata limit.');
+    this.descriptor.participantPermissions = policies;
+    await this.publishCollaborationState();
+  }
+  public lineComments(): LineComment[] { return this.descriptor.lineComments ?? []; }
+  public commentOffset(document: vscode.TextDocument, offset: number): number { return this.editorLineAnchorResolver?.(document, offset) ?? offset; }
+  public commentAnchors(key: string, cellId: string | undefined, start: number, end: number): Pick<LineCommentInput, 'startAnchor' | 'endAnchor'> {
+    const text = this.presenceText(key, cellId);
+    if (!text || start < 0 || end > text.length) throw new Error('Wait for project synchronization before commenting.');
+    return { startAnchor: encodeRelativeOffset(text, start), endAnchor: encodeRelativeOffset(text, end) };
+  }
+  public resolveComment(comment: LineComment): { start: number; end: number } | undefined {
+    const text = this.presenceText(comment.path, comment.cellId);
+    if (!text || !comment.startAnchor || !comment.endAnchor) return undefined;
+    const start = resolveRelativeOffset(text, comment.startAnchor, undefined), end = resolveRelativeOffset(text, comment.endAnchor, undefined);
+    return start === undefined || end === undefined ? undefined : { start, end };
+  }
+  public async changeComment(input: LineCommentInput | string): Promise<void> {
+    if (this.coordinator.isCurrentHost()) { await this.applyComment(input, this.descriptor.localPeer.peerId); return; }
+    const requestId = newId();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { this.commentRequests.delete(requestId); reject(new Error('The host did not acknowledge the comment.')); }, 10_000); timer.unref();
+      this.commentRequests.set(requestId, { resolve, reject, timer });
+      this.transport.sendTo(this.coordinator.clock.hostId, 'commentRequest', { requestId, input, clock: this.coordinator.clock });
+    });
+  }
+  private async applyComment(input: LineCommentInput | string, peerId: string): Promise<void> {
+    if (!this.permissionsFor(peerId).comment) throw new Error('Comments are disabled for this participant.');
+    const comments = this.descriptor.lineComments ??= [];
+    if (typeof input === 'string') {
+      const comment = comments.find((comment) => comment.id === input);
+      if (!comment || (comment.authorId !== peerId && peerId !== this.coordinator.clock.hostId)) throw new Error('Only the author or host can resolve a comment.');
+      this.descriptor.lineComments = comments.filter((entry) => entry !== comment);
+    } else {
+      let value = normalizeCommentInput(input);
+      if (comments.length >= MAX_LINE_COMMENTS) throw new Error('Resolve an existing comment before adding more.');
+      const text = this.presenceText(value.path, value.cellId);
+      if (!text) throw new Error('The selected project text is unavailable.');
+      value = reanchorComment(value, text);
+      const peer = peerId === this.descriptor.localPeer.peerId ? this.descriptor.localPeer : this.descriptor.knownPeers?.find((peer) => peer.peerId === peerId);
+      if (!peer) throw new Error('Unknown comment author.');
+      comments.push({ ...value, id: newId(), authorId: peerId, authorName: peer.displayName, createdAt: Date.now() });
+    }
+    await this.publishCollaborationState();
+  }
+  private sendCollaborationState(peerId?: string): void {
+    const meta = { revision: this.descriptor.collaborationRevision ?? 0, clock: this.coordinator.clock };
+    const payload = Buffer.from(JSON.stringify({ permissions: this.descriptor.participantPermissions ?? {}, comments: this.lineComments() }));
+    if (peerId) this.transport.sendTo(peerId, 'collaborationState', meta, payload);
+    else this.transport.broadcast('collaborationState', meta, payload);
+  }
+  private async publishCollaborationState(): Promise<void> {
+    this.descriptor.collaborationRevision = (this.descriptor.collaborationRevision ?? 0) + 1;
+    await this.persistDescriptor(); this.sendCollaborationState(); this.emit('collaborationChanged');
+  }
 
   public constructor(
     public readonly descriptor: SessionDescriptor,
@@ -744,6 +815,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     identityPrivateKey?: string,
   ) {
     super();
+    descriptor.participantPermissions = Object.fromEntries(Object.entries(descriptor.participantPermissions ?? {}).map(([id, value]) => {
+      if (!PEER_ID_PATTERN.test(id)) throw new Error('Invalid saved permission identity.');
+      return [id, normalizePermissions(value)];
+    }));
+    descriptor.lineComments = (descriptor.lineComments ?? []).map(normalizeLineComment);
+    if (descriptor.lineComments.length > MAX_LINE_COMMENTS) throw new Error('Too many saved comments.');
     this.lifecycleDiagnosticsRing = new LifecycleDiagnosticRing(descriptor.sessionId, descriptor.localPeer.peerId);
     descriptor.knownPeers = normalizeKnownPeers(descriptor.knownPeers, descriptor.localPeer.peerId);
     this.assignedJoinOrders.set(descriptor.localPeer.peerId, descriptor.localPeer.joinOrder);
@@ -1288,6 +1365,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (!this.hostTerminal) this.hostTerminal = new SharedTerminal({
       isHost: () => this.coordinator.isCurrentHost(),
       hostId: () => this.coordinator.clock.hostId,
+      canRead: (peer) => this.permissionsFor(peer).terminal !== 'none',
+      canWrite: (peer) => this.permissionsFor(peer).terminal === 'write',
+      canEnter: () => this.permissionsFor().terminal === 'write',
       available: () => !this.closed && !this.stopAllExecutions && !this.waitingForHostFolder && !this.endingSession && !this.changingBackingFolder,
       directory: () => this.descriptor.backingFolder || this.descriptor.workingFolder,
       prepare: async () => {
@@ -1300,7 +1380,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         if (this.closed) return;
         const framed = { ...meta, clock: this.coordinator.clock };
         if (peer) this.transport.sendTo(peer, type, framed, payload);
-        else this.transport.broadcast(type, framed, payload);
+        else for (const remote of this.transport.peerRuntime()) {
+          if (remote.peerId === this.descriptor.localPeer.peerId || this.permissionsFor(remote.peerId).terminal === 'none') continue;
+          try { this.transport.sendTo(remote.peerId, type, framed, payload); } catch { this.hostTerminal?.emit('deliveryDelayed'); }
+        }
       },
     });
     return this.hostTerminal;
@@ -1340,6 +1423,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     onRequestId?: (requestId: string) => void,
   ): Promise<JupyterExecutionResult> {
     this.assertExecutionAvailable();
+    if (!this.permissionsFor().execute) throw new Error('Code execution is disabled for this participant.');
     if (this.stoppedNotebookGates.has(notebookKey)) throw new Error('Confirmed notebook stop is in progress.');
     const requestId = newId();
     onRequestId?.(requestId);
@@ -1853,6 +1937,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public async interruptNotebook(notebookKey: string): Promise<void> {
+    if (!this.permissionsFor().execute) throw new Error('Code execution is disabled for this participant.');
     this.assertNoLocalManagedWork('interrupt', notebookKey);
     const target = this.computeForNotebook(notebookKey);
     if (target.executorId === this.descriptor.localPeer.peerId) await this.kernels.get(notebookKey)?.interrupt();
@@ -1860,6 +1945,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   public async restartNotebook(notebookKey: string): Promise<void> {
+    if (!this.permissionsFor().execute) throw new Error('Code execution is disabled for this participant.');
     this.assertNoLocalManagedWork('restart', notebookKey);
     const target = this.computeForNotebook(notebookKey);
     if (target.executorId === this.descriptor.localPeer.peerId) await this.kernels.get(notebookKey)?.restart();
@@ -1913,6 +1999,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     if (this.closed) throw new Error('Cannot edit text after the collaboration session has closed.');
     const key = normalizedTrackedPath(request.key);
     if (!key || key !== request.key) throw new Error('Editor text intent has an invalid project path.');
+    if (!this.canEdit(key)) throw new Error('You do not have permission to edit this file.');
     if (request.cellId !== undefined && !PEER_ID_PATTERN.test(request.cellId)) {
       throw new Error('Editor text intent has an invalid notebook cell id.');
     }
@@ -2412,6 +2499,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       connectionState: 'closing', routeKind: 'none', reason: diagnosticReason,
     });
     this.closed = true;
+    for (const pending of this.commentRequests.values()) { clearTimeout(pending.timer); pending.reject(new Error('Session ended.')); } this.commentRequests.clear();
     this.hostTerminal?.dispose();
     this.closeReason = reason;
     const terminal: SessionTerminalLifecycle = {
@@ -2677,6 +2765,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private acceptTextEditIntent(frame: WireFrame, sourceId: string): void {
     if (!this.coordinator.isCurrentHost() || this.recoveringHost || sourceId === this.descriptor.localPeer.peerId) return;
     const target = normalizeTextIntentTarget(frame.meta);
+    if (target && !this.canEdit(target.key, sourceId)) return;
     const operationId = String(frame.meta.operationId ?? '');
     const baseRevision = Number(frame.meta.baseRevision);
     const baseDigest = String(frame.meta.baseDigest ?? '');
@@ -2895,6 +2984,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.descriptor.knownPeers = normalizeKnownPeers([...known.values()], this.descriptor.localPeer.peerId);
       this.persistDescriptorInBackground();
       try {
+        if (this.coordinator.isCurrentHost()) this.sendCollaborationState(peer.peerId);
         this.sendFilesystemState(peer.peerId);
         if (this.coordinator.isCurrentHost()) {
           this.sendComputeState(peer.peerId);
@@ -3216,10 +3306,36 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (clock && compareClock(clock, this.coordinator.clock) < 0 && !isClockAgnosticFrame(frame.type)) return;
       if (frame.type.startsWith('shell')) {
         if (!clock || !sameClock(clock, this.coordinator.clock)) return;
+        if (!this.coordinator.isCurrentHost() && this.permissionsFor().terminal === 'none') return;
         this.sharedTerminal().handle(frame, sourceId);
         return;
       }
       switch (frame.type) {
+        case 'collaborationState': {
+          if (sourceId !== this.coordinator.clock.hostId || !clock || !sameClock(clock, this.coordinator.clock)
+            || !Number.isSafeInteger(frame.meta.revision) || Number(frame.meta.revision) < (this.descriptor.collaborationRevision ?? 0) || frame.payload.length > 8 * 1024 * 1024) break;
+          const state = JSON.parse(Buffer.from(frame.payload).toString('utf8')) as { permissions: Record<string, unknown>; comments: unknown[] };
+          if (!isPlainRecord(state.permissions) || Object.keys(state.permissions).length > 256 || !Array.isArray(state.comments) || state.comments.length > MAX_LINE_COMMENTS) throw new Error('Invalid collaboration state.');
+          const permissions = Object.fromEntries(Object.entries(state.permissions).map(([id, value]) => {
+            if (!PEER_ID_PATTERN.test(id)) throw new Error('Invalid permission identity.'); return [id, normalizePermissions(value)];
+          }));
+          const comments = state.comments.map(normalizeLineComment);
+          this.descriptor.participantPermissions = permissions; this.descriptor.lineComments = comments;
+          this.descriptor.collaborationRevision = Number(frame.meta.revision); this.persistDescriptorInBackground(); this.emit('collaborationChanged');
+          break;
+        }
+        case 'commentRequest': {
+          if (!this.coordinator.isCurrentHost() || !clock || !sameClock(clock, this.coordinator.clock) || !TRANSFER_ID_PATTERN.test(String(frame.meta.requestId))) break;
+          let error: string | undefined;
+          try { await this.applyComment(frame.meta.input as LineCommentInput | string, sourceId); } catch (reason) { error = formatError(reason); }
+          this.transport.sendTo(sourceId, 'commentResult', { requestId: frame.meta.requestId, error, clock: this.coordinator.clock }); break;
+        }
+        case 'commentResult': {
+          if (sourceId !== this.coordinator.clock.hostId) break;
+          const pending = this.commentRequests.get(String(frame.meta.requestId)); if (!pending) break;
+          this.commentRequests.delete(String(frame.meta.requestId)); clearTimeout(pending.timer);
+          if (frame.meta.error) pending.reject(new Error(String(frame.meta.error))); else pending.resolve(); break;
+        }
         case 'helloAck': {
           const peer = this.transport.peerRuntime().find((candidate) => candidate.peerId === sourceId);
           if (peer) this.coordinator.upsertPeer(peer);
@@ -3259,6 +3375,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const key = normalizedTrackedPath(String(frame.meta.key ?? ''));
           const kind = frame.meta.kind as DocumentKind;
           if (key && (kind === 'text' || kind === 'notebook')) {
+            if (sourceId !== this.coordinator.clock.hostId && !this.canEdit(key, sourceId)) break;
             const incomingState = normalizeFileState(frame.meta.fileState, sourceId, kind);
             if (!incomingState || !await this.acceptFileState(key, incomingState, sourceId)) break;
             if (this.effectiveFileState(key)?.deleted) break;
@@ -3511,6 +3628,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
           const from = normalizedTrackedPath(String(frame.meta.from ?? ''));
           const to = normalizedTrackedPath(String(frame.meta.to ?? ''));
           if (!from || !to || from === to) break;
+          if (sourceId !== this.coordinator.clock.hostId && !this.canEdit(from, sourceId, to)) break;
           if (relativePathsNested(from, to)) {
             this.log.appendLine(`[error] Refusing overlapping rename from ${sourceId}.`);
             break;
@@ -3999,6 +4117,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     this.remoteRuntimePresence.clear();
     this.sendRuntimePresenceToAll();
     this.emit('hostChanged', this.coordinator.clock);
+    if (isHost) this.sendCollaborationState();
     if (pauseDetail) {
       this.emit('hostPaused', this.coordinator.clock);
       if (isHost) this.emit('hostFolderRequired', this.coordinator.clock);
@@ -4285,7 +4404,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // participants can still see activity, but no local setting can turn a
     // line lock into an unannounced editable cursor.
     const shareCursor = true;
-    const cursorColor = '#4FC3F7';
+    const configuredColor = vscode.workspace.getConfiguration('pairNotebook').get<string>('cursorColor', '');
+    const cursorColor = configuredColor ? commentColor(configuredColor) : participantColor(this.descriptor.localPeer.peerId);
     const activeText = vscode.window.activeTextEditor;
     const activeNotebook = vscode.window.activeNotebookEditor;
     let activeFile: string | undefined;
@@ -4465,6 +4585,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private async onLocalDirectory(uri: vscode.Uri): Promise<void> {
     const relativePath = this.relativeKey(uri);
     if (!relativePath) return;
+    if (!this.canEdit(relativePath)) return;
     try {
       const target = await safeProjectTarget(this.descriptor.workingFolder, relativePath, true);
       const info = await lstat(target);
@@ -4493,6 +4614,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private renameNotebookRuntimeState(from: string, to: string): void {
+    if (this.coordinator.isCurrentHost()) {
+      let changed = false;
+      for (const comment of this.lineComments()) if (comment.path === from || comment.path.startsWith(from + '/')) { comment.path = to + comment.path.slice(from.length); changed = true; }
+      if (changed) this.runBackground('Move line comments', () => this.publishCollaborationState());
+    }
     this.assertNotebookRenameSafe(from, to);
     const moved = (key: string) => key === from ? to : key.startsWith(`${from}/`) ? `${to}${key.slice(from.length)}` : key;
     const move = <T>(map: Map<string, T>, replace?: (value: T) => void) => {
@@ -4526,6 +4652,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const rawFrom = this.relativeKey(oldUri, true);
     const rawTo = this.relativeKey(newUri, true);
     if (!rawFrom || !rawTo || rawFrom === rawTo) return;
+    if (!this.canEdit(rawFrom, this.descriptor.localPeer.peerId, rawTo)) return;
     if (relativePathsNested(rawFrom, rawTo)) {
       this.log.appendLine('[error] Ignored a project rename whose source and destination overlap.');
       return;
@@ -4564,6 +4691,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private async onLocalFile(uri: vscode.Uri, operation: 'create' | 'change'): Promise<void> {
     const relativePath = this.relativeKey(uri);
     if (!relativePath) return;
+    if (!this.canEdit(relativePath)) return;
     // Open editors are already observed through VS Code's document APIs. Reading
     // their just-saved disk image here can race with a newer keystroke and
     // mistakenly roll the CRDT back to the older serialized notebook.
@@ -4669,6 +4797,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private async applyLocalDeletion(relativePath: string): Promise<void> {
+    if (!this.canEdit(relativePath)) return;
     const tracked = this.project.has(relativePath)
       || [...this.binaryVersions.keys()].some((key) => key === relativePath || key.startsWith(`${relativePath}/`))
       || [...this.directories].some((key) => key === relativePath || key.startsWith(`${relativePath}/`))
@@ -4891,6 +5020,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const changed = !exact || compareFileState(incoming, exact) !== 0
       || exact.deleted !== incoming.deleted || exact.kind !== incoming.kind;
     if (changed) {
+      if (sourceId !== this.coordinator.clock.hostId && !this.canEdit(relativePath, sourceId)) return false;
       if (!incoming.deleted && applyEffects) this.assertNoPortableLivePathConflict(relativePath);
       this.setFileState(relativePath, incoming);
       this.fileRevisionCounter = Math.max(this.fileRevisionCounter, incoming.version);
@@ -4923,6 +5053,10 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   }
 
   private async applyDeletedPath(relativePath: string, suppressWatcher = true): Promise<void> {
+    if (this.coordinator.isCurrentHost()) {
+      const comments = this.lineComments().filter((comment) => comment.path !== relativePath && !comment.path.startsWith(relativePath + '/'));
+      if (comments.length !== this.lineComments().length) { this.descriptor.lineComments = comments; this.runBackground('Remove deleted line comments', () => this.publishCollaborationState()); }
+    }
     if (suppressWatcher) this.suppressDelete(relativePath);
     this.deleteNotebookRuntimeState(relativePath);
     this.project.deleteDocument(relativePath);
@@ -5096,8 +5230,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
-  private async reconcileExecutionManifest(manifest: ExecutionManifest): Promise<void> {
+  private async reconcileExecutionManifest(manifest: ExecutionManifest, sourceId: string): Promise<void> {
     const expectedDirectories = new Set(manifest?.directories ?? []);
+    for (const directory of expectedDirectories) if (!this.directories.has(directory) && sourceId !== this.coordinator.clock.hostId && !this.canEdit(directory, sourceId)) throw new Error('Participant cannot create this project directory.');
     // The execution barrier may add versions that the requester proved it has,
     // but it never turns an absent manifest entry into a delete operation.
     // Deletions must arrive through the normal versioned filesystem protocol.
@@ -5183,6 +5318,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private async handleExecutionBarrierCheck(frame: WireFrame, sourceId: string): Promise<void> {
     const requestId = String(frame.meta.requestId ?? '');
+    if (!this.permissionsFor(sourceId).execute) { this.transport.sendTo(sourceId, 'executionBarrierStatus', { requestId, success: false, message: 'Code execution is disabled for this participant.' }); return; }
     const notebookKey = normalizedTrackedPath(String(frame.meta.notebookKey ?? ''));
     const target = normalizeComputeTarget(frame.meta.target, sourceId);
     const manifest = normalizeExecutionManifest(frame.meta.manifest, sourceId);
@@ -5255,6 +5391,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
 
   private async handleExecutionBarrierCommit(frame: WireFrame, sourceId: string): Promise<void> {
     const requestId = String(frame.meta.requestId ?? '');
+    if (!this.permissionsFor(sourceId).execute) { this.transport.sendTo(sourceId, 'executionBarrierAck', { requestId, success: false, message: 'Code execution is disabled for this participant.' }); return; }
     const notebookKey = normalizedTrackedPath(String(frame.meta.notebookKey ?? ''));
     const target = normalizeComputeTarget(frame.meta.target, sourceId);
     const manifest = normalizeExecutionManifest(frame.meta.manifest, sourceId);
@@ -5283,7 +5420,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
     clearTimeout(pending.timer);
     this.pendingBarrierAuthorizations.delete(authorizationKey);
-    await this.reconcileExecutionManifest(manifest);
+    await this.reconcileExecutionManifest(manifest, sourceId);
     await this.flush();
     const badDocuments = Object.entries(manifest.documents)
       .filter(([key, hash]) => !this.project.has(key) || this.projectDocumentHash(key) !== hash)
@@ -5589,6 +5726,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.log.appendLine(`[error] Refusing binary transfer with an unsafe path from ${sourceId}.`);
       return;
     }
+    if (sourceId !== this.coordinator.clock.hostId && !this.canEdit(relativePath, sourceId)) return;
     if (!shouldTrackProjectPath(relativePath)) {
       this.log.appendLine(`[error] Refusing binary transfer targeting an internal project path from ${sourceId}.`);
       return;
@@ -5709,6 +5847,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     clearTimeout(transfer.idleTimer);
     await transfer.handle.close().catch(() => undefined);
     try {
+      if (sourceId !== this.coordinator.clock.hostId && !this.canEdit(transfer.relativePath, sourceId)) return;
       if (transfer.received.size !== transfer.expectedChunks || transfer.bytesWritten !== transfer.shape.size) {
         throw new Error('Binary transfer is incomplete.');
       }
@@ -6226,6 +6365,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
     };
 
+    if (!this.permissionsFor(sourceId).execute) { rejectRequest('PermissionDenied', 'Code execution is disabled for this participant.'); return; }
+
     // MeshTransport authenticates and binds sourceId before onMessage dispatches
     // here; this private boundary additionally rejects malformed/self identities.
     if (!PEER_ID_PATTERN.test(sourceId) || sourceId === this.descriptor.localPeer.peerId) {
@@ -6622,6 +6763,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       if (!TRANSFER_ID_PATTERN.test(requestId)) return;
       this.transport.sendTo(sourceId, 'kernelCommandResult', { requestId, success: false, message });
     };
+    if (!this.permissionsFor(sourceId).execute) { rejectCommand('Code execution is disabled for this participant.'); return; }
     if (!TRANSFER_ID_PATTERN.test(requestId) || !notebookKey || !target
       || (frame.meta.command !== 'interrupt' && frame.meta.command !== 'restart' && frame.meta.command !== 'prepare-stop')) {
       rejectCommand('The remote kernel command is malformed.');
@@ -6761,6 +6903,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const clock = this.coordinator.clock;
     const assertAuthority = () => {
       this.assertExecutionAvailable();
+      const requester = this.executionOwners.get(requestId)?.peerId;
+      if (requester && !this.permissionsFor(requester).execute) throw new Error('Execution permission was revoked before launch.');
       if (this.cancelledExecutionIds.has(requestId) || this.stopAllExecutions || this.stoppedNotebookGates.has(notebookKey)) {
         throw new Error('Execution was cancelled by a confirmed stop before it could start.');
       }

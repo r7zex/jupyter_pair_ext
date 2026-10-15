@@ -78,6 +78,7 @@ interface TextRenderGuard {
 }
 
 export class EditorSynchronizer implements vscode.Disposable {
+  public canEdit: ((key: string) => boolean) | undefined;
   private explicitlyDisposed = false;
   private get disposed(): boolean { return this.explicitlyDisposed || this.project.isDestroyed; }
   private readonly disposables: vscode.Disposable[] = [];
@@ -111,7 +112,9 @@ export class EditorSynchronizer implements vscode.Disposable {
     private readonly textIntentPublisher?: EditorTextIntentPublisher,
     private readonly uriKey?: (uri: vscode.Uri) => string | undefined,
     private readonly preserveInitialInput = true,
+    canEdit?: (key: string) => boolean,
   ) {
+    this.canEdit = canEdit;
     this.disposables.push(
       vscode.workspace.onDidOpenTextDocument((document) => this.bindTextDocument(document)),
       vscode.workspace.onDidChangeTextDocument((event) => this.onTextChanged(event)),
@@ -997,7 +1000,7 @@ export class EditorSynchronizer implements vscode.Disposable {
     const replica = new EditorTextReplica(this.project, key, cellId);
     this.replaceTextReplica(uri, replica);
     if (replica.source() === document.getText()) return;
-    if (document.isDirty && this.preserveInitialInput) {
+    if (document.isDirty && this.preserveInitialInput && this.canEdit?.(key) !== false) {
       // An already edited buffer is local work, not a stale saved projection.
       this.publishPostApplyText(document, replica, document.getText());
     } else {
@@ -1108,6 +1111,7 @@ export class EditorSynchronizer implements vscode.Disposable {
   }
 
   private publishTextChanges(document: vscode.TextDocument, key: string, cellId: string | undefined, changes: TextChange[]): void {
+    if (this.canEdit?.(key) === false) throw new Error('You do not have permission to edit this file.');
     const uri = document.uri.toString();
     let replica = this.textReplicas.get(uri);
     const canonical = cellId ? this.project.cellSource(key, cellId) : this.project.text(key);
@@ -1179,6 +1183,10 @@ export class EditorSynchronizer implements vscode.Disposable {
   private onNotebookChanged(event: vscode.NotebookDocumentChangeEvent): void {
     const key = this.keyForUri(event.notebook.uri);
     if (!key || this.applyingNotebooks.has(event.notebook.uri.toString())) return;
+    if (this.canEdit?.(key) === false) {
+      this.requestStructuralNotebookReconciliation(event.notebook, key, 'file is read only');
+      return;
+    }
 
     if (event.contentChanges.length) {
       for (const change of event.contentChanges) {

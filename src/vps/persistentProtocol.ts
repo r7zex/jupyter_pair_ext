@@ -1,3 +1,4 @@
+import type { ParticipantPermissions } from '../core/permissions';
 /** Independent server-hosted sessions. These credentials never authorize the legacy job broker. */
 export interface PersistentFileEntry {
   path: string;
@@ -26,12 +27,13 @@ export interface PersistentDevice {
   usingMemberIds?: string[];
 }
 export interface PersistentTarget { deviceId: string; gpuUuid?: string }
-export interface PersistentMember { id: string; name: string; role: 'owner' | 'admin' | 'member'; online: boolean }
+export interface PersistentMember { id: string; name: string; role: 'owner' | 'admin' | 'member'; online: boolean; permissions?: ParticipantPermissions }
 export interface PersistentConsent {
   id: string; requesterId: string; deviceId: string; gpuUuid?: string;
   status: 'pending' | 'approved' | 'denied' | 'revoked';
 }
 export interface PersistentSessionView {
+  collaborationRevision?: number;
   id: string; name: string; state: 'running' | 'stopped'; ownerId: string;
   memberId: string; allowMemberSwitch: boolean; members: PersistentMember[];
   devices: PersistentDevice[]; target: PersistentTarget; generation: number;
