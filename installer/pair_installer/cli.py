@@ -16,8 +16,8 @@ import tempfile
 from urllib.error import URLError
 from urllib.parse import urlsplit
 
-from . import checks, network, services
-from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, write
+from . import checks, legacy, network, services
+from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, switch, write
 
 
 def prompt(label: str, default: str = "", choices: tuple[str, ...] = ()) -> str:
@@ -81,13 +81,6 @@ def collect(mode: str) -> dict:
     if prompt("Install these Pair Notebook services? yes / no", "yes", ("yes", "no")) != "yes":
         raise InstallError("Installation cancelled.")
     return config
-
-
-def switch(target: Path) -> None:
-    temporary = ROOT / "server.next"
-    temporary.unlink(missing_ok=True)
-    temporary.symlink_to(target, target_is_directory=True)
-    temporary.replace(ROOT / "server")
 
 
 def install(config: dict, architecture: str, archive: Path | None) -> None:
@@ -213,14 +206,37 @@ def main() -> None:
             path = STATE / "installation.json"
             if not path.exists() and (STATE / "installation-pending.json").exists():
                 path = STATE / "installation-pending.json"
-            if not path.exists() and any((services.UNITS / f"{name}.service").exists() for name in services.SERVICES):
-                raise InstallError("An existing manual Pair service was detected. Use the documented manual migration; its units will not be overwritten.")
+            if not path.exists() and legacy.present():
+                config = legacy.discover()
+                print(f"Detected existing Pair Notebook {config['version']}. Existing services, projects, credentials and HTTPS will be retained.")
+                value = prompt("Existing server HTTPS address", legacy.default_endpoint())
+                config["endpoint"], config["host"] = network.endpoint(value, "existing")
+                if args.action == "rollback":
+                    raise InstallError("No previous installer-managed update is available to roll back.")
+                if args.action == "check":
+                    legacy.owner_credential(config)
+                    checks.verify(config)
+                    show(config)
+                    return
+                print("Updating restarts only the Pair server and worker; active Python kernels will stop.")
+                if prompt("Back up and update this installation? yes / no", "yes", ("yes", "no")) != "yes":
+                    raise InstallError("Update cancelled.")
+                legacy.update(config, args.archive)
+                show(config)
+                return
             if path.exists():
                 config = json.loads(path.read_text())
                 print(f"Detected Pair Notebook {config['version']} at {config['endpoint']}. Owner access and projects will be retained.")
                 default = "repair" if path.name == "installation-pending.json" else "check"
                 action = args.action or prompt("Action: check / repair / update / rollback", default, ("check", "repair", "update", "rollback"))
-                if action == "check":
+                if config.get("layout") == "existing":
+                    if action == "check":
+                        checks.verify(config)
+                    elif action == "rollback":
+                        legacy.rollback(config)
+                    else:
+                        legacy.update(config, args.archive)
+                elif action == "check":
                     checks.verify(config)
                 elif action == "rollback":
                     previous = Path(config.get("previous") or "")

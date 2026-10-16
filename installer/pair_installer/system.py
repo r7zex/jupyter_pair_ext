@@ -41,6 +41,13 @@ def write(path: Path, content: str, mode: int = 0o600) -> None:
     temporary.replace(path)
 
 
+def switch(target: Path) -> None:
+    temporary = ROOT / "server.next"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target, target_is_directory=True)
+    temporary.replace(ROOT / "server")
+
+
 def supported_system() -> str:
     if platform.system() != "Linux" or os.geteuid() != 0:
         raise InstallError("Run with sudo on Ubuntu 24.04 LTS or Debian 12 with systemd.")

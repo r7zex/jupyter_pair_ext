@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--occupied-https", action="store_true", help="Keep an unrelated TCP 443 service running and select 8443")
     parser.add_argument("--repair-runtime", action="store_true", help="Verify repair of a deliberately broken private Node executable")
     args = parser.parse_args()
+    args.report.parent.mkdir(parents=True, exist_ok=True)
     docker = ["docker"] + (["--config", args.docker_config] if args.docker_config else [])
     evidence = {"image": args.image, "mode": args.mode, "scope": "isolated systemd container on one Docker host", "checks": []}
 

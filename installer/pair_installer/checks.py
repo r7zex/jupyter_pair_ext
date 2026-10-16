@@ -34,16 +34,18 @@ def wait_health(url: str, attempts: int = 30) -> dict:
 
 def verify(config: dict, public: bool = True) -> None:
     local = f"http://127.0.0.1:{config['port']}"
+    node = str(config.get("node", ROOT / "runtime/node/bin/node"))
+    tools = Path(config.get("checkTools", ROOT / "server"))
     health = wait_health(local)
-    run(str(ROOT / "runtime/node/bin/node"), str(ROOT / "server/out/src/vps/relayCheck.js"), local)
+    run(node, str(tools / "out/src/vps/relayCheck.js"), local)
     if config["mode"] == "full":
         # The smoke script creates its own project, executes a real kernel cell,
         # verifies output and removes only that project in a finally block.
-        run("python3", str(ROOT / "server/scripts/pair-notebook-server-check.py"), "--url", local, "--credentials", str(STATE / "owner-server.json"))
+        run("python3", str(tools / "scripts/pair-notebook-server-check.py"), "--url", local, "--credentials", str(STATE / "owner-server.json"))
     if public and config["network"] != "lan":
         if wait_health(config["endpoint"]).get("instanceId") != health.get("instanceId"):
             raise InstallError("The configured HTTPS address reaches a different server. Correct DNS or proxy routing.")
-        run(str(ROOT / "runtime/node/bin/node"), str(ROOT / "server/out/src/vps/relayCheck.js"), config["endpoint"])
+        run(node, str(tools / "out/src/vps/relayCheck.js"), config["endpoint"])
     if config["network"] == "lan":
         root = Path("/var/lib/pair-notebook-proxy/.local/share/caddy/pki/authorities/local/root.crt")
         for _ in range(20):

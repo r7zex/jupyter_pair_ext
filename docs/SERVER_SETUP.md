@@ -54,7 +54,19 @@ Official TLS references, checked during development:
 
 Rerun the same downloaded command. Existing installations offer **check**, **repair**, **update** and **rollback**. Projects and owner credentials stay in their original storage. Releases use separate versioned directories and an atomic `server` symlink. Downloads and hashes are verified before stopping Pair services; a failed upgrade restores the previous binary, configurations and previously running Pair services and checks their health. A private project backup is retained. Project data is not replaced with an older snapshot during automatic rollback, so edits accepted during a brief upgrade are retained. No storage migration is introduced in 0.6.7.
 
-Update stops Pair workers and may interrupt active kernels. Schedule it while participants are idle. This does not stop unrelated services. Old manual deployments are not silently adopted: if the broker port or installation path is occupied, use the existing manual upgrade procedure in `PERSISTENT_VPS.md`, or install the new layout on an isolated host and migrate a consistent backed-up data directory explicitly.
+Update stops Pair workers and may interrupt active kernels. Schedule it while participants are idle. This does not stop unrelated services.
+
+### Existing manually installed servers
+
+The updated installer in this branch also recognizes packaged 0.6.6 and 0.6.7 installations using the documented `/opt/pair-notebook/server` service paths and `/etc/pair-notebook/server.env`. **The original published 0.6.7 installer does not include this follow-up.** Run the updated standalone utility on the server:
+
+```sh
+sudo python3 pair-notebook-install.pyz
+```
+
+It reads the existing broker port, data directories, Node executable and worker configuration. Confirm the detected HTTPS address (or enter it if it cannot be inferred), then accept the update. No manual service, proxy or secret-file editing is required. The utility downloads and verifies the existing immutable 0.6.7 server package, backs up configuration and stopped server/worker data, and retains the previous server release. Only the Pair server and worker restart. Existing service files, resource limits, proxy/certificates, Python environment, membership credentials and project storage are preserved. Both an existing server directory and a server symlink are supported. A failed start or failed HTTPS/WebSocket/Jupyter check restores the previous release and previously active Pair services without replacing current project data.
+
+The final screen supplies the existing HTTPS address and administrative credential for **Pair Notebook: Create Server Project**. Existing owners should reconnect their saved identity or import their existing owner JSON instead of joining as a new participant. Subsequent invocations offer check, repair, update and rollback. For adopted installations repair replaces the server payload using existing dependencies; it does not rebuild a broken Node/Python environment. Unsupported layouts are rejected before services change. New installations continue to use the full dependency/proxy/worker setup above.
 
 The installer deliberately keeps the admin token outside notebook execution. Worker sandbox checks fail closed if user/mount namespaces are unavailable. On Ubuntu, a profile for a private Pair-only bubblewrap binary permits its user namespace without changing the system-wide user-namespace sysctl.
 

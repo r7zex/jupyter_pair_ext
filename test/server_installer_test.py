@@ -3,14 +3,18 @@ import hashlib
 import io
 from pathlib import Path
 import socket
+import json
+import shlex
 import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
 from pair_installer.network import endpoint, free_port, proxy_config
 from pair_installer.system import InstallError, extract, verify, write
+from pair_installer import legacy
 
 
 class InstallerTests(unittest.TestCase):
@@ -74,6 +78,116 @@ class InstallerTests(unittest.TestCase):
             write(archive, "tampered")
             with self.assertRaises(InstallError):
                 verify(archive, sums)
+
+
+class ExistingInstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        base = Path(self.directory.name)
+        self.root, self.config, self.state = (base / name for name in ("opt", "etc", "state"))
+        self.data, self.worker = (base / name for name in ("data", "worker"))
+        for directory in (self.root / "server", self.config, self.state, self.data, self.worker):
+            directory.mkdir(parents=True)
+        self.server = self.root / "server"
+        write(self.server / "BUILD.json", json.dumps({"version": "0.6.6"}))
+        self.node = self.root / "node/bin/node"
+        write(self.node, "existing Node")
+        self.token = "fixture_" + "x" * 40
+        self.environment = (f"PAIR_VPS_BIND=127.0.0.1\nPAIR_VPS_PORT=8788\n"
+                            f"PAIR_VPS_DATA={shlex.quote(str(self.data))}\nPAIR_VPS_CLIENT_TOKEN={self.token}\n")
+        write(self.config / "server.env", self.environment)
+        self.units = {
+            "pair-notebook-server": "ExecStart=" + shlex.join([str(self.node), str(self.server / "out/src/vps/cli.js")])
+                + "\nEnvironmentFile=" + shlex.quote(str(self.config / "server.env")),
+            "pair-notebook-worker": "WorkingDirectory=" + str(self.worker) + "\nExecStart=" + shlex.join([
+                "/usr/bin/python3", str(self.server / "scripts/pair-notebook-session-agent.py"),
+                "--url", "http://127.0.0.1:8788", "--bridge", str(self.server / "media/jupyter_kernel_bridge.py"),
+            ]),
+            "pair-notebook-proxy": "ExecStart=/existing/caddy run --config /existing/Caddyfile",
+        }
+        self.calls = []
+
+        def run(*arguments, **kwargs):
+            self.calls.append(arguments)
+            if arguments[:2] == ("systemctl", "cat"):
+                return self.units[arguments[2]]
+            return ""
+
+        for name, value in (("ROOT", self.root), ("CONFIG", self.config), ("STATE", self.state), ("run", run)):
+            replacement = patch.object(legacy, name, value)
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def test_existing_installation_discovers_custom_port_and_runtime(self):
+        config = legacy.discover()
+        self.assertEqual(config["port"], 8788)
+        self.assertEqual(config["node"], str(self.node))
+        self.assertEqual(config["data"], str(self.data))
+        self.assertNotIn(self.token, json.dumps(config))
+        self.assertEqual((self.config / "server.env").read_text(), self.environment)
+        self.assertTrue(all(call[:2] == ("systemctl", "cat") for call in self.calls))
+
+    def test_existing_proxy_supplies_https_origin_with_custom_port(self):
+        write(self.config / "Caddyfile", "https://example.com:9443 {\n reverse_proxy 127.0.0.1:8788\n}\n")
+        self.assertEqual(legacy.default_endpoint(), "https://example.com:9443")
+        write(self.config / "Caddyfile", "https://one.example {\n}\nhttps://two.example {\n}\n")
+        self.assertEqual(legacy.default_endpoint(), "")
+
+    def test_adoption_reuses_existing_admin_token_without_changing_server(self):
+        config = {**legacy.discover(), "endpoint": "https://example.com:9443"}
+        legacy.owner_credential(config)
+        credential = json.loads((self.state / "owner-server.json").read_text())
+        self.assertEqual(credential, {"endpoint": config["endpoint"], "adminToken": self.token})
+        self.assertEqual((self.config / "server.env").read_text(), self.environment)
+        legacy.owner_credential(config)
+
+    def test_different_owner_recovery_credential_is_not_overwritten(self):
+        write(self.state / "owner-server.json", '{"adminToken":"other"}')
+        with self.assertRaisesRegex(InstallError, "differs"):
+            legacy.owner_credential({"endpoint": "https://example.com"})
+        self.assertEqual((self.state / "owner-server.json").read_text(), '{"adminToken":"other"}')
+
+    def test_adoption_rejects_different_worker_port_before_stopping_services(self):
+        self.units["pair-notebook-worker"] = self.units["pair-notebook-worker"].replace("8788", "9999")
+        with self.assertRaisesRegex(InstallError, "unsupported"):
+            legacy.discover()
+        self.assertFalse(any(call[:2] == ("systemctl", "stop") for call in self.calls))
+
+    def test_adoption_rejects_recursive_backup_paths(self):
+        write(self.config / "server.env", self.environment.replace(shlex.quote(str(self.data)), shlex.quote(str(self.root.parent))))
+        with self.assertRaisesRegex(InstallError, "overlaps"):
+            legacy.discover()
+
+    def test_bad_release_never_stops_existing_services(self):
+        config = {**legacy.discover(), "endpoint": "https://example.com"}
+        with patch.object(legacy.checks, "wait_health"), patch.object(legacy, "release", side_effect=InstallError("Checksum mismatch")):
+            with self.assertRaisesRegex(InstallError, "Checksum mismatch"):
+                legacy.update(config, None)
+        self.assertFalse(any(call[:2] == ("systemctl", "stop") for call in self.calls))
+        self.assertTrue(self.server.is_dir())
+
+    def test_failed_backup_preserves_original_directory_and_service_state(self):
+        config = {**legacy.discover(), "endpoint": "https://example.com"}
+        package = self.root.parent / "package"
+        package.mkdir()
+        write(package / "BUILD.json", '{"version":"0.6.7"}')
+        original_copy = legacy.shutil.copytree
+
+        def copy(source, destination, **kwargs):
+            if str(source) == str(self.data):
+                raise OSError("Disk full")
+            return original_copy(source, destination, **kwargs)
+
+        with patch.object(legacy.checks, "wait_health"), patch.object(legacy, "release", return_value=package), \
+                patch.object(legacy, "active_services", return_value=["pair-notebook-server"]), \
+                patch.object(legacy.shutil, "copytree", side_effect=copy), patch.object(legacy, "switch") as switch:
+            with self.assertRaisesRegex(OSError, "Disk full"):
+                legacy.update(config, None)
+        switch.assert_not_called()
+        self.assertEqual(json.loads((self.server / "BUILD.json").read_text())["version"], "0.6.6")
+        self.assertIn(("systemctl", "start", "pair-notebook-server"), self.calls)
+        self.assertNotIn(("systemctl", "start", "pair-notebook-worker"), self.calls)
 
 
 if __name__ == "__main__":
