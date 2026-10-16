@@ -478,6 +478,7 @@ describe('Persistent session actions preserve their original connection', () => 
     const replacement = { sessionId: 'replacement' };
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       connection: { sessionId: 'original', client: { call: async () => gate } },
+      context: { globalState: { get: () => [], update: async () => undefined } },
       files: { setConnection: () => undefined }, status: { hide: () => undefined }, changed: { fire: () => undefined },
     }) as { connection: unknown; leave: () => Promise<void> };
     const pending = ui.leave(); ui.connection = replacement; release(); await pending;
@@ -486,21 +487,25 @@ describe('Persistent session actions preserve their original connection', () => 
 
   it('keeps a newer attachment while retaining credentials from a delayed older heartbeat', async () => {
     let release!: () => void;
+    let reached!: () => void;
+    const heartbeatReached = new Promise<void>(resolve => { reached = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const originalCall = PersistentClient.prototype.call;
-    PersistentClient.prototype.call = async function <T>(): Promise<T> {
-      if (this.endpoint.includes('first.example')) await gate;
-      return { id: this.endpoint, name: this.endpoint, memberId: 'member', ownerId: 'owner', members: [{ id: 'member', name: 'Member', role: 'member', online: true }] } as T;
+    PersistentClient.prototype.call = async function <T>(operation: string): Promise<T> {
+      if (operation === 'compatibility') return { protocol: 1, features: ['notebook-bootstrap-empty-v1'] } as T;
+      if (this.endpoint.includes('first.example') && operation === 'heartbeat') { reached(); await gate; }
+      return { id: this.endpoint, name: this.endpoint, state: 'running', memberId: 'member', ownerId: 'owner', members: [{ id: 'member', name: 'Member', role: 'member', online: true }] } as T;
     };
     let saved: unknown[] = []; const credentials: string[] = [];
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       disposed: false, connectionAttempt: 0, credentialWrites: Promise.resolve(), updateUi: () => undefined,
       context: { secrets: { store: async (key: string) => { credentials.push(key); } },
         globalState: { get: () => saved, update: async (_key: string, value: unknown[]) => { saved = value; } } },
-      files: { setConnection: () => undefined, refresh: async () => undefined, uri: () => ({ toString: () => 'pair-vps://second/' }) },
+      files: { setConnection: () => undefined, accept: () => undefined, refresh: async () => undefined, uri: () => ({ toString: () => 'pair-vps://second/' }) },
     }) as { attach: (saved: unknown, token: string) => Promise<void>; connection: { sessionId: string } };
     const descriptor = (name: string) => ({ endpoint: `https://${name}.example`, sessionId: name, memberId: 'member', name });
     const first = ui.attach(descriptor('first'), 'a'.repeat(40));
+    await heartbeatReached;
     try {
       await ui.attach(descriptor('second'), 'b'.repeat(40)); release();
       await assert.rejects(first, /connection changed/);
@@ -508,6 +513,36 @@ describe('Persistent session actions preserve their original connection', () => 
       assert.equal(credentials.length, 2);
       assert.deepEqual(saved.map((item) => (item as { sessionId: string }).sessionId), ['second', 'first']);
     } finally { release(); PersistentClient.prototype.call = originalCall; }
+  });
+});
+
+describe('Server project startup safety', () => {
+  it('blocks incompatible attachment before mounting files or announcing readiness', async () => {
+    const original = PersistentClient.prototype.checkCompatibility;
+    let mounts = 0; const messages = informationMessages.length;
+    PersistentClient.prototype.checkCompatibility = async () => { throw new PersistentHttpError(426); };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      disposed: false, connectionAttempt: 0,
+      files: { setConnection: () => { mounts++; } },
+    }) as { attach: (saved: unknown, token: string) => Promise<void> };
+    try {
+      await assert.rejects(ui.attach({ endpoint: 'https://example.com', sessionId: 'project', memberId: 'owner', name: 'Saved project' }, 'a'.repeat(40)), /incompatible/);
+      assert.equal(mounts, 0); assert.equal(informationMessages.length, messages);
+    } finally { PersistentClient.prototype.checkCompatibility = original; }
+  });
+  it('persists explicit leave for only that identity without deleting credentials or server project data', async () => {
+    const first = { endpoint: 'https://example.com', sessionId: 'first', memberId: 'owner', name: 'First' };
+    const second = { ...first, sessionId: 'second', name: 'Second' };
+    let saved = [first, second] as (typeof first & { autoConnect?: boolean })[];
+    const operations: string[] = [];
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { ...first, client: { call: async (operation: string) => { operations.push(operation); } } },
+      context: { globalState: { get: () => saved, update: async (_key: string, value: typeof saved) => { saved = value; } }, secrets: { delete: () => { throw new Error('Credentials must survive Leave'); } } },
+      files: { setConnection: () => undefined }, status: { hide: () => undefined }, changed: { fire: () => undefined },
+    }) as { leave: () => Promise<void> };
+    await ui.leave();
+    assert.equal(saved[0]!.autoConnect, false); assert.equal(saved[1]!.autoConnect, undefined);
+    assert.deepEqual(operations, ['leave']);
   });
 });
 
@@ -557,7 +592,7 @@ describe('Persistent notebook kernel lifecycle UI', () => {
     boundary.window.activeNotebookEditor!.notebook.uri = { scheme: 'pair-vps', authority: 'other-session', path: '/test.ipynb' } as vscode.Uri;
     let called = false;
     const ui = controller(async () => { called = true; return execution('completed'); });
-    await assert.rejects(ui.releaseKernel(), /connected persistent VPS session/);
+    await assert.rejects(ui.releaseKernel(), /connected server project/);
     assert.equal(called, false);
   });
   it('does not report success in another session after switching connections during submission', async () => {

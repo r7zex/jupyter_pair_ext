@@ -4,12 +4,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createRuntimeProxyAgent } from '../runtime/proxyWebSocket';
 import { normalizeVpsUrl } from './protocol';
 import type { PersistentLiveEvent } from './persistentLive';
+import { PERSISTENT_PROTOCOL, SERVER_VERSION } from './compatibility';
+import { systemTlsOptions } from '../runtime/systemTls';
 
 export type PersistentCredential = { kind: 'anonymous' } | { kind: 'admin' | 'membership'; token: string };
 
 export class PersistentHttpError extends Error {
   public constructor(public readonly status: number, detail?: string) {
-    super((status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
+    super((status === 426 ? 'Client and server are incompatible. Install the matching Pair Notebook release, then reconnect. Unsaved editors and local history are preserved.'
+      : status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
       : status === 401 ? 'Your session credentials expired or were revoked. Connect again.'
         : status === 423 ? 'This line is occupied by another participant.'
         : status === 403 ? 'The server denied this operation for your session identity.'
@@ -23,6 +26,21 @@ export class PersistentHttpError extends Error {
 export class PersistentClient {
   private readonly requests = new Set<http.ClientRequest>();
   public readonly endpoint: string;
+  public async checkCompatibility(): Promise<void> {
+    let result: { protocol: number; features: string[]; minimumClientVersion?: string };
+    try { result = await this.call('compatibility'); }
+    catch (error) {
+      if (error instanceof PersistentHttpError && [400, 404].includes(error.status)) throw new PersistentHttpError(426, 'Update the server to 0.6.7 or later to enable compatibility checks.');
+      throw error;
+    }
+    if (!result || result.protocol !== PERSISTENT_PROTOCOL || !Array.isArray(result.features) || !result.features.includes('notebook-bootstrap-empty-v1')) throw new PersistentHttpError(426);
+    if (result.minimumClientVersion !== undefined) {
+      if (!/^\d+\.\d+\.\d+$/.test(result.minimumClientVersion)) throw new PersistentHttpError(426);
+      const required = result.minimumClientVersion.split('.').map(Number), current = SERVER_VERSION.split('.').map(Number);
+      const difference = current.findIndex((value, index) => value !== required[index]);
+      if (difference >= 0 && current[difference]! < required[difference]!) throw new PersistentHttpError(426, `Server requires client ${result.minimumClientVersion} or later.`);
+    }
+  }
   public constructor(endpoint: string, private readonly credential: PersistentCredential, private readonly deadlineMs = 15_000) {
     this.endpoint = normalizeVpsUrl(endpoint);
     if (credential.kind !== 'anonymous' && !/^[A-Za-z0-9_-]{32,256}$/.test(credential.token)) {
@@ -34,7 +52,7 @@ export class PersistentClient {
     if (['create', 'list'].includes(operation) && this.credential.kind !== 'admin') {
       return Promise.reject(new Error('This action requires a VPS administrative credential.'));
     }
-    if (!['create', 'list', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
+    if (!['compatibility', 'create', 'list', 'join', 'discover', 'acceptInvitation'].includes(operation) && this.credential.kind !== 'membership') {
       return Promise.reject(new Error('Join a persistent session before using its API.'));
     }
     if (operation === 'write' && typeof input.content === 'string' && input.content.length > 350_000) return this.writeLarge<T>(input);
@@ -53,9 +71,9 @@ export class PersistentClient {
         if (error) reject(error); else resolve(value!);
       };
       const request = (url.protocol === 'https:' ? https : http).request(url, {
-        method: 'POST', agent,
+        method: 'POST', agent, ...(url.protocol === 'https:' ? systemTlsOptions() : {}),
         headers: {
-          'content-type': 'application/json', 'content-length': bytes.length,
+          'content-type': 'application/json', 'content-length': bytes.length, 'x-pair-client-version': SERVER_VERSION,
           ...(this.credential.kind === 'anonymous' ? {} : { authorization: `Bearer ${this.credential.token}` }),
         },
       }, (response) => {
@@ -116,7 +134,7 @@ export class PersistentClient {
     const bytes = Buffer.from(JSON.stringify({ operation: 'subscribe', sessionId }));
     let closed = false; let connected = false;
     const request = (url.protocol === 'https:' ? https : http).request(url, {
-      method: 'POST', agent: createRuntimeProxyAgent(url.toString()),
+      method: 'POST', agent: createRuntimeProxyAgent(url.toString()), ...(url.protocol === 'https:' ? systemTlsOptions() : {}),
       headers: { 'content-type': 'application/json', 'content-length': bytes.length, authorization: `Bearer ${this.credential.token}` },
     }, (response) => {
       clearTimeout(deadline);

@@ -14,6 +14,7 @@ import { normalizeNotebookMetadata, parseIpynb } from '../core/projectFiles';
 import { REMOTE_ORIGIN } from '../core/types';
 import type { PresenceState } from '../runtime/session';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
+import { isPermanentConnectionError } from '../vps/compatibility';
 import { editSharedNotebook, sharedNotebook, type NotebookSyncReply, type SharedNotebook } from '../vps/persistentNotebookCrdt';
 import type { PersistentLiveEvent, PersistentPresence } from '../vps/persistentLive';
 import { cellUserMetadata, hasLegacyNotebookMetadata, notebookUserMetadata } from './persistentNotebookMetadata';
@@ -463,6 +464,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     try { await state.ready; this.current(state); if (capture) await state.editor?.prepareWorkingCopy(false); await this.send(state); }
     catch (error) {
       if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state);
+      else if (isPermanentConnectionError(error)) { state.blocked = true; }
       else if (!state.initialized && !state.closed) {
         // A rejected bootstrap promise must never poison all subsequent retries.
         state.editor?.dispose(); delete state.editor;

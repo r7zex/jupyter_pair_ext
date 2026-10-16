@@ -1,8 +1,8 @@
 {
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
-  "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent VPS workspaces and controlled remote Python execution.",
-  "version": "0.6.6",
+  "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent server workspaces and controlled remote Python execution.",
+  "version": "0.6.7",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -149,35 +149,35 @@
       },
       {
         "command": "pairNotebook.connectVps",
-        "title": "Pair Notebook: Connect to VPS",
+        "title": "Pair Notebook: Connect to Server",
         "icon": "$(plug)"
       },
       {
         "command": "pairNotebook.connectVpsCompute",
-        "title": "Pair Notebook: Connect to VPS Compute",
+        "title": "Pair Notebook: Connect to Server Compute",
         "icon": "$(remote)"
       },
       {
         "command": "pairNotebook.createVpsSession",
-        "title": "Pair Notebook: Create Persistent VPS Session",
+        "title": "Pair Notebook: Create Server Project",
         "icon": "$(add)"
       },
       {
         "command": "pairNotebook.joinVpsSession",
-        "title": "Pair Notebook: Join Persistent VPS Session"
+        "title": "Pair Notebook: Join Persistent Server Session"
       },
       {
         "command": "pairNotebook.manageVpsSession",
-        "title": "Pair Notebook: Manage Persistent VPS Session"
+        "title": "Pair Notebook: Manage Server Project"
       },
       {
         "command": "pairNotebook.leaveVpsSession",
-        "title": "Pair Notebook: Leave Persistent VPS Session",
+        "title": "Pair Notebook: Leave Server Project",
         "enablement": "pairNotebook.inVpsSession"
       },
       {
         "command": "pairNotebook.uploadVpsFolder",
-        "title": "Pair Notebook: Upload Files to VPS",
+        "title": "Pair Notebook: Upload Files to Server",
         "enablement": "pairNotebook.inVpsSession && pairNotebook.vpsOwner"
       },
       {
@@ -187,7 +187,7 @@
       },
       {
         "command": "pairNotebook.shareVpsComputer",
-        "title": "Pair Notebook: Share My Computer in VPS Session",
+        "title": "Pair Notebook: Share My Computer in Server Session",
         "enablement": "pairNotebook.inVpsSession"
       },
       {
@@ -207,32 +207,32 @@
       },
       {
         "command": "pairNotebook.refreshVpsSession",
-        "title": "Pair Notebook: Refresh Persistent VPS Session",
+        "title": "Pair Notebook: Refresh Persistent Server Session",
         "icon": "$(refresh)"
       },
       {
         "command": "pairNotebook.vpsFolderPublic",
-        "title": "Pair Notebook: Make VPS Folder Public",
+        "title": "Pair Notebook: Make Server Folder Public",
         "enablement": "pairNotebook.vpsOwner"
       },
       {
         "command": "pairNotebook.vpsFolderPrivate",
-        "title": "Pair Notebook: Make VPS Folder Private",
+        "title": "Pair Notebook: Make Server Folder Private",
         "enablement": "pairNotebook.vpsOwner"
       },
       {
         "command": "pairNotebook.runVpsJob",
-        "title": "Pair Notebook: Run Python on VPS Compute",
+        "title": "Pair Notebook: Run Python on Server Compute",
         "icon": "$(play)"
       },
       {
         "command": "pairNotebook.showVpsJobs",
-        "title": "Pair Notebook: Show VPS Jobs",
+        "title": "Pair Notebook: Show Server Jobs",
         "icon": "$(tasklist)"
       },
       {
         "command": "pairNotebook.cancelVpsJob",
-        "title": "Pair Notebook: Cancel VPS Job",
+        "title": "Pair Notebook: Cancel Server Job",
         "icon": "$(debug-stop)"
       },
       {
@@ -245,7 +245,7 @@
       },
       {
         "command": "pairNotebook.refreshVpsJobs",
-        "title": "Pair Notebook: Refresh VPS Compute",
+        "title": "Pair Notebook: Refresh Server Compute",
         "icon": "$(refresh)"
       },
       {
@@ -271,7 +271,7 @@
       },
       {
         "command": "pairNotebook.configureVpsSessions",
-        "title": "Pair Notebook: Configure Persistent Sessions"
+        "title": "Pair Notebook: Configure Server Connections"
       }
     ],
     "viewsContainers": {
@@ -426,7 +426,7 @@
           "default": "",
           "scope": "machine",
           "restricted": true,
-          "description": "HTTPS endpoint of your own Pair Notebook VPS relay and durable compute service. Run Connect to VPS Compute to store its team token securely. Persistent session participants instead use Connect to VPS with their session password."
+          "description": "HTTPS endpoint of your own Pair Notebook server relay and durable compute service. Run Connect to Server Compute to store its team token securely. Persistent session participants instead use Connect to Server with their session password."
         },
         "pairNotebook.cursorColor": {
           "type": "string",
@@ -438,7 +438,18 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Optional HTTPS Pair Notebook VPS relay origin for temporary sessions. Invitations carry this address automatically; no team token or guest setup is required. The last connected persistent VPS is used when empty."
+          "description": "Optional HTTPS Pair Notebook server relay origin for temporary sessions. Invitations carry this address automatically; no team token or guest setup is required. The last connected persistent server is used when empty."
+        },
+        "pairNotebook.serverRestore": {
+          "type": "string",
+          "enum": [
+            "automatic",
+            "ask",
+            "manual"
+          ],
+          "default": "automatic",
+          "scope": "application",
+          "description": "Restore saved server projects automatically with bounded retries, ask once, or require an explicit connection. Explicit Leave is remembered independently."
         }
       }
     }

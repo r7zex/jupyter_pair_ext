@@ -4,6 +4,7 @@ import { MAX_WIRE_FRAME_BYTES, decodeFrame, encodeFrame } from '../core/wire';
 import { normalizeVpsUrl, VPS_ID } from '../vps/protocol';
 import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
 import { createProxiedNodeWebSocket } from './proxyWebSocket';
+import { systemTlsOptions } from './systemTls';
 import { createRelayAnnounceProof, decryptRelayPacket, deriveRelayFrameKey, encryptRelayPacket,
   encryptRelayReadinessProbe, verifyRelayAnnounceProof, verifyRelayReadinessProbe } from './relayCrypto';
 
@@ -42,6 +43,7 @@ export class VpsFrameRelay implements FrameRelay {
   public start(): void {
     if (this.stopped || this.socket) return;
     const socket = (this.options.socketFactory ?? createProxiedNodeWebSocket)(this.url, undefined, {
+      ...(this.url.startsWith('wss:') ? systemTlsOptions() : {}),
       headers: this.options.vps.temporary ? {} : { authorization: `Bearer ${this.options.vps.token}` },
       handshakeTimeout: 10_000, maxPayload: 96 * 1024 * 1024, followRedirects: false,
     }, true);

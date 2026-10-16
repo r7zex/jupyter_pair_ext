@@ -29,7 +29,11 @@ try {
   await build({ absWorkingDir: root, entryPoints: ['src/vps/server.ts'], bundle: true,
     platform: 'node', target: 'node20', format: 'cjs', outfile: path.join(server, 'out/src/vps/server.js'),
     define: { 'process.env.WS_NO_BUFFER_UTIL': "'1'", 'process.env.WS_NO_UTF_8_VALIDATE': "'1'" } });
+  for (const entry of ['relayCli', 'relayCheck']) await build({ absWorkingDir: root, entryPoints: [`src/vps/${entry}.ts`], bundle: true,
+    platform: 'node', target: 'node20', format: 'cjs', outfile: path.join(server, `out/src/vps/${entry}.js`),
+    define: { 'process.env.WS_NO_BUFFER_UTIL': "'1'", 'process.env.WS_NO_UTF_8_VALIDATE': "'1'" } });
   const files = [
+    'scripts/pair-notebook-server-check.py', 'docs/SERVER_SETUP.md',
     'scripts/pair-notebook-wsl-agent.ps1',
     'scripts/persistent-session-soak.py',
     'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
@@ -65,6 +69,23 @@ try {
   await fs.mkdir(artifacts, { recursive: true });
   execFileSync('tar', ['-czf', archive, '-C', staging, 'server'], { stdio: 'inherit' });
   await fs.writeFile(`${archive}.sha256`, `${sha256(await fs.readFile(archive))}  ${path.basename(archive)}\n`);
+  const installer = path.join(staging, 'installer');
+  await fs.cp(path.join(root, 'installer'), installer, { recursive: true, filter: source => !source.split(path.sep).includes('__pycache__') && !source.endsWith('.pyc') });
+  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-m', 'zipapp', installer, '-o', path.join(artifacts, 'pair-notebook-install.pyz'), '-p', '/usr/bin/env python3'], { stdio: 'inherit' });
+  await fs.copyFile(path.join(root, 'deploy/install.sh'), path.join(artifacts, 'pair-notebook-install.sh'));
+  await fs.copyFile(path.join(root, 'docs/SERVER_SETUP.md'), path.join(artifacts, 'SERVER_SETUP.md'));
+  const relay = path.join(staging, 'relay');
+  await fs.mkdir(relay);
+  await fs.copyFile(path.join(server, 'out/src/vps/relayCli.js'), path.join(relay, 'relay.js'));
+  await fs.copyFile(path.join(server, 'out/src/vps/relayCheck.js'), path.join(relay, 'check.js'));
+  await fs.copyFile(path.join(root, 'docs/SERVER_SETUP.md'), path.join(relay, 'README.md'));
+  await fs.copyFile(path.join(root, 'LICENSE'), path.join(relay, 'LICENSE'));
+  const relayFiles = {};
+  for (const name of await fs.readdir(relay)) relayFiles[name] = sha256(await fs.readFile(path.join(relay, name)));
+  await fs.writeFile(path.join(relay, 'BUILD.json'), JSON.stringify({ version: pkg.version, baseCommit: source.commit, files: relayFiles }, null, 2) + '\n');
+  const relayArchive = path.join(artifacts, 'pair-notebook-relay.tar.gz');
+  execFileSync('tar', ['-czf', relayArchive, '-C', staging, 'relay'], { stdio: 'inherit' });
+  await fs.writeFile(`${relayArchive}.sha256`, `${sha256(await fs.readFile(relayArchive))}  ${path.basename(relayArchive)}\n`);
   console.log(`Packaged matching persistent server ${pkg.version}: ${archive}`);
 } finally {
   await fs.rm(staging, { recursive: true, force: true });

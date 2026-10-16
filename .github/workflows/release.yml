@@ -111,6 +111,10 @@ jobs:
           node scripts/make-artifacts.mjs --preflight-only
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
+          python -m unittest discover -s test -p server_installer_test.py -v
+          npm run package:persistent-server
+          node test/persistent_server_archive_smoke.mjs
+          node test/relay_archive_smoke.mjs
 
       - name: Prepare release files and notes
         id: release
@@ -130,10 +134,12 @@ jobs:
           VERSIONED_VSIX="pair-notebook-${VERSION}.vsix"
           SOURCE_ZIP="pair-notebook-complete-${VERSION}.zip"
           test -f "${VERSIONED_VSIX}"
+          cp artifacts/pair-notebook-install.pyz artifacts/pair-notebook-install.sh artifacts/pair-notebook-relay.tar.gz artifacts/pair-notebook-relay.tar.gz.sha256 artifacts/SERVER_SETUP.md .
           test -f "${SOURCE_ZIP}"
           cp artifacts/pair-notebook-server-persistent.tar.gz .
           cp artifacts/pair-notebook-server-persistent.tar.gz.sha256 .
           sha256sum --check pair-notebook-server-persistent.tar.gz.sha256
+          sha256sum "${VERSIONED_VSIX}" "${SOURCE_ZIP}" pair-notebook-server-persistent.tar.gz pair-notebook-install.pyz pair-notebook-install.sh pair-notebook-relay.tar.gz SERVER_SETUP.md > SHA256SUMS
 
           node scripts/create-release-notes.mjs "${VERSION}" release-notes.md
 
@@ -153,6 +159,12 @@ jobs:
             ${{ steps.release.outputs.source_zip }}
             pair-notebook-server-persistent.tar.gz
             pair-notebook-server-persistent.tar.gz.sha256
+            pair-notebook-install.pyz
+            pair-notebook-install.sh
+            pair-notebook-relay.tar.gz
+            pair-notebook-relay.tar.gz.sha256
+            SERVER_SETUP.md
+            SHA256SUMS
             release-notes.md
 
   publish:
@@ -198,7 +210,7 @@ jobs:
             RELEASE_FLAGS=(--prerelease)
           fi
 
-          ASSETS=("${VERSIONED_VSIX}" "pair-notebook-complete-${RELEASE_VERSION}.zip" "pair-notebook-server-persistent.tar.gz" "pair-notebook-server-persistent.tar.gz.sha256")
+          ASSETS=("${VERSIONED_VSIX}" "pair-notebook-complete-${RELEASE_VERSION}.zip" "pair-notebook-server-persistent.tar.gz" "pair-notebook-server-persistent.tar.gz.sha256" "pair-notebook-install.pyz" "pair-notebook-install.sh" "pair-notebook-relay.tar.gz" "pair-notebook-relay.tar.gz.sha256" "SERVER_SETUP.md" "SHA256SUMS")
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             EXISTING_NAMES="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
             MISSING_ASSETS=()

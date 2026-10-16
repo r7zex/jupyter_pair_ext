@@ -57,11 +57,24 @@ code --install-extension ${vsixName} --force
 
 ${changes}
 
+## Install your own server
+
+On Ubuntu 24.04 LTS or Debian 12 with systemd, run:
+
+\`\`\`sh
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/${repository || 'r7zex/jupyter_pair_ext'}/releases/download/${tag}/pair-notebook-install.sh -o pair-notebook-install.sh && sudo sh pair-notebook-install.sh
+\`\`\`
+
+Choose domain, public IP, LAN or an existing supported proxy and enter the server address. The installer prints the owner connection data after local readiness checks. Use \`--mode relay\` for a relay without a Jupyter worker. See \`SERVER_SETUP.md\` for certificate trust, external reachability, repair/update/rollback, owner and participant steps, and verification limits.
+
 ## Download
 
 - \`${vsixName}\` — install this extension on every participating computer. GitHub displays its SHA-256 digest next to the file.
 - \`pair-notebook-complete-${version}.zip\` — full source and matching compute agent for compute owners. Update editors, broker and agent together.
 - \`pair-notebook-server-persistent.tar.gz\` and its \`.sha256\` file — the matching dependency-bundled server, interactive agent and service templates for VPS operators. Follow \`docs/PERSISTENT_VPS.md\` in the archive; preserve existing data and take a backup before updating.
+- \`pair-notebook-install.sh\` and \`pair-notebook-install.pyz\` — interactive installer and verified launcher.
+- \`pair-notebook-relay.tar.gz\` — standalone prebuilt relay: extract and run \`node relay/relay.js\` behind HTTPS; \`node relay/check.js https://SERVER\` verifies encrypted exchange and reconnect.
+- \`SHA256SUMS\` and \`SERVER_SETUP.md\` — checksums and beginner instructions.
 
 GitHub also adds automatic **Source code** archives. They are for reading the source and cannot be installed as a VS Code extension.
 

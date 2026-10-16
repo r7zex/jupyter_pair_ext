@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.7
+
+- Add an interactive server installer for Ubuntu 24.04 LTS and Debian 12, prebuilt runtime downloads, isolated Jupyter, service accounts, managed TLS, checks, repair and transactional upgrades.
+- Include standalone relay-only startup and an encrypted WebSocket exchange/reconnect check in the server package.
+- Negotiate protocol support before restoring editable server projects, stop permanent retries, remember explicit leave, and offer automatic/ask/manual restoration. Preserve unsaved editors and local journals.
+- Use server/project terminology in connection actions while retaining command IDs, saved credentials and pair-vps URIs.
+- See docs/SERVER_SETUP.md and docs/SERVER_RELEASE_0_6_7.md for tested and unverified acceptance layers.
+
 ## 0.6.6 - 2026-10-16 (session execution and unified controls)
 
 - Repairs zero-byte notebooks created in the VPS explorer, including the first unsaved cell. Empty notebooks bootstrap safely; malformed nonempty JSON returns an actionable error without replacing the file.

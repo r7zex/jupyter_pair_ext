@@ -6,6 +6,7 @@ import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { atomicWriteFile } from '../core/atomicFile';
 import { PersistentSessionHost } from './persistentServer';
+import { persistentCapabilities } from './compatibility';
 import { AGENT_ONLINE_MS, CANCELLATION_CONFIRMATION_MS, GPU_UUID, LOG_RETENTION_BYTES, MAX_JOB_BYTES, MAX_LOG_CHUNK, VPS_ID,
   type AgentResources, type CancellationChallenge, type CancellationResult, type ComputeScope, type JobStatus, type JobSummary,
   type VpsAgent, type VpsJob, jobSummary, submissionDigest, terminalJob, validComputeScope, validDatasetIdentity, validateSubmission, visibleVpsText } from './protocol';
@@ -107,6 +108,7 @@ function resources(raw: any): AgentResources {
 
 /** A single-writer durable job broker and an opaque relay for one trusted team. */
 export class VpsServer {
+  private readonly instanceId = randomUUID();
   // A full 1000-job store can contain several GiB of source and output. Keep
   // only the bounded index resident; serialized operations read one payload.
   private readonly jobs = new Map<string, JobSummary>();
@@ -305,7 +307,7 @@ export class VpsServer {
     try {
       if (this.closing) throw new HttpError(503, 'VPS broker is stopping.');
       const url = new URL(request.url ?? '/', 'http://localhost');
-      if (request.method === 'GET' && url.pathname === '/health') { response.end(JSON.stringify({ status: 'ok', persistentSessions: true })); return; }
+      if (request.method === 'GET' && url.pathname === '/health') { response.end(JSON.stringify({ status: 'ok', persistentSessions: true, instanceId: this.instanceId, ...persistentCapabilities })); return; }
       if (url.pathname === '/v1/sessions/rpc') { clearTimeout(deadline); await this.persistent.handle(request, response); return; }
       const agentRoute = /^\/v1\/agents\/([A-Za-z0-9_-]{1,128})\/(poll|report)$/.exec(url.pathname);
       const token = agentRoute ? this.agentTokens.get(agentRoute[1]!) : undefined;

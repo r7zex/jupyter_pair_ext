@@ -1,0 +1,159 @@
+"""Small, checked operating-system and release operations."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import tarfile
+import urllib.request
+
+VERSION = "0.6.7"
+REPOSITORY = "r7zex/jupyter_pair_ext"
+ROOT = Path("/opt/pair-notebook")
+CONFIG = Path("/etc/pair-notebook")
+STATE = Path("/var/lib/pair-notebook-install")
+
+
+class InstallError(RuntimeError):
+    pass
+
+
+def run(*args: str, capture: bool = False) -> str:
+    result = subprocess.run(args, text=True, stdout=subprocess.PIPE if capture else None,
+                            stderr=subprocess.PIPE if capture else None, check=False)
+    if result.returncode:
+        # Commands can contain credentials. Do not include argv or captured output.
+        raise InstallError(f"{Path(args[0]).name} failed (exit {result.returncode}). Check the service journal locally.")
+    return result.stdout.strip() if capture else ""
+
+
+def write(path: Path, content: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".new")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), mode)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(content)
+    temporary.chmod(mode)
+    temporary.replace(path)
+
+
+def supported_system() -> str:
+    if platform.system() != "Linux" or os.geteuid() != 0:
+        raise InstallError("Run with sudo on Ubuntu 24.04 LTS or Debian 12 with systemd.")
+    release = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines() if "=" in line)
+    name, version = (release.get(key, "").strip('"') for key in ("ID", "VERSION_ID"))
+    if (name, version) not in {("ubuntu", "24.04"), ("debian", "12")}:
+        raise InstallError(f"Unsupported OS: {name} {version}. Supported: Ubuntu 24.04 LTS, Debian 12.")
+    if not Path("/run/systemd/system").exists():
+        raise InstallError("A running systemd is required. Ordinary containers and WSL without systemd are not supported servers.")
+    architecture = {"x86_64": "x64", "aarch64": "arm64"}.get(platform.machine())
+    if not architecture:
+        raise InstallError("Supported CPU architectures: x86_64 and aarch64.")
+    return architecture
+
+
+def fetch(url: str, destination: Path) -> None:
+    if not url.startswith("https://"):
+        raise InstallError("Downloads require HTTPS.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"User-Agent": f"PairNotebookInstaller/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=120) as response, destination.open("wb") as output:
+        if not response.url.startswith("https://"):
+            raise InstallError("Download redirected outside HTTPS.")
+        shutil.copyfileobj(response, output)
+
+
+def verify(file: Path, checksums: Path, algorithm: str = "sha256") -> None:
+    matches = [line.split()[0] for line in checksums.read_text().splitlines()
+               if len(line.split()) == 2 and line.split()[1].lstrip("*") == file.name]
+    if len(matches) != 1 or hashlib.new(algorithm, file.read_bytes()).hexdigest() != matches[0]:
+        raise InstallError(f"Checksum mismatch: {file.name}.")
+
+
+def extract(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as bundle:
+        members = bundle.getmembers()
+        for member in members:
+            target = (destination / member.name).resolve()
+            if not target.is_relative_to(destination.resolve()) or not (member.isfile() or member.isdir()):
+                raise InstallError("Unsafe path or linked entry in archive.")
+        if hasattr(tarfile, "data_filter"):
+            bundle.extractall(destination, members=members, filter="data")
+        else:
+            # Debian 12's Python predates extraction filters. Every member was
+            # checked above; links, special files and escapes are prohibited.
+            bundle.extractall(destination, members=members)
+
+
+def release(directory: Path, local_archive: Path | None = None) -> Path:
+    archive = directory / "pair-notebook-server-persistent.tar.gz"
+    checksums = directory / "pair-notebook-server-persistent.tar.gz.sha256"
+    if local_archive:
+        verify(local_archive, Path(str(local_archive) + ".sha256"))
+        shutil.copyfile(local_archive, archive)
+        checksums.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
+    else:
+        base = f"https://github.com/{REPOSITORY}/releases/download/v{VERSION}"
+        fetch(f"{base}/{archive.name}", archive)
+        fetch(f"{base}/{checksums.name}", checksums)
+    verify(archive, checksums)
+    extract(archive, directory / "unpacked")
+    server = directory / "unpacked/server"
+    manifest = json.loads((server / "BUILD.json").read_text())
+    if manifest["version"] != VERSION:
+        raise InstallError("Installer and server versions differ.")
+    for name, digest in manifest["files"].items():
+        file = (server / name).resolve()
+        if not file.is_relative_to(server.resolve()) or hashlib.sha256(file.read_bytes()).hexdigest() != digest:
+            raise InstallError("Server manifest verification failed.")
+    return server
+
+
+def account(name: str, directory: str) -> None:
+    if subprocess.run(["getent", "passwd", name], stdout=subprocess.DEVNULL, check=False).returncode:
+        run("useradd", "--system", "--user-group", "--home-dir", directory, "--shell", "/usr/sbin/nologin", name)
+
+
+def runtime(directory: Path, architecture: str) -> None:
+    """Install private upstream binaries; leave host Node and reverse proxies alone."""
+    runtime_root = ROOT / "runtime"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    if not (runtime_root / "node/bin/node").exists():
+        sums = directory / "SHASUMS256.txt"
+        fetch("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt", sums)
+        filenames = [line.split()[1] for line in sums.read_text().splitlines()
+                     if line.split()[1].endswith(f"-linux-{architecture}.tar.xz")]
+        if len(filenames) != 1:
+            raise InstallError("Could not select the supported Node.js 22 build.")
+        archive = directory / filenames[0]
+        fetch(f"https://nodejs.org/dist/latest-v22.x/{archive.name}", archive)
+        verify(archive, sums)
+        node = runtime_root / "node/bin/node"
+        node.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive) as bundle:
+            member = next(item for item in bundle.getmembers() if item.name.endswith("/bin/node"))
+            source = bundle.extractfile(member)
+            if not member.isfile() or source is None:
+                raise InstallError("Node.js archive does not contain a regular executable.")
+            with source, node.open("wb") as output:
+                shutil.copyfileobj(source, output)
+        node.chmod(0o755)
+    if not (runtime_root / "caddy").exists():
+        metadata = directory / "caddy-release.json"
+        fetch("https://api.github.com/repos/caddyserver/caddy/releases/latest", metadata)
+        tag = json.loads(metadata.read_text())["tag_name"]
+        cpu = {"x64": "amd64", "arm64": "arm64"}[architecture]
+        archive = directory / f"caddy_{tag.removeprefix('v')}_linux_{cpu}.tar.gz"
+        sums = directory / "caddy_checksums.txt"
+        base = f"https://github.com/caddyserver/caddy/releases/download/{tag}"
+        fetch(f"{base}/{archive.name}", archive)
+        fetch(f"{base}/caddy_{tag.removeprefix('v')}_checksums.txt", sums)
+        verify(archive, sums, "sha512")
+        extract(archive, directory / "caddy")
+        shutil.copyfile(directory / "caddy/caddy", runtime_root / "caddy")
+        (runtime_root / "caddy").chmod(0o755)

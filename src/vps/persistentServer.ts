@@ -18,6 +18,7 @@ import type { TextChange } from '../core/crdt';
 import { editSharedNotebook, type NotebookSyncReply } from './persistentNotebookCrdt';
 import type { PersistentCommand, PersistentDevice, PersistentExecution, PersistentMember, PersistentMembership, PersistentRpcRequest, PersistentSessionView } from './persistentProtocol';
 import { safeJobPath, VPS_ID, visibleVpsText } from './protocol';
+import { persistentCapabilities } from './compatibility';
 import { defaultPermissions, mayEdit, mayChangeTree, normalizePermissions, type ParticipantPermissions } from '../core/permissions';
 import { MAX_LINE_COMMENTS, normalizeCommentInput, normalizeLineComment, reanchorComment, commentColor, participantColor, type LineComment } from '../core/lineComments';
 
@@ -313,6 +314,7 @@ export class PersistentSessionHost {
 
   private async dispatch(body: PersistentRpcRequest, credential: string, address: string): Promise<unknown> {
     if (this.closing) throw new SessionError(503, 'Session service is stopping.');
+    if (body.operation === 'compatibility') return persistentCapabilities;
     if (['discover', 'join', 'acceptInvitation'].includes(body.operation)) this.limitAuthentication(address);
     if (body.operation === 'discover') {
       const value = typeof body.password === 'string' && body.password.length >= 12 && body.password.length <= 1024 ? body.password : '';

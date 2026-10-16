@@ -39,7 +39,7 @@ export async function readVpsConnection(context: vscode.ExtensionContext): Promi
   if (!endpoint) return undefined;
   const url = normalizeVpsUrl(endpoint);
   const token = await context.secrets.get(vpsSecretKey(url));
-  if (token && !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error('The stored VPS access token is invalid. Connect to VPS again.');
+  if (token && !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error('The stored VPS access token is invalid. Connect to Server again.');
   return token ? { url, token } : undefined;
 }
 
@@ -91,7 +91,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
       const connection = await readVpsConnection(this.context);
       if (!connection) {
         const connect = new ComputeItem('Connect to your VPS');
-        connect.command = { command: 'pairNotebook.connectVpsCompute', title: 'Connect to VPS Compute' };
+        connect.command = { command: 'pairNotebook.connectVpsCompute', title: 'Connect to Server Compute' };
         return [connect];
       }
       if (!item) return [new ComputeItem('Compute machines', 'agents'), new ComputeItem('Background jobs', 'jobs')];
@@ -138,7 +138,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
 
   private async client(): Promise<VpsClient> {
     const connection = await readVpsConnection(this.context);
-    if (!connection) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS Compute first.');
+    if (!connection) throw new Error('Connect your VPS with Pair Notebook: Connect to Server Compute first.');
     const client = new VpsClient(connection.url, connection.token);
     this.clientConnections.set(client, connection);
     return client;
@@ -177,7 +177,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before submitting Python for remote execution.');
     const initial = await readVpsConnection(this.context);
     this.assertBrokerProject();
-    if (!initial) throw new Error('Connect your VPS with Pair Notebook: Connect to VPS first.');
+    if (!initial) throw new Error('Connect your VPS with Pair Notebook: Connect to Server first.');
     const client = new VpsClient(initial.url, initial.token);
     const legacy = this.context.globalState.get<{ endpoint: string; id: string }>('pairNotebook.pendingVpsJob');
     if (legacy?.endpoint === client.endpoint) {
@@ -356,7 +356,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
   private assertBrokerProject(): void {
     const uri = vscode.window.activeNotebookEditor?.notebook.uri ?? vscode.window.activeTextEditor?.document.uri;
     if (uri?.scheme === 'pair-vps' || vscode.workspace.workspaceFolders?.[0]?.uri.scheme === 'pair-vps') {
-      throw new Error('Run this project with the Pair Notebook • Persistent VPS notebook kernel. Background VPS Compute does not accept persistent VPS files.');
+      throw new Error('Run this project with the Pair Notebook • Server project notebook kernel. Background VPS Compute does not accept server project files.');
     }
   }
 
@@ -507,7 +507,7 @@ export class VpsComputeController implements vscode.TreeDataProvider<ComputeItem
         if (this.disposed || generation !== this.logGeneration) return;
         if (error instanceof VpsHttpError && [401, 403, 404].includes(error.status)) {
           this.appendOutput(error.status === 404 ? '[Job not found on this VPS. Refresh VPS Jobs.]\n'
-            : '[VPS access denied. Use Connect to VPS to update your credentials.]\n');
+            : '[VPS access denied. Use Connect to Server to update your credentials.]\n');
           this.logTimer = undefined;
           return;
         }

@@ -101,8 +101,8 @@ describe('VPS project input resources', () => {
     const originalAgents = VpsClient.prototype.agents;
     VpsClient.prototype.agents = async () => { apiCalls++; return []; };
     try {
-      await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
-      await assert.rejects((controller as any).sourceSnapshot(), /Persistent VPS notebook kernel/);
+      await assert.rejects(controller.submit(), /Server project notebook kernel/);
+      await assert.rejects((controller as any).sourceSnapshot(), /Server project notebook kernel/);
       assert.deepEqual({ sourceReads, credentialReads, apiCalls, selections, prompts: inputOptions.length },
         { sourceReads: 0, credentialReads: 0, apiCalls: 0, selections: 0, prompts: 0 });
     } finally { VpsClient.prototype.agents = originalAgents; }
@@ -238,7 +238,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       }, selection: { start: 0 } };
       return items[0];
     };
-    await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
+    await assert.rejects(controller.submit(), /Server project notebook kernel/);
     assert.equal(sourceReads, 0);
     assert.equal((await client.jobs()).length, 0);
     assert.equal(inputOptions.length, 0);
@@ -251,7 +251,7 @@ describe('VPS compute UI recovery and lifecycle regressions', () => {
       workspaceFolders = [{ uri: { scheme: 'pair-vps', authority: 'private-session', path: '/', fsPath: '/' } }];
     };
     try {
-      await assert.rejects(controller.submit(), /Persistent VPS notebook kernel/);
+      await assert.rejects(controller.submit(), /Server project notebook kernel/);
       assert.equal((await client.jobs()).length, 0);
     } finally { PendingSubmissionStore.prototype.save = save; }
   });

@@ -114,6 +114,7 @@ let lifecycleReadyRuntime: SessionRuntime | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   activationContext = context;
   output = vscode.window.createOutputChannel('Pair Notebook');
+  output.appendLine(`[info] Activated Pair Notebook ${context.extension.packageJSON.version}; path=${context.extensionPath}; protocol=1`);
   const proxyMigrationPending = shouldMigrateLegacyProxyPassword(
     context.globalState.get<unknown>(PROXY_CREDENTIAL_MIGRATION_KEY),
   );

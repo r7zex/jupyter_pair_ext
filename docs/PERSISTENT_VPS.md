@@ -1,3 +1,7 @@
+# Server installation
+
+For new servers use the [interactive installer](SERVER_SETUP.md). The manual procedure below remains for existing deployments. VPS command identifiers and `pair-vps` URIs remain compatible.
+
 # Persistent VPS sessions — 0.6.5
 
 Use the main Pair Notebook panel to create, join, configure or leave a persistent VPS session. The VPS retains session authority, membership, files and execution receipts while editors are offline. The panel displays the endpoint, session ID, matching Explorer folder, participants and selected compute device. Legacy broker commands remain callable for compatibility but have no separate sidebar view.
