@@ -256,7 +256,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     this.current(state);
     if (saved && this.canEdit?.(state.key) === false) { await rename(state.file, `${state.file}.read-only-${randomUUID()}.json`); saved = undefined; this.remoteBootstrap.add(state.notebook); }
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
-    const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
+    const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, bootstrapEmpty: true }); this.current(state);
     if (reply.textProtocol !== 'yjs-intents-v1') throw new Error('The VPS server needs an update before live editing can connect safely.');
     if (reply.bootstrapEmpty && state.notebook.cellCount && this.canEdit?.(state.key) !== false && !this.remoteBootstrap.has(state.notebook)) {
       const cells = state.notebook.getCells().map((cell) => {

@@ -583,6 +583,11 @@ export class PersistentSessionHost {
       const file = await session.workspace.read(filename, owner);
       const { doc, epoch, template } = loadNotebookCrdt(file.content);
       try {
+        if (template.cells.length === 0 && sharedNotebook(doc).cells.length === 0
+          && (!template.metadata?.pair_crdt || template.metadata.pair_crdt.bootstrapEmpty === true)
+          && body.bootstrapEmpty !== true && body.update === undefined && body.snapshot === undefined && body.intent === undefined && body.stateVector === undefined) {
+          throw new SessionError(426, 'Update Pair Notebook to 0.6.6 before opening this new notebook; its unsaved first cell must be preserved.');
+        }
         if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced. Preserve offline edits and reopen it.');
         const before = Buffer.from(Y.encodeStateAsUpdate(doc));
         const previous = sharedNotebook(doc);

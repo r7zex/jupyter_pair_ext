@@ -35,7 +35,10 @@ describe('Persistent VPS Session Host', () => {
   it('synchronizes a newly created zero-byte notebook and executes its first unsaved cell', async () => {
     await registerVps();
     assert.equal((await call('write', { path: 'new.ipynb', content: '', expectedRevision: 0 })).status, 200);
-    const initial = await call('notebookSync', { path: 'new.ipynb', actor: 'a'.repeat(32) });
+    const before = (await call('read', { path: 'new.ipynb' })).data.content;
+    assert.equal((await call('notebookSync', { path: 'new.ipynb', actor: 'a'.repeat(32) })).status, 426, 'older clients must not erase the unsaved first cell');
+    assert.equal((await call('read', { path: 'new.ipynb' })).data.content, before);
+    const initial = await call('notebookSync', { path: 'new.ipynb', actor: 'a'.repeat(32), bootstrapEmpty: true });
     assert.equal(initial.status, 200);
     assert.deepEqual(initial.data.cells, []);
     const edited = await call('notebookSync', { path: 'new.ipynb', epoch: initial.data.epoch,
