@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { PairNotebookController } from '../../src/vscode/jupyterController';
-import { SessionRuntime } from '../../src/runtime/session';
+import type { SessionRuntime } from '../../src/runtime/session';
 import { EditorSynchronizer } from '../../src/vscode/sync';
 
 suite('Pair Notebook — production NotebookController in real VS Code', () => {
@@ -41,7 +41,10 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
     const backing = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-solo-backing-'));
     const log = vscode.window.createOutputChannel(`Pair Notebook Solo Execution E2E ${Date.now()}`);
     const python = process.env.PAIR_NOTEBOOK_E2E_PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
-    const runtime = new SessionRuntime({
+    // Match the deployed CommonJS bundle on VS Code's minimum Node runtime.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { SessionRuntime: Runtime } = require(process.env.PAIR_NOTEBOOK_E2E_RUNTIME!) as { SessionRuntime: typeof import('../../src/runtime/session').SessionRuntime };
+    const runtime: SessionRuntime = new Runtime({
       sessionId: 'solo-execution', projectId: 'solo-project', projectName: 'Solo execution', mode: 'resilient', role: 'host',
       localPeer: { peerId: 'solo-owner', displayName: 'Owner', joinOrder: 0 }, hostPeerId: 'solo-owner',
       backingFolder: backing, workingFolder: fixture.root, createdAt: Date.now(), sessionEpoch: 1, hostEpoch: 0,
