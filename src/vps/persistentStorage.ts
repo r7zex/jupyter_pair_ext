@@ -217,6 +217,9 @@ export class PersistentWorkspace {
       const name = normalizePath(value);
       this.authorize(name, owner, next);
       let bytes = decodeContent(content, this.limits.maxFileBytes);
+      if (name.endsWith('.ipynb') && !bytes.toString('utf8').trim()) {
+        bytes = Buffer.from(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [] }));
+      }
       if (name.endsWith('.ipynb') && !preserveNotebookIdentity) {
         // Raw file replacement must not retain an obsolete embedded replica.
         try { const notebook = JSON.parse(bytes.toString('utf8')) as { metadata?: Record<string, unknown> };

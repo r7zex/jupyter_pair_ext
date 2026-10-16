@@ -8,14 +8,14 @@ import type { PersistentLiveEvent } from './persistentLive';
 export type PersistentCredential = { kind: 'anonymous' } | { kind: 'admin' | 'membership'; token: string };
 
 export class PersistentHttpError extends Error {
-  public constructor(public readonly status: number) {
-    super(status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
+  public constructor(public readonly status: number, detail?: string) {
+    super((status === 409 ? 'The server project changed. Reload its latest version before saving your edit.'
       : status === 401 ? 'Your session credentials expired or were revoked. Connect again.'
         : status === 423 ? 'This line is occupied by another participant.'
         : status === 403 ? 'The server denied this operation for your session identity.'
           : status === 404 ? 'The session, file or execution is unavailable.'
             : status === 429 ? 'Too many requests. Wait before trying again.'
-              : `Persistent VPS request failed (HTTP ${status}).`);
+              : `Persistent VPS request failed (HTTP ${status}).`) + (detail ? ` ${detail}` : ''));
   }
 }
 
@@ -68,7 +68,15 @@ export class PersistentClient {
         });
         response.on('error', () => finish(new Error('Persistent VPS response was interrupted.')));
         response.on('end', () => {
-          if (response.statusCode !== 200) { finish(new PersistentHttpError(response.statusCode ?? 0)); return; }
+          if (response.statusCode !== 200) {
+            let detail: string | undefined;
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { error?: unknown; requestId?: unknown };
+              if (typeof body.error === 'string' && body.error.length <= 2048) detail = body.error;
+              if (typeof body.requestId === 'string' && /^[a-f0-9-]{36}$/.test(body.requestId)) detail = `${detail ?? 'VPS operation failed.'} Server request ID: ${body.requestId}`;
+            } catch { /* Non-JSON proxies retain the HTTP status fallback. */ }
+            finish(new PersistentHttpError(response.statusCode ?? 0, detail)); return;
+          }
           try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8')) as T); }
           catch { finish(new Error('Persistent VPS returned invalid JSON.')); }
         });

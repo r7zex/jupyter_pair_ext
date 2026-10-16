@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 
 export interface SharedCell { id: string; cell_type: string; source: string; metadata: Record<string, unknown> }
 export interface SharedNotebook { cells: SharedCell[]; metadata: Record<string, unknown> }
-export interface NotebookSyncReply { epoch: string; update: string; revision: number; textProtocol?: 'yjs-intents-v1'; identity?: string; acknowledgedSequence?: number; cells: SharedCell[]; metadata: Record<string, unknown> }
+export interface NotebookSyncReply { epoch: string; update: string; revision: number; textProtocol?: 'yjs-intents-v1'; identity?: string; acknowledgedSequence?: number; bootstrapEmpty?: boolean; cells: SharedCell[]; metadata: Record<string, unknown> }
 const validId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 const MAX_REPLICA_BYTES = 64 * 1024 * 1024;
 export function sharedNotebook(doc: Y.Doc): SharedNotebook {
@@ -47,8 +47,11 @@ export function editSharedNotebook(doc: Y.Doc, notebook: SharedNotebook): void {
   });
 }
 export function loadNotebookCrdt(content: string): { doc: Y.Doc; epoch: string; template: Record<string, any> } {
-  const template = JSON.parse(Buffer.from(content, 'base64').toString('utf8')) as Record<string, any>;
-  if (!Array.isArray(template.cells) || template.cells.length > 10000) throw new Error('Invalid notebook.');
+  const source = Buffer.from(content, 'base64').toString('utf8');
+  let template: Record<string, any>;
+  try { template = source.trim() ? JSON.parse(source) : { nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [] }; }
+  catch { throw Object.assign(new Error('Notebook JSON is invalid. Restore a valid notebook before synchronizing.'), { status: 400 }); }
+  if (!template || !Array.isArray(template.cells) || template.cells.length > 10000) throw Object.assign(new Error('Invalid notebook.'), { status: 400 });
   const doc = new Y.Doc(); const state = template.metadata?.pair_crdt;
   const epoch = typeof state?.epoch === 'string' && validId(state.epoch) ? state.epoch : randomUUID();
   if (state) {
@@ -64,9 +67,11 @@ export function loadNotebookCrdt(content: string): { doc: Y.Doc; epoch: string; 
 }
 export function saveNotebookCrdt(doc: Y.Doc, epoch: string, template: Record<string, any>): string {
   const state = sharedNotebook(doc); const update = Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64');
+  const bootstrapEmpty = state.cells.length === 0 && template.cells.length === 0
+    && (!template.metadata?.pair_crdt || template.metadata.pair_crdt.bootstrapEmpty === true);
   if (Buffer.byteLength(update) > MAX_REPLICA_BYTES) throw new Error('Notebook replica exceeds its bounded storage budget.');
   const old = new Map<string, any>(template.cells.map((cell: any) => [cell.id, cell]));
-  return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update, ...(template.metadata?.pair_crdt?.intents ? { intents: template.metadata.pair_crdt.intents } : {}) } }, cells: state.cells.map((cell) => {
+  return Buffer.from(JSON.stringify({ ...template, nbformat: 4, nbformat_minor: 5, metadata: { ...state.metadata, pair_crdt: { epoch, update, ...(bootstrapEmpty ? { bootstrapEmpty: true } : {}), ...(template.metadata?.pair_crdt?.intents ? { intents: template.metadata.pair_crdt.intents } : {}) } }, cells: state.cells.map((cell) => {
     const before = old.get(cell.id);
     const result = { ...before, ...cell, ...(cell.cell_type === 'code' ? { outputs: before?.cell_type === 'code' ? before.outputs ?? [] : [], execution_count: before?.cell_type === 'code' ? before.execution_count ?? null : null } : {}) };
     if (cell.cell_type !== 'code') { delete result.outputs; delete result.execution_count; }

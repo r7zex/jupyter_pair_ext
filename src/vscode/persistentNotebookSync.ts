@@ -258,6 +258,19 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
     const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor }); this.current(state);
     if (reply.textProtocol !== 'yjs-intents-v1') throw new Error('The VPS server needs an update before live editing can connect safely.');
+    if (reply.bootstrapEmpty && state.notebook.cellCount && this.canEdit?.(state.key) !== false && !this.remoteBootstrap.has(state.notebook)) {
+      const cells = state.notebook.getCells().map((cell) => {
+        const candidate = cell.metadata.id ?? cell.metadata.pairNotebookCellId;
+        const id = typeof candidate === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : randomUUID();
+        state.ids.seed(cell, undefined, id);
+        return { id, cell_type: cell.kind === 2 ? 'code' : 'markdown', source: cell.document.getText(), metadata: cellUserMetadata(cell.metadata, typeof cell.metadata.id === 'string' && !!cell.metadata.metadata) };
+      });
+      const initial = await state.connection.client.call<NotebookSyncReply>('notebookSync', {
+        sessionId: state.connection.sessionId, path: state.key, actor: state.actor, epoch: reply.epoch,
+        snapshotStateVector: Buffer.from(Y.encodeStateVectorFromUpdate(Buffer.from(reply.update, 'base64'))).toString('base64'),
+        snapshot: { cells, metadata: notebookUserMetadata(state.notebook.metadata) },
+      }); this.current(state); Object.assign(reply, initial);
+    }
     state.acknowledgedSequence = reply.acknowledgedSequence ?? 0;
     Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.epoch = reply.epoch; state.revision = reply.revision; state.identity = reply.identity;
     const vector = Y.encodeStateVector(state.doc);

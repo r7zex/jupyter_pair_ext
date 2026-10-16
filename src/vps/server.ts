@@ -124,6 +124,8 @@ export class VpsServer {
     void operation.finally(() => this.requests.delete(operation));
   });
   private readonly sockets = new WebSocketServer({ noServer: true, maxPayload: 96 * 1024 * 1024 });
+  private readonly temporarySockets = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  private readonly relayAdmissions = new Map<string, { since: number; count: number }>();
   private readonly rooms = new Map<string, Map<string, { socket: WebSocket; announce?: string }>>();
   private heartbeat: NodeJS.Timeout | undefined;
   private stopPromise: Promise<void> | undefined;
@@ -160,12 +162,14 @@ export class VpsServer {
       const url = new URL(request.url ?? '/', 'http://localhost');
       const room = url.searchParams.get('room') ?? '';
       const peer = url.searchParams.get('peer') ?? '';
-      if (this.closing || url.pathname !== '/v1/relay' || !this.principals.some((principal) => this.authorized(request, principal.token))
-        || !/^[a-f0-9]{64}$/.test(room) || !VPS_ID.test(peer) || this.sockets.clients.size >= 128
+      const temporary = url.pathname === '/v1/temporary-relay';
+      if (this.closing || (!temporary && (url.pathname !== '/v1/relay' || !this.principals.some((principal) => this.authorized(request, principal.token))))
+        || !/^[a-f0-9]{64}$/.test(room) || !VPS_ID.test(peer) || this.sockets.clients.size + this.temporarySockets.clients.size >= 128
+        || (temporary && (this.temporarySockets.clients.size >= 32 || !this.admitTemporaryRelay(request.socket.remoteAddress ?? 'unknown')))
         || (this.rooms.get(room)?.has(peer) ?? false)) {
         socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return;
       }
-      this.sockets.handleUpgrade(request, socket, head, (connection) => this.connectRelay(room, peer, connection));
+      (temporary ? this.temporarySockets : this.sockets).handleUpgrade(request, socket, head, (connection) => this.connectRelay(room, peer, connection));
     });
   }
 
@@ -195,7 +199,7 @@ export class VpsServer {
       this.server.listen(port, host, () => { this.server.off('error', reject); resolve(); });
     });
     this.heartbeat = setInterval(() => {
-      for (const socket of this.sockets.clients) {
+      for (const socket of [...this.sockets.clients, ...this.temporarySockets.clients]) {
         if ((socket as WebSocket & { awaitingPong?: boolean }).awaitingPong) { socket.terminate(); continue; }
         (socket as WebSocket & { awaitingPong?: boolean }).awaitingPong = true;
         socket.ping();
@@ -240,7 +244,7 @@ export class VpsServer {
   private async close(): Promise<void> {
     this.closing = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
-    for (const socket of this.sockets.clients) socket.terminate();
+    for (const socket of [...this.sockets.clients, ...this.temporarySockets.clients]) socket.terminate();
     const closed = this.server.listening ? new Promise<void>((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve())) : Promise.resolve();
     this.server.closeIdleConnections();
     this.persistent.closeLiveConnections();
@@ -248,6 +252,7 @@ export class VpsServer {
     await this.serial;
     await this.persistent.stop();
     await new Promise<void>((resolve) => this.sockets.close(() => resolve()));
+    await new Promise<void>((resolve) => this.temporarySockets.close(() => resolve()));
     await closed;
     await this.releaseStoreLock();
   }
@@ -665,6 +670,17 @@ export class VpsServer {
     }
     if (append.length || body.result !== undefined) await this.save(updated);
     return { offset: updated.logEnd, cancelRequested: updated.cancelRequested };
+  }
+
+  private admitTemporaryRelay(address: string): boolean {
+    const now = Date.now();
+    for (const [key, entry] of this.relayAdmissions) if (now - entry.since >= 60_000) this.relayAdmissions.delete(key);
+    const entry = this.relayAdmissions.get(address);
+    if (!entry) {
+      if (this.relayAdmissions.size >= 256) return false;
+      this.relayAdmissions.set(address, { since: now, count: 1 }); return true;
+    }
+    return ++entry.count <= 60;
   }
 
   private connectRelay(room: string, peer: string, socket: WebSocket): void {

@@ -17,15 +17,15 @@ describe('terminal lifecycle product wiring', () => {
     );
     assert.equal(
       commands.get('pairNotebook.runActiveCell')?.enablement,
-      'pairNotebook.inSession && pairNotebook.executionAvailable',
+      '(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession',
     );
     assert.equal(
       commands.get('pairNotebook.restartKernel')?.enablement,
-      'pairNotebook.inSession && pairNotebook.executionAvailable',
+      '(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession',
     );
     assert.equal(
       manifest.contributes.menus['notebook/cell/title'][0].when,
-      'pairNotebook.inSession && pairNotebook.executionAvailable',
+      '(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession',
     );
   });
 });

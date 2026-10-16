@@ -25,7 +25,12 @@ const MAX_PENDING_RENDER_EVENTS = 2_048;
 const MAX_PENDING_RENDER_BYTES = 32 * 1024 * 1024;
 
 export class PairNotebookController implements vscode.Disposable, NotebookCellStateRenderer {
-  private readonly controller: vscode.NotebookController;
+  public readonly controller: vscode.NotebookController;
+  public persistent: {
+    owns(notebook: vscode.NotebookDocument): boolean;
+    execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void>;
+    interrupt(notebook: vscode.NotebookDocument): Promise<void>;
+  } | undefined;
   private runtime: SessionRuntime | undefined;
   private synchronizer: EditorSynchronizer | undefined;
   private readonly disposables: vscode.Disposable[] = [];
@@ -43,13 +48,14 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.controller = vscode.notebooks.createNotebookController(
       'pair-notebook-jupyter',
       'jupyter-notebook',
-      'Pair Notebook • Jupyter',
+      'Pair Notebook',
       (cells, notebook) => this.execute(cells, notebook),
     );
     this.controller.supportedLanguages = ['python'];
     this.controller.supportsExecutionOrder = true;
     this.controller.description = 'Real Jupyter kernel on the selected Pair Notebook compute target';
     this.controller.interruptHandler = async (notebook) => {
+      if (this.persistent?.owns(notebook)) { await this.persistent.interrupt(notebook); return; }
       const runtime = this.requireRuntime();
       const key = runtime.notebookKey(notebook.uri);
       if (key && await runtime.confirmOperation('interrupt', key)) this.cancelQueuedExecution(notebook);
@@ -86,7 +92,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private readonly selectActiveController = (editor: vscode.NotebookEditor | undefined): void => {
-    if (!editor || !this.runtime?.notebookKey(editor.notebook.uri)) return;
+    if (!editor || (!this.runtime?.notebookKey(editor.notebook.uri) && !this.persistent?.owns(editor.notebook))) return;
     // Affinity alone does not bind the controller to a newly activated notebook.
     void this.selectController(editor).catch((error: unknown) => {
       this.log.appendLine(`[error] Could not restore Pair Notebook kernel selection: ${String(error)}`);
@@ -147,8 +153,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   public async executeActive(): Promise<void> {
     const editor = vscode.window.activeNotebookEditor;
     if (!editor) throw new Error('Open a notebook and select a code cell first.');
-    const runtime = this.requireRuntime();
-    if (!runtime.notebookKey(editor.notebook.uri)) throw new Error('The active notebook is outside the Pair Notebook working copy.');
+    if (!this.persistent?.owns(editor.notebook) && !this.requireRuntime().notebookKey(editor.notebook.uri)) throw new Error('The active notebook is outside the Pair Notebook working copy.');
     const cells = editor.notebook.getCells(editor.selection).filter((cell) => cell.kind === vscode.NotebookCellKind.Code);
     if (!cells.length) throw new Error('Select a Python code cell first.');
     await this.selectController(editor);
@@ -218,6 +223,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
+    if (this.persistent?.owns(notebook)) { await this.persistent.execute(cells, notebook); return; }
     const runtime = this.requireRuntime();
     const runtimeGeneration = this.runtimeGeneration;
     const cancellationGeneration = this.cancellationGenerations.get(notebook) ?? 0;

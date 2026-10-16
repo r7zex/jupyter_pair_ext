@@ -32,6 +32,30 @@ describe('Persistent VPS Session Host', () => {
   });
   afterEach(async () => { await server.stop(); await rm(directory, { recursive: true, force: true }); });
 
+  it('synchronizes a newly created zero-byte notebook and executes its first unsaved cell', async () => {
+    await registerVps();
+    assert.equal((await call('write', { path: 'new.ipynb', content: '', expectedRevision: 0 })).status, 200);
+    const initial = await call('notebookSync', { path: 'new.ipynb', actor: 'a'.repeat(32) });
+    assert.equal(initial.status, 200);
+    assert.deepEqual(initial.data.cells, []);
+    const edited = await call('notebookSync', { path: 'new.ipynb', epoch: initial.data.epoch,
+      snapshotStateVector: Buffer.from(Y.encodeStateVectorFromUpdate(Buffer.from(initial.data.update, 'base64'))).toString('base64'),
+      snapshot: { metadata: {}, cells: [{ id: 'new-cell', cell_type: 'code', source: 'a = 1\na', metadata: {} }] } });
+    assert.equal(edited.status, 200);
+    const run = await call('execute', { notebook: 'new.ipynb', cellIndex: 0, expectedRevision: edited.data.revision, requestId: 'first-new-cell' });
+    assert.equal(run.status, 200);
+    const claimed = await rpc({ operation: 'claim', deviceId: 'vps' }, agent);
+    assert.equal(Buffer.from(claimed.data.command.command.codeBase64, 'base64').toString(), 'a = 1\na');
+  });
+
+  it('reports malformed notebook JSON as a recoverable client error without overwriting it', async () => {
+    const invalid = encoded('{unfinished');
+    await call('write', { path: 'broken.ipynb', content: invalid, expectedRevision: 0 });
+    const reply = await call('notebookSync', { path: 'broken.ipynb' });
+    assert.equal(reply.status, 400); assert.match(reply.data.error, /Notebook JSON/);
+    assert.equal((await call('read', { path: 'broken.ipynb' })).data.content, invalid);
+  });
+
   it('persists independent owner credentials, files and lifecycle after all participants leave and server restarts', async () => {
     const snapshot = (await call('mkdir', { path: 'project', expectedRevision: 0 })).data;
     assert.equal((await call('write', { path: 'project/shared.txt', content: encoded('saved'), expectedRevision: snapshot.revision })).status, 200);

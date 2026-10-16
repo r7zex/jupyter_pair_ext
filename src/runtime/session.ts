@@ -2043,7 +2043,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const pythonPath = configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
     [this.hardware, this.environments] = await Promise.all([
       discoverHardware(pythonPath),
-      discoverPythonEnvironments(this.descriptor.workingFolder, pythonPath),
+      discoverPythonEnvironments(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath),
     ]);
     this.publishHardwarePresence();
     this.emit('hardware', this.hardware);
@@ -6949,9 +6949,17 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       }
       this.transition('kernel-starting', `Starting Jupyter kernel for ${notebookKey}.`);
       const configuration = vscode.workspace.getConfiguration('pairNotebook');
-      const pythonPath = target.pythonPath
+      let pythonPath = target.pythonPath
         ?? this.descriptor.notebookPythonPaths?.[notebookKey]
         ?? configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
+      if (!target.pythonPath && !this.descriptor.notebookPythonPaths?.[notebookKey]
+        && ['python', 'python3'].includes(pythonPath)) {
+        const environments = await discoverPythonEnvironments(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath);
+        const ready = environments.find((environment) => environment.jupyterReady
+          && (!target.device.startsWith('gpu:') || environment.cudaAvailable));
+        if (ready) pythonPath = ready.executable;
+      }
+      assertAuthority();
       const gpuMatch = /^gpu:(\d+)$/.exec(target.device);
       kernel = new JupyterKernel(
         pythonPath,

@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent VPS workspaces and controlled remote Python execution.",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -132,12 +132,12 @@
       {
         "command": "pairNotebook.runActiveCell",
         "title": "Pair Notebook: Run Active Cell on Compute",
-        "enablement": "pairNotebook.inSession && pairNotebook.executionAvailable"
+        "enablement": "(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession"
       },
       {
         "command": "pairNotebook.restartKernel",
         "title": "Pair Notebook: Restart Jupyter Kernel",
-        "enablement": "pairNotebook.inSession && pairNotebook.executionAvailable"
+        "enablement": "(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession"
       },
       {
         "command": "pairNotebook.openRecentProject",
@@ -259,15 +259,19 @@
       },
       {
         "command": "pairNotebook.managePermissions",
-        "title": "Pair Notebook: Права участников"
+        "title": "Pair Notebook: РџСЂР°РІР° СѓС‡Р°СЃС‚РЅРёРєРѕРІ"
       },
       {
         "command": "pairNotebook.addLineComment",
-        "title": "Pair Notebook: Комментарий к строкам"
+        "title": "Pair Notebook: РљРѕРјРјРµРЅС‚Р°СЂРёР№ Рє СЃС‚СЂРѕРєР°Рј"
       },
       {
         "command": "pairNotebook.resolveLineComment",
-        "title": "Pair Notebook: Закрыть комментарий"
+        "title": "Pair Notebook: Р—Р°РєСЂС‹С‚СЊ РєРѕРјРјРµРЅС‚Р°СЂРёР№"
+      },
+      {
+        "command": "pairNotebook.configureVpsSessions",
+        "title": "Pair Notebook: Configure Persistent Sessions"
       }
     ],
     "viewsContainers": {
@@ -285,14 +289,6 @@
           "id": "pairNotebook.dashboard",
           "name": "Pair Notebook",
           "type": "webview"
-        },
-        {
-          "id": "pairNotebook.vpsCompute",
-          "name": "VPS Compute"
-        },
-        {
-          "id": "pairNotebook.persistentSessions",
-          "name": "Persistent VPS Sessions"
         }
       ]
     },
@@ -313,51 +309,10 @@
         {
           "command": "pairNotebook.runActiveCell",
           "group": "navigation@20",
-          "when": "pairNotebook.inSession && pairNotebook.executionAvailable"
+          "when": "(pairNotebook.inSession && pairNotebook.executionAvailable) || pairNotebook.inVpsSession"
         }
       ],
-      "view/title": [
-        {
-          "command": "pairNotebook.connectVpsCompute",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@0"
-        },
-        {
-          "command": "pairNotebook.connectVps",
-          "when": "view == pairNotebook.persistentSessions",
-          "group": "navigation@0"
-        },
-        {
-          "command": "pairNotebook.createVpsSession",
-          "when": "view == pairNotebook.persistentSessions",
-          "group": "navigation@1"
-        },
-        {
-          "command": "pairNotebook.refreshVpsSession",
-          "when": "view == pairNotebook.persistentSessions",
-          "group": "navigation@2"
-        },
-        {
-          "command": "pairNotebook.runVpsJob",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@1"
-        },
-        {
-          "command": "pairNotebook.showVpsJobs",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@2"
-        },
-        {
-          "command": "pairNotebook.cancelVpsJob",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@3"
-        },
-        {
-          "command": "pairNotebook.refreshVpsJobs",
-          "when": "view == pairNotebook.vpsCompute",
-          "group": "navigation@4"
-        }
-      ],
+      "view/title": [],
       "editor/context": [
         {
           "command": "pairNotebook.addLineComment",
@@ -368,6 +323,32 @@
           "command": "pairNotebook.resolveLineComment",
           "when": "pairNotebook.inSession || pairNotebook.inVpsSession",
           "group": "pairNotebook@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "pairNotebook.connectVpsCompute",
+          "when": "false"
+        },
+        {
+          "command": "pairNotebook.runVpsJob",
+          "when": "false"
+        },
+        {
+          "command": "pairNotebook.showVpsJobs",
+          "when": "false"
+        },
+        {
+          "command": "pairNotebook.cancelVpsJob",
+          "when": "false"
+        },
+        {
+          "command": "pairNotebook.refreshVpsJobs",
+          "when": "false"
+        },
+        {
+          "command": "pairNotebook.startComputeSession",
+          "when": "false"
         }
       ]
     },
@@ -452,6 +433,12 @@
           "default": "",
           "pattern": "^(|#[0-9a-fA-F]{6})$",
           "description": "Cursor and line comment color. Empty selects a stable participant color."
+        },
+        "pairNotebook.relayUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional HTTPS Pair Notebook VPS relay origin for temporary sessions. Invitations carry this address automatically; no team token or guest setup is required. The last connected persistent VPS is used when empty."
         }
       }
     }

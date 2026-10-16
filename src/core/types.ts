@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { normalizeRelayEndpoint } from './relayEndpoint';
 import { validateIdentityPublicKey } from './identity';
 import type { ParticipantPermissions } from './permissions';
 import type { LineComment } from './lineComments';
@@ -133,6 +134,7 @@ export function normalizeHostClock(value: unknown, expectedSessionEpoch?: number
 }
 
 export interface SessionDescriptor {
+  relayUrl?: string;
   participantPermissions?: Record<string, ParticipantPermissions>;
   lineComments?: LineComment[];
   collaborationRevision?: number;
@@ -160,6 +162,7 @@ export interface SessionDescriptor {
 }
 
 export interface InviteData {
+  relayUrl?: string;
   sessionId: string;
   projectId: string;
   projectName: string;
@@ -200,6 +203,7 @@ export function formatInvite(invite: InviteData): string {
     hostName: invite.hostDisplayName,
     hostKey: invite.hostIdentityKey!,
   });
+  if (invite.relayUrl) query.set('relay', normalizeRelayEndpoint(invite.relayUrl));
   return `pair-notebook://join/${encodeURIComponent(invite.sessionId)}?${query.toString()}`;
 }
 
@@ -249,6 +253,7 @@ export function parseInvite(raw: string): InviteData {
   return {
     sessionId,
     projectId,
+    ...(parsed.searchParams.has('relay') ? { relayUrl: normalizeRelayEndpoint(parsed.searchParams.get('relay')!) } : {}),
     projectName: cleanProjectName(projectName),
     token,
     mode,

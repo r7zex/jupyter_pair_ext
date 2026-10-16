@@ -4,8 +4,67 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { PairNotebookController } from '../../src/vscode/jupyterController';
+import { SessionRuntime } from '../../src/runtime/session';
+import { EditorSynchronizer } from '../../src/vscode/sync';
 
 suite('Pair Notebook — production NotebookController in real VS Code', () => {
+  test('routes the active cell through the single controller into a persistent backend', async function () {
+    this.timeout(10_000);
+    const fixture = await openNotebookFixture('a = 1\na');
+    const log = vscode.window.createOutputChannel(`Pair Notebook Unified Controller E2E ${Date.now()}`);
+    const controller = new PairNotebookController(log);
+    let calls = 0;
+    controller.persistent = {
+      owns: notebook => notebook === fixture.notebook,
+      execute: async cells => {
+        calls++;
+        assert.equal(cells[0]?.document.getText(), 'a = 1\na');
+        const execution = controller.controller.createNotebookCellExecution(cells[0]!);
+        execution.start(Date.now());
+        await execution.replaceOutput([new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.text('1', 'text/plain')])]);
+        execution.end(true, Date.now());
+      },
+      interrupt: async () => undefined,
+    };
+    try {
+      await controller.executeActive();
+      assert.equal(calls, 1);
+      await waitFor(() => fixture.notebook.cellAt(0).executionSummary?.success === true, 3000, 'persistent execution summary');
+      assert.equal(fixture.notebook.cellAt(0).executionSummary?.success, true);
+      assert.equal(Buffer.from(fixture.notebook.cellAt(0).outputs[0]!.items[0]!.data).toString(), '1');
+    } finally { controller.dispose(); log.dispose(); await fixture.dispose(); }
+  });
+
+  test('executes two real Jupyter cells as the only session owner and preserves Python variables', async function () {
+    this.timeout(30_000);
+    const fixture = await openNotebookFixture('a = 41\nprint(a + 1)');
+    const backing = await mkdtemp(path.join(os.tmpdir(), 'pair-notebook-solo-backing-'));
+    const log = vscode.window.createOutputChannel(`Pair Notebook Solo Execution E2E ${Date.now()}`);
+    const python = process.env.PAIR_NOTEBOOK_E2E_PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
+    const runtime = new SessionRuntime({
+      sessionId: 'solo-execution', projectId: 'solo-project', projectName: 'Solo execution', mode: 'resilient', role: 'host',
+      localPeer: { peerId: 'solo-owner', displayName: 'Owner', joinOrder: 0 }, hostPeerId: 'solo-owner',
+      backingFolder: backing, workingFolder: fixture.root, createdAt: Date.now(), sessionEpoch: 1, hostEpoch: 0,
+      computeExecutorId: 'solo-owner', pythonPath: python, notebookPythonPaths: { 'controller.ipynb': python },
+    }, 'solo-test-token-that-is-long-enough', { extensionUri: vscode.Uri.file(path.resolve(__dirname, '../../..')) } as vscode.ExtensionContext, log);
+    runtime.project.ensureNotebook('controller.ipynb', { metadata: {}, cells: [{ id: 'controller-fixture', kind: 2, language: 'python', source: 'a = 41\nprint(a + 1)', metadata: {}, outputs: [] }] });
+    const controller = new PairNotebookController(log);
+    const synchronizer = new EditorSynchronizer(runtime.project, fixture.root, log, undefined, controller);
+    controller.setSynchronizer(synchronizer); controller.setRuntime(runtime);
+    try {
+      await synchronizer.whenNotebookReady(fixture.notebook);
+      await controller.executeActive();
+      await waitFor(() => fixture.notebook.cellAt(0).executionSummary?.success !== undefined, 3000, 'owner-only execution completion');
+      assert.equal(fixture.notebook.cellAt(0).executionSummary?.success, true, fixture.notebook.cellAt(0).outputs.flatMap(output => output.items.map(item => Buffer.from(item.data).toString())).join('\n'));
+      await waitFor(() => fixture.notebook.cellAt(0).outputs.some(output => output.items.some(item => Buffer.from(item.data).toString().includes('42'))), 3000, 'real owner-only Jupyter result');
+      const cell = fixture.notebook.cellAt(0);
+      const edit = new vscode.WorkspaceEdit(); edit.replace(cell.document.uri, new vscode.Range(cell.document.positionAt(0), cell.document.positionAt(cell.document.getText().length)), 'print(a + 2)');
+      assert.equal(await vscode.workspace.applyEdit(edit), true);
+      await controller.executeActive();
+      await waitFor(() => cell.outputs.some(output => output.items.some(item => Buffer.from(item.data).toString().includes('43'))), 3000, 'retained Python variable');
+    } finally { controller.dispose(); synchronizer.dispose(); await runtime.leave(); log.dispose(); await fixture.dispose(); await rm(backing, { recursive: true, force: true }); }
+  });
+
   test('renders remote outputs and terminal execution state through NotebookCellExecution', async function () {
     this.timeout(10_000);
     const fixture = await openNotebookFixture('print("remote")');

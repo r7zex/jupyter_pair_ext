@@ -120,6 +120,7 @@ export class PersistentComputePolicy {
   }
 
   setMembers(members: PersistentMember[]): void {
+    const ownerWasOnline = this.members.get(this.ownerId)?.online === true;
     const before = [...this.members.values()].map((member) => `${member.id}:${member.online}`).sort().join(',');
     this.members.clear();
     for (const member of members) {
@@ -130,6 +131,9 @@ export class PersistentComputePolicy {
     }
     const after = [...this.members.values()].map((member) => `${member.id}:${member.online}`).sort().join(',');
     if (before !== after) this.invalidatePending();
+    if (!ownerWasOnline && this.members.get(this.ownerId)?.online && this.selectionMode === 'member') {
+      this.setTarget(this.ownerId, this.ownerBaseline, 'owner');
+    }
     this.reconcile();
   }
 
@@ -195,8 +199,13 @@ export class PersistentComputePolicy {
     const device = this.devices.get(deviceId);
     if (!device || device.id === 'vps' || device.ownerId !== memberId) throw new PersistentComputeError('Only the device owner can change sharing.');
     if (typeof enabled !== 'boolean') throw new PersistentComputeError('Invalid device sharing setting.', 400);
+    const newlyEnabled = enabled && !device.enabled;
     if (device.enabled !== enabled) this.invalidatePending();
     device.enabled = enabled;
+    if (newlyEnabled && memberId === this.ownerId && this.ownerBaseline.deviceId === 'vps') {
+      this.ownerBaseline = { deviceId };
+      this.setTarget(memberId, this.ownerBaseline, 'owner');
+    }
     this.reconcile();
   }
 
@@ -374,9 +383,12 @@ export class PersistentComputePolicy {
   private requireSwitchPermission(memberId: string, device: PersistentDevice): void {
     const member = this.requireMember(memberId);
     if (!member.online) throw new PersistentComputeError('The requesting member must be online.');
-    if (memberId === this.ownerId || this.allowMemberSwitch) return;
-    const humans = this.onlineHumans();
-    if (humans.length === 1 && humans[0]!.id === memberId && device.id !== 'vps' && device.ownerId === memberId && device.enabled) return;
+    if (memberId === this.ownerId) return;
+    if (!this.members.get(this.ownerId)?.online) {
+      if (device.id === 'vps' || (device.ownerId === memberId && device.enabled)) return;
+      throw new PersistentComputeError('Without the session owner, select the VPS or your own shared computer.');
+    }
+    if (this.allowMemberSwitch) return;
     throw new PersistentComputeError('The session owner has disabled member compute switching.');
   }
 
