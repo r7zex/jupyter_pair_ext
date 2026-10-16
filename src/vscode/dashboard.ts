@@ -2,9 +2,11 @@ import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { normalizeRecentProjects, presentRecentExit } from '../core/recentProjects';
 import { SessionRuntime, SessionSnapshot } from '../runtime/session';
+import type { PersistentSessionView } from '../vps/persistentProtocol';
 
 interface DashboardState {
   live: boolean;
+  persistent?: PersistentSessionView & { endpoint?: string; connected?: boolean };
   isHost?: boolean;
   recent?: Array<{
     name: string;
@@ -62,6 +64,7 @@ export interface DashboardConnection {
 export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
   private runtime: SessionRuntime | undefined;
+  private persistent: DashboardState['persistent'];
   private timer: NodeJS.Timeout | undefined;
   private messageSubscription: vscode.Disposable | undefined;
   private lastState: DashboardState = { live: false };
@@ -75,7 +78,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.view = view;
     view.webview.options = {
       enableScripts: true,
-      enableCommandUris: ['pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.connectVps'],
+      enableCommandUris: ['pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.createVpsSession', 'pairNotebook.joinVpsSession', 'pairNotebook.configureVpsSessions'],
       localResourceRoots: [],
     };
     this.messageSubscription?.dispose();
@@ -118,6 +121,11 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.view?.show?.(true);
   }
 
+  public setPersistentSession(view: PersistentSessionView | undefined, endpoint?: string, connected = true): void {
+    this.persistent = view ? { ...view, connected, ...(endpoint ? { endpoint } : {}) } : undefined;
+    this.push(true);
+  }
+
   public refresh(): void {
     this.push(true);
   }
@@ -131,7 +139,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
 
   private push(force = false): void {
     if (!this.view) return;
-    const next = this.runtime ? toDashboardState(this.runtime.snapshot(), this.runtime.localComputePresence()) : {
+    const next = this.persistent ? { live: true, persistent: this.persistent } : this.runtime ? toDashboardState(this.runtime.snapshot(), this.runtime.localComputePresence()) : {
       live: false,
       recent: dashboardRecentProjects(this.context.globalState.get<unknown>('pairNotebook.recent', [])),
     };
@@ -156,9 +164,18 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
 }
 
 const commandMap: Record<string, string> = {
+  createVps: 'pairNotebook.createVpsSession',
+  joinVps: 'pairNotebook.joinVpsSession',
+  manageVps: 'pairNotebook.manageVpsSession',
+  leaveVps: 'pairNotebook.leaveVpsSession',
+  computeVps: 'pairNotebook.selectVpsCompute',
+  shareVps: 'pairNotebook.shareVpsComputer',
+  uploadVps: 'pairNotebook.uploadVpsFolder',
+  restartVps: 'pairNotebook.restartVpsKernel',
+  recoverVps: 'pairNotebook.recoverVpsExecution',
   start: 'pairNotebook.startSession',
   join: 'pairNotebook.joinSession',
-  vps: 'pairNotebook.connectVps',
+  vps: 'pairNotebook.configureVpsSessions',
   invite: 'pairNotebook.copyInvite',
   leave: 'pairNotebook.leaveSession',
   end: 'pairNotebook.endSession',
@@ -400,8 +417,8 @@ function html(): string {
   <h1>PAIR NOTEBOOK</h1>
   <main id="content">
     <p class="hero">Совместная работа с Jupyter и кодом через защищённое P2P-подключение.</p>
-    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Начать сессию</a><a class="fallback-button" href="command:pairNotebook.joinSession">Подключиться</a><a class="fallback-button" href="command:pairNotebook.connectVps">Постоянная VPS-сессия</a></div>
-    <p class="tiny">Если интерактивная панель не загрузится, эти две команды всё равно работают.</p>
+    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Начать временную сессию</a><a class="fallback-button" href="command:pairNotebook.joinSession">Подключиться к временной сессии</a><a class="fallback-button" href="command:pairNotebook.createVpsSession">Создать постоянную vps-сессию</a><a class="fallback-button" href="command:pairNotebook.joinVpsSession">Подключиться к постоянной сессии</a><a class="fallback-button" href="command:pairNotebook.configureVpsSessions">Настроить свои постоянные сессии</a></div>
+    <p class="tiny">Если интерактивная панель не загрузится, эти команды всё равно работают.</p>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
@@ -442,11 +459,26 @@ function html(): string {
       const root = document.getElementById('content');
       if (!state.live) {
         const recent = (state.recent || []).map(item => '<div class="card"><strong>Сессия: '+esc(item.name)+'</strong><div>Хост: '+esc(item.hostName)+'</div><div class="tiny">Вы вышли '+esc(item.relativeExit)+' • '+esc(item.exitDate)+'</div><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
-        root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать сессию</button><button id="join" class="secondary">Подключиться</button><button id="vps" class="secondary">Постоянная VPS-сессия</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
+        root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать временную сессию</button><button id="join" class="secondary">Подключиться к временной сессии</button><button id="createVps" class="secondary">Создать постоянную vps-сессию</button><button id="joinVps" class="secondary">Подключиться к постоянной сессии</button><button id="vps" class="secondary">Настроить свои постоянные сессии</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
         document.getElementById('start').onclick = () => command('start');
         document.getElementById('join').onclick = () => command('join');
         document.getElementById('vps').onclick = () => command('vps');
+        document.getElementById('createVps').onclick = () => command('createVps');
+        document.getElementById('joinVps').onclick = () => command('joinVps');
         if (document.getElementById('recent')) document.getElementById('recent').onclick = () => command('recent');
+        return;
+      }
+      if (state.persistent) {
+        const session = state.persistent;
+        const target = session.devices.find(device => device.id === session.target.deviceId);
+        const owner = session.members.find(member => member.id === session.ownerId);
+        const own = session.memberId === session.ownerId;
+        const members = session.members.map(member => '<div class="card"><strong>'+esc(member.name)+'</strong><div class="tiny">'+esc(member.role === 'owner' ? 'Владелец' : member.role === 'admin' ? 'Администратор' : 'Участник')+' · '+(member.online ? 'В сети' : 'Не в сети')+'</div></div>').join('');
+        const controls = action('computeVps','Выбрать вычислитель',target?.name || session.target.deviceId)+action('shareVps','Мой компьютер','НАСТРОИТЬ')+action('manageVps','Управление сессией','ОТКРЫТЬ')+(own ? action('uploadVps','Загрузить файлы на VPS','ОТКРЫТЬ')+action('permissions','Права участников','НАСТРОИТЬ') : '')+action('restartVps','Перезапустить kernel','ОТКРЫТЬ')+action('recoverVps','Результаты выполнения','ОТКРЫТЬ')+action('leaveVps','Покинуть сессию','ВЫЙТИ',{danger:true});
+        root.innerHTML = '<div class="connection '+(session.connected === false ? 'pending' : 'online')+'">'+(session.connected === false ? 'ВОССТАНАВЛИВАЕМ СОЕДИНЕНИЕ' : session.state === 'running' ? 'СЕССИЯ ПОДКЛЮЧЕНА' : 'СЕССИЯ ОСТАНОВЛЕНА')+'</div><div class="title">'+esc(session.name)+'</div><div class="badge">Постоянная VPS-сессия</div>'+section('persistentConnection','ПОДКЛЮЧЕНИЕ','<div class="card"><div>'+esc(session.endpoint)+'</div><div class="tiny">ID: '+esc(session.id)+'</div><div class="tiny">Папка проекта: VPS: '+esc(session.name)+'</div><div class="tiny">pair-vps://'+esc(session.id)+'/</div><div class="tiny">Владелец: '+esc(owner?.name)+' · '+(owner?.online ? 'В сети' : 'Не в сети')+'</div></div>')+section('persistentCompute','ВЫЧИСЛЕНИЯ','<div class="card"><strong>'+esc(target?.name || session.target.deviceId)+'</strong><div>'+esc(target?.cpu)+'</div><div class="tiny">'+esc(target?.python)+' · '+(session.target.gpuUuid ? 'GPU' : 'CPU')+' · '+(target?.online ? 'В сети' : 'Недоступен')+'</div><div class="tiny">'+esc((target?.diagnostics || []).join('; '))+'</div></div>')+section('persistentMembers','УЧАСТНИКИ: '+session.members.filter(member => member.online).length,members)+section('persistentActions','ДЕЙСТВИЯ','<div class="actions">'+controls+'</div>');
+        for (const name of ['computeVps','shareVps','manageVps','uploadVps','permissions','restartVps','recoverVps','leaveVps']) {
+          const button = document.getElementById(name); if (button) button.onclick = () => command(name);
+        }
         return;
       }
       const detailsOpen = document.getElementById('moreActions')?.open ?? false;

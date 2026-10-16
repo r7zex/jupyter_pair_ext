@@ -27,6 +27,9 @@ function setup(online: string[] = ['owner', 'alice', 'bob']): {
     policy.registerDevice(id, device(`${id}-pc`));
     policy.share(id, `${id}-pc`, true);
   }
+  presence([...new Set([...online, 'owner'])]);
+  policy.select('owner', { deviceId: 'vps' });
+  presence(online);
   return { policy, presence, advance: (milliseconds) => { now += milliseconds; } };
 }
 
@@ -70,22 +73,28 @@ describe('persistent session compute authorization', () => {
     assert.throws(() => policy.setMembers([member('vps', true)]), /human member/);
   });
 
-  it('requires explicit sharing for the sole-human exception and restricts it to their own computer', () => {
+  it('allows absent-owner members to select the VPS or their own explicitly shared computer', () => {
     const { policy } = setup(['alice']);
     policy.share('alice', 'alice-pc', false);
-    assert.throws(() => policy.select('alice', { deviceId: 'alice-pc' }), /disabled member/);
+    assert.throws(() => policy.select('alice', { deviceId: 'alice-pc' }), /your own/);
     policy.share('alice', 'alice-pc', true);
     policy.select('alice', { deviceId: 'alice-pc' });
-    assert.throws(() => policy.select('alice', { deviceId: 'bob-pc' }), /disabled member/);
-    assert.throws(() => policy.select('alice', { deviceId: 'vps' }), /disabled member/);
-    assert.deepEqual(policy.view().target, { deviceId: 'alice-pc' });
+    assert.throws(() => policy.select('alice', { deviceId: 'bob-pc' }), /your own/);
+    policy.select('alice', { deviceId: 'vps' });
+    assert.deepEqual(policy.view().target, { deviceId: 'vps' });
   });
 
-  it('reverts future admissions when a second human joins and leaves accepted execution identities unchanged', () => {
+  it('retains the selected member computer with multiple participants until the owner returns', () => {
     const { policy, presence } = setup(['alice']);
     policy.select('alice', { deviceId: 'alice-pc', gpuUuid: GPU_ONE });
     const accepted = policy.executionTarget('alice');
     presence(['alice', 'bob']);
+    assert.deepEqual(policy.executionTarget('alice').target, accepted.target);
+    assert.equal(policy.view().generation, accepted.generation);
+    assert.throws(() => policy.select('bob', { deviceId: 'alice-pc', gpuUuid: GPU_TWO }), /your own/);
+    policy.select('bob', { deviceId: 'bob-pc' });
+    policy.select('alice', accepted.target);
+    presence(['owner', 'alice', 'bob']);
     assert.deepEqual(policy.executionTarget('alice').target, { deviceId: 'vps' });
     assert.ok(policy.view().generation > accepted.generation);
     assert.throws(() => policy.assertExecutionTarget('alice', accepted.target, accepted.generation), /expired compute selection/);
@@ -96,16 +105,33 @@ describe('persistent session compute authorization', () => {
     assert.deepEqual(accepted.target, { deviceId: 'alice-pc', gpuUuid: GPU_ONE });
   });
 
-  it('restores an available owner baseline after a sole participant loses the exception', () => {
+  it('restores the owner baseline when the owner returns', () => {
     const { policy, presence } = setup(['owner', 'bob']);
     const request = policy.select('owner', { deviceId: 'bob-pc' }).consent!;
     policy.decideConsent('bob', request.id, true);
     presence(['alice']);
     policy.select('alice', { deviceId: 'alice-pc' });
-    presence(['alice', 'bob']);
+    presence(['owner', 'alice', 'bob']);
     assert.deepEqual(policy.view().target, { deviceId: 'bob-pc' });
     assert.deepEqual(policy.view().ownerBaseline, { deviceId: 'bob-pc' });
     assert.throws(() => policy.executionTarget('alice'), /consent/);
+  });
+
+  it('defaults to a ready shared owner computer and falls back to VPS when it disconnects', () => {
+    const policy = new PersistentComputePolicy('session-auto-owner', 'owner');
+    policy.setMembers([member('owner', true, 'owner'), member('alice', true)]);
+    policy.registerVps({ ...device('vps'), gpus: [] });
+    assert.deepEqual(policy.view().target, { deviceId: 'vps' });
+    policy.registerDevice('owner', device('owner-pc'));
+    policy.share('owner', 'owner-pc', true);
+    assert.deepEqual(policy.view().target, { deviceId: 'owner-pc' });
+    policy.setMembers([member('owner', false, 'owner'), member('alice', true)]);
+    assert.deepEqual(policy.view().target, { deviceId: 'vps' });
+    policy.setMembers([member('owner', true, 'owner'), member('alice', true)]);
+    assert.deepEqual(policy.view().target, { deviceId: 'owner-pc' });
+    policy.select('owner', { deviceId: 'vps' });
+    policy.share('owner', 'owner-pc', true);
+    assert.deepEqual(policy.view().target, { deviceId: 'vps' }, 'agent registration must preserve an explicit owner choice');
   });
 
   it('keeps baseline sharing consent mandatory for the owner and rejects admin permission bypasses', () => {

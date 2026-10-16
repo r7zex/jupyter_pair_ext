@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { build } from 'esbuild';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const extensionTestsPath = path.join(projectRoot, 'out', 'test', 'e2e', 'suite', 'index.js');
@@ -24,11 +25,18 @@ await Promise.all([
 ]);
 await writeFile(path.join(workspaceDir, 'README.txt'), 'Pair Notebook VS Code Extension Host E2E workspace.\n', 'utf8');
 await assertReadable(extensionTestsPath, 'Compile the project before running E2E tests.');
+const sessionRuntimePath = path.join(tempRoot, 'session-runtime.cjs');
+await build({
+  entryPoints: [path.join(projectRoot, 'src/runtime/session.ts')], bundle: true, platform: 'node', target: 'node20', format: 'cjs',
+  external: ['vscode'], outfile: sessionRuntimePath,
+  define: { 'process.env.WS_NO_BUFFER_UTIL': "'1'", 'process.env.WS_NO_UTF_8_VALIDATE': "'1'" },
+});
 
 const inheritedEnv = {
   ...process.env,
   PAIR_NOTEBOOK_E2E: '1',
   PAIR_NOTEBOOK_E2E_WORKSPACE: workspaceDir,
+  PAIR_NOTEBOOK_E2E_RUNTIME: sessionRuntimePath,
 };
 
 const launchArgs = [

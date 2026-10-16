@@ -52,7 +52,7 @@ describe('Persistent adapter through the existing production editor', () => {
         else for (const change of rebaseTextChanges(intent.baseline, text.toString(), intent.changes).sort((a, b) => b.offset - a.offset)) { if (change.deleteCount) text.delete(change.offset, change.deleteCount); if (change.insertText) text.insert(change.offset, change.insertText); }
         sequences.set(intent.actor, intent.sequence);
       }
-      const reply: NotebookSyncReply = { epoch, revision: 1, textProtocol: 'yjs-intents-v1', identity: '0123456789abcdef0123456789abcdef', acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
+      const reply: NotebookSyncReply = { epoch, revision: 1, bootstrapEmpty: sharedNotebook(doc).cells.length === 0, textProtocol: 'yjs-intents-v1', identity: '0123456789abcdef0123456789abcdef', acknowledgedSequence: sequences.get(input.actor ?? input.intent?.actor) ?? 0, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'), ...sharedNotebook(doc) };
       const blocked = gate; gate = undefined; if (blocked) await blocked();
       if (lostAck && input.intent) { lostAck = false; throw new Error('Acknowledgement lost after server commit'); }
       return reply;
@@ -68,6 +68,16 @@ describe('Persistent adapter through the existing production editor', () => {
     assert.equal(cell.document.text, 'base-local'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local');
     const late = pause(); const pending = sync.flush(notebook); await late.reached; change(cell.document.text.length, 0, '!'); late.release(); await pending; await sync.flush(notebook);
     assert.equal(cell.document.text, 'base-local!'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-local!');
+  });
+
+  it('publishes the first unsaved cell when the server notebook has no cells', async () => {
+    editSharedNotebook(doc, { cells: [], metadata: {} });
+    cell.document.text = 'a = 1\na';
+    cell.document.isDirty = true;
+    const reply = await sync.prepareExecution(notebook);
+    assert.equal(reply?.cells.length, 1);
+    assert.equal(reply?.cells[0]?.source, 'a = 1\na');
+    assert.equal(cell.document.text, 'a = 1\na');
   });
   it('recovers a rejected bootstrap promise after a transient connection error', async () => {
     const original = connection.client.call; let fail = true;

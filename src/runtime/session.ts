@@ -53,7 +53,7 @@ import { SharedTerminal } from '../core/sharedTerminal';
 import { defaultPermissions, mayChangeTree, normalizePermissions, type ParticipantPermissions } from '../core/permissions';
 import { MAX_LINE_COMMENTS, normalizeCommentInput, normalizeLineComment, reanchorComment, participantColor, commentColor, type LineComment, type LineCommentInput } from '../core/lineComments';
 import { validateIdentityPublicKey } from '../core/identity';
-import { discoverPythonEnvironments, PythonEnvironment } from '../core/pythonEnvironments';
+import { discoverPythonEnvironments, resolveDefaultJupyterPython, PythonEnvironment } from '../core/pythonEnvironments';
 import {
   classifyFile,
   decodeUtf8ProjectFile,
@@ -2043,7 +2043,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     const pythonPath = configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
     [this.hardware, this.environments] = await Promise.all([
       discoverHardware(pythonPath),
-      discoverPythonEnvironments(this.descriptor.workingFolder, pythonPath),
+      discoverPythonEnvironments(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath),
     ]);
     this.publishHardwarePresence();
     this.emit('hardware', this.hardware);
@@ -6933,6 +6933,18 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // A running kernel still needs dependencies removed since its last cell.
     await this.prepareHostRepositoryFiles();
     assertAuthority();
+    let pythonPath: string | undefined;
+    if (!this.kernels.has(notebookKey)) {
+      const configuration = vscode.workspace.getConfiguration('pairNotebook');
+      pythonPath = target.pythonPath
+        ?? this.descriptor.notebookPythonPaths?.[notebookKey]
+        ?? configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
+      if (!target.pythonPath && !this.descriptor.notebookPythonPaths?.[notebookKey]
+        && ['python', 'python3'].includes(pythonPath)) {
+        pythonPath = await resolveDefaultJupyterPython(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath, target.device.startsWith('gpu:'));
+      }
+      assertAuthority();
+    }
     // Re-read after the filesystem barrier: another request can have installed
     // this notebook's kernel while preparation was awaiting I/O.
     let kernel = this.kernels.get(notebookKey);
@@ -6948,13 +6960,9 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         this.kernelStatuses.delete(idleCandidate);
       }
       this.transition('kernel-starting', `Starting Jupyter kernel for ${notebookKey}.`);
-      const configuration = vscode.workspace.getConfiguration('pairNotebook');
-      const pythonPath = target.pythonPath
-        ?? this.descriptor.notebookPythonPaths?.[notebookKey]
-        ?? configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
       const gpuMatch = /^gpu:(\d+)$/.exec(target.device);
       kernel = new JupyterKernel(
-        pythonPath,
+        pythonPath!,
         vscode.Uri.joinPath(this.context.extensionUri, 'media', 'jupyter_kernel_bridge.py').fsPath,
         this.descriptor.backingFolder || this.descriptor.workingFolder,
         gpuMatch ? Number(gpuMatch[1]) : undefined,

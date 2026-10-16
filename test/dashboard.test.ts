@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import Module from 'node:module';
+import vm from 'node:vm';
 
 describe('dashboard webview startup', () => {
   it('registers its message receiver before loading HTML and always ships a visible fallback', async () => {
@@ -71,10 +72,12 @@ describe('dashboard webview startup', () => {
 
     provider.resolveWebviewView({ webview, show: () => undefined });
 
-    assert.match(assignedHtml, /Начать сессию/);
+    assert.match(assignedHtml, /Начать временную сессию/);
     assert.match(assignedHtml, /Подключиться/);
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
-    assert.match(assignedHtml, /command:pairNotebook\.connectVps">Постоянная VPS-сессия/);
+    assert.match(assignedHtml, /command:pairNotebook\.configureVpsSessions">Настроить свои постоянные сессии/);
+    assert.match(assignedHtml, /Создать постоянную vps-сессию/);
+    assert.match(assignedHtml, /Подключиться к постоянной сессии/);
     assert.doesNotMatch(assignedHtml, /command:pairNotebook\.connectVpsCompute/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
@@ -95,7 +98,7 @@ describe('dashboard webview startup', () => {
     assert.doesNotMatch(assignedHtml, new RegExp(['Tail', 'scale'].join(''), 'i'));
     assert.deepEqual(webview.options.localResourceRoots, []);
     assert.deepEqual(webview.options.enableCommandUris, [
-      'pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.connectVps',
+      'pairNotebook.startSession', 'pairNotebook.joinSession', 'pairNotebook.createVpsSession', 'pairNotebook.joinVpsSession', 'pairNotebook.configureVpsSessions',
     ]);
     assert.equal(posted.length, 1, 'a complete landing state is posted after HTML assignment');
     const landing = posted[0] as { patch?: { recent?: Array<Record<string, unknown>> } };
@@ -114,8 +117,25 @@ describe('dashboard webview startup', () => {
     receive?.({ command: 'webviewError', detail: 'synthetic failure' });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(posted.length, 2, 'the ready handshake requests a fresh state in case the first post raced');
-    assert.deepEqual(executed, ['pairNotebook.joinSession', 'pairNotebook.connectVps']);
+    assert.deepEqual(executed, ['pairNotebook.joinSession', 'pairNotebook.configureVpsSessions']);
     assert.deepEqual(errors, ['Pair Notebook panel error: synthetic failure']);
+    const persistent = { id: 'server-project', name: '<Private project>', state: 'running', ownerId: 'owner', memberId: 'owner', allowMemberSwitch: false,
+      members: [{ id: 'owner', name: 'Alice', role: 'owner', online: true }], devices: [{ id: 'vps', name: 'VPS CPU', cpu: 'CPU model', python: 'Python 3', online: true, gpus: [] }], target: { deviceId: 'vps' }, generation: 1, consents: [], revision: 0 };
+    provider.setPersistentSession(persistent, 'https://relay.example');
+    const elements = new Map<string, { innerHTML: string; onclick?: () => void }>();
+    const getElementById = (id: string) => { let element = elements.get(id); if (!element) { element = { innerHTML: '' }; elements.set(id, element); } return element; };
+    let renderMessage: ((event: unknown) => void) | undefined;
+    vm.runInNewContext(assignedHtml.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1]!, {
+      document: { getElementById, activeElement: {} },
+      window: { addEventListener: (_type: string, callback: (event: unknown) => void) => { renderMessage = callback; } },
+      acquireVsCodeApi: () => ({ postMessage: () => undefined }),
+    });
+    renderMessage?.({ data: posted.at(-1) });
+    assert.match(getElementById('content').innerHTML, /&lt;Private project&gt;/);
+    assert.match(getElementById('content').innerHTML, /pair-vps:\/\/server-project/);
+    assert.match(getElementById('content').innerHTML, /Покинуть сессию/);
+    provider.setPersistentSession(undefined);
+    assert.equal((posted.at(-1) as { patch: { live: boolean } }).patch.live, false);
     provider.dispose();
   });
 });

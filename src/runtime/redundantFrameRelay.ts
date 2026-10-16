@@ -62,7 +62,8 @@ export class RedundantFrameRelay implements FrameRelay {
 
   public updateVps(connection?: VpsRelayConnection): void {
     if (this.stopped) return;
-    if (connection?.url === this.vpsConnection?.url && connection?.token === this.vpsConnection?.token) {
+    if (connection?.url === this.vpsConnection?.url && connection?.token === this.vpsConnection?.token
+      && connection?.temporary === this.vpsConnection?.temporary) {
       if (this.vpsRelay && this.failedStarts.has(this.vpsRelay)) {
         try { this.vpsRelay.start(); this.failedStarts.delete(this.vpsRelay); }
         catch (error) { this.failedStarts.set(this.vpsRelay, asError(error)); }

@@ -1,6 +1,12 @@
 # Persistent VPS sessions — 0.6.5
 
-Use **Pair Notebook: Connect to VPS** for server-owned collaborative projects. The VPS retains session authority, membership, files and execution receipts while editors are offline. **Connect to VPS Compute** is the separate team relay/background-job connection described in [VPS_COMPUTE.md](VPS_COMPUTE.md).
+Use the main Pair Notebook panel to create, join, configure or leave a persistent VPS session. The VPS retains session authority, membership, files and execution receipts while editors are offline. The panel displays the endpoint, session ID, matching Explorer folder, participants and selected compute device. Legacy broker commands remain callable for compatibility but have no separate sidebar view.
+
+Version 0.6.6 uses one Pair Notebook controller for both session types. When no session is connected, the panel exposes separate temporary-session and persistent-session actions. Saved connections display the project name and membership identity; Configure Persistent Sessions can reconnect or forget a local saved connection without deleting the server project.
+
+**My computer** can prepare and launch the bundled isolated agent directly. Windows requires an existing Ubuntu/Debian WSL2 distribution; Linux requires working bubblewrap isolation. Preparation creates a dedicated Python environment rather than modifying system Python. A ready owner agent is reused automatically, and newly enabled owner sharing becomes the default compute target. If local isolation is unavailable, the VPS remains the fallback. Explicitly selected Python environments are preserved; the default temporary-session interpreter can discover Jupyter in the original project's `.venv`.
+
+Temporary invitations can carry an HTTPS Pair Notebook relay origin. Set `pairNotebook.relayUrl` once, or reuse the last connected persistent VPS. Guests need only the invitation; they do not receive the team administration token. The additional relay route is end-to-end encrypted, bounded and independent of WebRTC; direct P2P and existing public fallbacks are still used. Measured latency depends on the endpoints and route; 100 ms is a target, not an unconditional network guarantee.
 
 Install the same 0.6.5 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/VPS, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
 
@@ -63,7 +69,7 @@ Owners control invitations, membership revocation, visibility and device policy.
 
 ## Notebook editing and saving
 
-Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension, server and session agent together to 0.6.4; the extension checks the server's text protocol before editing.
+Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension and server together to 0.6.6; the extension checks the server's text protocol before editing. Zero-byte notebooks are initialized as valid empty notebooks. Their first unsaved editor cells are committed against the server's initial state vector, without restoring cells deleted from an existing populated notebook.
 
 Native Save persists source, user metadata, outputs and execution counts. Editing an executed cell retains previous output. Results from a changed source/cell identity/generation remain fenced. Save immediately after Run settles the native execution lifecycle; a save racing with a later remote document version can require a further save. Reopen and verify the stored notebook when qualifying a new build.
 
@@ -74,6 +80,8 @@ Open ordinary UTF-8 project files also synchronize characters live. Run flushes 
 ## Compute, consent and isolation
 
 The selected device runs independent stateful Jupyter kernels. Select the active device to request personal execution consent without switching it. Server policy rechecks machine-owner consent, sharing and membership. Revocation prevents subsequent unauthorized work. Changing device or privacy scope advances kernel generation. Ordinary rename and unrelated file deletion preserve the notebook kernel and its variables. Save Python objects to files explicitly when changing devices: files transfer, RAM does not.
+
+All editors use the same selected session compute target. A ready, explicitly shared owner computer becomes the initial default; the VPS is used while that computer is absent or unavailable. With the owner offline, any number of connected members can select the VPS or their own shared computer, and cannot select a different member's computer. The owner's baseline is restored when the owner returns. Switching devices applies to future admissions and never rewrites the immutable target of already accepted work.
 
 Accepted inputs are immutable snapshots. Large files transfer in checked 256 KiB chunks; returned models publish atomically after checksum and version checks. The default project budget is 128 MiB and 4096 entries, with up to 256 changed artifacts per cell. Retained output is bounded to 8 MiB per execution, with an explicit diagnostic on overflow; overflow still accepts a final status and releases the queue. Run All stops after a failed cell, including failed artifact publication. Interrupt also cancels a run that has not reached its worker.
 

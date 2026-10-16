@@ -7,7 +7,7 @@ import { createProxiedNodeWebSocket } from './proxyWebSocket';
 import { createRelayAnnounceProof, decryptRelayPacket, deriveRelayFrameKey, encryptRelayPacket,
   encryptRelayReadinessProbe, verifyRelayAnnounceProof, verifyRelayReadinessProbe } from './relayCrypto';
 
-export interface VpsRelayConnection { url: string; token: string }
+export interface VpsRelayConnection { url: string; token: string; temporary?: boolean }
 const MAX_ENVELOPE_HEADER_BYTES = 512;
 const PROBE_INTERVAL_MS = 10_000;
 const PROBE_TIMEOUT_MS = 10_000;
@@ -30,7 +30,7 @@ export class VpsFrameRelay implements FrameRelay {
     socketFactory?: typeof createProxiedNodeWebSocket }) {
     if (!VPS_ID.test(options.localPeerId)) throw new Error('Invalid VPS peer ID.');
     this.key = deriveRelayFrameKey(options.token, options.sessionId);
-    const url = new URL(normalizeVpsUrl(options.vps.url) + '/v1/relay');
+    const url = new URL(normalizeVpsUrl(options.vps.url) + (options.vps.temporary ? '/v1/temporary-relay' : '/v1/relay'));
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('room', createHash('sha256').update(`pair-vps-v1|${options.sessionId}|${options.token}`).digest('hex'));
     url.searchParams.set('peer', options.localPeerId);
@@ -42,7 +42,7 @@ export class VpsFrameRelay implements FrameRelay {
   public start(): void {
     if (this.stopped || this.socket) return;
     const socket = (this.options.socketFactory ?? createProxiedNodeWebSocket)(this.url, undefined, {
-      headers: { authorization: `Bearer ${this.options.vps.token}` },
+      headers: this.options.vps.temporary ? {} : { authorization: `Bearer ${this.options.vps.token}` },
       handshakeTimeout: 10_000, maxPayload: 96 * 1024 * 1024, followRedirects: false,
     }, true);
     this.socket = socket;

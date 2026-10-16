@@ -6,7 +6,7 @@ import { sourceProvenance } from './build-provenance.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
-const files = ['out/extension.js', 'media/jupyter_kernel_bridge.py', 'media/native/manifest.json',
+const files = ['out/extension.js', 'media/jupyter_kernel_bridge.py', 'scripts/pair-notebook-session-agent.py', 'media/native/manifest.json',
   ...(await fs.readdir(path.join(root, 'media/native'))).filter((name) => name.endsWith('.node')).sort().map((name) => `media/native/${name}`)];
 const hashes = {};
 for (const name of files) hashes[name] = createHash('sha256').update(await fs.readFile(path.join(root, name))).digest('hex');

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.6 - 2026-10-16 (session execution and unified controls)
+
+- Repairs zero-byte notebooks created in the VPS explorer, including the first unsaved cell. Empty notebooks bootstrap safely; malformed nonempty JSON returns an actionable error without replacing the file.
+- Uses one Pair Notebook controller for temporary and persistent sessions. Routes native Run, Run All, interruption and active-cell commands to the connected session; discovers local Jupyter environments in the original project folder.
+- Displays persistent project identity, endpoint, participants, compute readiness and Leave in the main panel. Replaces the disconnected screen with explicit temporary and persistent actions; removes the separate VPS Compute and persistent-session trees.
+- Allows any online participant to select the VPS or their own shared computer while the owner is absent. Restores the owner's selected target when they return, defaults ready owner sharing to their computer and retains accepted execution identities.
+- Adds a bounded encrypted WebSocket fallback for temporary sessions, carried in invitations without an administrative token. Reuses the remembered VPS endpoint or `pairNotebook.relayUrl`; existing direct and public fallback paths remain available.
+- Adds preparation and launch of the bundled isolated local compute agent from My computer, plus automatic reuse for owners. Windows requires WSL2; Linux requires working bubblewrap isolation. An unavailable local runtime leaves VPS execution available.
+- Preserves server error details and correlates internal failures with credential-free server logs. Saved connections show project names and distinguish membership identities.
+
 ## 0.6.5 - 2026-10-15 (participant permissions and line comments)
 
 - Adds host/owner-managed participant permissions: exact editable files or directory subtrees, read-only mode, code execution, and line comments. P2P shared terminals support no access, viewing, or explicitly granted command input; queued work rechecks authority before launch.

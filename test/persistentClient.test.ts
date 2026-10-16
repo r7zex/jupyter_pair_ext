@@ -490,7 +490,7 @@ describe('Persistent session actions preserve their original connection', () => 
     const originalCall = PersistentClient.prototype.call;
     PersistentClient.prototype.call = async function <T>(): Promise<T> {
       if (this.endpoint.includes('first.example')) await gate;
-      return { id: this.endpoint, memberId: 'member', ownerId: 'owner' } as T;
+      return { id: this.endpoint, name: this.endpoint, memberId: 'member', ownerId: 'owner', members: [{ id: 'member', name: 'Member', role: 'member', online: true }] } as T;
     };
     let saved: unknown[] = []; const credentials: string[] = [];
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {

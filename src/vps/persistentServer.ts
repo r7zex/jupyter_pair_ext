@@ -162,7 +162,13 @@ export class PersistentSessionHost {
       const policyStatus = (error as { status?: unknown }).status;
       if (typeof policyStatus === 'number' && policyStatus >= 400 && policyStatus < 500) status = policyStatus;
       response.statusCode = status;
-      response.end(JSON.stringify({ error: status < 500 ? (error as Error).message : 'Persistent session operation failed.' }));
+      const requestId = randomUUID();
+      if (status >= 500) {
+        const code = (error as NodeJS.ErrnoException).code;
+        const frames = error instanceof Error ? error.stack?.split('\n').slice(1, 9).join('\n') : undefined;
+        console.error(`[persistent] request=${requestId} code=${typeof code === 'string' && /^[A-Z_]+$/.test(code) ? code : 'INTERNAL'}\n${frames ?? ''}`);
+      }
+      response.end(JSON.stringify({ error: status < 500 ? (error as Error).message : 'Persistent session operation failed.', ...(status >= 500 ? { requestId } : {}) }));
     } finally { clearTimeout(deadline); }
   }
 
@@ -577,6 +583,11 @@ export class PersistentSessionHost {
       const file = await session.workspace.read(filename, owner);
       const { doc, epoch, template } = loadNotebookCrdt(file.content);
       try {
+        if (template.cells.length === 0 && sharedNotebook(doc).cells.length === 0
+          && (!template.metadata?.pair_crdt || template.metadata.pair_crdt.bootstrapEmpty === true)
+          && body.bootstrapEmpty !== true && body.update === undefined && body.snapshot === undefined && body.intent === undefined && body.stateVector === undefined) {
+          throw new SessionError(426, 'Update Pair Notebook to 0.6.6 before opening this new notebook; its unsaved first cell must be preserved.');
+        }
         if (body.epoch !== undefined && body.epoch !== epoch) throw new SessionError(409, 'Notebook was replaced. Preserve offline edits and reopen it.');
         const before = Buffer.from(Y.encodeStateAsUpdate(doc));
         const previous = sharedNotebook(doc);
@@ -649,7 +660,9 @@ export class PersistentSessionHost {
         const vector = typeof body.stateVector === 'string' && body.stateVector.length <= 65536 ? Buffer.from(body.stateVector, 'base64') : undefined;
         let update: string;
         try { update = Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64'); } catch { throw new SessionError(400, 'Invalid CRDT state vector.'); }
-        return { epoch, revision, update, textProtocol: 'yjs-intents-v1', acknowledgedSequence, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
+        const bootstrapEmpty = sharedNotebook(doc).cells.length === 0 && template.cells.length === 0
+          && (!template.metadata?.pair_crdt || template.metadata.pair_crdt.bootstrapEmpty === true);
+        return { epoch, revision, update, textProtocol: 'yjs-intents-v1', acknowledgedSequence, bootstrapEmpty, identity: session.workspace.notebookIdentity(filename, owner), ...(body.compact === true ? { cells: [], metadata: {} } : sharedNotebook(doc)) } satisfies NotebookSyncReply;
       } finally { doc.destroy(); }
     }
     if (body.operation === 'snapshot') return session.workspace.snapshot(owner);

@@ -26,6 +26,7 @@ import {
   type PendingSessionLaunch,
 } from './core/manualSessionRestore';
 import { discoverPythonEnvironments } from './core/pythonEnvironments';
+import { normalizeRelayEndpoint } from './core/relayEndpoint';
 import { copyProject } from './core/projectFiles';
 import {
   accessibleRecentProjects,
@@ -93,6 +94,7 @@ let synchronizer: EditorSynchronizer | undefined;
 let presence: PresenceRenderer | undefined;
 let notebookController: PairNotebookController;
 let persistentController: PersistentSessionController | undefined;
+let invitedRelayUrl: string | undefined;
 let dashboard: DashboardProvider;
 let status: vscode.StatusBarItem;
 let statusTimer: NodeJS.Timeout | undefined;
@@ -122,7 +124,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   dashboard = new DashboardProvider(context, output);
   notebookController = new PairNotebookController(output);
   const vpsCompute = new VpsComputeController(context, () => runtime);
-  persistentController = new PersistentSessionController(context, output);
+  persistentController = new PersistentSessionController(context, output, notebookController.controller,
+    (view, endpoint, connected) => dashboard.setPersistentSession(view, endpoint, connected), () => !runtime);
+  notebookController.persistent = persistentController;
   context.subscriptions.push(persistentController);
   context.subscriptions.push(new LineCommentController((document) => persistentController?.commentBackend(document) ?? (runtime ? peerCommentBackend(runtime, document) : undefined)));
   register(context, 'pairNotebook.managePermissions', async () => {
@@ -164,6 +168,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'pairNotebook.turnUrls',
         'pairNotebook.turnUsername',
         'pairNotebook.vpsUrl',
+        'pairNotebook.relayUrl',
         'http.proxy',
         'http.proxySupport',
         'http.noProxy',
@@ -186,7 +191,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   register(context, 'pairNotebook.startSession', () => startSession(context));
   register(context, 'pairNotebook.joinSession', () => joinSession(context));
-  register(context, 'pairNotebook.leaveSession', () => leaveSession());
+  register(context, 'pairNotebook.leaveSession', () => persistentController?.connected ? persistentController.leave() : leaveSession());
   register(context, 'pairNotebook.endSession', () => endSession());
   register(context, 'pairNotebook.copyInvite', () => copyInvite());
   register(context, 'pairNotebook.openPanel', async () => {
@@ -254,7 +259,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.showComputeResources', () => showComputeResources());
   register(context, 'pairNotebook.selectPythonEnvironment', () => selectPythonEnvironment());
   register(context, 'pairNotebook.runActiveCell', async () => notebookController.executeActive());
-  register(context, 'pairNotebook.restartKernel', async () => notebookController.restartActive());
+  register(context, 'pairNotebook.restartKernel', async () => persistentController?.connected ? persistentController.restartKernel() : notebookController.restartActive());
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
   startLifecycleWatchdog(context);
@@ -283,11 +288,12 @@ export async function deactivate(): Promise<void> {
 }
 
 async function startSession(context: vscode.ExtensionContext): Promise<void> {
+  invitedRelayUrl = undefined;
   if (!await requireTrustedWorkspaceForSessionStart()) return;
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
-  if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
+  if (runtime || persistentController?.connected) throw new Error('A Pair Notebook session is already active in this window.');
   await applyMeshNetworkConfiguration(context, { checkProxy: true });
   const localDisplayName = await promptDisplayName(
     displayName(),
@@ -339,6 +345,7 @@ async function startSession(context: vscode.ExtensionContext): Promise<void> {
   };
   const descriptor: SessionDescriptor = {
     sessionId,
+    ...(temporaryRelayEndpoint(context) ? { relayUrl: temporaryRelayEndpoint(context)! } : {}),
     projectId,
     projectName: cleanProjectName(projectName),
     mode: 'resilient',
@@ -370,7 +377,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
   if (workspaceSessionRestore) {
     throw new Error('The existing Pair Notebook workspace session is still restoring. Wait for it to finish or report an error.');
   }
-  if (runtime) throw new Error('A Pair Notebook session is already active in this window.');
+  if (runtime || persistentController?.connected) throw new Error('A Pair Notebook session is already active in this window.');
   await applyMeshNetworkConfiguration(context, { checkProxy: true });
   const raw = await vscode.window.showInputBox({
     title: 'Join Pair Notebook Session',
@@ -379,6 +386,8 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
   });
   if (!raw) return;
   const invite = parseInvite(raw);
+  invitedRelayUrl = invite.relayUrl;
+  await applyMeshNetworkConfiguration(context, { checkProxy: true });
   let nickname = await promptDisplayName(
     displayName(),
     'Введите имя для этой совместной сессии. Имена участников не могут повторяться.',
@@ -438,6 +447,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
   ).then(undefined, (error) => output.appendLine(`[error] Could not remember display name: ${formatError(error)}`));
   const descriptor: SessionDescriptor = {
     sessionId: invite.sessionId,
+    ...(invite.relayUrl ? { relayUrl: invite.relayUrl } : {}),
     projectId: invite.projectId,
     projectName: invite.projectName,
     // Keep the legacy wire value for compatible invites. Runtime authority is
@@ -950,6 +960,7 @@ async function copyInvite(): Promise<void> {
   }
   const descriptor = active.descriptor;
   const invite: InviteData = {
+    ...(temporaryRelayEndpoint(activationContext!) ? { relayUrl: temporaryRelayEndpoint(activationContext!)! } : {}),
     sessionId: descriptor.sessionId,
     projectId: descriptor.projectId,
     projectName: descriptor.projectName,
@@ -1300,12 +1311,21 @@ async function applyMeshNetworkConfiguration(
   if (options.checkProxy) await assertProxyReachable(proxy);
   if (generation !== meshNetworkConfigurationGeneration) return;
   configureMeshNetwork({
-    vps,
+    vps: temporaryRelayEndpoint(context) ? { url: temporaryRelayEndpoint(context)!, token: '', temporary: true } : vps,
     turnUrls: configuration.get<string[]>('turnUrls', []),
     turnUsername: configuration.get<string>('turnUsername', '').trim() || undefined,
     turnPassword: turnPassword || undefined,
     proxy,
   });
+}
+
+function temporaryRelayEndpoint(context: vscode.ExtensionContext): string | undefined {
+  const value = runtime?.descriptor.relayUrl ?? invitedRelayUrl
+    ?? (vscode.workspace.getConfiguration('pairNotebook').get<string>('relayUrl', '').trim()
+    || context.globalState.get<string>('pairNotebook.persistentEndpoint', ''));
+  if (!value) return undefined;
+  try { return normalizeRelayEndpoint(value); }
+  catch { return undefined; }
 }
 
 function queueAutomaticNetworkRecovery(context: vscode.ExtensionContext, reason: string): void {

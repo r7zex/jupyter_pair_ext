@@ -2237,8 +2237,7 @@ describe('protocol and notebook compatibility', () => {
     assert.equal(manifest.capabilities.virtualWorkspaces.supported, true);
     const connectionCommands = manifest.contributes.commands.filter((command: { command: string }) => ['pairNotebook.connectVps', 'pairNotebook.connectVpsCompute'].includes(command.command));
     assert.equal(connectionCommands.length, 2, 'Persistent session and broker compute connections remain separate commands.');
-    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVps' && item.when === 'view == pairNotebook.persistentSessions'));
-    assert.ok(manifest.contributes.menus['view/title'].some((item: { command: string; when: string }) => item.command === 'pairNotebook.connectVpsCompute' && item.when === 'view == pairNotebook.vpsCompute'));
+    assert.deepEqual(manifest.contributes.views.pairNotebook.map((view: { id: string }) => view.id), ['pairNotebook.dashboard']);
     assert.equal(manifest.devDependencies['@types/vscode'], manifest.engines.vscode.replace(/^\^/, ''));
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowRemoteCompute'], undefined);
     assert.equal(manifest.contributes.configuration.properties['pairNotebook.allowCpu'], undefined);
@@ -2394,9 +2393,11 @@ describe('protocol and notebook compatibility', () => {
       sessionId: 'session', projectId: 'project', projectName: 'Demo project', mode: 'resilient',
       token: 'abcdefghijklmnopqrstuvwxyz1234567890', sessionEpoch: 123, hostPeerId: 'host-id', hostDisplayName: 'Alice',
       hostIdentityKey: TEST_IDENTITY_PUBLIC_KEY, hostEpoch: 7,
+      relayUrl: 'https://relay.example',
     });
     const decoded = parseInvite(encoded);
     assert.equal(decoded.hostPeerId, 'host-id');
+    assert.equal(decoded.relayUrl, 'https://relay.example');
     assert.equal(decoded.hostDisplayName, 'Alice');
     assert.equal(decoded.hostIdentityKey, TEST_IDENTITY_PUBLIC_KEY);
     assert.equal(decoded.projectName, 'Demo project');

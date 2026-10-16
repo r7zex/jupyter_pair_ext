@@ -18,6 +18,21 @@ export interface PythonEnvironment {
   source: string;
 }
 
+/** CPU startup should not import PyTorch in every discovered environment. */
+export async function resolveDefaultJupyterPython(workspaceRoot: string, configured: string, cuda = false): Promise<string> {
+  if (!cuda) {
+    try {
+      const { stdout } = await execFileAsync(configured, ['-c', 'import sys,jupyter_client,ipykernel;print(sys.executable)'], {
+        timeout: 8_000, maxBuffer: 16 * 1024, windowsHide: true,
+      });
+      const executable = stdout.trim();
+      if (executable && executable.length <= 4096 && !/[\0\r\n]/.test(executable)) return executable;
+    } catch { /* Fall back to other project environments when the default lacks Jupyter. */ }
+  }
+  const environments = await discoverPythonEnvironments(workspaceRoot, configured);
+  return environments.find(environment => environment.jupyterReady && (!cuda || environment.cudaAvailable))?.executable ?? configured;
+}
+
 export async function discoverPythonEnvironments(workspaceRoot: string, configured: string): Promise<PythonEnvironment[]> {
   const candidates = new Map<string, string>();
   const add = (value: string | undefined, source: string) => {

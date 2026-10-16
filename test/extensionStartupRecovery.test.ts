@@ -41,7 +41,7 @@ describe('extension retry after startup failure', () => {
           networkDiagnostics: () => ({}), leave: () => hungCleanup ? cleanup : Promise.resolve() },
       });
       const code = `
-        let runtime = fakeRuntime, lifecycleReadyRuntime, workspaceSessionRestore;
+        let runtime = fakeRuntime, persistentController, lifecycleReadyRuntime, workspaceSessionRestore;
         async function restoreWorkspaceSession(context) {
           const startupRuntime = runtime;
           try { throw new Error('injected transport failure'); } ${startupTry.catchClause!.getText(tree)}

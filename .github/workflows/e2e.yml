@@ -55,6 +55,15 @@ jobs:
       - name: Install locked project dependencies
         run: npm ci
 
+      - name: Set up Python for real owner-only notebook execution
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Jupyter kernel dependencies
+        run: python -m pip install jupyter_client==8.10.0 ipykernel==7.4.0
+
       - name: Install isolated VS Code E2E driver
         # The driver has its own node_modules tree. `npm ci` remains the exact
         # package-lock installation used to compile and exercise project code.
@@ -67,6 +76,7 @@ jobs:
           PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
           PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+          PAIR_NOTEBOOK_E2E_PYTHON: ${{ steps.python.outputs.python-path }}
         run: xvfb-run -a npm run test:e2e
 
       - name: Run real VS Code Extension Host E2E
@@ -76,4 +86,5 @@ jobs:
           PAIR_NOTEBOOK_E2E_TEST_ELECTRON_PATH: .e2e-driver/node_modules/@vscode/test-electron/out/index.js
           PAIR_NOTEBOOK_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
           PAIR_NOTEBOOK_E2E_TIMEOUT_MS: '240000'
+          PAIR_NOTEBOOK_E2E_PYTHON: ${{ steps.python.outputs.python-path }}
         run: npm run test:e2e
