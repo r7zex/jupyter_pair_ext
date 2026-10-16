@@ -107,7 +107,7 @@ def install(config: dict, architecture: str, archive: Path | None) -> None:
         if config["mode"] == "full":
             packages += ["bubblewrap", "python3", "apparmor"]
         run("apt-get", "update")
-        run("apt-get", "install", "-y", "--no-install-recommends", *packages)
+        run("env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "apt-get", "install", "-y", "--no-install-recommends", *packages)
         runtime(directory, architecture)
         services.prepare_accounts(config["mode"] == "full")
         destination = ROOT / "releases" / f"{VERSION}-{stamp}"

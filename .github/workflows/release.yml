@@ -112,8 +112,6 @@ jobs:
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
           python -m unittest discover -s test -p server_installer_test.py -v
-          npm run package:persistent-server
-          node test/persistent_server_archive_smoke.mjs
           node test/relay_archive_smoke.mjs
 
       - name: Prepare release files and notes

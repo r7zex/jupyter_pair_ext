@@ -575,7 +575,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const save = (this.credentialWrites ?? Promise.resolve()).then(async () => {
       await this.context.secrets.store(membershipKey(connection), token);
       const connections = this.context.globalState.get<SavedConnection[]>(CONNECTIONS_KEY, []).filter((item) => !(item.endpoint === connection.endpoint && item.sessionId === connection.sessionId && item.memberId === connection.memberId));
-      const descriptor = { endpoint: connection.endpoint, sessionId: connection.sessionId, memberId: connection.memberId, name: connection.name, role: connection.role ?? 'member' as const, autoConnect: true };
+      const descriptor = { endpoint: connection.endpoint, sessionId: connection.sessionId, memberId: connection.memberId, name: connection.name, role: connection.role ?? 'member' as const, autoConnect: attempt === this.connectionAttempt };
       if (attempt === this.connectionAttempt) connections.unshift(descriptor); else connections.push(descriptor);
       await this.context.globalState.update(CONNECTIONS_KEY, connections.slice(0, 20));
     });
@@ -630,6 +630,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       await this.context.globalState.update(CONNECTIONS_KEY, saved.map(item => (connection ? membershipKey(item) === membershipKey(connection) : roots.has(item.sessionId)) ? { ...item, autoConnect: false } : item));
     }
     if (!connection) return;
+    await Promise.all([this.notebookSync?.checkpoint(), this.textSync?.checkpoint()]);
     // Deactivation never stops a session or cancels accepted runs.
     try { if (notifyServer) await connection.client.call('leave', { sessionId: connection.sessionId }); }
     finally {

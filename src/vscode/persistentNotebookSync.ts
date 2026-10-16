@@ -111,6 +111,9 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     this.heartbeat = setInterval(() => { this.ensureStream(); this.schedulePresence(); }, 1000); this.heartbeat.unref();
   }
   dispose(): void { clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose(); this.reset(); }
+  async checkpoint(): Promise<void> {
+    await Promise.all([...this.states.values()].filter(state => state.initialized && !state.closed).map(state => this.journal(state)));
+  }
   async shutdown(): Promise<void> {
     clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose();
     await Promise.all([...this.states.values()].filter((state) => state.initialized && !state.closed)

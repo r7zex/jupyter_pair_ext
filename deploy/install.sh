@@ -13,7 +13,7 @@ esac
 test -d /run/systemd/system || { echo "A running systemd is required." >&2; exit 1; }
 if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
     apt-get update
-    apt-get install -y --no-install-recommends python3 curl ca-certificates
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends python3 curl ca-certificates
 fi
 PAIR_DOWNLOAD=$(mktemp -d)
 trap 'rm -rf "$PAIR_DOWNLOAD"' EXIT HUP INT TERM

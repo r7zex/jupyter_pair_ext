@@ -204,7 +204,7 @@ describe('Round 2 output selection regressions', () => {
     endpoint = 'http://localhost:9999'; secrets.set(vpsSecretKey(endpoint), 'a'.repeat(32));
     const original = VpsClient.prototype.job;
     VpsClient.prototype.job = async () => { throw new VpsHttpError(status); };
-    try { await controller.showJob('missing'); assert.equal((controller as any).logTimer, undefined); assert.match(output, status === 404 ? /not found/i : /Connect to VPS/i); }
+    try { await controller.showJob('missing'); assert.equal((controller as any).logTimer, undefined); assert.match(output, status === 404 ? /not found/i : /Connect to Server/i); }
     finally { VpsClient.prototype.job = original; }
   });
 });

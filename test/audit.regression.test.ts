@@ -97,13 +97,19 @@ describe('audit regressions', () => {
       assert.match(publishJob, /GH_REPO:\s+\$\{\{ github\.repository \}\}/);
       assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
       assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
-      assert.match(publishJob, /ASSETS=\("\$\{VERSIONED_VSIX\}" "pair-notebook-complete-\$\{RELEASE_VERSION\}\.zip" "pair-notebook-server-persistent\.tar\.gz" "pair-notebook-server-persistent\.tar\.gz\.sha256"\)/);
+      const declaredAssets = publishJob.match(/ASSETS=\(([^\n]*)\)/)?.[1] ?? '';
+      for (const asset of ['${VERSIONED_VSIX}', 'pair-notebook-complete-${RELEASE_VERSION}.zip',
+        'pair-notebook-server-persistent.tar.gz', 'pair-notebook-server-persistent.tar.gz.sha256',
+        'pair-notebook-install.pyz', 'pair-notebook-install.sh', 'pair-notebook-relay.tar.gz', 'SERVER_SETUP.md', 'SHA256SUMS']) {
+        assert.ok(declaredAssets.includes(`"${asset}"`), `release must publish ${asset}`);
+      }
       assert.match(verifyJob, /npm run package:persistent-server\s+ npm run test:persistent:server/);
       assert.match(verifyJob, /sha256sum --check pair-notebook-server-persistent\.tar\.gz\.sha256/);
       assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
       assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
       assert.match(releaseNotesScript, /pair-notebook-complete-\$\{version\}\.zip/);
-      assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix|SHA256SUMS/);
+      assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix/);
+      assert.match(releaseNotesScript, /SHA256SUMS/);
       assert.doesNotMatch(workflow, /--clobber/);
       const compareIndex = publishJob.indexOf('cmp --silent');
       const editIndex = publishJob.indexOf('gh release edit');

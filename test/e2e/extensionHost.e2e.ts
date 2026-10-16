@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 import { CollaborativeProject, type ProjectUpdate } from '../../src/core/crdt';
 import { LOCAL_EDITOR_ORIGIN, REMOTE_ORIGIN } from '../../src/core/types';
 import { EditorSynchronizer } from '../../src/vscode/sync';
+import { SERVER_VERSION } from '../../src/vps/compatibility';
 
 const EXTENSION_ID = 'pair-notebook.pair-notebook';
 const PROJECT_COMMANDS = [
@@ -52,6 +53,8 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     assert.ok(extension, `${EXTENSION_ID} must be loaded as the development extension`);
     await extension.activate();
     assert.equal(extension.isActive, true);
+    assert.equal(extension.packageJSON.version, SERVER_VERSION, 'the activated Extension Host must match the release protocol build');
+    console.log(`Activated Pair Notebook ${extension.packageJSON.version}; path=${extension.extensionPath}`);
   });
 
   suiteTeardown(async () => {
@@ -76,6 +79,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     assert.equal(configuration.get('selectedCudaDevice'), 0);
     assert.equal(configuration.get('persistenceDebounceMs'), 750);
     assert.equal(configuration.get('logLevel'), 'info');
+    assert.equal(configuration.get('serverRestore'), 'automatic');
     assert.deepEqual(configuration.get('turnUrls'), []);
     assert.equal(configuration.get('turnUsername'), '');
     assert.equal(configuration.get('proxyUrl'), '');

@@ -171,5 +171,6 @@ export class PersistentTextSynchronizer implements vscode.Disposable {
     this.stopped = true; clearInterval(this.timer); for (const listener of this.listeners) listener.dispose();
     for (const state of [...this.states.values()]) this.close(state);
   }
+  async checkpoint(): Promise<void> { await Promise.all([...this.states.values()].map(state => this.persist(state))); }
   dispose(): void { if (this.stopped) return; this.stopped = true; clearInterval(this.timer); for (const listener of this.listeners) listener.dispose(); this.reset(); }
 }

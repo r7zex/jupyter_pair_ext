@@ -517,6 +517,19 @@ describe('Persistent session actions preserve their original connection', () => 
 });
 
 describe('Server project startup safety', () => {
+  it('waits for local notebook and text journals before detaching a project', async () => {
+    let release!: () => void; let saved = false;
+    const journal = new Promise<void>(resolve => { release = () => { saved = true; resolve(); }; });
+    const connection = { endpoint: 'https://example.com', sessionId: 'project', memberId: 'owner', name: 'Project', client: { call: async () => undefined } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, context: { globalState: { get: () => [], update: async () => undefined } },
+      notebookSync: { checkpoint: () => journal, reset: () => { assert(saved); } },
+      textSync: { checkpoint: () => journal, reset: () => { assert(saved); } },
+      files: { setConnection: () => undefined }, status: { hide: () => undefined }, changed: { fire: () => undefined },
+    }) as { leave: () => Promise<void>; connection?: unknown };
+    const leaving = ui.leave(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ui.connection, connection); release(); await leaving; assert.equal(ui.connection, undefined);
+  });
   it('blocks incompatible attachment before mounting files or announcing readiness', async () => {
     const original = PersistentClient.prototype.checkCompatibility;
     let mounts = 0; const messages = informationMessages.length;
