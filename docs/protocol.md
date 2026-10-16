@@ -1,6 +1,6 @@
 # Pair Notebook protocol
 
-## Persistent VPS protocol in 0.6.3
+## Persistent server protocol in 0.6.7
 
 Persistent sessions use authenticated HTTPS RPC and server-sent events, separate from the encrypted peer protocol below. Session credentials cannot authorize administrative creation or legacy team jobs. The server checks membership, revisions and inherited folder privacy before reads, writes, discovery and execution.
 
@@ -10,9 +10,9 @@ Execution admission pins source, cell identity, privacy scope, target and kernel
 
 ## Peer room and admission
 
-The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The invite contains no IP address, hostname, or listening port. New invites include the current pinned host epoch, which bootstrap and runtime admission preserve after voluntary transfers; legacy invites without it default to epoch zero.
+The room key consists of a fixed application ID, the random session ID, and a 256-bit invite token supplied as the Trystero password. The base peer invitation requires no listening address. It can additionally carry an HTTPS server-relay origin for fallback, without an administrative credential. New invites include the current pinned host epoch, which bootstrap and runtime admission preserve after voluntary transfers; legacy invites without it default to epoch zero.
 
-Before Trystero admits a peer, Pair Notebook 0.6.5 exchanges a protocol-v8 handshake containing:
+Before Trystero admits a peer, Pair Notebook 0.6.7 exchanges a protocol-v8 handshake containing:
 
 - session ID;
 - connection purpose (`runtime` or `bootstrap`);
@@ -78,9 +78,9 @@ These interactive execution owners still belong to Extension Host. Independent l
 
 ## Shared host command terminal
 
-`shellSnapshotRequest`, `shellSnapshot` and `shellOutput` travel through the authenticated mesh, including the VPS relay. They carry the exact current host clock. Only the current host may publish terminal output; guests reject messages from another peer, stale clocks and malformed sequence/generation metadata. `shellInput` requires an explicit host-issued write permission. It carries a command and random request ID; `shellInputResult` acknowledges admission or reports rejection.
+`shellSnapshotRequest`, `shellSnapshot` and `shellOutput` travel through the authenticated mesh, including the server relay. They carry the exact current host clock. Only the current host may publish terminal output; guests reject messages from another peer, stale clocks and malformed sequence/generation metadata. `shellInput` requires an explicit host-issued write permission. It carries a command and random request ID; `shellInputResult` acknowledges admission or reports rejection.
 
-Hosts publish a process `streamId`, a UUID `generation`, a monotonic nonnegative `generationIndex` and a per-generation `sequence` on terminal snapshots/output. Guests adopt a different stream only through a snapshot echoing their current random `requestId`; reconnect replaces that request ID. This permits host-process restart under the same host clock without accepting delayed snapshots or replies from the old process. Within the verified stream, guests remember the newest generation counter as soon as its output arrives, clear the old view and request a fresh snapshot. A delayed snapshot from an older repository cannot roll back that view. A host-clock change resets the receiver's stream/counter so a new host can start its own numbering. Legacy frames without the counter remain accepted until the first ordered frame; update the host and every participant to 0.6.5 for the current protocol and permission checks.
+Hosts publish a process `streamId`, a UUID `generation`, a monotonic nonnegative `generationIndex` and a per-generation `sequence` on terminal snapshots/output. Guests adopt a different stream only through a snapshot echoing their current random `requestId`; reconnect replaces that request ID. This permits host-process restart under the same host clock without accepting delayed snapshots or replies from the old process. Within the verified stream, guests remember the newest generation counter as soon as its output arrives, clear the old view and request a fresh snapshot. A delayed snapshot from an older repository cannot roll back that view. A host-clock change resets the receiver's stream/counter so a new host can start its own numbering. Legacy frames without the counter remain accepted until the first ordered frame; update the host and every participant to 0.6.7 for the current protocol and permission checks.
 
 The host starts a local command shell in its backing repository after the file barrier. Output is UTF-8 decoded per pipe, coalesced into at most 16 Ki UTF-16-unit chunks, sequenced and retained within 128 Ki UTF-16 units without splitting surrogate pairs. A sequence gap requests the bounded authoritative snapshot; unacknowledged requests retry and route replacement sends the latest snapshot. Explicit host transfer, backing-folder changes and session shutdown fail closed if they would destroy managed work without its separate typed confirmation. Forced Extension Host shutdown remains a lifetime limit. The VS Code Pseudoterminal accepts line input from the host and participants explicitly granted `terminal: write`. The host authenticates and deduplicates request IDs and rechecks that grant after asynchronous repository preparation. Participants with `terminal: none` receive neither snapshots nor output. Ctrl+C requests an empty-field exact `CONFIRM` before stopping the captured shell generation and pending commands. New command admission invalidates the old challenge. Closing the terminal tab only detaches observation.
 
@@ -127,4 +127,4 @@ Ending a session is distinct from leaving. The host requests a peer drain/ack fe
 
 Only the current pinned host may send `collaborationState` with its host clock and monotonic revision. Its JSON payload carries participant policies and up to 256 comments. Guests cannot grant themselves authority. Exact file paths and explicit directory rules ending in `/` are checked for text/notebook updates, lifecycle changes, binary commits and both sides of renames. Directory changes check every affected entry. Execution and shared terminal input have separate admission checks. Policies and comments persist in session descriptors and survive authenticated host transfer.
 
-`commentRequest` carries a random request ID and a comment or removal ID; `commentResult` acknowledges success or rejection. The host stamps authenticated author identity. Comments use stable cell IDs and Yjs relative start/end anchors. On the VPS, `permissions`, `comments`, `addComment`, and `removeComment` RPCs use the existing authenticated membership boundary; only the owner changes policy. Comment reads are filtered through current Public/Private visibility. Text/notebook replica epochs prevent old comments from attaching to replaced files.
+`commentRequest` carries a random request ID and a comment or removal ID; `commentResult` acknowledges success or rejection. The host stamps authenticated author identity. Comments use stable cell IDs and Yjs relative start/end anchors. On the server, `permissions`, `comments`, `addComment`, and `removeComment` RPCs use the existing authenticated membership boundary; only the owner changes policy. Comment reads are filtered through current Public/Private visibility. Text/notebook replica epochs prevent old comments from attaching to replaced files.

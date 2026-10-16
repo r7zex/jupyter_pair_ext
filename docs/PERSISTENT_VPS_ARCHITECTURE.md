@@ -1,4 +1,4 @@
-# Persistent VPS architecture — 0.6.3
+# Persistent server architecture — 0.6.7
 
 The server is the permanent Session Host. Editors may disconnect without transferring authority or ending accepted computation. The existing human-host peer runtime and detached background-job broker remain separate modes. Persistent sessions reuse the existing Yjs/editor/Jupyter mechanisms through an authenticated server adapter.
 

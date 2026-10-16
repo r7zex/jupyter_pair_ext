@@ -1,22 +1,25 @@
-# Your VPS and persistent compute machines
+# Your server and persistent compute machines
 
-Version 0.6.3. This guide covers **Connect to VPS Compute**, the optional encrypted relay and independent background-job broker. **Connect to VPS** instead opens a server-owned collaborative workspace with session credentials; follow [Persistent VPS sessions](PERSISTENT_VPS.md) for that mode.
+Version 0.6.7. This guide covers **Connect to Server Compute**, the optional encrypted relay and independent background-job broker. **Connect to Server** instead opens a server-owned collaborative workspace with session credentials; follow [Persistent server sessions](PERSISTENT_VPS.md) for that mode.
 
 
-Pair Notebook can use your own VPS as an additional **end-to-end encrypted P2P relay** and as a **durable background-job broker**. A standalone agent on a PC executes Python jobs using that PC's CPU or NVIDIA GPU. The PC connects outward over HTTPS; it does not need a public IP, inbound port, VS Code, or the Session Host role. You can also run an agent on the VPS itself.
+Pair Notebook can use your own server as an additional **end-to-end encrypted P2P relay** and as a **durable background-job broker**. A standalone agent on a PC executes Python jobs using that PC's CPU or NVIDIA GPU. The PC connects outward over HTTPS; it does not need a public IP, inbound port, VS Code, or the Session Host role. You can also run an agent on the server itself.
 
-Once the agent starts a job, switching off the submitting laptop, leaving the collaborative session, closing VS Code, losing the VPS connection, or restarting the agent service does not terminate its detached training process. Reconnect later, from any team computer, to inspect the shared job and output. The compute PC must remain awake and powered on.
+Once the agent starts a job, switching off the submitting laptop, leaving the collaborative session, closing VS Code, losing the server connection, or restarting the agent service does not terminate its detached training process. Reconnect later, from any team computer, to inspect the shared job and output. The compute PC must remain awake and powered on.
 
-## 1. Install the service on the VPS
+## 1. Install the service on the server
 
-Use Node.js 20+ and Python 3.10+ for agents. From this feature branch on a Linux VPS:
+Use Node.js 20+ and Python 3.10+ for agents. For a manual background-job broker on a Linux server (new notebook servers use [the installer](SERVER_SETUP.md)):
 
 ```bash
-git clone --branch codex/vps-persistent-compute https://github.com/r7zex/jupyter_pair_ext.git
-cd jupyter_pair_ext
-npm ci
-npm run compile
+curl -fL https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-server-persistent.tar.gz -o pair-notebook-server-persistent.tar.gz
+curl -fL https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-server-persistent.tar.gz.sha256 -o pair-notebook-server-persistent.tar.gz.sha256
+sha256sum --check pair-notebook-server-persistent.tar.gz.sha256
+tar -xzf pair-notebook-server-persistent.tar.gz
+cd server
 ```
+
+No npm install or source build is required. Place this verified directory at the service's `/opt/pair-notebook-vps` working directory before starting the manual unit below. Back up an existing deployment before replacing its binaries; retain its state and credentials.
 
 Generate **two different** tokens with `openssl rand -hex 32`: a team token for editors, and an agent token for each compute machine. Keep credentials outside the repository. For example, create `/etc/pair-notebook/vps.env`, owned by the service account and readable only by it:
 
@@ -34,7 +37,7 @@ Run `npm run vps:server` with those environment variables, or install a systemd 
 
 ```ini
 [Unit]
-Description=Pair Notebook VPS relay and job broker
+Description=Pair Notebook server relay and job broker
 After=network-online.target
 Wants=network-online.target
 
@@ -110,29 +113,29 @@ On Windows, run the same script with the selected Python executable and Windows 
 
 ## 3. Connect every collaborator
 
-Install Pair Notebook 0.6.3 on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to VPS Compute**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
+Install Pair Notebook 0.6.7 on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to Server Compute**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
 
-Each collaborator keeps using the normal session invitation for editing. Start or rejoin the session after connecting the VPS to add its private relay. Direct P2P and the existing public relay paths remain available. Only holders of the session invite can decrypt relay frames; the VPS handles opaque ciphertext and routing metadata. The VPS service does not need the session invitation secret.
+Each collaborator keeps using the normal session invitation for editing. Start or rejoin the session after connecting the server to add its private relay. Direct P2P and the existing public relay paths remain available. Only holders of the session invite can decrypt relay frames; the server handles opaque ciphertext and routing metadata. The server service does not need the session invitation secret.
 
-Background job code and output use authenticated HTTPS between the team, broker and agent and are stored on the VPS/PC. Team members authorized to submit jobs can execute Python with the agent account's privileges; run agents under a dedicated account appropriate for your trusted collaborators.
+Background job code and output use authenticated HTTPS between the team, broker and agent and are stored on the server/PC. Team members authorized to submit jobs can execute Python with the agent account's privileges; run agents under a dedicated account appropriate for your trusted collaborators.
 
 ## 4. Submit and follow training
 
-Use the **VPS Compute** view in the Pair Notebook sidebar, or these commands:
+Use the command palette for these retained background-compute commands. There is no separate Compute sidebar view:
 
 | Command | Result |
 | --- | --- |
-| Connect to VPS | Configure the HTTPS endpoint and securely save the team token. |
-| Run Python on VPS Compute | Choose a PC and CPU/GPU, then submit the open Python script or selected notebook scope. |
-| Show VPS Jobs | List the team's jobs and follow a job's retained output. |
-| Cancel VPS Job | Cancel a queued job or request termination of a running job and its child processes. |
-| Refresh VPS Compute | Refresh machines and jobs. |
+| Connect to Server Compute | Configure the HTTPS endpoint and securely save the team token. |
+| Run Python on Server Compute | Choose a PC and CPU/GPU, then submit the open Python script or selected notebook scope. |
+| Show Server Jobs | List the team's jobs and follow a job's retained output. |
+| Cancel Server Job | Cancel a queued job or request termination of a running job and its child processes. |
+| Refresh Server Compute | Refresh machines and jobs. |
 
-Click a machine to select its compute device; click a job to follow its output. You can submit from a guest or without an active P2P session. Registered offline agents can receive queued jobs, which start when they reconnect. The VPS processes one job at a time per agent, in queue order.
+Use the device picker to select a machine and the job picker to follow retained output. You can submit from a guest or without an active P2P session. Registered offline agents can receive queued jobs, which start when they reconnect. The server processes one job at a time per agent, in queue order.
 
 For collaborative projects, the extension snapshots tracked text files from shared document state after all selection dialogs finish: Python modules, configuration, requirements, and small CSV/text datasets. Unsaved imported modules and other open text resources are included. A standalone trusted workspace snapshots these resources from its repository and overlays dirty editors, while a file opened without a workspace sends only the active file. Private credential paths and binary files are excluded. Nested scripts and notebook programs can import Python modules from the snapshot root.
 
-A notebook can submit its active cell or all Python code cells in a fresh process with a shared namespace between submitted cells. Existing Jupyter kernel variables and interactive input are unavailable; IPython magics and shell syntax work when the selected interpreter has IPython installed. Regular live notebook execution runs in the Session Host's backing repository; background execution is selected explicitly with **Run Python on VPS Compute** and uses the compute PC's immutable job directory. Files present only on the Session Host do not automatically exist on another compute PC: transfer large/binary datasets into the agent's owner `--workspace`, declare their relative paths, sizes and SHA-256 in `--data-manifest`, then submit. The agent copies only declared owner data into the immutable job directory; `PAIR_NOTEBOOK_WORKSPACE` points to that verified copy. See [owner data preparation](PERSISTENT_RESEARCH.md#owner-data-and-immutable-preparation).
+A notebook can submit its active cell or all Python code cells in a fresh process with a shared namespace between submitted cells. Existing Jupyter kernel variables and interactive input are unavailable; IPython magics and shell syntax work when the selected interpreter has IPython installed. Regular live notebook execution runs in the Session Host's backing repository; background execution is selected explicitly with **Run Python on Server Compute** and uses the compute PC's immutable job directory. Files present only on the Session Host do not automatically exist on another compute PC: transfer large/binary datasets into the agent's owner `--workspace`, declare their relative paths, sizes and SHA-256 in `--data-manifest`, then submit. The agent copies only declared owner data into the immutable job directory; `PAIR_NOTEBOOK_WORKSPACE` points to that verified copy. See [owner data preparation](PERSISTENT_RESEARCH.md#owner-data-and-immutable-preparation).
 
 The submitted snapshot is immutable for that job: later collaborative edits do not alter running training. At most 256 text files and 4 MiB of JSON input can be sent. Install dependencies on the agent in advance; scripts are launched without a shell or automatic package installation. Large datasets stay on the PC.
 
@@ -141,28 +144,28 @@ The submitted snapshot is immutable for that job: later collaborative edits do n
 - A disconnected laptop or stopped polling daemon does not stop the detached training process. The agent buffers output on disk and reports it after reconnecting.
 - A private supervisor watches a pipe owned by the detached job runner. If that runner crashes or is terminated, the supervisor stops training and its descendants. It holds `execution.lock` until cleanup finishes, reaping orphaned workers on Linux and using a Job Object on Windows.
 - On Linux, the runner also adopts descendants if its private supervisor crashes, then stops and reaps them before publishing a failed result. Its `run.lock` remains held throughout that cleanup.
-- VPS restarts preserve queued jobs, running claims, cancellation requests, completion results and output. Retried submissions with the same ID do not create a second job.
+- server restarts preserve queued jobs, running claims, cancellation requests, completion results and output. Retried submissions with the same ID do not create a second job.
 - If a submission response is lost, the editor retains its immutable input in private extension storage. The next Run command retries that input and ID before accepting a new job, including after an editor restart. It never assumes that an absent job listing means a timed-out request cannot still commit. After confirmation, Run can create a fresh job.
-- Changing VPS configuration replaces the private P2P channel during an active session and stops the old endpoint's output watcher. Other available transports continue working.
+- Changing server configuration replaces the private P2P channel during an active session and stops the old endpoint's output watcher. Other available transports continue working.
 - An agent restart with its original state directory resumes reporting from the same runner and its stored output. An ambiguous launch, runner crash or PC reboot is reported as interrupted only after recovery can acquire both `run.lock` and `execution.lock`. Recovery waits for descendant cleanup and never automatically executes that accepted job again. Resume from a checkpoint in a new job if needed.
 - A different agent installation cannot take over an already running claim. Restore the original state directory to reconcile it; do not delete agent state as a recovery shortcut.
 - Cancellation of an offline agent is delivered when it reconnects. Cancellation is a request until that agent confirms it; it cannot power off a remote process while the network is unavailable.
-- Each job retains its source, files and checkpoints in `<agent-state>/jobs/<job-id>/work/`. Retrieve artifacts through your existing SSH/file access to that PC, and explicitly stage a verified checkpoint for a new continuation. The VPS UI displays status and logs; it does not stream model weights or datasets.
+- Each job retains its source, files and checkpoints in `<agent-state>/jobs/<job-id>/work/`. Retrieve artifacts through your existing SSH/file access to that PC, and explicitly stage a verified checkpoint for a new continuation. The server UI displays status and logs; it does not stream model weights or datasets.
 - The broker retains the last 1 MiB of each job's output. The PC stores up to 32 MiB of output and continues draining further output so verbose training cannot block on a full pipe. Job files remain until the owner archives them.
 - The broker supports up to 1000 stored jobs. Archive completed job JSON files while the broker is stopped, and retain any active claims. Use one broker process per store.
-- The broker keeps job metadata in memory and reads one payload from disk at a time, so archived source/output do not all occupy VPS memory.
+- The broker keeps job metadata in memory and reads one payload from disk at a time, so archived source/output do not all occupy server memory.
 - The broker enforces a directory ownership lock. A dead process on the same hostname can be recovered automatically. Incomplete locks, a different hostname, containers sharing storage, and PID reuse require operator inspection: stop all brokers and remove `<data-directory>/.broker-lock` only after confirming there is no writer. A second live broker cannot open the store.
 
-The P2P editor session retains its existing host availability rules. A persistent compute agent does not become the editor Session Host. Background jobs and their VPS view remain available independently of that editor session.
+The P2P editor session retains its existing host availability rules. A persistent compute agent does not become the editor Session Host. Background-job commands remain available independently of that editor session.
 
 Notebook jobs preserve cell boundaries, a shared Python namespace and future-import state. The selected environment can run IPython magics and shell syntax when IPython is installed; ordinary Python cells also work without it. The first failed cell stops the job. Source snapshots remain bounded text inputs; binary datasets are owner-provisioned and copied through a pinned, hash-verified manifest.
 
 ## Verification
 
-Automated loopback checks cover credential separation, path validation, idempotent submissions, durable claims after a VPS restart, bounded/idempotent log replay, queued/running cancellation, encrypted P2P delivery and reconnection. A real Python agent test kills the polling daemon and stops the VPS while the detached program continues, then reconnects with the original state and verifies exactly one execution and recovered output. Additional real process tests kill the private supervisor, kill and terminate the detached runner, cancel training, and complete entrypoints that leave workers alive. They verify that descendants stop before completion or recovery, including Linux workers that create their own session, and that recovery never launches an accepted job again.
+Automated loopback checks cover credential separation, path validation, idempotent submissions, durable claims after a server restart, bounded/idempotent log replay, queued/running cancellation, encrypted P2P delivery and reconnection. A real Python agent test kills the polling daemon and stops the server while the detached program continues, then reconnects with the original state and verifies exactly one execution and recovered output. Additional real process tests kill the private supervisor, kill and terminate the detached runner, cancel training, and complete entrypoints that leave workers alive. They verify that descendants stop before completion or recovery, including Linux workers that create their own session, and that recovery never launches an accepted job again.
 
 The repository retains generic broker, recovery, UI and transport regression tests. Run `npm run compile`, `npm run test:vps:audit`, and `npm run test:vps:agent` to repeat them.
 
 These checks use local CPU processes on Linux and a substituted VS Code API boundary for UI tests. Windows Job Object supervision is implemented but has not been verified on native Windows. Deployment certificates, public-network routing, a real VS Code extension host, Windows service wrappers and physical GPU training must be tested in their respective environments.
 
-For source-specific target VPS, native editor and WSL/CUDA evidence, see the [current acceptance record](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md). Those observations do not imply every backend or physical UI path was exercised.
+For source-specific target server, native editor and WSL/CUDA evidence, see the [current acceptance record](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md). Those observations do not imply every backend or physical UI path was exercised.

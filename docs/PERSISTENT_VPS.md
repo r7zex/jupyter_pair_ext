@@ -1,30 +1,30 @@
 # Server installation
 
-For new servers use the [interactive installer](SERVER_SETUP.md). The manual procedure below remains for existing deployments. VPS command identifiers and `pair-vps` URIs remain compatible.
+For new servers use the [interactive installer](SERVER_SETUP.md). The manual procedure below remains for existing deployments. server command identifiers and `pair-vps` URIs remain compatible.
 
-# Persistent VPS sessions — 0.6.5
+# Persistent server sessions — 0.6.7
 
-Use the main Pair Notebook panel to create, join, configure or leave a persistent VPS session. The VPS retains session authority, membership, files and execution receipts while editors are offline. The panel displays the endpoint, session ID, matching Explorer folder, participants and selected compute device. Legacy broker commands remain callable for compatibility but have no separate sidebar view.
+Use the main Pair Notebook panel to create, join, configure or leave a persistent server session. The server retains session authority, membership, files and execution receipts while editors are offline. The panel displays the endpoint, session ID, matching Explorer folder, participants and selected compute device. Legacy broker commands remain callable for compatibility but have no separate sidebar view.
 
-Version 0.6.6 uses one Pair Notebook controller for both session types. When no session is connected, the panel exposes separate temporary-session and persistent-session actions. Saved connections display the project name and membership identity; Configure Persistent Sessions can reconnect or forget a local saved connection without deleting the server project.
+Version 0.6.7 uses one Pair Notebook controller for both session types. When no session is connected, the panel exposes separate temporary-session and persistent-session actions. Saved connections display the project name and membership identity; Configure Server Connections can reconnect or forget a local saved connection without deleting the server project.
 
-**My computer** can prepare and launch the bundled isolated agent directly. Windows requires an existing Ubuntu/Debian WSL2 distribution; Linux requires working bubblewrap isolation. Preparation creates a dedicated Python environment rather than modifying system Python. A ready owner agent is reused automatically, and newly enabled owner sharing becomes the default compute target. If local isolation is unavailable, the VPS remains the fallback. Explicitly selected Python environments are preserved; the default temporary-session interpreter can discover Jupyter in the original project's `.venv`.
+**My computer** can prepare and launch the bundled isolated agent directly. Windows requires an existing Ubuntu/Debian WSL2 distribution; Linux requires working bubblewrap isolation. Preparation creates a dedicated Python environment rather than modifying system Python. A ready owner agent is reused automatically, and newly enabled owner sharing becomes the default compute target. If local isolation is unavailable, the server remains the fallback. Explicitly selected Python environments are preserved; the default temporary-session interpreter can discover Jupyter in the original project's `.venv`.
 
-Temporary invitations can carry an HTTPS Pair Notebook relay origin. Set `pairNotebook.relayUrl` once, or reuse the last connected persistent VPS. Guests need only the invitation; they do not receive the team administration token. The additional relay route is end-to-end encrypted, bounded and independent of WebRTC; direct P2P and existing public fallbacks are still used. Measured latency depends on the endpoints and route; 100 ms is a target, not an unconditional network guarantee.
+Temporary invitations can carry an HTTPS Pair Notebook relay origin. Set `pairNotebook.relayUrl` once, or reuse the last connected persistent server. Guests need only the invitation; they do not receive the team administration token. The additional relay route is end-to-end encrypted, bounded and independent of WebRTC; direct P2P and existing public fallbacks are still used. Measured latency depends on the endpoints and route; 100 ms is a target, not an unconditional network guarantee.
 
-Install the same 0.6.5 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/VPS, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
+Install the same 0.6.7 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/server, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
 
 ## Participant permissions and comments
 
-The session owner can use **Manage Persistent VPS Session → Права участников** or **Pair Notebook: Права участников** to manage each member’s editable files, execution and comments. These policies and comments persist on the server. The existing VPS service has no shared operating-system shell; shared terminal permissions apply to P2P host terminals. See [instructions](PARTICIPANT_PERMISSIONS_AND_COMMENTS.md).
+The session owner can use **Manage Server Project → Права участников** or **Pair Notebook: Права участников** to manage each member’s editable files, execution and comments. These policies and comments persist on the server. The existing server service has no shared operating-system shell; shared terminal permissions apply to P2P host terminals. See [instructions](PARTICIPANT_PERMISSIONS_AND_COMMENTS.md).
 
 ## Release files and requirements
 
-Download from [release v0.6.5](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.5):
+Download from [release v0.6.7](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.7):
 
-- `pair-notebook-0.6.5.vsix`: install on every editor, then reload VS Code.
-- `pair-notebook-server-persistent.tar.gz` and `.sha256`: bundled server, agent/bridge, operator guide and service templates. No npm install/build is needed on the VPS.
-- `pair-notebook-complete-0.6.5.zip`: matching source, tests and background agent.
+- `pair-notebook-0.6.7.vsix`: install on every editor, then reload VS Code.
+- `pair-notebook-server-persistent.tar.gz` and `.sha256`: bundled server, agent/bridge, operator guide and service templates. No npm install/build is needed on the server.
+- `pair-notebook-complete-0.6.7.zip`: matching source, tests and background agent.
 
 The server needs Node.js 20 or newer, private durable storage and verified HTTPS. The Linux worker needs its own non-root account, Python environment with `jupyter_client`/`ipykernel`, and working bubblewrap/user namespaces or an isolated Linux-container runtime. Python dependencies and CUDA belong to the selected executor. Do not silently switch interpreters when readiness fails.
 
@@ -48,7 +48,7 @@ Extract into a new retained release directory. Use a stable `/opt/pair-notebook/
 | `PAIR_VPS_DATA` | Durable store private to the server account |
 | `PAIR_VPS_CLIENT_TOKEN` | Separate administrative/legacy operator credential |
 | `PAIR_VPS_AGENT_TOKENS` | Independent tokens keyed by worker ID |
-| `PAIR_VPS_SESSION_AGENT_ID` | Default VPS worker ID, normally `vps` |
+| `PAIR_VPS_SESSION_AGENT_ID` | Default server worker ID, normally `vps` |
 
 Generate independent random secrets into private service files. Do not put secrets in command lines, shared folders, Git, diagnostic output or kernel snapshots. A session password/member token is not the creation token. Retain owner credentials privately.
 
@@ -69,11 +69,11 @@ python3 scripts/pair-notebook-session-admin.py create \
 
 Use the configured port. Import the owner file through the extension's persistent-session actions; members connect using the public endpoint and session password or an authorized invitation. Lifecycle commands `start`, `stop`, `restart` and `delete` use `--member-config` with an owner/delegated credential. Inspect `--help` before administrative operations.
 
-Owners control invitations, membership revocation, visibility and device policy. Invitations can expire or be revoked; read-only grants cannot mutate Public content. Private files, notebooks, results and execution identities are owner-only. Private execution uses an isolated owner namespace and eligible owner/VPS target. Visibility changes reset the relevant namespace; ambiguous reconciliation must not turn Private data Public.
+Owners control invitations, membership revocation, visibility and device policy. Invitations can expire or be revoked; read-only grants cannot mutate Public content. Private files, notebooks, results and execution identities are owner-only. Private execution uses an isolated owner namespace and eligible owner/server target. Visibility changes reset the relevant namespace; ambiguous reconciliation must not turn Private data Public.
 
 ## Notebook editing and saving
 
-Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension and server together to 0.6.6; the extension checks the server's text protocol before editing. Zero-byte notebooks are initialized as valid empty notebooks. Their first unsaved editor cells are committed against the server's initial state vector, without restoring cells deleted from an existing populated notebook.
+Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension and server together to 0.6.7; the extension checks the server's text protocol before editing. Zero-byte notebooks are initialized as valid empty notebooks. Their first unsaved editor cells are committed against the server's initial state vector, without restoring cells deleted from an existing populated notebook.
 
 Native Save persists source, user metadata, outputs and execution counts. Editing an executed cell retains previous output. Results from a changed source/cell identity/generation remain fenced. Save immediately after Run settles the native execution lifecycle; a save racing with a later remote document version can require a further save. Reopen and verify the stored notebook when qualifying a new build.
 
@@ -85,11 +85,11 @@ Open ordinary UTF-8 project files also synchronize characters live. Run flushes 
 
 The selected device runs independent stateful Jupyter kernels. Select the active device to request personal execution consent without switching it. Server policy rechecks machine-owner consent, sharing and membership. Revocation prevents subsequent unauthorized work. Changing device or privacy scope advances kernel generation. Ordinary rename and unrelated file deletion preserve the notebook kernel and its variables. Save Python objects to files explicitly when changing devices: files transfer, RAM does not.
 
-All editors use the same selected session compute target. A ready, explicitly shared owner computer becomes the initial default; the VPS is used while that computer is absent or unavailable. With the owner offline, any number of connected members can select the VPS or their own shared computer, and cannot select a different member's computer. The owner's baseline is restored when the owner returns. Switching devices applies to future admissions and never rewrites the immutable target of already accepted work.
+All editors use the same selected session compute target. A ready, explicitly shared owner computer becomes the initial default; the server is used while that computer is absent or unavailable. With the owner offline, any number of connected members can select the server or their own shared computer, and cannot select a different member's computer. The owner's baseline is restored when the owner returns. Switching devices applies to future admissions and never rewrites the immutable target of already accepted work.
 
 Accepted inputs are immutable snapshots. Large files transfer in checked 256 KiB chunks; returned models publish atomically after checksum and version checks. The default project budget is 128 MiB and 4096 entries, with up to 256 changed artifacts per cell. Retained output is bounded to 8 MiB per execution, with an explicit diagnostic on overflow; overflow still accepts a final status and releases the queue. Run All stops after a failed cell, including failed artifact publication. Interrupt also cancels a run that has not reached its worker.
 
-Closing or uninstalling the extension ends a P2P session when performed by its host; a guest leaves only its own connection. In VPS mode the editor leaves membership presence, journals local edits and closes its requests. Server sessions and accepted independent work continue. A forced process kill cannot execute extension cleanup; remote peers then rely on heartbeat expiry.
+Closing or uninstalling the extension ends a P2P session when performed by its host; a guest leaves only its own connection. In server mode the editor leaves membership presence, journals local edits and closes its requests. Server sessions and accepted independent work continue. A forced process kill cannot execute extension cleanup; remote peers then rely on heartbeat expiry.
 
 Verify the actual Linux runtime before registration:
 
@@ -100,7 +100,7 @@ python3 scripts/pair-notebook-session-agent.py \
   --check-isolation
 ```
 
-Use the worker service with a separate private token/state, `--max-kernels 1` on the small VPS, and explicit `--share`. Keep credentials and host-private data outside kernel mounts. Bubblewrap denies kernel network access and exposes only the admitted workspace, bridge and required Python/system roots. Isolation failure is an error, not permission to run unconfined.
+Use the worker service with a separate private token/state, `--max-kernels 1` on the small server, and explicit `--share`. Keep credentials and host-private data outside kernel mounts. Bubblewrap denies kernel network access and exposes only the admitted workspace, bridge and required Python/system roots. Isolation failure is an error, not permission to run unconfined.
 
 Windows uses `scripts/pair-notebook-wsl-agent.ps1` with a selected WSL2 distribution. `-Action Check` verifies readiness; `-Action Run` starts the foreground agent with private Linux config/state and `--share`. `-Action Install` installs the selected agent runtime and requires a deliberate installation decision. Use a non-root Linux user and Linux filesystem storage for Python/CUDA; slow Windows-mounted environments can fail cold-start readiness. Do not change other distributions, global WSL settings, drivers or VPN routing.
 
@@ -108,7 +108,7 @@ Containers use an immutable installed image ID (`--runtime-image`) and the inter
 
 ## Resource and disk limits
 
-Service templates are starting points, not proof of aggregate limits. On the acceptance VPS all Pair processes share `/pair.slice/pair-notebook.slice`: **35% CPU, 384 MiB RAM, 128 MiB swap**. The worker has one kernel. The bounded soak has its own 25% CPU/256 MiB limit within the aggregate and a 25-hour maximum. Do not raise the aggregate to make tests pass. Inspect actual limits, OOM events, restarts and journal errors; a low memory peak alone does not prove success.
+Service templates are starting points, not proof of aggregate limits. On the acceptance server all Pair processes share `/pair.slice/pair-notebook.slice`: **35% CPU, 384 MiB RAM, 128 MiB swap**. The worker has one kernel. The bounded soak has its own 25% CPU/256 MiB limit within the aggregate and a 25-hour maximum. Do not raise the aggregate to make tests pass. Inspect actual limits, OOM events, restarts and journal errors; a low memory peak alone does not prove success.
 
 Keep hardening enabled. Only the interactive worker needs the narrowly scoped `ProtectKernelTunables=false` exception for its mount namespace. Do not apply it to other services or change global userns/AppArmor/sysctl settings as a workaround.
 

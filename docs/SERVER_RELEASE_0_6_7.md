@@ -12,6 +12,8 @@ An additional read-only SSH probe identified the running systemd server PID and 
 
 The exact 0.6.6 server condition is `notebookSync` on a zero-cell document with no CRDT bootstrap, where an old client sends neither `bootstrapEmpty: true` nor an update/snapshot/intent/stateVector. The server deliberately returns 426 to preserve the client's unsaved first cell. Heartbeat succeeds independently, explaining the contradictory connected notification. The new client checks compatibility and prepares restored notebooks before announcing readiness.
 
+After the owner identified the existing sslip.io setup, its exact origin was recovered from VS Code's saved connection rather than guessed from the public IP. A read-only external probe passed trusted hostname/chain validation (Let's Encrypt issuer YE2), `/health`, actual WebSocket 101, AES-GCM exchange, disconnect/reconnect and a second exchange. This tests the existing 0.6.6 endpoint; it is not evidence of new ACME issuance or installation by 0.6.7. No proxy configuration was changed.
+
 ## Executed isolated acceptance
 
 Sanitized machine-readable results are in [evidence/server-0.6.7](evidence/server-0.6.7). Tests used systemd containers on Docker in WSL2 on one physical Windows computer, x86_64. They exercise real Linux services, bubblewrap, Jupyter, TLS and WebSockets. They do not establish bare-metal, ARM64 or multi-computer behavior. Installer archives were built from the release branch during development; exact immutable release artifacts are separately built and checked by the release workflow.

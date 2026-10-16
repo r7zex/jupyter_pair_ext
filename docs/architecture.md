@@ -1,6 +1,6 @@
 # Pair Notebook architecture
 
-Version 0.6.5 retains three execution lifetimes. Peer sessions retain a human Session Host and its Extension Host kernels/shell. [Persistent VPS sessions](PERSISTENT_VPS_ARCHITECTURE.md) keep session authority on the server and stateful kernels on independent isolated agents. [Background jobs](PERSISTENT_RESEARCH.md) use their own detached supervisor/runner, immutable inputs and durable receipts. A transport connection is not the lifetime of accepted computation.
+Version 0.6.7 retains three execution lifetimes. Peer sessions retain a human Session Host and its Extension Host kernels/shell. [Persistent server sessions](PERSISTENT_VPS_ARCHITECTURE.md) keep session authority on the server and stateful kernels on independent isolated agents. [Background jobs](PERSISTENT_RESEARCH.md) use their own detached supervisor/runner, immutable inputs and durable receipts. A transport connection is not the lifetime of accepted computation.
 
 The component and peer execution contracts below describe human-host sessions. Persistent sessions reuse the editor/Jupyter mechanisms through a separate server protocol; their device consent, Public/Private namespaces and reconnect rules are documented separately.
 
