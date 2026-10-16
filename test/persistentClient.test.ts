@@ -101,6 +101,7 @@ const boundary = {
     workspaceFolders: undefined as vscode.WorkspaceFolder[] | undefined,
     notebookDocuments: [] as vscode.NotebookDocument[],
     updateWorkspaceFolders: () => true,
+    registerFileSystemProvider: () => ({ dispose: () => undefined }),
     fs: { stat: async () => ({ type: 1, size: 5 }), readFile: async () => Buffer.from('local private fixture') },
   },
 };

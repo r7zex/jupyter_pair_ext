@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { WebSocket } from 'ws';
+import { WebSocket, type ClientOptions } from 'ws';
 import { MAX_WIRE_FRAME_BYTES, decodeFrame, encodeFrame } from '../core/wire';
 import { normalizeVpsUrl, VPS_ID } from '../vps/protocol';
 import { type FrameRelay, type FrameRelayOptions } from './frameRelay';
@@ -43,10 +43,11 @@ export class VpsFrameRelay implements FrameRelay {
   public start(): void {
     if (this.stopped || this.socket) return;
     const socket = (this.options.socketFactory ?? createProxiedNodeWebSocket)(this.url, undefined, {
-      ...(this.url.startsWith('wss:') ? systemTlsOptions() : {}),
+      ...(this.url.startsWith('wss:') ? systemTlsOptions(this.url) : {}),
       headers: this.options.vps.temporary ? {} : { authorization: `Bearer ${this.options.vps.token}` },
       handshakeTimeout: 10_000, maxPayload: 96 * 1024 * 1024, followRedirects: false,
-    }, true);
+    // ws forwards these TLS options unchanged; its types retain a legacy boolean verifier signature.
+    } as unknown as ClientOptions, true);
     this.socket = socket;
     this.nonce = '';
     socket.on('open', () => {

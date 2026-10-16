@@ -266,6 +266,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private folderSync: PersistentFolderSync | undefined;
   private disposed = false;
   private connectionAttempt = 0;
+  private fileRegistration: vscode.Disposable | undefined;
   private readonly connectionWarnings = new Set<string>();
   private credentialWrites: Promise<void> = Promise.resolve();
   private readonly promptedConsents = new Set<string>();
@@ -306,6 +307,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       if (!document) return false;
       await this.notebookSync.flush(document, true); await this.files.refresh(); return true;
     };
+    this.setFilesReadonly(true);
     this.disposables.push(this.notebookSync, this.textSync,
       this.notebook.onDidChangeSelectedNotebooks(({ notebook, selected }) => {
         if (selected) {
@@ -314,7 +316,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
           void this.mirrorActiveExecutions().catch((error) => this.log.appendLine(`[debug] Execution discovery: ${error instanceof Error ? error.message : 'Unavailable.'}`));
         } else this.selectedNotebooks.delete(notebook);
       }),
-      vscode.workspace.registerFileSystemProvider(SCHEME, this.files, { isCaseSensitive: true }),
+      new vscode.Disposable(() => this.fileRegistration?.dispose()),
       vscode.workspace.onDidOpenNotebookDocument((notebook) => this.claim(notebook)),
       vscode.workspace.onDidCloseNotebookDocument((notebook) => this.files.release(notebook.uri)),
       vscode.workspace.onDidCloseTextDocument((document) => this.files.release(document.uri)),
@@ -372,7 +374,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         if (isPermanentConnectionError(error)) { this.connectionProblem(error); return; }
         if (++restoreRetries >= 5) { this.connectionProblem(new Error('The saved server is unavailable. Use Connect to Server to retry. Your local editors and history are preserved.')); return; }
         restoreAttempt = this.connectionAttempt;
-        this.log.appendLine('[debug] Saved server project is unavailable; retrying its connection.');
+        this.log.appendLine(`[debug] Saved server project is unavailable; retrying its connection: ${error instanceof Error ? error.message : 'Connection failed.'}`);
         restoreTimer = setTimeout(() => { restoreTimer = undefined; void requestRestore().catch((failure) => this.connectionProblem(failure)); }, Math.min(30_000, 2000 * 2 ** (restoreRetries - 1))); restoreTimer.unref();
       }
     };
@@ -382,13 +384,19 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.disposables.push(vscode.workspace.onDidGrantWorkspaceTrust(() => { void requestRestore().catch((error) => this.connectionProblem(error)); }));
     this.disposables.push(vscode.workspace.onDidOpenNotebookDocument(notebook => { if (notebook.uri.scheme === SCHEME) void requestRestore().catch((error) => this.connectionProblem(error)); }));
   }
+  private setFilesReadonly(readonly: boolean): void {
+    this.fileRegistration?.dispose();
+    this.fileRegistration = vscode.workspace.registerFileSystemProvider(SCHEME, this.files, { isCaseSensitive: true, isReadonly: readonly });
+  }
   private connectionProblem(error: unknown): void {
     const message = error instanceof Error ? error.message : 'The server project is unavailable.';
     if (this.connectionWarnings.has(message)) return;
     this.connectionWarnings.add(message);
     this.log.appendLine(`[error] Server connection suspended: ${message}`);
-    void vscode.window.showWarningMessage(`Pair Notebook: ${message}`, 'Open Releases', 'Reconnect').then((action) => {
+    const help = error instanceof PersistentHttpError && error.status === 426 ? 'Open Releases' : 'Saved Connections';
+    void vscode.window.showWarningMessage(`Pair Notebook: ${message}`, help, 'Reconnect').then((action) => {
       if (action === 'Open Releases') void vscode.env.openExternal(vscode.Uri.parse('https://github.com/r7zex/jupyter_pair_ext/releases/latest'));
+      if (action === 'Saved Connections') void this.configure().catch((failure) => this.connectionProblem(failure));
       if (action === 'Reconnect') void this.connect().catch((failure) => this.connectionProblem(failure));
     });
   }
@@ -589,6 +597,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.view = view;
     this.files.setConnection(connection);
     this.files.accept(initialSnapshot);
+    this.setFilesReadonly(false);
     current();
     await vscode.commands.executeCommand('setContext', 'pairNotebook.inVpsSession', true);
     current();
@@ -631,6 +640,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     }
     if (!connection) return;
     await Promise.all([this.notebookSync?.checkpoint(), this.textSync?.checkpoint()]);
+    if (connection === this.connection) this.setFilesReadonly(true);
     // Deactivation never stops a session or cancels accepted runs.
     try { if (notifyServer) await connection.client.call('leave', { sessionId: connection.sessionId }); }
     finally {

@@ -119,11 +119,19 @@ def account(name: str, directory: str) -> None:
         run("useradd", "--system", "--user-group", "--home-dir", directory, "--shell", "/usr/sbin/nologin", name)
 
 
+def executable_version(file: Path, argument: str, prefix: str) -> bool:
+    try:
+        result = subprocess.run([str(file), argument], text=True, capture_output=True, timeout=10, check=False)
+        return result.returncode == 0 and result.stdout.strip().startswith(prefix)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def runtime(directory: Path, architecture: str) -> None:
     """Install private upstream binaries; leave host Node and reverse proxies alone."""
     runtime_root = ROOT / "runtime"
     runtime_root.mkdir(parents=True, exist_ok=True)
-    if not (runtime_root / "node/bin/node").exists():
+    if not executable_version(runtime_root / "node/bin/node", "--version", "v22."):
         sums = directory / "SHASUMS256.txt"
         fetch("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt", sums)
         filenames = [line.split()[1] for line in sums.read_text().splitlines()
@@ -140,10 +148,12 @@ def runtime(directory: Path, architecture: str) -> None:
             source = bundle.extractfile(member)
             if not member.isfile() or source is None:
                 raise InstallError("Node.js archive does not contain a regular executable.")
-            with source, node.open("wb") as output:
+            temporary = node.with_suffix(".new")
+            with source, temporary.open("wb") as output:
                 shutil.copyfileobj(source, output)
-        node.chmod(0o755)
-    if not (runtime_root / "caddy").exists():
+        temporary.chmod(0o755)
+        temporary.replace(node)
+    if not executable_version(runtime_root / "caddy", "version", "v2."):
         metadata = directory / "caddy-release.json"
         fetch("https://api.github.com/repos/caddyserver/caddy/releases/latest", metadata)
         tag = json.loads(metadata.read_text())["tag_name"]
@@ -155,5 +165,7 @@ def runtime(directory: Path, architecture: str) -> None:
         fetch(f"{base}/caddy_{tag.removeprefix('v')}_checksums.txt", sums)
         verify(archive, sums, "sha512")
         extract(archive, directory / "caddy")
-        shutil.copyfile(directory / "caddy/caddy", runtime_root / "caddy")
-        (runtime_root / "caddy").chmod(0o755)
+        temporary = runtime_root / "caddy.new"
+        shutil.copyfile(directory / "caddy/caddy", temporary)
+        temporary.chmod(0o755)
+        temporary.replace(runtime_root / "caddy")

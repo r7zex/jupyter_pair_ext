@@ -71,7 +71,7 @@ export class PersistentClient {
         if (error) reject(error); else resolve(value!);
       };
       const request = (url.protocol === 'https:' ? https : http).request(url, {
-        method: 'POST', agent, ...(url.protocol === 'https:' ? systemTlsOptions() : {}),
+        method: 'POST', agent, ...(url.protocol === 'https:' ? systemTlsOptions(url) : {}),
         headers: {
           'content-type': 'application/json', 'content-length': bytes.length, 'x-pair-client-version': SERVER_VERSION,
           ...(this.credential.kind === 'anonymous' ? {} : { authorization: `Bearer ${this.credential.token}` }),
@@ -134,7 +134,7 @@ export class PersistentClient {
     const bytes = Buffer.from(JSON.stringify({ operation: 'subscribe', sessionId }));
     let closed = false; let connected = false;
     const request = (url.protocol === 'https:' ? https : http).request(url, {
-      method: 'POST', agent: createRuntimeProxyAgent(url.toString()), ...(url.protocol === 'https:' ? systemTlsOptions() : {}),
+      method: 'POST', agent: createRuntimeProxyAgent(url.toString()), ...(url.protocol === 'https:' ? systemTlsOptions(url) : {}),
       headers: { 'content-type': 'application/json', 'content-length': bytes.length, authorization: `Bearer ${this.credential.token}` },
     }, (response) => {
       clearTimeout(deadline);

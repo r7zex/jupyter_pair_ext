@@ -55,6 +55,7 @@ def verify(config: dict, public: bool = True) -> None:
         run("cp", str(root), "/usr/local/share/ca-certificates/pair-notebook-local.crt")
         run("update-ca-certificates")
         run("cp", str(root), str(CONFIG / "local-ca.crt"))
+        (CONFIG / "local-ca.crt").chmod(0o644)
         if wait_health(config["endpoint"]).get("instanceId") != health.get("instanceId"):
             raise InstallError("The LAN address reaches a different Pair server.")
         run("env", f"NODE_EXTRA_CA_CERTS={CONFIG / 'local-ca.crt'}", str(ROOT / "runtime/node/bin/node"), str(ROOT / "server/out/src/vps/relayCheck.js"), config["endpoint"])

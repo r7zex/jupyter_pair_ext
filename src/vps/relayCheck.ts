@@ -14,7 +14,8 @@ async function check(): Promise<void> {
   const peers = [randomUUID(), randomUUID()]; const sockets = new Set<WebSocket>();
   const connect = async (peer: string): Promise<WebSocket> => {
     const url = new URL(origin); url.searchParams.set('room', room); url.searchParams.set('peer', peer);
-    const socket = new WebSocket(url, { handshakeTimeout: 10_000, ...systemTlsOptions() }); sockets.add(socket);
+    // The runtime verifier follows node:tls's Error/undefined contract, unlike the legacy ws declaration.
+    const socket = new WebSocket(url, { handshakeTimeout: 10_000, ...systemTlsOptions(url) } as unknown as WebSocket.ClientOptions); sockets.add(socket);
     await once(socket, 'open'); return socket;
   };
   try {

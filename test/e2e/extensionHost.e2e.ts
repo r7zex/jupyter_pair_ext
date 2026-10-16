@@ -80,6 +80,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     assert.equal(configuration.get('persistenceDebounceMs'), 750);
     assert.equal(configuration.get('logLevel'), 'info');
     assert.equal(configuration.get('serverRestore'), 'automatic');
+    assert.equal(vscode.workspace.fs.isWritableFileSystem('pair-vps'), false, 'server editors must remain read-only until compatibility is established');
     assert.deepEqual(configuration.get('turnUrls'), []);
     assert.equal(configuration.get('turnUsername'), '');
     assert.equal(configuration.get('proxyUrl'), '');
