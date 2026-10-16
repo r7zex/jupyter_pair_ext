@@ -53,7 +53,7 @@ import { SharedTerminal } from '../core/sharedTerminal';
 import { defaultPermissions, mayChangeTree, normalizePermissions, type ParticipantPermissions } from '../core/permissions';
 import { MAX_LINE_COMMENTS, normalizeCommentInput, normalizeLineComment, reanchorComment, participantColor, commentColor, type LineComment, type LineCommentInput } from '../core/lineComments';
 import { validateIdentityPublicKey } from '../core/identity';
-import { discoverPythonEnvironments, PythonEnvironment } from '../core/pythonEnvironments';
+import { discoverPythonEnvironments, resolveDefaultJupyterPython, PythonEnvironment } from '../core/pythonEnvironments';
 import {
   classifyFile,
   decodeUtf8ProjectFile,
@@ -6954,10 +6954,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         ?? configuration.get<string>('pythonPath', this.descriptor.pythonPath || 'python');
       if (!target.pythonPath && !this.descriptor.notebookPythonPaths?.[notebookKey]
         && ['python', 'python3'].includes(pythonPath)) {
-        const environments = await discoverPythonEnvironments(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath);
-        const ready = environments.find((environment) => environment.jupyterReady
-          && (!target.device.startsWith('gpu:') || environment.cudaAvailable));
-        if (ready) pythonPath = ready.executable;
+        pythonPath = await resolveDefaultJupyterPython(this.descriptor.backingFolder || this.descriptor.workingFolder, pythonPath, target.device.startsWith('gpu:'));
       }
       assertAuthority();
       const gpuMatch = /^gpu:(\d+)$/.exec(target.device);
