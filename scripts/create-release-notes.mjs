@@ -71,7 +71,7 @@ Choose domain, public IP, LAN or an existing supported proxy and enter the serve
 
 - \`${vsixName}\` — install this extension on every participating computer. GitHub displays its SHA-256 digest next to the file.
 - \`pair-notebook-complete-${version}.zip\` — full source and matching compute agent for compute owners. Update editors, broker and agent together.
-- \`pair-notebook-server-persistent.tar.gz\` and its \`.sha256\` file — the matching dependency-bundled server, interactive agent and service templates for VPS operators. Follow \`docs/PERSISTENT_VPS.md\` in the archive; preserve existing data and take a backup before updating.
+- \`pair-notebook-server-persistent.tar.gz\` and its \`.sha256\` file — the matching dependency-bundled server, interactive agent and service templates for server operators. Follow \`docs/PERSISTENT_VPS.md\` in the archive; preserve existing data and take a backup before updating.
 - \`pair-notebook-install.sh\` and \`pair-notebook-install.pyz\` — interactive installer and verified launcher.
 - \`pair-notebook-relay.tar.gz\` — standalone prebuilt relay: extract and run \`node relay/relay.js\` behind HTTPS; \`node relay/check.js https://SERVER\` verifies encrypted exchange and reconnect.
 - \`SHA256SUMS\` and \`SERVER_SETUP.md\` — checksums and beginner instructions.

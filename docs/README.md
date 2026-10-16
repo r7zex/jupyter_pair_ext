@@ -12,4 +12,4 @@
 - [Target acceptance, 14 October 2026](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md): source-specific observations and unverified requirements, with sanitized evidence.
 - [Changelog](../CHANGELOG.md), [license](../LICENSE) and [Iroh third-party notices](../media/iroh-notice.md).
 
-The 0.6.3 release consolidates the earlier 0.6.x development work. Historical plans and superseded audits remain available in Git history; they are not current operating instructions. Published release archives are separate from the source tree.
+Release 0.6.7 adds the interactive server installer and safe project restoration. See the [current verification report](SERVER_RELEASE_0_6_7.md) for executed checks and limitations. Historical plans and superseded audits remain in Git history; they are not current operating instructions. Published release archives are separate from the source tree.

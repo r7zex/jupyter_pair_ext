@@ -30,7 +30,7 @@ def prompt(label: str, default: str = "", choices: tuple[str, ...] = ()) -> str:
 
 def collect(mode: str) -> dict:
     print("Server location is independent of provider: dedicated, physical, cloud or LAN.")
-    print("Public modes require incoming TCP 80 and 443 forwarded to this machine. CGNAT needs a public route or LAN mode.")
+    print("Public modes require incoming TCP 80 and the chosen HTTPS port (default 443) forwarded to this machine. CGNAT needs a public route or LAN mode.")
     kind = prompt("Connection: domain / ip / lan / proxy", "domain", ("domain", "ip", "lan", "proxy"))
     value = prompt("Server domain or HTTPS address" if kind != "lan" else "LAN IP or DNS name")
     url, host = network.endpoint(value, kind)
