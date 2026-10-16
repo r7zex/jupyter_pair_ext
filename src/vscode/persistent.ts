@@ -49,6 +49,7 @@ function sameEntries(left: PersistentSnapshot, right: PersistentSnapshot): vscod
 
 /** Server authoritative files. Stale saves fail and leave the editor's dirty changes intact. */
 export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.Disposable {
+  public restore: ((uri: vscode.Uri) => Promise<void>) | undefined;
   public canEdit: ((key: string) => boolean) | undefined;
   private readonly changed = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
   public readonly onDidChangeFile = this.changed.event;
@@ -92,6 +93,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   }
   public watch(): vscode.Disposable { return new vscode.Disposable(() => undefined); }
   public async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
+    if (!this.connection) await this.restore?.(uri);
     const key = this.check(uri);
     if (!key) return { type: vscode.FileType.Directory, ctime: 0, mtime: this.snapshot.revision, size: 0 };
     await this.refresh();
@@ -105,6 +107,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     return { ...current, ...(this.canEdit?.(key) === false ? { permissions: vscode.FilePermission.Readonly } : {}) };
   }
   public async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
+    if (!this.connection) await this.restore?.(uri);
     const key = this.check(uri);
     await this.refresh();
     const prefix = key ? `${key}/` : '';
@@ -112,6 +115,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
       .map((entry): [string, vscode.FileType] => [entry.path.slice(prefix.length), entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File]);
   }
   public async readFile(uri: vscode.Uri): Promise<Uint8Array> {
+    if (!this.connection) await this.restore?.(uri);
     const key = this.check(uri);
     const connection = this.requireConnection();
     const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
@@ -351,11 +355,12 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     let restoreRetries = 0;
     let restoreApproved = false;
     let restoration: Promise<void> | undefined;
+    let requestedUri: vscode.Uri | undefined;
     let restoreTimer: NodeJS.Timeout | undefined;
     this.disposables.push({ dispose: () => { if (restoreTimer) clearTimeout(restoreTimer); } });
     const restore = async (): Promise<void> => {
-      if (!vscode.workspace.isTrusted || this.connection || this.disposed || restoreAttempt !== this.connectionAttempt) return;
-      const uri = vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === SCHEME)?.uri
+      if (!vscode.workspace.isTrusted || this.connection || this.disposed || restoreTimer || restoreAttempt !== this.connectionAttempt) return;
+      const uri = requestedUri ?? vscode.workspace.workspaceFolders?.find((folder) => folder.uri.scheme === SCHEME)?.uri
         ?? vscode.workspace.notebookDocuments.find(notebook => notebook.uri.scheme === SCHEME)?.uri;
       if (!uri) return;
       const saved = this.context.globalState.get<SavedConnection[]>(CONNECTIONS_KEY, []).find((item) => item.sessionId === uri.authority);
@@ -379,10 +384,15 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
     };
     // Adding the first folder restarts VS Code's extension host. Resume the explicit server project handoff.
-    const requestRestore = (): Promise<void> => restoration ??= restore().finally(() => { restoration = undefined; });
+    const requestRestore = (uri?: vscode.Uri): Promise<void> => {
+      if (uri?.scheme === SCHEME) requestedUri = uri;
+      return restoration ??= restore().finally(() => { restoration = undefined; });
+    };
+    this.files.restore = requestRestore;
     void requestRestore().catch((error) => this.connectionProblem(error));
     this.disposables.push(vscode.workspace.onDidGrantWorkspaceTrust(() => { void requestRestore().catch((error) => this.connectionProblem(error)); }));
     this.disposables.push(vscode.workspace.onDidOpenNotebookDocument(notebook => { if (notebook.uri.scheme === SCHEME) void requestRestore().catch((error) => this.connectionProblem(error)); }));
+    this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => { void requestRestore().catch(error => this.connectionProblem(error)); }));
   }
   private setFilesReadonly(readonly: boolean): void {
     this.fileRegistration?.dispose();

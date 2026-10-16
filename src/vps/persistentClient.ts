@@ -105,7 +105,14 @@ export class PersistentClient {
       }, this.deadlineMs);
       deadline.unref();
       this.requests.add(request);
-      request.on('error', () => finish(new Error('Cannot reach the VPS. Check its address, TLS certificate and network connection.')));
+      request.on('error', (error: NodeJS.ErrnoException) => {
+        const message = error.code === 'ERR_TLS_CERT_ALTNAME_INVALID' ? 'The server certificate does not match its address. Use the domain or IP in its certificate.'
+          : ['UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'SELF_SIGNED_CERT_IN_CHAIN', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'].includes(error.code ?? '') ? 'The server certificate is not trusted. Install the server root CA on this client or repair its public certificate chain.'
+            : ['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID'].includes(error.code ?? '') ? 'The server certificate is expired or not yet valid. Check certificate renewal and the server clock.'
+              : ['ENOTFOUND', 'EAI_AGAIN'].includes(error.code ?? '') ? 'Cannot resolve the server address. Check its DNS records and your network.'
+                : 'Cannot reach the server. Check its address, HTTPS port, proxy and network connection.';
+        finish(new Error(message));
+      });
       request.end(bytes);
     });
   }

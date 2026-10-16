@@ -11,6 +11,12 @@ from .system import CONFIG, ROOT, InstallError, run, write
 
 
 def endpoint(value: str, mode: str) -> tuple[str, str]:
+    if "://" not in value:
+        try:
+            if ipaddress.ip_address(value).version == 6:
+                value = f"[{value}]"
+        except ValueError:
+            pass
     parsed = urlsplit(value if "://" in value else f"https://{value}")
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
         raise InstallError("Use an HTTPS origin without a path, password or query.")
@@ -27,8 +33,8 @@ def endpoint(value: str, mode: str) -> tuple[str, str]:
         raise InstallError("Choose public-IP mode for an IP address.")
     if mode == "proxy" and address is not None and not address.is_global:
         raise InstallError("Existing-proxy public TLS requires a global IP or domain. Choose managed LAN mode for private addresses.")
-    if parsed.port not in {None, 443} and mode in {"domain", "ip"}:
-        raise InstallError("Public managed TLS uses port 443. Choose existing-proxy mode for a custom external port.")
+    if parsed.port in {0, 80}:
+        raise InstallError("Choose an HTTPS port between 1 and 65535, other than the HTTP challenge port 80.")
     return parsed.geturl().rstrip("/"), host
 
 
@@ -51,11 +57,12 @@ def addresses(host: str) -> set[str]:
         raise InstallError("DNS resolution failed. Correct the domain's A/AAAA records before installing.") from error
 
 
-def proxy_config(host: str, mode: str, port: int, certificate: str = "") -> str:
+def proxy_config(host: str, mode: str, port: int, certificate: str = "", https_port: int = 443) -> str:
     target = f"127.0.0.1:{port}"
     site = f"https://{host}" if ":" not in host else f"https://[{host}]"
+    site += f":{https_port}"
     tls = "tls internal" if mode == "lan" else f"tls {certificate}/fullchain.pem {certificate}/privkey.pem"
-    return f"""{{
+    content = f"""{{
     admin off
     auto_https disable_redirects
 }}
@@ -67,14 +74,19 @@ def proxy_config(host: str, mode: str, port: int, certificate: str = "") -> str:
         respond 404
     }}
 }}
-:80 {{
-    handle /.well-known/acme-challenge/* {{
+"""
+    if mode != "lan":
+        content += """:80 {
+    handle /.well-known/acme-challenge/* {
         root * /var/lib/pair-notebook-acme
         file_server
-    }}
-    respond 404
-}}
+    }
+    handle {
+        respond 404
+    }
+}
 """
+    return content
 
 
 def configure_proxy(config: dict, initial: bool = False) -> None:
@@ -84,7 +96,7 @@ def configure_proxy(config: dict, initial: bool = False) -> None:
     if initial and mode in {"domain", "ip"}:
         content = ":80 {\n root * /var/lib/pair-notebook-acme\n file_server\n}\n"
     else:
-        content = proxy_config(host, mode, config["port"], f"/etc/letsencrypt-pair/live/{host}")
+        content = proxy_config(host, mode, config["port"], f"/etc/letsencrypt-pair/live/{host}", config.get("httpsPort", 443))
     write(CONFIG / "Caddyfile", content, 0o644)
     run(str(ROOT / "runtime/caddy"), "validate", "--config", str(CONFIG / "Caddyfile"), "--adapter", "caddyfile")
 

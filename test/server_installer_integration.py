@@ -40,6 +40,8 @@ def main() -> None:
     parser.add_argument("--docker-config")
     parser.add_argument("--mode", choices=["full", "relay"], default="full")
     parser.add_argument("--keep-container", action="store_true", help="Retain this isolated test server for further acceptance")
+    parser.add_argument("--occupied-https", action="store_true", help="Keep an unrelated TCP 443 service running and select 8443")
+    parser.add_argument("--repair-runtime", action="store_true", help="Verify repair of a deliberately broken private Node executable")
     args = parser.parse_args()
     docker = ["docker"] + (["--config", args.docker_config] if args.docker_config else [])
     evidence = {"image": args.image, "mode": args.mode, "scope": "isolated systemd container on one Docker host", "checks": []}
@@ -88,9 +90,17 @@ for identity in identities.values():
                 break
             time.sleep(0.5)
         ip = command("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", args.name).stdout.strip()
+        unrelated_pid = None
+        if args.occupied_https:
+            command("exec", args.name, "systemd-run", "--unit=pair-unrelated-443", "/usr/bin/python3", "-m", "http.server", "443", "--bind", "127.0.0.1")
+            for _ in range(30):
+                if command("exec", args.name, "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:443", success=False).returncode == 0:
+                    break
+                time.sleep(.1)
+            unrelated_pid = command("exec", args.name, "systemctl", "show", "-p", "MainPID", "pair-unrelated-443").stdout
         installer = ["exec", "-i", args.name, "python3", "/release/pair-notebook-install.pyz", "--archive", "/release/pair-notebook-server-persistent.tar.gz", "--mode", args.mode]
         print(f"Installing {args.mode} on clean {args.image}", flush=True)
-        command(*installer, input=f"lan\n{ip}\n8787\nyes\n")
+        command(*installer, input=f"lan\n{ip}\n8787\n" + ("\n" if args.occupied_https else "") + "yes\n")
         check("clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect" + ("; real isolated Jupyter cell returns 42" if args.mode == "full" else "; no Jupyter worker"))
         credential_hash = command("exec", args.name, "sha256sum", "/var/lib/pair-notebook-install/owner-server.json").stdout
         if args.mode == "full":
@@ -103,6 +113,13 @@ for identity in identities.values():
             project_fixture("verify")
         assert credential_hash == command("exec", args.name, "sha256sum", "/var/lib/pair-notebook-install/owner-server.json").stdout
         check("repair retains owner credentials")
+        if args.repair_runtime:
+            program = "from pathlib import Path; p=Path('/opt/pair-notebook/runtime/node/bin/node'); p.rename(p.with_name('node.fixture-backup')); p.write_text('#!/bin/sh\\nexit 1\\n'.replace('\\\\n','\\n')); p.chmod(0o755)"
+            command("exec", args.name, "python3", "-c", program)
+            command(*installer, "--action", "repair")
+            if args.mode == "full":
+                project_fixture("verify")
+            check("repair replaces a broken private Node runtime and retains project access")
         command(*installer, "--action", "update")
         if args.mode == "full":
             project_fixture("verify")
@@ -128,6 +145,10 @@ for identity in identities.values():
             result = command("exec", args.name, "sh", "-c", "test ! -d /opt/pair-notebook/worker-venv && ! systemctl is-enabled pair-notebook-worker.service >/dev/null 2>&1")
             assert result.returncode == 0
             check("relay-only installation has no Python/Jupyter worker runtime or unit")
+        if args.occupied_https:
+            assert unrelated_pid == command("exec", args.name, "systemctl", "show", "-p", "MainPID", "pair-unrelated-443").stdout
+            command("exec", args.name, "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:443")
+            check("installer uses HTTPS 8443 while the unrelated TCP 443 service keeps its PID")
         evidence["passed"] = True
     finally:
         args.report.parent.mkdir(parents=True, exist_ok=True)

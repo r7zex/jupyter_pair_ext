@@ -1,0 +1,31 @@
+{
+  "scope": "two independent logical API clients in one Node process on one host; HTTPS to isolated Linux server",
+  "physicalComputers": false,
+  "vscodeUi": false,
+  "localInputScope": "synchronous Y.Text insertion only; excludes keyboard, VS Code event loop and rendering",
+  "checks": [
+    "owner creates project; second client joins by invitation without administrative key",
+    "old empty-notebook request is rejected; capable client preserves first unsaved cell",
+    "60 simultaneous same-cell/same-line CRDT edits converge; no line lock",
+    "actual isolated Jupyter executes the jointly edited first cell and returns 42",
+    "leave and reconnect with retained identity restore all cell edits and saved output"
+  ],
+  "localCrdtInput": {
+    "samples": 60,
+    "medianMs": 0.045,
+    "p95Ms": 0.284,
+    "worstMs": 0.881
+  },
+  "serverAcknowledgement": {
+    "samples": 60,
+    "medianMs": 67.601,
+    "p95Ms": 77.37,
+    "worstMs": 93.182
+  },
+  "secondClientObservation": {
+    "samples": 60,
+    "medianMs": 68.677,
+    "p95Ms": 79.109,
+    "worstMs": 109.108
+  }
+}

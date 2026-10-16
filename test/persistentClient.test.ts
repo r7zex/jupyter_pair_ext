@@ -518,6 +518,21 @@ describe('Persistent session actions preserve their original connection', () => 
 });
 
 describe('Server project startup safety', () => {
+  it('restores a saved file URI before reading its remote bytes', async () => {
+    const files = new PersistentFileSystem();
+    const uri = { scheme: 'pair-vps', authority: 'project', path: '/test.ipynb' } as vscode.Uri;
+    let release!: () => void; let reads = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    files.restore = async requested => {
+      assert.equal(requested, uri); await gate;
+      files.setConnection({ endpoint: 'https://example.com', sessionId: 'project', memberId: 'owner', name: 'Project', client: {
+        call: async () => { reads++; return { content: Buffer.from('preserved notebook').toString('base64'), revision: 1 }; },
+      } } as never);
+    };
+    const reading = files.readFile(uri); assert.equal(reads, 0); release();
+    assert.equal(Buffer.from(await reading).toString(), 'preserved notebook'); assert.equal(reads, 1);
+    files.dispose();
+  });
   it('waits for local notebook and text journals before detaching a project', async () => {
     let release!: () => void; let saved = false;
     const journal = new Promise<void>(resolve => { release = () => { saved = true; resolve(); }; });

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .system import InstallError, run, write
 
@@ -11,6 +12,7 @@ MARKER = "# Pair Notebook managed virtual host"
 
 def configure(config: dict, tls: bool = False) -> None:
     host = config["host"]
+    https_port = urlsplit(config.get("endpoint", f"https://{host}")).port or 443
     if SITE.exists():
         if not SITE.read_text().startswith(MARKER):
             raise InstallError("The nginx Pair configuration path is already owned by another configuration.")
@@ -28,8 +30,8 @@ server {{
 """
     if tls:
         content += f"""server {{
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen {https_port} ssl;
+    listen [::]:{https_port} ssl;
     server_name {host};
     ssl_certificate /etc/letsencrypt-pair/live/{host}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt-pair/live/{host}/privkey.pem;

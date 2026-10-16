@@ -1,0 +1,14 @@
+{
+  "image": "pair-installer-ubuntu-067",
+  "mode": "relay",
+  "scope": "isolated systemd container on one Docker host",
+  "checks": [
+    "clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect; no Jupyter worker",
+    "repeat invocation detects installation and verifies it",
+    "repair retains owner credentials",
+    "update retains owner credentials",
+    "explicit rollback passes readiness checks",
+    "relay-only installation has no Python/Jupyter worker runtime or unit"
+  ],
+  "passed": true
+}

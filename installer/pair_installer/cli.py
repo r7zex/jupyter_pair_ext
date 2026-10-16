@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 from urllib.error import URLError
+from urllib.parse import urlsplit
 
 from . import checks, network, services
 from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, write
@@ -40,6 +41,7 @@ def collect(mode: str) -> dict:
         raise InstallError("Choose a private port between 1024 and 65535.")
     network.free_port(port, "127.0.0.1")
     config = {"version": VERSION, "mode": mode, "network": kind, "endpoint": url, "host": host, "port": port}
+    config["httpsPort"] = urlsplit(url).port or 443
     if kind == "proxy":
         default = "nginx" if shutil.which("nginx") else "caddy"
         config["proxy"] = prompt("Existing proxy to integrate: caddy / nginx", default, ("caddy", "nginx"))
@@ -58,8 +60,20 @@ def collect(mode: str) -> dict:
                 config["certificateMode"] = "domain"
         print("A new virtual host will be added with backup and validation. Existing hostnames are refused.")
     else:
-        network.free_port(80)
-        network.free_port(443)
+        if kind != "lan":
+            network.free_port(80)
+        try:
+            network.free_port(config["httpsPort"])
+        except InstallError:
+            if urlsplit(url).port is not None:
+                raise
+            alternative = int(prompt("HTTPS port 443 is occupied. Use another HTTPS port", "8443"))
+            host_port = f"[{host}]:{alternative}" if ":" in host else f"{host}:{alternative}"
+            url, _ = network.endpoint(host_port, kind)
+            network.free_port(alternative)
+            config.update(endpoint=url, httpsPort=alternative)
+        if config["httpsPort"] == port:
+            raise InstallError("The private broker and HTTPS proxy need different ports.")
     if kind == "lan":
         print("Each owner and participant must trust the generated local-ca.crt. TLS verification remains enabled.")
     if network.managed_certificate(config):
@@ -103,7 +117,9 @@ def install(config: dict, architecture: str, archive: Path | None) -> None:
         directory = Path(temporary)
         package = release(directory, archive)
         # All downloads and hash verification precede service interruption.
-        packages = ["ca-certificates", "python3-venv", "openssl", "xz-utils"]
+        packages = ["ca-certificates", "openssl", "xz-utils"]
+        if config["mode"] == "full" or network.managed_certificate(config):
+            packages.append("python3-venv")
         if config["mode"] == "full":
             packages += ["bubblewrap", "python3", "apparmor"]
         run("apt-get", "update")

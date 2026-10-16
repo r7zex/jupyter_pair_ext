@@ -26,6 +26,13 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(InstallError):
                 endpoint(value, "lan")
 
+    def test_ipv6_and_alternate_https_ports_preserve_other_listeners(self):
+        self.assertEqual(endpoint("2606:4700:4700::1111", "ip"), ("https://[2606:4700:4700::1111]", "2606:4700:4700::1111"))
+        self.assertEqual(endpoint("8.8.8.8:8443", "ip")[0], "https://8.8.8.8:8443")
+        value = proxy_config("192.168.1.8", "lan", 8787, https_port=8443)
+        self.assertIn("https://192.168.1.8:8443", value)
+        self.assertNotIn(":80 {", value)
+
     def test_proxy_includes_real_websocket_and_rpc_routes(self):
         value = proxy_config("192.168.1.8", "lan", 8787)
         self.assertIn("tls internal", value)

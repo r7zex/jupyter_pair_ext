@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "checks": [
+    "nginx virtual-host configuration validates and serves trusted fixture TLS",
+    "actual WebSocket handshake, AES-GCM exchange and reconnect through nginx",
+    "invalid replacement restores previous working proxy configuration",
+    "unrelated nginx site bytes and unrelated service PID preserved"
+  ]
+}

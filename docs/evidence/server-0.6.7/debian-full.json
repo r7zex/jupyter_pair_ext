@@ -1,0 +1,15 @@
+{
+  "image": "pair-installer-debian-067",
+  "mode": "full",
+  "scope": "isolated systemd container on one Docker host",
+  "checks": [
+    "clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect; real isolated Jupyter cell returns 42",
+    "owner creates a durable project; second participant joins by invitation and reads its file",
+    "repeat invocation detects installation and verifies it",
+    "repair retains owner credentials",
+    "update retains owner credentials",
+    "explicit rollback passes readiness checks",
+    "injected server-start failure automatically restores working previous release and owner access"
+  ],
+  "passed": true
+}
