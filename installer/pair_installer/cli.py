@@ -229,7 +229,9 @@ def main() -> None:
             if path.exists():
                 config = json.loads(path.read_text())
                 print(f"Detected Pair Notebook {config['version']} at {config['endpoint']}. Owner access and projects will be retained.")
-                default = "repair" if path.name == "installation-pending.json" else "check"
+                default = "update" if config["version"] != VERSION else "check"
+                if path.name == "installation-pending.json":
+                    default = "repair"
                 actions = ("check", "repair", "update", "rollback") + (("recover-owner",) if config["mode"] == "full" else ())
                 action = args.action or prompt("Action: " + " / ".join(actions), default, actions)
                 if action == "recover-owner":

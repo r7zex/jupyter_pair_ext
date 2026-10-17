@@ -61,10 +61,10 @@ baseline={str(file):hashlib.sha256(file.read_bytes()).hexdigest() for file in fi
         python(verify)
         command('cp', str(args.setup), f'{args.container}:/var/lib/pair-notebook-install/setup-new.sh')
         setup = ['exec', '-i', args.container, 'sh', '/var/lib/pair-notebook-install/setup-new.sh']
-        command(*setup, '--action', 'update')
+        command(*setup, input='\n')
         assert json.loads(command('exec', args.container, 'cat', '/opt/pair-notebook/server/BUILD.json').stdout)['version'] == version
         python(verify)
-        check('published 0.6.7 managed installation upgrades with new self-contained utility; owners, members, files and settings retained')
+        check('new utility defaults to update from published 0.6.7; owners, members, files and settings retained')
         command('cp', str(args.setup), f'{args.container}:/var/lib/pair-notebook-install/setup-new.sh')
         command(*setup, '--action', 'check')
         check('fresh copy of utility detects existing version and passes real Jupyter, HTTPS and encrypted reconnect')
