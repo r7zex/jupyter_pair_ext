@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm, access, symlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
 import { waitForInitialState } from '../src/core/initialState';
@@ -33,6 +35,27 @@ describe('initial project state recovery', () => {
 
 describe('temporary guest workspace removal', () => {
   const { removeGuest } = createRequire(__filename)(path.resolve(__dirname, '../../media/cleanup-session.cjs')) as { removeGuest: (base: string, target: string) => Promise<boolean> };
+  it('runs the detached cleanup outside the guest cwd so it can remove files after editor exit', async () => {
+    const fixture = await mkdtemp(path.join(os.tmpdir(), 'pair-guest-editor-exit-'));
+    try {
+      const base = path.join(fixture, 'pair-notebook.pair-notebook');
+      const target = path.join(base, 'sessions', 'session', 'guest');
+      const workingFolder = path.join(target, 'workspace');
+      await mkdir(workingFolder, { recursive: true });
+      await writeFile(path.join(workingFolder, 'copy.py'), 'print(42)');
+      const context = { extensionPath: path.resolve(__dirname, '../..'), globalStorageUri: { fsPath: base } };
+      const descriptor = { role: 'peer', sessionId: 'session', localPeer: { peerId: 'guest' }, workingFolder };
+      const code = "const {retireGuestWorkspace}=require(process.argv[1]);const input=JSON.parse(process.argv[2]);retireGuestWorkspace(input.context,input.descriptor).then(()=>process.exit(0),()=>process.exit(1));";
+      const child = spawn(process.execPath, ['-e', code, path.resolve(__dirname, '../src/vscode/temporarySessions.js'), JSON.stringify({ context, descriptor })], { cwd: workingFolder, windowsHide: true, stdio: 'ignore' });
+      const [exit] = await once(child, 'exit'); assert.equal(exit, 0);
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        try { await access(target); } catch { return; }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      assert.fail('Detached cleanup kept its own guest workspace locked.');
+    } finally { await rm(fixture, { recursive: true, force: true }); }
+  });
   it('removes only an explicitly retired guest, including journals beside its workspace', async () => {
     const fixture = await mkdtemp(path.join(os.tmpdir(), 'pair-guest-cleanup-'));
     try {

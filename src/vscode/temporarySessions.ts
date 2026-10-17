@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import type * as vscode from 'vscode';
 import { atomicWriteFile } from '../core/atomicFile';
 import type { SessionDescriptor } from '../core/types';
@@ -30,7 +31,7 @@ export async function retireGuestWorkspace(context: vscode.ExtensionContext, des
 }
 
 function spawnGuestCleanup(context: vscode.ExtensionContext, root: string): void {
-  const child = spawn(process.execPath, [path.join(context.extensionPath, 'media', 'cleanup-session.cjs'), context.globalStorageUri.fsPath, root], { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+  const child = spawn(process.execPath, [path.join(context.extensionPath, 'media', 'cleanup-session.cjs'), context.globalStorageUri.fsPath, root], { cwd: os.tmpdir(), detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
   child.on('error', () => undefined); // The next activation retries its persisted cleanup request.
   child.unref();
 }
