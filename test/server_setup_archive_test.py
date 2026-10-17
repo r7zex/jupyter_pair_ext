@@ -1,4 +1,4 @@
-"""Verify the actual three-file public download layout and embedded payloads."""
+"""Verify the public download layout and embedded payloads."""
 import base64
 import hashlib
 import io

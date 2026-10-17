@@ -26,6 +26,10 @@ export async function packageServerSetup({ root, installer, artifacts, relay, ve
 
 Run your own encrypted fallback relay when direct peer connections are unavailable.
 
+On Windows, double-click **pair-notebook-ws-server.cmd** and enter your hostname/IP. The launcher uses an existing Node.js 20+ or downloads a verified private runtime. Click the tray icon once to stop/start the server; right-click for its address, certificate and Exit.
+
+Trust the generated public certificate on every participating computer. On Windows, run \`certutil -user -addstore Root server\\relay-ca.crt\`, then fully restart VS Code. Keep the private files in \`server/\` on the host. Internet hosting requires a reachable port and may need port forwarding; the Windows launcher uses a local trust certificate.
+
 On Ubuntu 24.04 LTS or Debian 12 with systemd:
 
 \`\`\`sh
