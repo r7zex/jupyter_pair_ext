@@ -6,6 +6,8 @@
 test/**
 scripts/**
 !scripts/pair-notebook-session-agent.py
+!scripts/isolated_packages.py
+!scripts/prepare_compute_runtime.py
 
 out/test/**
 src/**

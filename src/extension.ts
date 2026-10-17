@@ -1,3 +1,4 @@
+import { SESSION_NOTEBOOK_TYPE, SessionNotebookSerializer } from './vscode/sessionNotebook';
 import { LineCommentController, peerCommentBackend } from './vscode/lineComments';
 import { prepareExtensionStorage, clearLocalConnections } from './vscode/extensionStorage';
 import { claimGuestWorkspace, isTemporaryGuestWorkspace, retireGuestWorkspace, sweepGuestWorkspaces } from './vscode/temporarySessions';
@@ -127,10 +128,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await context.globalState.update(PROXY_CREDENTIAL_MIGRATION_KEY, PROXY_CREDENTIAL_MIGRATION_VERSION);
   }
   dashboard = new DashboardProvider(context, output, async () => persistentController?.getSessionPassword());
+  context.subscriptions.push(vscode.workspace.registerNotebookSerializer(SESSION_NOTEBOOK_TYPE, new SessionNotebookSerializer()));
   notebookController = new PairNotebookController(output);
   const vpsCompute = new VpsComputeController(context, () => runtime);
-  persistentController = new PersistentSessionController(context, output, notebookController.controller,
-    (view, endpoint, connected) => dashboard.setPersistentSession(view, endpoint, connected), () => !runtime);
+  persistentController = new PersistentSessionController(context, output, notebookController,
+    (view, endpoint, connected) => {
+      notebookController.refreshSession();
+      dashboard.setPersistentSession(view, endpoint, connected);
+    }, () => !runtime);
   notebookController.persistent = persistentController;
   context.subscriptions.push(persistentController);
   register(context, 'pairNotebook.forgetAllConnections', async () => {
@@ -678,7 +683,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
             });
             lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
           }
-          if (descriptor.role === 'peer') {
+          if (isTemporaryGuestWorkspace(context, descriptor)) {
             await discardGuestWorkspace(context, descriptor);
             if (reason === 'host-unreachable') void vscode.window.showWarningMessage(
               'Pair Notebook: the host could not be reached. The temporary guest workspace was closed. Join again using the host invitation.',
@@ -745,7 +750,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
         output.appendLine(`[error] Failed startup cleanup: ${formatError(cleanupError)}`);
       });
     }
-    if (descriptor.role === 'peer') await discardGuestWorkspace(context, descriptor);
+    await discardGuestWorkspace(context, descriptor);
     if (error instanceof SessionStartCancelledError) return;
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
@@ -920,7 +925,7 @@ async function leaveActiveSession(
       }
     }
     await active.leave();
-    if (active.descriptor.role === 'peer') await discardGuestWorkspace(context, active.descriptor);
+    await discardGuestWorkspace(context, active.descriptor);
   })().finally(() => {
     localSessionExit = undefined;
   });
@@ -930,7 +935,7 @@ async function leaveActiveSession(
 async function leaveSession(): Promise<void> {
   const active = requireRuntime();
   const answer = await vscode.window.showWarningMessage(
-    'Leave the editor session? Guest files are temporary and will be removed. The host project and independent background jobs are preserved. Active interactive kernels and the host shell require a separate CONFIRM before stopping.',
+    'Leave the editor session? This session’s temporary working copy will be removed. The original host project and independent background jobs are preserved. Active interactive kernels and the host shell require a separate CONFIRM before stopping.',
     { modal: true },
     'Leave Session',
   );
@@ -957,7 +962,7 @@ async function discardGuestWorkspace(context: vscode.ExtensionContext, descripto
   await retireGuestWorkspace(context, descriptor);
   await forgetWorkspaceSession(context, descriptor);
   const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
-  await context.globalState.update('pairNotebook.recent', forgetRecentProject(recent, descriptor.workingFolder));
+  if (descriptor.role === 'peer') await context.globalState.update('pairNotebook.recent', forgetRecentProject(recent, descriptor.workingFolder));
   await closeSessionTabs(descriptor.workingFolder);
   const folder = vscode.workspace.workspaceFolders?.find(item => sameWorkspacePath(item.uri.fsPath, descriptor.workingFolder));
   if (folder) vscode.workspace.updateWorkspaceFolders(folder.index, 1);

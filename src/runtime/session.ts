@@ -3106,6 +3106,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const currentHostFailed = !this.coordinator.isCurrentHost()
         && peer.peerId === this.coordinator.clock.hostId;
       if (!this.closed && !this.waitingForHostFolder
+        && !this.transport.hasRoute(this.coordinator.clock.hostId)
         && (currentHostFailed || this.runtimeState === 'connecting')) {
         this.transition('reconnecting', detail);
       }
@@ -3321,7 +3322,11 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       switch (frame.type) {
         case 'stateRequest':
           if (this.coordinator.isCurrentHost()) {
-            void this.sendProjectState(sourceId).catch(error => {
+            this.sendFilesystemState(sourceId);
+            void this.sendProjectState(sourceId).then(() => {
+              const reconciliationId = String(frame.meta.reconciliationId ?? '');
+              if (TRANSFER_ID_PATTERN.test(reconciliationId) && !this.closed) this.transport.sendTo(sourceId, 'stateEnd', { reconciliationId });
+            }).catch(error => {
               this.log.appendLine(`[error] Project state retry: ${formatError(error)}`);
             });
           }
@@ -3468,6 +3473,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             && sourceId !== this.coordinator.clock.hostId) break;
           this.initialStateReceived = true;
           this.stateReadyResolve();
+          if (sourceId === this.coordinator.clock.hostId) this.emit('projectReconciled', sourceId, frame.meta.reconciliationId);
           // A paused session (new host has not chosen a folder yet) must stay
           // paused even when the host finishes a state reconciliation; the
           // host's later hostStorageReady message owns the resume transition.
@@ -5278,6 +5284,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     target: NotebookComputeTarget,
   ): Promise<ExecutionManifest> {
     let lastError = 'remote versions did not converge';
+    let recoveredProject = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const manifest = this.executionManifest();
       const statusPromise = this.waitForBarrierReply(requestId, 'status', executorId);
@@ -5290,6 +5297,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       );
       const status = await statusPromise;
       if (status.success !== true) {
+        if (status.projectSynchronizationRequired === true && !recoveredProject) {
+          recoveredProject = true;
+          await this.recoverExecutionProject(executorId, requestId);
+          attempt -= 1;
+          continue;
+        }
         throw new Error(`File synchronization was refused by the executor: ${String(status.message ?? 'invalid barrier request')}`);
       }
       const missingDocuments = requestedManifestPaths(status.missingDocuments, manifest.documents);
@@ -5321,6 +5334,27 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       lastError = String(ack.message ?? 'remote hash verification failed');
     }
     throw new Error(`File synchronization failed before execution: ${lastError}`);
+  }
+
+  private async recoverExecutionProject(executorId: string, requestId: string): Promise<void> {
+    if (executorId !== this.coordinator.clock.hostId) throw new Error('Project recovery requires the current session host.');
+    this.emit('executionPreparing', { requestId, stage: 'synchronizing-project' });
+    await new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error): void => {
+        clearTimeout(timer);
+        this.off('projectReconciled', reconciled);
+        this.off('terminal', closed);
+        if (error) reject(error); else resolve();
+      };
+      const reconciled = (peerId: string, reconciliationId: unknown): void => {
+        if (peerId === executorId && reconciliationId === requestId) finish();
+      };
+      const closed = (): void => finish(new Error('The session ended during project synchronization.'));
+      const timer = setTimeout(() => finish(new Error('Project synchronization did not complete before execution. No code was started.')), EXECUTION_BARRIER_REPLY_TIMEOUT_MS);
+      this.on('projectReconciled', reconciled);
+      this.on('terminal', closed);
+      void this.sendToWithRouteRecovery(executorId, 'stateRequest', { reconciliationId: requestId }).catch(error => finish(error instanceof Error ? error : new Error('Project synchronization failed.')));
+    });
   }
 
   private executionManifest(): ExecutionManifest {
@@ -5370,7 +5404,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       this.transport.sendTo(sourceId, 'executionBarrierStatus', {
         requestId,
         success: false,
-        message: 'The requester is missing local project entries; wait for normal project synchronization and retry.',
+        projectSynchronizationRequired: true,
+        message: `Project synchronization is incomplete: ${extraDocuments.length} documents, ${extraBinaries.length} binary files, ${extraDirectories.length} directories are missing on the requester.`,
       });
       return;
     }
@@ -7239,7 +7274,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     // directly from CRDT bytes, and setWorkingCopyWriter() requeues all paths.
     // Headless/integration runtimes fall back to atomic disk writes after the
     // short binding window, so the runtime remains usable without the UI layer.
-    return this.deferWorkingCopyWrites;
+    return this.deferWorkingCopyWrites || this.isOpenInEditor(relativePath);
   }
 
   private armWorkingCopyFallback(): void {

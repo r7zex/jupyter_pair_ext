@@ -14,6 +14,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,10 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import uuid
+
+_PACKAGES_SPEC = importlib.util.spec_from_file_location("pair_isolated_packages", Path(__file__).with_name("isolated_packages.py"))
+_PACKAGES = importlib.util.module_from_spec(_PACKAGES_SPEC)
+_PACKAGES_SPEC.loader.exec_module(_PACKAGES)
 
 ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 GPU_ID = re.compile(r"^GPU-[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$")
@@ -50,6 +55,10 @@ MAX_ARTIFACT_DEPTH = 16
 
 
 class AgentError(ValueError):
+    pass
+
+
+class PackageInstallationError(AgentError):
     pass
 
 
@@ -434,6 +443,8 @@ class Sandbox:
     def environment(self, gpu_uuid):
         env = clean_environment()
         env["CUDA_VISIBLE_DEVICES"] = gpu_uuid or ""
+        if getattr(self, "package_root", None):
+            env["PAIR_NOTEBOOK_PACKAGES"] = "/packages/current"
         return env
 
     def command(self, workspace, gpu_uuid, python_args=None):
@@ -448,6 +459,8 @@ class Sandbox:
         # Loader cache contains library paths, never server credentials.
         if Path("/etc/ld.so.cache").is_file():
             args += ["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]
+        if getattr(self, "package_root", None):
+            args += ["--ro-bind", str(self.package_root), "/packages"]
         args += ["--bind", str(workspace), "/work", "--dir", "/bridge",
                  "--ro-bind", str(self.bridge), "/bridge/jupyter_kernel_bridge.py", "--chdir", "/work"]
         if gpu_uuid:
@@ -820,6 +833,11 @@ class SessionAgent:
                 receipt["state"] = "completed"
                 self._persist()
                 return
+            package_key = (command["sessionId"], command["kernelId"], command.get("scope", "public"))
+            package_root = self.state / "packages" / hashlib.sha256(json.dumps(package_key).encode()).hexdigest()
+            if isinstance(self.sandbox, Sandbox):
+                package_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self.sandbox.package_root = package_root
             bridge = self.kernels.get(key)
             if bridge is None:
                 # No command is running in another bridge on this serial device.
@@ -847,12 +865,24 @@ class SessionAgent:
             if self.active["commandKind"] == "restart":
                 self._append({"type": "kernelState", "requestId": self.active["requestId"],
                               "message": "Restarting the selected Python kernel clears its variables."})
-            bridge.send(command["command"])
+            submitted = command["command"]
+            if self.active["commandKind"] == "execute":
+                try:
+                    requirements = _PACKAGES.installation_requirements(base64.b64decode(submitted.get("codeBase64", ""), validate=True).decode("utf-8"))
+                    if requirements is not None:
+                        if not isinstance(self.sandbox, Sandbox):
+                            raise ValueError("Managed package installation currently requires Linux bubblewrap compute.")
+                        message = _PACKAGES.install_wheels(self.sandbox, package_root, requirements)
+                        replacement = "import site, importlib; site.addsitedir('/packages/current'); importlib.invalidate_caches(); print(" + repr(message) + ")"
+                        submitted = {**submitted, "codeBase64": base64.b64encode(replacement.encode()).decode()}
+                except (ValueError, OSError, subprocess.SubprocessError) as error:
+                    raise PackageInstallationError(str(error) if isinstance(error, ValueError) else "Package installation failed; the previous environment is preserved.") from error
+            bridge.send(submitted)
         except (OSError, ValueError, KeyError) as error:
             receipt["state"] = "failed"
             receipt["error"] = str(error) if isinstance(error, AgentError) else "Interactive kernel preparation failed."
             failed_bridge = self.active.get("bridge")
-            if failed_bridge:
+            if failed_bridge and not isinstance(error, PackageInstallationError):
                 self.kernels = {key: value for key, value in self.kernels.items() if value is not failed_bridge}
                 failed_bridge.close()
                 self.active["bridge"] = None

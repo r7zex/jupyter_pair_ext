@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { normalizeRecentProjects, presentRecentExit } from '../core/recentProjects';
 import { SessionRuntime, SessionSnapshot } from '../runtime/session';
 import type { ServerSessionView } from './serverSessionView';
+import { commentColor, participantColor } from '../core/lineComments';
 
 interface DashboardState {
   live: boolean;
@@ -22,6 +23,7 @@ interface DashboardState {
   participants?: Array<{
     id: string;
     name: string;
+    color: string;
     role: string;
     active: string;
     latency: number;
@@ -101,7 +103,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
           try { password = await this.sessionPassword(); }
           catch { void vscode.window.showErrorMessage('Could not load the saved session password. Reconnect or ask the owner to set a new password.'); }
           if (this.persistent?.id !== session.id || this.persistent?.memberId !== session.memberId || this.persistent?.endpoint !== session.endpoint) return;
-          await this.view?.webview.postMessage({ type: 'sessionPassword', sessionId: session.id, memberId: session.memberId, value: password });
+          if (password === undefined) void vscode.window.showInformationMessage('No session password is saved on this computer. Ask the project owner for access.');
+          await this.view?.webview.postMessage({ type: 'sessionPassword', endpoint: session.endpoint, sessionId: session.id, memberId: session.memberId, value: password });
         });
         return;
       }
@@ -246,6 +249,7 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
       return {
         id: peer.peerId,
         name: state?.peer.displayName ?? peer.displayName,
+        color: state?.cursorColor ? commentColor(state.cursorColor) : participantColor(peer.peerId),
         role: `${peer.peerId === snapshot.clock.hostId ? '👑 HOST ' : ''}${peer.peerId === snapshot.computeExecutorId ? '⚡ COMPUTE' : ''}`.trim(),
         active: state?.activeFile
           ? `${state.activeFile}${state.activeNotebookCell !== undefined ? ` • ячейка ${state.activeNotebookCell + 1}` : ''}`
@@ -431,6 +435,8 @@ function html(): string {
     details { margin-top: 10px; border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); border-radius: 6px; padding: 7px; }
     summary { color: var(--vscode-foreground); cursor: pointer; font-size: 11px; font-weight: 600; user-select: none; }
     .password-row { margin-top: 9px; }
+    .password-row .icon-button { flex: 0 0 30px; width: 30px; padding: 4px; }
+    .participant-color { display: inline-block; width: 9px; height: 9px; border: 1px solid var(--vscode-foreground); border-radius: 2px; margin-right: 6px; vertical-align: middle; }
     .password-row input { min-width: 0; width: 100%; border: 1px solid var(--vscode-input-border, transparent); color: var(--vscode-input-foreground); background: var(--vscode-input-background); padding: 4px 6px; box-sizing: border-box; }
     .icon-button { flex: none; padding: 4px 6px; }
     .endpoint { overflow-wrap: anywhere; margin-bottom: 7px; }
@@ -474,9 +480,11 @@ function html(): string {
     };
     const section = (id, title, content, className='') => '<section class="section '+className+'" aria-labelledby="'+id+'Title"><h2 id="'+id+'Title">'+esc(title).toUpperCase()+'</h2><div class="section-content">'+content+'</div></section>';
     const eyeIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const copyIcon = '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" aria-hidden="true"><rect x="5" y="5" width="8" height="9" rx="1"/><path d="M10 3V2H2v9h1"/></svg>';
+    const colorDot = color => '<span class="participant-color" style="background:'+(/^#[0-9a-f]{6}$/i.test(color || '') ? color : '#3b82f6')+'" aria-label="Participant color"></span>';
     const eyeOffIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m3 3 18 18M10 5c7-1 12 7 12 7s-2 4-6 6M6 6c-3 2-4 6-4 6s4 7 10 7h2"/></svg>';
     const sessionHeader = (status, label, name, mode) => '<div class="connection '+status+'">'+esc(label)+'</div><div class="titleline"><div class="title">'+esc(name)+'</div><span class="badge">'+esc(mode)+'</span></div>';
-    const participantCard = (name, role, detail, extra) => '<div class="card participant"><div class="row"><strong>'+esc(name)+'</strong><span>'+esc(detail)+'</span></div>'+(role?'<div class="role">'+esc(role)+'</div>':'')+extra+'</div>';
+    const participantCard = (name, role, detail, extra, color) => '<div class="card participant"><div class="row"><strong>'+colorDot(color)+esc(name)+'</strong><span>'+esc(detail)+'</span></div>'+(role?'<div class="role">'+esc(role)+'</div>':'')+extra+'</div>';
     const computeSummary = (name, device, cpu, status, extra) => '<div class="card"><div class="row"><strong>'+esc(name)+'</strong><span class="badge">'+esc(device)+'</span></div><div class="tiny">'+esc(cpu)+'</div><div class="tiny">'+esc(status)+'</div>'+extra+'</div>';
     const connection = () => {
       if (state.closed) return { className:'offline', text:'○ SESSION ENDED' };
@@ -509,10 +517,10 @@ function html(): string {
         if (passwordIdentity !== identity || session.connected === false) { revealedPassword = undefined; passwordRequested = false; passwordIdentity = identity; }
         const detailsOpen = document.getElementById('moreActions')?.open ?? false;
         const online = session.members.filter(member => member.online);
-        const people = online.map(member => participantCard('🟢 '+member.name, (member.id === session.ownerId ? '👑 OWNER' : member.role === 'admin' ? 'ADMINISTRATOR' : 'PARTICIPANT')+(member.id === session.memberId ? ' · YOU' : ''), '', '<div class="tiny">'+esc(member.id === session.memberId && session.activeKernel ? session.activeKernel.notebook : '')+'</div>')).join('') || '<div class="tiny">No participants online</div>';
+        const people = online.map(member => participantCard('🟢 '+member.name, (member.id === session.ownerId ? '👑 OWNER' : member.role === 'admin' ? 'ADMINISTRATOR' : 'PARTICIPANT')+(member.id === session.memberId ? ' · YOU' : ''), '', '<div class="tiny">'+esc(member.id === session.memberId && session.activeKernel ? session.activeKernel.notebook : '')+'</div>', session.presenceColors?.[member.id] || session.memberColors?.[member.id])).join('') || '<div class="tiny">No participants online</div>';
         const kernel = session.activeKernel;
         const scope = kernel?.scope === 'private' ? 'Private' : 'Shared';
-        const password = '<div class="password-row"><span class="tiny">Session password</span><div class="row"><input id="sessionPassword" readonly aria-label="Session password" type="'+(revealedPassword === undefined ? 'password' : 'text')+'" value="'+esc(revealedPassword === undefined ? '************' : revealedPassword)+'" /><button id="togglePassword" class="secondary icon-button" aria-label="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'" title="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'">'+(revealedPassword === undefined ? eyeIcon : eyeOffIcon)+'</button>'+(revealedPassword === undefined ? '' : action('copyVpsPassword','Copy',''))+'</div></div>';
+        const password = '<div class="password-row"><span class="tiny">Session password</span><div class="row"><input id="sessionPassword" readonly aria-label="Session password" type="'+(revealedPassword === undefined ? 'password' : 'text')+'" value="'+esc(revealedPassword === undefined ? '************' : revealedPassword)+'" /><button id="togglePassword" class="secondary icon-button" aria-label="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'" title="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'">'+(revealedPassword === undefined ? eyeIcon : eyeOffIcon)+'</button>'+(revealedPassword === undefined ? '' : '<button id="copyVpsPassword" class="secondary icon-button" title="Copy password" aria-label="Copy password">'+copyIcon+'</button>')+'</div></div>';
         const connectionCard = '<div class="card"><div class="tiny">Server address</div><div class="endpoint">'+esc(session.endpoint)+'</div><div class="row"><span>Owner</span><strong>'+esc(owner?.name || 'Unknown')+(own ? ' (you)' : '')+'</strong></div>'+password+'</div>';
         const hostCard = '<div class="card"><strong>🖥 VPS</strong><div class="tiny">Owner: '+esc(owner?.name || 'Unknown')+(own ? ' · You' : '')+'</div></div>';
         const kernelDetail = kernel ? '<div class="row"><span>'+scope+' kernel</span><strong>'+esc(kernel.notebook)+'</strong></div><div class="tiny">'+(kernel.scope === 'private' ? 'Only the project owner can access this kernel and its results.' : 'Everyone with access to this notebook shares its Python variables and results.')+'</div>' : '<div class="tiny">Open a notebook in this server project to select its kernel.</div>';
@@ -546,7 +554,7 @@ function html(): string {
         const indicator = recovering ? '🟡' : '🟢';
         const stateLine = recovering ? '<div class="tiny q-warn">↻ Reconnecting</div>' : '';
         const latency = recovering || p.latency < 0 ? '—' : p.latency+' ms';
-        return participantCard(indicator+' '+p.name,p.role,latency,stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div>');
+        return participantCard(indicator+' '+p.name,p.role,latency,stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div>',p.color);
       }).join('') || '<div class="tiny">No participants online</div>';
       const connectionState = connection();
       const conn = state.connection;
@@ -602,7 +610,7 @@ function html(): string {
       const message = event.data;
       if (!message || typeof message !== 'object') return;
       if (message.type === 'sessionPassword') {
-        if (passwordRequested && message.sessionId === state.persistent?.id && message.memberId === state.persistent?.memberId) { revealedPassword = typeof message.value === 'string' ? message.value : undefined; passwordRequested = false; render(); }
+        if (passwordRequested && message.endpoint === state.persistent?.endpoint && message.sessionId === state.persistent?.id && message.memberId === state.persistent?.memberId) { revealedPassword = typeof message.value === 'string' ? message.value : undefined; passwordRequested = false; render(); }
         return;
       }
       if (message.type !== 'state' || !message.patch || typeof message.patch !== 'object') return;

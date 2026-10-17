@@ -1645,7 +1645,7 @@ function stripCollaborationMetadata(metadata: Record<string, unknown>): Record<s
   return copy;
 }
 
-function outputsFromCell(cell: vscode.NotebookCell): OutputSnapshot[] {
+export function outputsFromCell(cell: Pick<vscode.NotebookCell, 'outputs'>): OutputSnapshot[] {
   if (cell.outputs.length > MAX_CELL_OUTPUTS) {
     throw new Error(`Cell exceeds the ${MAX_CELL_OUTPUTS}-output limit.`);
   }
@@ -1678,7 +1678,7 @@ function editorVisibleExecution(
   };
 }
 
-function executionFromCell(cell: vscode.NotebookCell): CellExecutionSnapshot | undefined {
+export function executionFromCell(cell: Pick<vscode.NotebookCell, 'executionSummary'>): CellExecutionSnapshot | undefined {
   const summary = cell.executionSummary;
   if (!summary || (summary.executionOrder === undefined && summary.success === undefined && !summary.timing)) return undefined;
   return {
@@ -1695,7 +1695,7 @@ function toNotebookOutput(output: OutputSnapshot): vscode.NotebookCellOutput {
   );
 }
 
-function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
+export function toNotebookCellData(cell: CellSnapshot): vscode.NotebookCellData {
   const result = new vscode.NotebookCellData(cell.kind, cell.source, cell.language);
   result.metadata = { ...cell.metadata, pairNotebookCellId: cell.id };
   result.outputs = cell.outputs.map(toNotebookOutput);

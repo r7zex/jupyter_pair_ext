@@ -147,10 +147,12 @@ describe('dashboard webview startup', () => {
     assert.match(getElementById('content').innerHTML, /Leave session/);
     getElementById('togglePassword').onclick?.();
     assert.deepEqual(JSON.parse(JSON.stringify(renderCommands.at(-1))), { command: 'revealVpsPassword' });
-    renderMessage?.({ data: { type: 'sessionPassword', sessionId: 'server-project', memberId: 'owner', value: '<private-password>' } });
+    renderMessage?.({ data: { type: 'sessionPassword', endpoint: 'https://relay.example', sessionId: 'server-project', memberId: 'owner', value: '<private-password>' } });
     assert.match(getElementById('content').innerHTML, /Hide password/);
     assert.match(getElementById('content').innerHTML, /&lt;private-password&gt;/);
     assert.match(getElementById('content').innerHTML, /id="copyVpsPassword"/);
+    assert.match(getElementById('content').innerHTML, /aria-label="Copy password"/);
+    assert.doesNotMatch(getElementById('content').innerHTML, />Copy<|C\.\.\./);
     getElementById('togglePassword').onclick?.();
     assert.doesNotMatch(getElementById('content').innerHTML, /private-password|id="copyVpsPassword"/);
     provider.setPersistentSession({ ...persistent, target: { deviceId: 'guest-gpu', gpuUuid: 'GPU-other' }, activeKernel: { notebook: 'Private/research.ipynb', scope: 'private', deviceId: 'vps', canRestart: true } }, 'https://relay.example');

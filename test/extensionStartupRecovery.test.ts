@@ -28,7 +28,7 @@ describe('extension retry after startup failure', () => {
       const warning = new Promise<void>((resolve) => { dismiss = resolve; });
       const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
       const context = vm.createContext({
-        output: { appendLine() {} }, descriptor: {},
+        output: { appendLine() {} }, descriptor: {}, discardGuestWorkspace: async () => undefined,
         formatError: (error: Error) => error.message,
         SessionTerminatedError: class extends Error {}, SessionStartCancelledError,
         awaitFailedStartupCleanup: (task: Promise<unknown>) => awaitFailedStartupCleanup(task, 20),

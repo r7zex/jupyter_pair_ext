@@ -1,4 +1,6 @@
+import { SESSION_NOTEBOOK_TYPE } from './sessionNotebook';
 import * as vscode from 'vscode';
+import { EventEmitter } from 'node:events';
 import { renderNotebookCellState } from './notebookCellStateRenderer';
 import { CellExecutionSnapshot } from '../core/crdt';
 import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
@@ -25,8 +27,32 @@ const MAX_PENDING_RENDER_EVENTS = 2_048;
 const MAX_PENDING_RENDER_BYTES = 32 * 1024 * 1024;
 
 export class PairNotebookController implements vscode.Disposable, NotebookCellStateRenderer {
-  public readonly controller: vscode.NotebookController;
+  private registeredController: vscode.NotebookController | undefined;
+  private selectionSubscription: vscode.Disposable | undefined;
+  private readonly selectionEvents = new EventEmitter();
+  public readonly onDidChangeSelectedNotebooks: vscode.Event<{ notebook: vscode.NotebookDocument; selected: boolean }> = listener => {
+    this.selectionEvents.on('selection', listener);
+    return { dispose: () => { this.selectionEvents.off('selection', listener); } };
+  };
+  public get controller(): vscode.NotebookController {
+    const notebook = vscode.window.activeNotebookEditor?.notebook;
+    if (!this.runtime && !this.persistent?.connected
+      && !(notebook && this.persistent?.owns(notebook))) {
+      throw new Error('Join a Pair Notebook session before selecting its kernel.');
+    }
+    return this.registeredController ?? this.registerController();
+  }
+  public refreshSession(): void {
+    if (this.runtime || this.persistent?.connected) return;
+    this.finishActiveExecutions();
+    this.finishMirroredExecutions();
+    this.selectionSubscription?.dispose();
+    this.selectionSubscription = undefined;
+    this.registeredController?.dispose();
+    this.registeredController = undefined;
+  }
   public persistent: {
+    connected?: boolean;
     owns(notebook: vscode.NotebookDocument): boolean;
     execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void>;
     interrupt(notebook: vscode.NotebookDocument): Promise<void>;
@@ -45,34 +71,42 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly retiredCellStates = new WeakSet<vscode.NotebookCell>();
 
   public constructor(private readonly log: vscode.OutputChannel) {
-    this.controller = vscode.notebooks.createNotebookController(
+    const claim = (notebook: vscode.NotebookDocument) => this.claimNotebook(notebook);
+    this.disposables.push(
+      vscode.workspace.onDidOpenNotebookDocument(claim),
+      vscode.window.onDidChangeActiveNotebookEditor(this.selectActiveController),
+    );
+  }
+
+  public claimNotebook(notebook: vscode.NotebookDocument): void {
+    if (this.runtime?.notebookKey(notebook.uri) || this.persistent?.owns(notebook)) {
+        if (notebook.notebookType && notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
+          if (vscode.window.activeNotebookEditor?.notebook === notebook) this.selectActiveController(vscode.window.activeNotebookEditor);
+          return;
+        }
+        this.controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
+    }
+  }
+
+  private registerController(): vscode.NotebookController {
+    const controller = vscode.notebooks.createNotebookController(
       'pair-notebook-jupyter',
-      'jupyter-notebook',
+      SESSION_NOTEBOOK_TYPE,
       'Pair Notebook',
       (cells, notebook) => this.execute(cells, notebook),
     );
-    this.controller.supportedLanguages = ['python'];
-    this.controller.supportsExecutionOrder = true;
-    this.controller.description = 'Real Jupyter kernel on the selected Pair Notebook compute target';
-    this.controller.interruptHandler = async (notebook) => {
+    controller.supportedLanguages = ['python'];
+    controller.supportsExecutionOrder = true;
+    controller.description = 'Real Jupyter kernel on the selected Pair Notebook compute target';
+    controller.interruptHandler = async (notebook) => {
       if (this.persistent?.owns(notebook)) { await this.persistent.interrupt(notebook); return; }
       const runtime = this.requireRuntime();
       const key = runtime.notebookKey(notebook.uri);
       if (key && await runtime.confirmOperation('interrupt', key)) this.cancelQueuedExecution(notebook);
     };
-    const claim = (notebook: vscode.NotebookDocument) => {
-      if (this.runtime?.notebookKey(notebook.uri)) {
-        // VS Code exposes Preferred as its strongest NotebookController
-        // affinity. All Pair commands route through this controller; native
-        // kernels are never used by Pair's execution/output protocol.
-        this.controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
-      }
-    };
-    this.disposables.push(
-      this.controller,
-      vscode.workspace.onDidOpenNotebookDocument(claim),
-      vscode.window.onDidChangeActiveNotebookEditor(this.selectActiveController),
-    );
+    this.registeredController = controller;
+    this.selectionSubscription = controller.onDidChangeSelectedNotebooks?.(event => this.selectionEvents.emit('selection', event));
+    return controller;
   }
 
   public setRuntime(runtime: SessionRuntime | undefined): void {
@@ -83,9 +117,10 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
     }
     this.runtime = runtime;
+    this.refreshSession();
     if (runtime) for (const notebook of vscode.workspace.notebookDocuments) {
       if (runtime.notebookKey(notebook.uri)) {
-        this.controller.updateNotebookAffinity(notebook, vscode.NotebookControllerAffinity.Preferred);
+        this.claimNotebook(notebook);
       }
     }
     this.selectActiveController(vscode.window.activeNotebookEditor);
@@ -99,11 +134,20 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     });
   };
 
-  private async selectController(editor: vscode.NotebookEditor): Promise<void> {
+  private async selectController(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
+    if (editor.notebook.notebookType && editor.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
+      await vscode.commands.executeCommand('vscode.openWith', editor.notebook.uri, SESSION_NOTEBOOK_TYPE);
+      const document = vscode.workspace.notebookDocuments.find(notebook => notebook.notebookType === SESSION_NOTEBOOK_TYPE && notebook.uri.toString() === editor.notebook.uri.toString());
+      const reopened = document ? await vscode.window.showNotebookDocument(document, { preview: false }) : undefined;
+      if (!reopened || reopened.notebook.notebookType !== SESSION_NOTEBOOK_TYPE || reopened.notebook.uri.toString() !== editor.notebook.uri.toString()) throw new Error('Open this session notebook in the Pair Notebook session editor to execute it.');
+      editor = reopened;
+    }
+    const controller = this.controller;
     const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
-      id: 'pair-notebook-jupyter', extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
+      id: controller.id, extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
     });
     if (selected !== true) throw new Error('VS Code could not select the Pair Notebook kernel.');
+    return editor;
   }
 
   public setSynchronizer(synchronizer: EditorSynchronizer | undefined): void {
@@ -151,12 +195,12 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   public async executeActive(): Promise<void> {
-    const editor = vscode.window.activeNotebookEditor;
+    let editor = vscode.window.activeNotebookEditor;
     if (!editor) throw new Error('Open a notebook and select a code cell first.');
     if (!this.persistent?.owns(editor.notebook) && !this.requireRuntime().notebookKey(editor.notebook.uri)) throw new Error('The active notebook is outside the Pair Notebook working copy.');
+    editor = await this.selectController(editor);
     const cells = editor.notebook.getCells(editor.selection).filter((cell) => cell.kind === vscode.NotebookCellKind.Code);
     if (!cells.length) throw new Error('Select a Python code cell first.');
-    await this.selectController(editor);
     await this.execute(cells, editor.notebook);
   }
 
@@ -165,6 +209,9 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     this.finishActiveExecutions();
     this.finishMirroredExecutions();
     this.remoteExecutionRequestIds = new WeakMap<vscode.NotebookCell, string>();
+    this.selectionSubscription?.dispose();
+    this.registeredController?.dispose();
+    this.selectionEvents.removeAllListeners();
     for (const disposable of this.disposables) disposable.dispose();
   }
 
@@ -182,6 +229,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     cell: vscode.NotebookCell,
     request: NotebookCellRenderRequest,
   ): Promise<void> {
+    if (!this.registeredController || (!this.runtime && !this.persistent?.connected)) return;
+    if (cell.notebook.notebookType && cell.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) return;
     if (!request.outputsChanged && !request.executionChanged) return;
     if (this.retiredCellStates.has(cell)) return;
     const target: CellExecutionSnapshot | undefined = request.execution;
@@ -223,6 +272,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {
+    if (notebook.notebookType && notebook.notebookType !== SESSION_NOTEBOOK_TYPE) throw new Error('Open this notebook in the Pair Notebook session editor before executing it.');
     if (this.persistent?.owns(notebook)) { await this.persistent.execute(cells, notebook); return; }
     const runtime = this.requireRuntime();
     const runtimeGeneration = this.runtimeGeneration;

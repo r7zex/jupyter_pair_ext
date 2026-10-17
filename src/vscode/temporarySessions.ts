@@ -8,9 +8,10 @@ import type { SessionDescriptor } from '../core/types';
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
 function guestRoot(context: vscode.ExtensionContext, descriptor: SessionDescriptor): string | undefined {
-  if (descriptor.role !== 'peer' || !ID.test(descriptor.sessionId) || !ID.test(descriptor.localPeer.peerId)) return undefined;
+  if (!ID.test(descriptor.sessionId) || !ID.test(descriptor.localPeer.peerId)) return undefined;
   const root = path.join(context.globalStorageUri.fsPath, 'sessions', descriptor.sessionId, descriptor.localPeer.peerId);
   if (!samePath(descriptor.workingFolder, path.join(root, 'workspace'))) return undefined;
+  if (descriptor.backingFolder && samePath(descriptor.backingFolder, descriptor.workingFolder)) return undefined;
   return root;
 }
 
@@ -72,7 +73,7 @@ export async function sweepGuestWorkspaces(context: vscode.ExtensionContext, act
         const marker = path.join(folder, '.pair-notebook-session.json');
         if (!(await lstat(marker)).isFile()) continue;
         const descriptor = JSON.parse(await readFile(marker, 'utf8')) as SessionDescriptor;
-        if (descriptor.sessionId === session.name && descriptor.localPeer?.peerId === peer.name && descriptor.role === 'peer') {
+        if (descriptor.sessionId === session.name && descriptor.localPeer?.peerId === peer.name) {
           await retireGuestWorkspace(context, { ...descriptor, workingFolder: folder });
           retired.push(folder);
         }

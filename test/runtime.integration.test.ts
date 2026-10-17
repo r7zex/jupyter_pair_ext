@@ -1572,6 +1572,89 @@ describe('runtime repair invariants', () => {
     }
   });
 
+  it('keeps open restored notebooks on the editor save path after the binding grace expires', async () => {
+    const runtime: any = Object.create(SessionRuntime.prototype);
+    runtime.workingCopyWriter = undefined;
+    runtime.deferWorkingCopyWrites = false;
+    runtime.isOpenInEditor = (key: string) => key === 'restored.ipynb';
+    assert.equal(await runtime.writeWorkingCopy('restored.ipynb', Buffer.from('{}')), true);
+    assert.equal(await runtime.writeWorkingCopy('closed.py', Buffer.from('x = 1')), false);
+  });
+
+  it('keeps a healthy relay session ready when a parallel direct handshake fails', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-route-status-'));
+    const peer = new SessionRuntime(descriptor({ sessionId: 'route-status', role: 'peer', peerId: 'peer', hostPeerId: 'host', workingFolder: root, pythonPath: process.execPath }), 'route-status-token-that-is-long-enough', context(root), logger());
+    try {
+      peer.installTransportHandlers(); peer.runtimeState = 'ready';
+      peer.transport.hasRoute = () => true;
+      peer.transport.emit('connectionError', { peerId: 'host', displayName: 'Host' }, new Error('handshake timed out'));
+      assert.equal(peer.runtimeState, 'ready');
+      peer.transport.hasRoute = () => false;
+      peer.transport.emit('connectionError', { peerId: 'host', displayName: 'Host' }, new Error('route lost'));
+      assert.equal(peer.runtimeState, 'reconnecting');
+    } finally { await peer.disposeAsync(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('registers no notebook kernel before joining and retires it after leaving', () => {
+    const before = fakeVscode.__controllers.length;
+    const pair = new PairNotebookController(logger());
+    assert.equal(fakeVscode.__controllers.length, before);
+    assert.throws(() => pair.controller, /Join a Pair Notebook session/);
+    const session: any = { notebookKey: () => undefined };
+    pair.setRuntime(session);
+    const native = pair.controller;
+    let disposed = 0;
+    native.dispose = () => { disposed += 1; };
+    pair.setRuntime(undefined);
+    assert.equal(disposed, 1);
+    assert.throws(() => pair.controller, /Join a Pair Notebook session/);
+    pair.dispose();
+  });
+
+  it('recovers requester-only project lag through normal state before committing execution', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-barrier-state-'));
+    const host = new SessionRuntime(descriptor({ sessionId: 'barrier-state', role: 'host', peerId: 'host', hostPeerId: 'host', workingFolder: path.join(root, 'host'), pythonPath: process.execPath }), 'barrier-state-token-that-is-long-enough', context(root), logger());
+    const peer = new SessionRuntime(descriptor({ sessionId: 'barrier-state', role: 'peer', peerId: 'peer', hostPeerId: 'host', workingFolder: path.join(root, 'peer'), pythonPath: process.execPath }), 'barrier-state-token-that-is-long-enough', context(root), logger());
+    const target = { executorId: 'host', device: 'cpu', epoch: 0, author: 'peer' };
+    let delivery = Promise.resolve(), recoveries = 0, commits = 0;
+    host.remoteComputeTargetError = () => undefined;
+    const hostTransport = host.transport, peerTransport = peer.transport;
+    hostTransport.awaitDrain = async () => delivery;
+    hostTransport.sendTo = (_id: string, type: string, meta: any, payload = new Uint8Array()) => {
+      if (type === 'executionBarrierStatus') peer.resolveBarrierReply(meta.requestId, 'status', 'host', meta);
+      else if (type === 'executionBarrierAck') peer.resolveBarrierReply(meta.requestId, 'ack', 'host', meta);
+      else delivery = delivery.then(() => peer.onMessage({ type, meta, payload }, 'host'));
+    };
+    peerTransport.waitForRoute = async () => undefined;
+    peerTransport.sendTo = (_id: string, type: string, meta: any) => {
+      if (type === 'executionBarrierCheck') void host.handleExecutionBarrierCheck({ meta }, 'peer');
+      else if (type === 'executionBarrierCommit') { commits++; void host.handleExecutionBarrierCommit({ meta }, 'peer'); }
+      else if (type === 'stateRequest') {
+        recoveries++;
+        host.sendFilesystemState('peer');
+        void host.sendProjectState('peer').then(async () => {
+          await delivery;
+          peer.emit('projectReconciled', 'host', meta.reconciliationId);
+        });
+      }
+    };
+    try {
+      host.project.ensureText('helper.py', 'value = 42');
+      host.ensureLiveFileState('helper.py', 'text');
+      host.project.ensureNotebook('work.ipynb');
+      peer.project.applyRemoteUpdate('work.ipynb', 'notebook', host.project.encodeUpdate('work.ipynb'));
+      host.directories.add('empty'); host.ensureLiveFileState('empty', 'directory');
+      const manifest = await peer.synchronizeExecutionFiles('host', 'state-recovery', 'work.ipynb', target);
+      assert.ok(manifest.documents['helper.py']);
+      assert.ok(manifest.directories.includes('empty'));
+      assert.equal(host.project.text('helper.py').toString(), 'value = 42');
+      assert.equal(recoveries, 1); assert.equal(commits, 1);
+    } finally {
+      await Promise.all([host.disposeAsync(), peer.disposeAsync()]);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('defers every working-copy write until restored editors are bound', async () => {
     const runtime: any = Object.create(SessionRuntime.prototype);
     runtime.workingCopyWriter = undefined;
@@ -1793,6 +1876,8 @@ describe('runtime repair invariants', () => {
 describe('remote NotebookController rendering', () => {
   it('renders outputs, running state and success without recreating the cell', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('remote-render-success');
     const cell = fakeCell('remote', notebook);
     cell.outputs = [];
@@ -1837,6 +1922,8 @@ describe('remote NotebookController rendering', () => {
 
   it('restores final timing when timestamps are available before start', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('remote-render-timing');
     const cell = fakeCell('timed', notebook);
     cell.outputs = [];
@@ -1864,6 +1951,8 @@ describe('remote NotebookController rendering', () => {
 
   it('maps remote failure and historical order-only state without leaving an active execution', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('remote-render-failure');
     const failed = fakeCell('failed', notebook);
     failed.outputs = [];
@@ -1905,6 +1994,8 @@ describe('remote NotebookController rendering', () => {
 
   it('retires a mirrored running execution when its cell is structurally deleted', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('remote-render-delete');
     const cell = fakeCell('while True: pass', notebook);
     try {
@@ -1941,6 +2032,8 @@ describe('remote NotebookController rendering', () => {
 
   it('publishes terminal failure when an authoritative kernel execution throws', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('authoritative-kernel-failure');
     const cell = fakeCell('raise SystemExit()', notebook);
     const executionUpdates: any[] = [];
@@ -1982,6 +2075,8 @@ describe('remote NotebookController rendering', () => {
 
   it('retires a deleted cell UI while accepted computation remains running', async () => {
     const pairController = new PairNotebookController(logger());
+    pairController.persistent = { connected: true, owns: () => false, execute: async () => undefined, interrupt: async () => undefined };
+    void pairController.controller;
     const notebook = notebookForController('active-cell-delete');
     const cell = fakeCell('while True: pass', notebook);
     let cellExists = true;

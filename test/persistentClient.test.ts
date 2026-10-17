@@ -149,7 +149,7 @@ describe('Persistent server file save conflicts', () => {
       connection, disposed: false, view: { generation: 1 }, executions: new Map(), mirroredRuns: new Map(), latestExecutions: new Map(),
       managedRuns: new WeakMap(), localRunning: new Set(), selectedNotebooks: new Set([notebook]),
       files: { visibilityOf: () => 'public' }, observe: async () => run,
-      notebook: { createNotebookCellExecution: () => { presentations++; return { start() {}, end() {} }; } },
+      notebookSource: { createNotebookCellExecution: () => { presentations++; return { start() {}, end() {} }; } },
     }) as any;
     boundary.workspace.notebookDocuments = [notebook] as any;
     try {
@@ -355,7 +355,7 @@ describe('Persistent notebook execution connection ownership', () => {
     const handle = { start() {}, clearOutput: async () => undefined, appendOutput: async () => undefined, end: (success: unknown) => { ended.push(success); } };
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       connection, notebookQueues: new Map(), executions: new Map(), disposed: false, files: { revision: 1, refresh: async () => undefined },
-      context: { globalState: { update: async () => undefined } }, notebook: { createNotebookCellExecution: () => handle },
+      context: { globalState: { get: (_key: string, fallback: unknown) => fallback, update: async () => undefined } }, notebookSource: { createNotebookCellExecution: () => handle },
       notebookSync: { prepareExecution: async () => { if (preparationFails) { preparationFails = false; throw new Error('prepare failed'); } return undefined; } },
       textSync: { flushAll: async () => { importsFlushed++; } }, observe: async () => ({ state: 'failed', events: [] }),
     }) as ExecutionUi;
@@ -387,7 +387,7 @@ describe('Persistent notebook execution connection ownership', () => {
     const handle = { start: () => undefined, clearOutput: async () => undefined, appendOutput: async () => undefined, end: (success: boolean) => { ended = success; } };
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       connection, notebookQueues: new Map(), executions: new Map(), disposed: false,
-      context: { globalState: { update: async () => undefined } }, notebook: { createNotebookCellExecution: () => handle },
+      context: { globalState: { get: (_key: string, fallback: unknown) => fallback, update: async () => undefined } }, notebookSource: { createNotebookCellExecution: () => handle },
       notebookSync: { prepareExecution: async () => { entered(); await waiting; return { revision: 1, cells: [] }; } },
     }) as ExecutionUi;
     const cell = { index: 0, kind: 2, document: { languageId: 'python', getText: () => 'print(1)' } } as unknown as vscode.NotebookCell;
@@ -406,8 +406,8 @@ describe('Persistent notebook execution connection ownership', () => {
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       connection, notebookQueues: new Map(), executions: new Map(), disposed: false,
       files: { revision: 9, refresh: async () => undefined },
-      context: { globalState: { update: async () => undefined } },
-      notebook: { createNotebookCellExecution: () => handle },
+      context: { globalState: { get: (_key: string, fallback: unknown) => fallback, update: async () => undefined } },
+      notebookSource: { createNotebookCellExecution: () => handle },
       observe: async () => ({ state: 'completed' }),
     }) as ExecutionUi;
     const cell = { index: 0, kind: 2, document: { languageId: 'python', getText: () => 'print("displayed")' } } as unknown as vscode.NotebookCell;
@@ -452,7 +452,7 @@ describe('Persistent session actions preserve their original connection', () => 
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const dialog = new Promise<void>((resolve) => { opened = resolve; });
     const calls: unknown[] = [];
-    const original = { sessionId: 'original', client: { call: async () => { calls.push('original'); return {}; } } };
+    const original = { sessionId: 'original', client: { call: async () => { calls.push('original'); return { id: 'run', notebook: 'old.ipynb', cellIndex: 0, state: 'completed', deviceId: 'vps', generation: 1, events: [] }; } } };
     const replacement = { sessionId: 'replacement', client: { call: async () => { calls.push('replacement'); return { id: 'run', notebook: 'old.ipynb', state: 'completed' }; } } };
     const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
       connection: original, disposed: false, poll: async () => undefined,
@@ -470,7 +470,7 @@ describe('Persistent session actions preserve their original connection', () => 
     const pending = (ui[action] as () => Promise<void>)(); await dialog;
     ui.connection = replacement; release();
     await assert.rejects(pending, /session changed/);
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, action === 'recoverExecution' ? ['original'] : []);
   });
 
   it('does not clear a replacement connection when an old leave acknowledgement arrives late', async () => {

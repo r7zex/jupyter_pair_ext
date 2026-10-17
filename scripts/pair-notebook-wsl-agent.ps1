@@ -16,7 +16,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Install WSL2 and a dedicated Ubuntu distributi
 $plain = ($wslInfo -join "`n") -replace "`0",''
 if ($plain -notmatch ('(?m)^.*\b' + [regex]::Escape($Distro) + '\s+\S+\s+2\s*$')) { throw 'The selected distribution must be running WSL2. Check wsl --list --verbose.' }
 if ($Action -eq 'Install') {
-  & wsl.exe --distribution $Distro --user root --exec sh -c 'set -eu; apt-get update; apt-get install -y python3-venv bubblewrap; install -d -m 0755 "$1/scripts" "$1/media"; python3 -m venv "$1/venv"; "$1/venv/bin/python" -m pip install jupyter_client==8.10.0 ipykernel==7.4.0' sh $LinuxRoot
+  & wsl.exe --distribution $Distro --user root --exec sh -c 'set -eu; apt-get update; apt-get install -y python3-venv bubblewrap; install -d -m 0755 "$1/scripts" "$1/media"; python3 -m venv "$1/venv"; "$1/venv/bin/python" -m pip install jupyter_client==8.10.0 ipykernel==7.3.0' sh $LinuxRoot
   if ($LASTEXITCODE -ne 0) { throw 'WSL2 prerequisite installation failed.' }
   $files = @(@('scripts/pair-notebook-session-agent.py','scripts/pair-notebook-session-agent.py'), @('media/jupyter_kernel_bridge.py','media/jupyter_kernel_bridge.py'))
   foreach ($item in $files) {

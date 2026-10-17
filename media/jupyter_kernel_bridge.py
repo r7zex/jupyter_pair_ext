@@ -433,6 +433,8 @@ def main() -> int:
     working_directory = os.environ.get("PAIR_NOTEBOOK_CWD") or os.getcwd()
     manager = KernelManager(kernel_name="python3")
     manager.kernel_spec.argv = [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"]
+    if os.environ.get("PAIR_NOTEBOOK_PACKAGES") == "/packages/current":
+        manager.kernel_spec.argv = [sys.executable, "-c", "import site,runpy; site.addsitedir('/packages/current'); runpy.run_module('ipykernel_launcher', run_name='__main__')", "-f", "{connection_file}"]
     try:
         manager.start_kernel(cwd=working_directory, env=dict(os.environ),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

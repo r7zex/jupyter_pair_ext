@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent server workspaces and controlled remote Python execution.",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {
@@ -259,15 +259,15 @@
       },
       {
         "command": "pairNotebook.managePermissions",
-        "title": "Pair Notebook: РџСЂР°РІР° СѓС‡Р°СЃС‚РЅРёРєРѕРІ"
+        "title": "Pair Notebook: \u0420\u045f\u0421\u0402\u0420\u00b0\u0420\u0406\u0420\u00b0 \u0421\u0453\u0421\u2021\u0420\u00b0\u0421\u0403\u0421\u201a\u0420\u0405\u0420\u0451\u0420\u0454\u0420\u0455\u0420\u0406"
       },
       {
         "command": "pairNotebook.addLineComment",
-        "title": "Pair Notebook: РљРѕРјРјРµРЅС‚Р°СЂРёР№ Рє СЃС‚СЂРѕРєР°Рј"
+        "title": "Pair Notebook: \u0420\u0459\u0420\u0455\u0420\u0458\u0420\u0458\u0420\u00b5\u0420\u0405\u0421\u201a\u0420\u00b0\u0421\u0402\u0420\u0451\u0420\u2116 \u0420\u0454 \u0421\u0403\u0421\u201a\u0421\u0402\u0420\u0455\u0420\u0454\u0420\u00b0\u0420\u0458"
       },
       {
         "command": "pairNotebook.resolveLineComment",
-        "title": "Pair Notebook: Р—Р°РєСЂС‹С‚СЊ РєРѕРјРјРµРЅС‚Р°СЂРёР№"
+        "title": "Pair Notebook: \u0420\u2014\u0420\u00b0\u0420\u0454\u0421\u0402\u0421\u2039\u0421\u201a\u0421\u040a \u0420\u0454\u0420\u0455\u0420\u0458\u0420\u0458\u0420\u00b5\u0420\u0405\u0421\u201a\u0420\u00b0\u0421\u0402\u0420\u0451\u0420\u2116"
       },
       {
         "command": "pairNotebook.configureVpsSessions",
@@ -456,7 +456,19 @@
           "description": "Restore saved server projects automatically with bounded retries, ask once, or require an explicit connection. Explicit Leave is remembered independently."
         }
       }
-    }
+    },
+    "notebooks": [
+      {
+        "type": "pair-notebook-session",
+        "displayName": "Pair Notebook session",
+        "selector": [
+          {
+            "filenamePattern": "*.ipynb"
+          }
+        ],
+        "priority": "option"
+      }
+    ]
   },
   "scripts": {
     "clean": "rimraf out",

@@ -11,9 +11,21 @@ interface AgentConnection { endpoint: string; sessionId: string; memberId: strin
 
 /** Launches the bundled isolated agent; membership secrets never enter command arguments. */
 export class PersistentAgentLauncher {
+  private starting: Promise<void> | undefined;
+  private startingSession: string | undefined;
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel) {}
 
   async start(connection: AgentConnection, token: string, install = false): Promise<void> {
+    if (this.starting) {
+      if (this.startingSession !== connection.sessionId) throw new Error('This computer is already being prepared for another project. Wait for setup to finish.');
+      return this.starting;
+    }
+    this.startingSession = connection.sessionId;
+    this.starting = this.startOnce(connection, token, install).finally(() => { this.starting = undefined; this.startingSession = undefined; });
+    return this.starting;
+  }
+
+  private async startOnce(connection: AgentConnection, token: string, install: boolean): Promise<void> {
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before sharing this computer.');
     const directory = path.join(this.context.globalStorageUri.fsPath, 'local-agents', connection.sessionId);
     const marker = path.join(directory, 'process.json');
@@ -55,11 +67,29 @@ export class PersistentAgentLauncher {
       python = path.join(this.context.globalStorageUri.fsPath, 'agent-runtime', 'bin', 'python');
     } else throw new Error('Local persistent compute on macOS requires the Docker agent described in PERSISTENT_VPS.md.');
     if (install) {
-      const runtime = path.posix.dirname(path.posix.dirname(python.replace(/\\/g, '/')));
-      const arguments_ = ['-m', 'venv', runtime];
-      if (process.platform === 'win32') await run(command, [...prefix, 'python3', ...arguments_], { timeout: 60_000, windowsHide: true });
-      else await run(command, arguments_, { timeout: 60_000, windowsHide: true });
-      await run(process.platform === 'win32' ? command : python, [...prefix, ...(process.platform === 'win32' ? [python] : []), '-m', 'pip', 'install', 'jupyter_client==8.10.0', 'ipykernel==7.4.0'], { timeout: 240_000, windowsHide: true, maxBuffer: 1024 * 1024 });
+      const setupScript = vscode.Uri.joinPath(this.context.extensionUri, 'scripts', 'prepare_compute_runtime.py').fsPath;
+      const { stdout } = await run(command, [...prefix, ...(process.platform === 'win32' ? ['python3', linuxPath(setupScript)] : [setupScript]),
+        '--root', path.posix.dirname(path.posix.dirname(python.replace(/\\/g, '/'))), '--agent', script, '--bridge', bridge],
+      { timeout: 240_000, windowsHide: true, maxBuffer: 1024 * 1024 }).catch(error => {
+        const reason = String(error.stderr ?? '');
+        const message = /Requires-Python|Python 3\.10/.test(reason) ? 'This compute runtime requires Python 3.10 or newer.'
+          : /certificate|CERTIFICATE_VERIFY_FAILED|TLS/i.test(reason) ? 'Python package setup could not verify the package index TLS certificate.'
+          : /No matching distribution|Could not find a version/.test(reason) ? 'The package index cannot provide the required compatible Jupyter packages.'
+          : /Connection|timed out|resolve|network/i.test(reason) ? 'The package index could not be reached. Check its network access and retry.'
+          : 'The isolated Python runtime could not be prepared. Open Pair Notebook output for the setup stage and retry.';
+        this.log.appendLine(`[error] Compute setup failed (exit ${typeof error.code === 'number' ? error.code : 'unavailable'}): ${message}`);
+        throw new Error(message);
+      });
+      const prepared = JSON.parse(stdout) as { python: string };
+      if (!prepared.python.startsWith(path.posix.dirname(path.posix.dirname(python.replace(/\\/g, '/'))) + '-')) throw new Error('Compute setup returned an invalid managed runtime path.');
+      python = prepared.python;
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(path.join(directory, 'runtime.json'), JSON.stringify({ python }), { mode: 0o600 });
+    } else {
+      try {
+        const saved = JSON.parse(await readFile(path.join(directory, 'runtime.json'), 'utf8')) as { python: string };
+        if (typeof saved.python === 'string' && saved.python.startsWith(path.posix.dirname(path.posix.dirname(python.replace(/\\/g, '/'))) + '-')) python = saved.python;
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
     const executable = process.platform === 'win32' ? command : python;
     const arguments_ = [...prefix, ...(process.platform === 'win32' ? [python] : []), script, '--python', python, '--bridge', bridge];

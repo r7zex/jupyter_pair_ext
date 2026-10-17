@@ -37,7 +37,7 @@ try {
     'scripts/pair-notebook-server-check.py', 'docs/SERVER_SETUP.md',
     'scripts/pair-notebook-wsl-agent.ps1',
     'scripts/persistent-session-soak.py',
-    'scripts/pair-notebook-session-agent.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
+    'scripts/pair-notebook-session-agent.py', 'scripts/isolated_packages.py', 'scripts/prepare_compute_runtime.py', 'scripts/pair-notebook-session-admin.py', 'media/jupyter_kernel_bridge.py',
     'docs/PERSISTENT_VPS.md', 'docs/PERSISTENT_VPS_ARCHITECTURE.md',
     'docs/PARTICIPANT_PERMISSIONS_AND_COMMENTS.md',
     'docs/REPAIR_VERIFICATION_2026_10_15.md',

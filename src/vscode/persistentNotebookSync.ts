@@ -90,6 +90,9 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private readonly remoteBootstrap = new WeakSet<vscode.NotebookDocument>();
   private readonly presenceEvents = new EventEmitter();
   private presence: PersistentPresence[] = [];
+  public participantColors(): Record<string, string> {
+    return Object.fromEntries(this.presence.map(state => [state.peer.peerId, state.cursorColor]));
+  }
   private stream: { dispose(): void } | undefined;
   private streamConnection: Connection | undefined;
   private reconnect: NodeJS.Timeout | undefined;

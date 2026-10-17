@@ -1,3 +1,4 @@
+import { SESSION_NOTEBOOK_TYPE, SessionNotebookSerializer } from '../../src/vscode/sessionNotebook';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -8,6 +9,21 @@ import type { SessionRuntime } from '../../src/runtime/session';
 import { EditorSynchronizer } from '../../src/vscode/sync';
 
 suite('Pair Notebook — production NotebookController in real VS Code', () => {
+  suiteSetup(async () => { await vscode.extensions.getExtension('pair-notebook.pair-notebook')!.activate(); });
+  test('round-trips attachment, metadata, outputs and stable cell IDs in the session serializer', () => {
+    const serializer = new SessionNotebookSerializer();
+    const original = { nbformat: 4, nbformat_minor: 5, metadata: { customStudy: { name: 'Study' }, kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' }, language_info: { name: 'python' } }, cells: [
+      { cell_type: 'markdown', id: 'markdown', source: ['![image](attachment:tiny.png)'], metadata: { tags: ['note'] }, attachments: { 'tiny.png': { 'image/png': 'YWJj' } } },
+      { cell_type: 'code', id: 'code', source: ['print(42)'], metadata: { tags: ['run'] }, execution_count: 3, outputs: [{ output_type: 'stream', name: 'stdout', text: ['42\n'] }] },
+    ] };
+    const saved = JSON.parse(Buffer.from(serializer.serializeNotebook(serializer.deserializeNotebook(Buffer.from(JSON.stringify(original))))).toString());
+    assert.deepEqual(saved.metadata, original.metadata);
+    assert.deepEqual(saved.cells[0].attachments, original.cells[0]!.attachments);
+    assert.deepEqual(saved.cells.map((cell: any) => cell.id), ['markdown', 'code']);
+    assert.equal(saved.cells[1].execution_count, 3);
+    assert.deepEqual(saved.cells[1].outputs, original.cells[1]!.outputs);
+  });
+
   test('routes the active cell through the single controller into a persistent backend', async function () {
     this.timeout(10_000);
     const fixture = await openNotebookFixture('a = 1\na');
@@ -73,6 +89,9 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
     const fixture = await openNotebookFixture('print("remote")');
     const log = vscode.window.createOutputChannel(`Pair Notebook Controller E2E ${Date.now()}`);
     const controller = new PairNotebookController(log);
+    controller.persistent = { connected: true, owns: notebook => notebook === fixture.notebook, execute: async () => undefined, interrupt: async () => undefined };
+    const native = controller.controller;
+    assert.ok(native);
     try {
       const editor = vscode.window.activeNotebookEditor;
       assert.ok(editor);
@@ -126,6 +145,9 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
     const fixture = await openNotebookFixture('print("stream")');
     const log = vscode.window.createOutputChannel(`Pair Notebook Controller Stream E2E ${Date.now()}`);
     const controller = new PairNotebookController(log);
+    controller.persistent = { connected: true, owns: notebook => notebook === fixture.notebook, execute: async () => undefined, interrupt: async () => undefined };
+    const native = controller.controller;
+    assert.ok(native);
     try {
       const editor = vscode.window.activeNotebookEditor;
       assert.ok(editor);
@@ -195,8 +217,10 @@ async function openNotebookFixture(source: string): Promise<NotebookFixture> {
     nbformat: 4,
     nbformat_minor: 5,
   }), 'utf8');
-  const notebook = await vscode.workspace.openNotebookDocument(vscode.Uri.file(absolutePath));
-  await vscode.window.showNotebookDocument(notebook, { preview: false, preserveFocus: false });
+  await vscode.commands.executeCommand('vscode.openWith', vscode.Uri.file(absolutePath), SESSION_NOTEBOOK_TYPE);
+  const notebook = vscode.workspace.notebookDocuments.find(document => document.uri.toString() === vscode.Uri.file(absolutePath).toString() && document.notebookType === SESSION_NOTEBOOK_TYPE)!;
+  assert.ok(notebook, 'the session serializer must open this notebook');
+  await vscode.window.showNotebookDocument(notebook, { preview: false });
   return {
     root,
     notebook,

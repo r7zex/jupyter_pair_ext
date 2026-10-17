@@ -96,6 +96,20 @@ function remote(peerId: string, activeLine: number, activeLineAnchor?: string): 
 }
 
 describe('presence renderer selected-line mode', () => {
+  it('keeps exact-cursor presence as a line highlight without a caret or inline name', () => {
+    const h = createHarness([remote('guest', 1)], {});
+    h.runtime.exactCursor = true;
+    h.runtime.resolvePresenceCursor = () => ({ anchor: 7, active: 7 });
+    h.editor('work.py', 'zero\none here\ntwo');
+    const renderer = new h.PresenceRenderer(h.runtime);
+    const rendered = h.applied.filter(entry => entry.options.length);
+    assert.equal(rendered.length, 1);
+    assert.equal(rendered[0]!.type.options.isWholeLine, true);
+    assert.equal(rendered[0]!.type.options.borderWidth, undefined);
+    assert.equal(rendered[0]!.options[0].renderOptions, undefined);
+    assert.equal(rendered[0]!.options[0].hoverMessage, undefined);
+    renderer.dispose();
+  });
   it('renders a whole-line highlight from a collapsed line-start anchor', () => {
     const h = createHarness([remote('guest', 1)], {});
     h.editor('work.py', 'zero\none here\ntwo');

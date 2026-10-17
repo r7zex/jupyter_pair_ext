@@ -18,10 +18,9 @@ export interface PresenceSource {
   notebookKey?(uri: vscode.Uri): string | undefined;
 }
 
-/** Existing selected-line renderer, with optional host-supplied character carets. */
+/** Whole-line presence; relative positions remain owned by the session source. */
 export class PresenceRenderer implements vscode.Disposable {
   private readonly decorations = new Map<string, vscode.TextEditorDecorationType>();
-  private readonly cursors = new Map<string, vscode.TextEditorDecorationType>();
   private readonly colors = new Map<string, string>();
   private readonly disposables: vscode.Disposable[];
   private signature = '';
@@ -49,7 +48,6 @@ export class PresenceRenderer implements vscode.Disposable {
   public dispose(): void {
     for (const decoration of this.decorations.values()) decoration.dispose();
     this.decorations.clear();
-    for (const decoration of this.cursors.values()) decoration.dispose(); this.cursors.clear();
     for (const disposable of this.disposables) disposable.dispose();
   }
 
@@ -74,7 +72,6 @@ export class PresenceRenderer implements vscode.Disposable {
 
     for (const editor of vscode.window.visibleTextEditors) {
       for (const decoration of this.decorations.values()) editor.setDecorations(decoration, []);
-      for (const decoration of this.cursors.values()) editor.setDecorations(decoration, []);
       const location = this.editorLocation(editor);
       if (!location) continue;
       for (const state of states) {
@@ -86,16 +83,7 @@ export class PresenceRenderer implements vscode.Disposable {
         editor.setDecorations(this.decorationFor(state.peer.peerId, color), [{
           // Keep the whole-line decoration from tracking mutable line contents across newline edits.
           range: new vscode.Range(textLine.range.start, textLine.range.start),
-          hoverMessage: state.peer.displayName,
         }]);
-        const cursor = this.runtime.exactCursor ? this.runtime.resolvePresenceCursor?.(state) : undefined;
-        if (cursor) {
-          let decoration = this.cursors.get(state.peer.peerId);
-          if (!decoration) { decoration = vscode.window.createTextEditorDecorationType({ borderStyle: 'solid', borderWidth: '0 0 0 2px', borderColor: color, rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen }); this.cursors.set(state.peer.peerId, decoration); }
-          const position = editor.document.positionAt(cursor.active);
-          editor.setDecorations(decoration, [{ range: new vscode.Range(position, position), hoverMessage: state.peer.displayName,
-            renderOptions: { after: { contentText: state.peer.displayName, color, margin: '0 0 0 4px', fontStyle: 'italic' } } }]);
-        }
       }
     }
   }
@@ -136,9 +124,6 @@ export class PresenceRenderer implements vscode.Disposable {
     if (existing) return existing;
     const decoration = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
-      borderStyle: 'solid',
-      borderWidth: '0 0 0 2px',
-      borderColor: color,
       backgroundColor: color + '22',
       overviewRulerColor: color,
       overviewRulerLane: vscode.OverviewRulerLane.Right,
@@ -183,7 +168,6 @@ export class PresenceRenderer implements vscode.Disposable {
     this.colors.delete(peerId);
     this.decorations.get(peerId)?.dispose();
     this.decorations.delete(peerId);
-    this.cursors.get(peerId)?.dispose(); this.cursors.delete(peerId);
   }
 
   private relativeKey(uri: vscode.Uri): string | undefined {
