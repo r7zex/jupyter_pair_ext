@@ -50,3 +50,4 @@ eslint.config.mjs
 **/*.key
 **/*.keystore
 **/*.jks
+media/storage-locations.json

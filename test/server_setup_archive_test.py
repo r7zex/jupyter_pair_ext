@@ -41,7 +41,7 @@ class SetupArchiveTests(unittest.TestCase):
 
     def test_ws_server_zip_has_clear_launcher_bundled_relay_and_matching_manifest(self):
         with zipfile.ZipFile(ARTIFACTS / 'pair-notebook-ws-server.zip') as archive:
-            self.assertEqual(set(archive.namelist()), {'pair-notebook-ws-server.sh', 'relay.js', 'check.js', 'README.md', 'LICENSE', 'BUILD.json'})
+            self.assertEqual(set(archive.namelist()), {'pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE', 'BUILD.json'})
             manifest = json.loads(archive.read('BUILD.json'))
             self.assertEqual(manifest['version'], VERSION)
             for name, digest in manifest['files'].items():
@@ -49,6 +49,12 @@ class SetupArchiveTests(unittest.TestCase):
             self.assertIn(b'PAIR_DEFAULT_MODE=relay', archive.read('pair-notebook-ws-server.sh'))
             self.assertEqual(installer_payload(archive.read('pair-notebook-ws-server.sh')),
                              installer_payload((ARTIFACTS / 'pair-notebook-server-setup.sh').read_bytes()))
+
+    def test_remove_utility_embeds_matching_installer_and_self_removal(self):
+        content = (ARTIFACTS / 'pair-notebook-server-remove.sh').read_bytes()
+        self.assertIn(b'PAIR_DEFAULT_ACTION="uninstall"', content)
+        self.assertIn(b'rm -f -- "$PAIR_SETUP_FILE"', content)
+        self.assertEqual(installer_payload(content), installer_payload((ARTIFACTS / 'pair-notebook-server-setup.sh').read_bytes()))
 
 
 if __name__ == '__main__':

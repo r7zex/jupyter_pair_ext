@@ -42,6 +42,7 @@ function collectFiles(directory, relative = '') {
   for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
     const relativePath = relative ? `${relative}/${item.name}` : item.name;
     const lowerName = item.name.toLowerCase();
+    if (relativePath === 'media/storage-locations.json') continue;
     // A linked Git worktree stores `.git` as a file, while a normal checkout
     // stores it as a directory. Exclude repository/runtime internals by path
     // segment before branching on the filesystem entry type.

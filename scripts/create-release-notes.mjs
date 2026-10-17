@@ -15,6 +15,7 @@ const notes = `## Downloads
 | --- | --- |
 | ${asset(`pair-notebook-${version}.vsix`)} | Install in VS Code using **Extensions: Install from VSIX...**, then reload. |
 | ${asset('pair-notebook-server-setup.sh')} | Install/update your server: projects, isolated Jupyter, HTTPS and WebSocket relay. |
+| ${asset('pair-notebook-server-remove.sh')} | Remove Pair services and export Python/notebook files on the VPS. |
 | ${asset('pair-notebook-ws-server.zip')} | Standalone encrypted WebSocket server for temporary peer sessions. |
 
 ## Set up or update your server
@@ -33,12 +34,12 @@ In VS Code use **Pair Notebook: Create Server Project** with the printed address
 
 ## WebSocket server only
 
-Extract **pair-notebook-ws-server.zip**, then run \`sh pair-notebook-ws-server.sh\` on the Linux server. Set **Pair Notebook: Relay Url** to the printed HTTPS address and share a temporary-session invitation. Guests receive the relay address automatically. A home host needs reachable ports/port forwarding. The full setup already includes this relay.
+Extract **pair-notebook-ws-server.zip**. On Windows, run **pair-notebook-ws-server.cmd** for a tray server: click its icon to stop/start and trust its generated CA on every client. On Linux, run \`sh pair-notebook-ws-server.sh\`. Set **Pair Notebook: Relay Url** to the HTTPS address and share a temporary-session invitation. A home host needs reachable ports/port forwarding. The full setup already includes this relay.
 
 ## Changes
 
 ${changes}
 
-[Verification and limits](${base}/blob/v${version}/docs/SERVER_RELEASE_0_6_8.md). GitHub's automatic source archives are for developers. Detailed build artifacts/internal checksums are retained with the workflow run.
+[Verification and limits](${base}/blob/v${version}/docs/SERVER_RELEASE_0_6_9.md). GitHub's automatic source archives are for developers. Detailed build artifacts/internal checksums are retained with the workflow run.
 `;
 fs.writeFileSync(outputPath, notes, 'utf8');

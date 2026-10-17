@@ -54,9 +54,27 @@ Updates stop Pair workers and active Python kernels. Save needed Python objects 
 
 After reinstalling the extension, reconnect a saved identity or use **Connect to Server → Import existing owner / member credential**. Members can join again with an invitation or password.
 
+Removing the extension clears its local connection history, session working copies and credential encryption key. A reinstall starts with no remembered hosts. Keep an owner credential outside extension storage if you want to import it later, or use server-side owner recovery. User-selected project folders and server files are not removed by extension uninstall. **Pair Notebook: Forget All Connections and Local Caches** performs an explicit local reset without uninstalling.
+
+The dashboard uses the same layout as a self-host session. **VPS** is the host; **Owner** names the project creator. Creating a project asks for your owner name and retains the returned owner membership. Joining with a password creates a participant membership. The password eye toggles visibility; Copy appears only while visible. Passwords entered during creation/join are encrypted in client SecretStorage. A password cannot be recovered from its server hash; an owner who imports an old key can set a new password under **More actions**.
+
+**Compute** names the active notebook and its **Shared** or **Private** kernel. Shared variables/results belong to everyone with access to that notebook; Private execution is owner-only. **Restart shared/private kernel** targets that notebook and clears its variables after confirmation. Ordinary results appear in notebook cells. **Recover interrupted run**, under More actions, handles a previously accepted execution after a disconnect.
+
+## Remove the server
+
+Download `pair-notebook-server-remove.sh` from the release and run it on the VPS:
+
+```sh
+sh pair-notebook-server-remove.sh
+```
+
+Confirm **yes**. Only `.py` and `.ipynb` files are exported into `/root/pair-notebook-files/<timestamp>/`, retaining project paths and restricted access. Their contents are verified before removal. Then Pair services, session data, credentials, history, caches, certificates and private runtimes are removed. Shared OS packages, SSH, firewall rules, VPN and unrelated services remain. Download setup again to start fresh. Setup/removal shell downloads delete themselves after use.
+
 If the owner's local credential was lost, choose **recover-owner**, select the project and explicitly confirm. Only that project's owner key is replaced; old owner credentials stop working. Files, ownership identity and other participants remain. Copy the printed private owner JSON securely to your computer and import it with **Connect to Server**. Recovery requires local server-administrator access; it is not a public project-takeover API.
 
 ## WebSocket server
+
+On Windows, extract the ZIP and double-click **pair-notebook-ws-server.cmd**. Enter the hostname/IP clients will use. The tray icon starts/stops the server with one left click; its menu copies the HTTPS address, opens the trust certificate and exits. Node 20+ is used when available; otherwise a private Node runtime is downloaded and checksum-verified. Trust `server/relay-ca.crt` on each client (Windows: `certutil -user -addstore Root server\relay-ca.crt`) and restart VS Code. The Windows launcher uses local TLS trust; public access additionally requires reachable ports/forwarding. **Exit** stops the relay; temporary broker files are removed. The portable `server` directory holds one address/certificate configuration, not past sessions.
 
 The full setup already includes `/v1/temporary-relay`. For relay-only deployment, extract `pair-notebook-ws-server.zip` and run:
 

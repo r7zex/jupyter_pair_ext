@@ -17,9 +17,10 @@ export async function packageServerSetup({ root, installer, artifacts, relay, ve
   const digest = createHash('sha256').update(bytes).digest('hex');
   const template = (await fs.readFile(path.join(root, 'deploy/install.sh'), 'utf8')).replace(/\r\n/g, '\n');
   const encoded = bytes.toString('base64').match(/.{1,76}/g).join('\n') + '\n';
-  const setup = mode => template.replace('__PAIR_VERSION__', version)
-    .replace('__PAIR_DEFAULT_MODE__', mode).replace('__PAIR_INSTALLER_SHA256__', digest) + encoded;
+  const setup = (mode, action = '') => template.replace('__PAIR_VERSION__', version)
+    .replace('__PAIR_DEFAULT_MODE__', mode).replace('__PAIR_DEFAULT_ACTION__', action ? JSON.stringify(action) : "''").replace('__PAIR_INSTALLER_SHA256__', digest) + encoded;
   await fs.writeFile(path.join(artifacts, 'pair-notebook-server-setup.sh'), setup('full'), { mode: 0o755 });
+  await fs.writeFile(path.join(artifacts, 'pair-notebook-server-remove.sh'), setup('full', 'uninstall'), { mode: 0o755 });
   await fs.writeFile(path.join(relay, 'pair-notebook-ws-server.sh'), setup('relay'), { mode: 0o755 });
   await fs.writeFile(path.join(relay, 'README.md'), `# Pair Notebook WebSocket server ${version}
 
@@ -37,7 +38,8 @@ In VS Code set Pair Notebook: Relay Url (pairNotebook.relayUrl) to the printed H
 
 For an existing HTTPS reverse proxy and Node.js 20+, run \`node relay.js\` with PAIR_VPS_BIND=127.0.0.1 and PAIR_VPS_PORT set to your private port. Forward /v1/temporary-relay with WebSocket upgrade support and /health. Verify with \`node check.js https://YOUR_SERVER\` from a participant's network.
 `);
-  const names = ['pair-notebook-ws-server.sh', 'relay.js', 'check.js', 'README.md', 'LICENSE'];
+  for (const name of ['pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1']) await fs.copyFile(path.join(root, 'deploy/relay', name), path.join(relay, name));
+  const names = ['pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE'];
   const manifest = JSON.parse(await fs.readFile(path.join(relay, 'BUILD.json'), 'utf8'));
   manifest.files = {};
   for (const name of names) manifest.files[name] = createHash('sha256').update(await fs.readFile(path.join(relay, name))).digest('hex');

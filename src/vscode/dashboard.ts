@@ -2,11 +2,11 @@ import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { normalizeRecentProjects, presentRecentExit } from '../core/recentProjects';
 import { SessionRuntime, SessionSnapshot } from '../runtime/session';
-import type { PersistentSessionView } from '../vps/persistentProtocol';
+import type { ServerSessionView } from './serverSessionView';
 
 interface DashboardState {
   live: boolean;
-  persistent?: PersistentSessionView & { endpoint?: string; connected?: boolean };
+  persistent?: ServerSessionView & { endpoint?: string; connected?: boolean };
   isHost?: boolean;
   recent?: Array<{
     name: string;
@@ -72,6 +72,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
   public constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly log?: vscode.OutputChannel,
+    private readonly sessionPassword: () => Promise<string | undefined> = async () => undefined,
   ) {}
 
   public resolveWebviewView(view: vscode.WebviewView): void {
@@ -90,6 +91,16 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
         : '';
       if (requested === 'webviewReady') {
         this.push(true);
+        return;
+      }
+      if (requested === 'revealVpsPassword') {
+        const session = this.persistent;
+        if (!session || session.connected === false) return;
+        this.runBackground('Reveal session password', async () => {
+          const password = await this.sessionPassword();
+          if (this.persistent?.id !== session.id || this.persistent?.memberId !== session.memberId || this.persistent?.endpoint !== session.endpoint) return;
+          await this.view?.webview.postMessage({ type: 'sessionPassword', sessionId: session.id, memberId: session.memberId, value: password });
+        });
         return;
       }
       if (requested === 'webviewError') {
@@ -121,7 +132,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.view?.show?.(true);
   }
 
-  public setPersistentSession(view: PersistentSessionView | undefined, endpoint?: string, connected = true): void {
+  public setPersistentSession(view: ServerSessionView | undefined, endpoint?: string, connected = true): void {
     this.persistent = view ? { ...view, connected, ...(endpoint ? { endpoint } : {}) } : undefined;
     this.push(true);
   }
@@ -173,6 +184,9 @@ const commandMap: Record<string, string> = {
   uploadVps: 'pairNotebook.uploadVpsFolder',
   restartVps: 'pairNotebook.restartVpsKernel',
   recoverVps: 'pairNotebook.recoverVpsExecution',
+  copyVpsPassword: 'pairNotebook.copyVpsSessionPassword',
+  changeVpsPassword: 'pairNotebook.changeVpsSessionPassword',
+  inviteVps: 'pairNotebook.copyVpsInvitation',
   start: 'pairNotebook.startSession',
   join: 'pairNotebook.joinSession',
   vps: 'pairNotebook.configureVpsSessions',
@@ -218,9 +232,9 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
     live: true,
     isHost: snapshot.isHost,
     projectName: snapshot.descriptor.projectName,
-    mode: snapshot.descriptor.mode === 'resilient' ? 'Закреплённый хост' : 'Только хост',
+    mode: snapshot.descriptor.mode === 'resilient' ? 'Persistent host' : 'Host only',
     durationSeconds: Math.floor((Date.now() - snapshot.startedAt) / 1000),
-    hostName: host?.peer.displayName ?? snapshot.peers.find((peer) => peer.peerId === snapshot.clock.hostId)?.displayName ?? 'Недоступно',
+    hostName: host?.peer.displayName ?? snapshot.peers.find((peer) => peer.peerId === snapshot.clock.hostId)?.displayName ?? 'Unavailable',
     participants: snapshot.peers.map((peer) => {
       const state = presence.get(peer.peerId);
       const gpu = state?.hardware?.gpus[0];
@@ -228,10 +242,10 @@ function toDashboardState(snapshot: SessionSnapshot, localPresence?: ReturnType<
       return {
         id: peer.peerId,
         name: state?.peer.displayName ?? peer.displayName,
-        role: `${peer.peerId === snapshot.clock.hostId ? '👑 ХОСТ ' : ''}${peer.peerId === snapshot.computeExecutorId ? '⚡ ВЫЧИСЛЕНИЯ' : ''}`.trim(),
+        role: `${peer.peerId === snapshot.clock.hostId ? '👑 HOST ' : ''}${peer.peerId === snapshot.computeExecutorId ? '⚡ COMPUTE' : ''}`.trim(),
         active: state?.activeFile
           ? `${state.activeFile}${state.activeNotebookCell !== undefined ? ` • ячейка ${state.activeNotebookCell + 1}` : ''}`
-          : 'Нет активного файла',
+          : 'No active file',
         latency: peer.connectionState === 'recovering' ? -1 : peer.latency,
         hardware: gpu
           ? `${gpu.model} • ${(gpu.vramMb / 1024).toFixed(0)} GB`
@@ -410,19 +424,26 @@ function html(): string {
     .color-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; border: 1px solid var(--vscode-contrastBorder, transparent); }
     details { margin-top: 10px; border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); border-radius: 6px; padding: 7px; }
     summary { color: var(--vscode-foreground); cursor: pointer; font-size: 11px; font-weight: 600; user-select: none; }
+    .password-row { margin-top: 9px; }
+    .password-row input { min-width: 0; width: 100%; border: 1px solid var(--vscode-input-border, transparent); color: var(--vscode-input-foreground); background: var(--vscode-input-background); padding: 4px 6px; box-sizing: border-box; }
+    .icon-button { flex: none; padding: 4px 6px; }
+    .endpoint { overflow-wrap: anywhere; margin-bottom: 7px; }
     .danger { color: var(--vscode-errorForeground) !important; }
   </style>
 </head>
 <body>
   <h1>PAIR NOTEBOOK</h1>
   <main id="content">
-    <p class="hero">Совместная работа с Jupyter и кодом через защищённое P2P-подключение.</p>
-    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Начать временную сессию</a><a class="fallback-button" href="command:pairNotebook.joinSession">Подключиться к временной сессии</a><a class="fallback-button" href="command:pairNotebook.createVpsSession">Создать постоянную vps-сессию</a><a class="fallback-button" href="command:pairNotebook.joinVpsSession">Подключиться к постоянной сессии</a><a class="fallback-button" href="command:pairNotebook.configureVpsSessions">Настроить свои постоянные сессии</a></div>
-    <p class="tiny">Если интерактивная панель не загрузится, эти команды всё равно работают.</p>
+    <p class="hero">Collaborate on notebooks and code in encrypted sessions.</p>
+    <div class="actions"><a class="fallback-button" href="command:pairNotebook.startSession">Start self-host session</a><a class="fallback-button" href="command:pairNotebook.joinSession">Join self-host session</a><a class="fallback-button" href="command:pairNotebook.createVpsSession">Create server project</a><a class="fallback-button" href="command:pairNotebook.joinVpsSession">Connect to server</a><a class="fallback-button" href="command:pairNotebook.configureVpsSessions">Saved connections</a></div>
+    <p class="tiny">These commands also work if the interactive panel cannot load.</p>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     let state = { live: false };
+    let revealedPassword;
+    let passwordIdentity = '';
+    let passwordRequested = false;
     const command = (name) => vscode.postMessage({ command: name });
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const duration = (seconds) => [Math.floor(seconds/3600), Math.floor(seconds/60)%60, seconds%60].map(x => String(x).padStart(2,'0')).join(':');
@@ -437,7 +458,7 @@ function html(): string {
       return palette.map(item => ({ name:item[0], distance:rgb(item[1]).reduce((sum,part,index) => sum + (part-current[index])**2,0) })).sort((a,b) => a.distance-b.distance)[0].name;
     };
     const value = (text, enabled) => '<span class="button-value '+(enabled===true?'on':enabled===false?'off':'')+'">'+esc(text)+'</span>';
-    const toggle = (id, pressed, label) => '<button id="'+id+'" class="secondary toggle" aria-pressed="'+Boolean(pressed)+'" title="'+esc(label+': '+(pressed?'включено':'выключено'))+'"><span class="button-label">'+esc(label)+'</span>'+value(pressed?'ВКЛ':'ВЫКЛ',Boolean(pressed))+'</button>';
+    const toggle = (id, pressed, label) => '<button id="'+id+'" class="secondary toggle" aria-pressed="'+Boolean(pressed)+'" title="'+esc(label+': '+(pressed?'включено':'выключено'))+'"><span class="button-label">'+esc(label)+'</span>'+value(pressed?'ON':'OFF',Boolean(pressed))+'</button>';
     const action = (id, label, current, options={}) => {
       const fullLabel = String(options.title || (current ? label+': '+current : label));
       const classes = (options.secondary===false?'':'secondary')+(options.danger?' danger':'')+(options.wide?' wide':'')+(options.path?' path-action':'');
@@ -446,20 +467,25 @@ function html(): string {
       return '<span id="'+id+'Tooltip" class="action-tooltip'+(options.wide?' wide':'')+'" data-tooltip="'+esc(fullLabel)+'"'+(options.disabled?' tabindex="0" role="group" aria-label="'+esc(fullLabel)+'"':'')+'>'+button+'</span>';
     };
     const section = (id, title, content, className='') => '<section class="section '+className+'" aria-labelledby="'+id+'Title"><h2 id="'+id+'Title">'+esc(title)+'</h2><div class="section-content">'+content+'</div></section>';
+    const eyeIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const eyeOffIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m3 3 18 18M10 5c7-1 12 7 12 7s-2 4-6 6M6 6c-3 2-4 6-4 6s4 7 10 7h2"/></svg>';
+    const sessionHeader = (status, label, name, mode) => '<div class="connection '+status+'">'+esc(label)+'</div><div class="titleline"><div class="title">'+esc(name)+'</div><span class="badge">'+esc(mode)+'</span></div>';
+    const participantCard = (name, role, detail, extra) => '<div class="card participant"><div class="row"><strong>'+esc(name)+'</strong><span>'+esc(detail)+'</span></div>'+(role?'<div class="role">'+esc(role)+'</div>':'')+extra+'</div>';
+    const computeSummary = (name, device, cpu, status, extra) => '<div class="card"><div class="row"><strong>'+esc(name)+'</strong><span class="badge">'+esc(device)+'</span></div><div class="tiny">'+esc(cpu)+'</div><div class="tiny">'+esc(status)+'</div>'+extra+'</div>';
     const connection = () => {
-      if (state.closed) return { className:'offline', text:'○ СЕССИЯ ЗАВЕРШЕНА' };
-      if (state.runtimeState === 'host-unavailable') return { className:'offline', text:'○ ХОСТ НЕДОСТУПЕН' };
+      if (state.closed) return { className:'offline', text:'○ SESSION ENDED' };
+      if (state.runtimeState === 'host-unavailable') return { className:'offline', text:'○ HOST OFFLINE' };
       if (state.waitingForHostFolder) return { className:'pending', text:'Ⅱ ПАУЗА • ОЖИДАНИЕ ПАПКИ ХОСТА' };
-      if (state.runtimeState === 'connecting') return { className:'pending', text:'◐ ПОДКЛЮЧЕНИЕ' };
-      if (state.runtimeState === 'reconnecting') return { className:'pending', text:'◐ ПЕРЕПОДКЛЮЧЕНИЕ' };
-      if (['executor-unavailable','kernel-failed','file-synchronization-failed'].includes(state.runtimeState)) return { className:'pending', text:'● В СЕТИ • ЕСТЬ ПРОБЛЕМА' };
-      return { className:'online', text:'● В СЕТИ' };
+      if (state.runtimeState === 'connecting') return { className:'pending', text:'◐ CONNECTING' };
+      if (state.runtimeState === 'reconnecting') return { className:'pending', text:'◐ RECONNECTING' };
+      if (['executor-unavailable','kernel-failed','file-synchronization-failed'].includes(state.runtimeState)) return { className:'pending', text:'● ONLINE • NEEDS ATTENTION' };
+      return { className:'online', text:'● ONLINE' };
     };
     function render() {
       const root = document.getElementById('content');
       if (!state.live) {
-        const recent = (state.recent || []).map(item => '<div class="card"><strong>Сессия: '+esc(item.name)+'</strong><div>Хост: '+esc(item.hostName)+'</div><div class="tiny">Вы вышли '+esc(item.relativeExit)+' • '+esc(item.exitDate)+'</div><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
-        root.innerHTML = '<p class="hero">Совместная работа с Jupyter и кодом с задержкой, близкой к сетевой.</p><div class="actions"><button id="start">Начать временную сессию</button><button id="join" class="secondary">Подключиться к временной сессии</button><button id="createVps" class="secondary">Создать постоянную vps-сессию</button><button id="joinVps" class="secondary">Подключиться к постоянной сессии</button><button id="vps" class="secondary">Настроить свои постоянные сессии</button></div>'+(recent?'<h2>НЕДАВНИЕ ПРОЕКТЫ</h2>'+recent+'<button id="recent" class="secondary">Открыть недавний</button>':'');
+        const recent = (state.recent || []).map(item => '<div class="card"><strong>Session: '+esc(item.name)+'</strong><div>Host: '+esc(item.hostName)+'</div><div class="tiny">Left '+esc(item.relativeExit)+' • '+esc(item.exitDate)+'</div><div class="tiny">'+esc(item.folder)+'</div></div>').join('');
+        root.innerHTML = '<p class="hero">Collaborate on notebooks and code in encrypted sessions.</p><div class="actions"><button id="start">Start self-host session</button><button id="join" class="secondary">Join self-host session</button><button id="createVps" class="secondary">Create server project</button><button id="joinVps" class="secondary">Connect to server</button><button id="vps" class="secondary">Saved connections</button></div>'+(recent?'<h2>RECENT PROJECTS</h2>'+recent+'<button id="recent" class="secondary">Open recent</button>':'');
         document.getElementById('start').onclick = () => command('start');
         document.getElementById('join').onclick = () => command('join');
         document.getElementById('vps').onclick = () => command('vps');
@@ -470,14 +496,35 @@ function html(): string {
       }
       if (state.persistent) {
         const session = state.persistent;
-        const target = session.devices.find(device => device.id === session.target.deviceId);
+        const target = session.devices.find(device => device.id === (session.activeKernel?.deviceId || session.target.deviceId));
         const owner = session.members.find(member => member.id === session.ownerId);
         const own = session.memberId === session.ownerId;
-        const members = session.members.map(member => '<div class="card"><strong>'+esc(member.name)+'</strong><div class="tiny">'+esc(member.role === 'owner' ? 'Владелец' : member.role === 'admin' ? 'Администратор' : 'Участник')+' · '+(member.online ? 'В сети' : 'Не в сети')+'</div></div>').join('');
-        const controls = action('computeVps','Выбрать вычислитель',target?.name || session.target.deviceId)+action('shareVps','Мой компьютер','НАСТРОИТЬ')+action('manageVps','Управление сессией','ОТКРЫТЬ')+(own ? action('uploadVps','Загрузить файлы на сервер','ОТКРЫТЬ')+action('permissions','Права участников','НАСТРОИТЬ') : '')+action('restartVps','Перезапустить kernel','ОТКРЫТЬ')+action('recoverVps','Результаты выполнения','ОТКРЫТЬ')+action('leaveVps','Покинуть сессию','ВЫЙТИ',{danger:true});
-        root.innerHTML = '<div class="connection '+(session.connected === false ? 'pending' : 'online')+'">'+(session.connected === false ? 'ВОССТАНАВЛИВАЕМ СОЕДИНЕНИЕ' : session.state === 'running' ? 'СЕССИЯ ПОДКЛЮЧЕНА' : 'СЕССИЯ ОСТАНОВЛЕНА')+'</div><div class="title">'+esc(session.name)+'</div><div class="badge">Сохранённый проект на сервере</div>'+section('persistentConnection','ПОДКЛЮЧЕНИЕ','<div class="card"><div>'+esc(session.endpoint)+'</div><div class="tiny">ID: '+esc(session.id)+'</div><div class="tiny">Папка проекта: Server project: '+esc(session.name)+'</div><div class="tiny">pair-vps://'+esc(session.id)+'/</div><div class="tiny">Владелец: '+esc(owner?.name)+' · '+(owner?.online ? 'В сети' : 'Не в сети')+'</div></div>')+section('persistentCompute','ВЫЧИСЛЕНИЯ','<div class="card"><strong>'+esc(target?.name || session.target.deviceId)+'</strong><div>'+esc(target?.cpu)+'</div><div class="tiny">'+esc(target?.python)+' · '+(session.target.gpuUuid ? 'GPU' : 'CPU')+' · '+(target?.online ? 'В сети' : 'Недоступен')+'</div><div class="tiny">'+esc((target?.diagnostics || []).join('; '))+'</div></div>')+section('persistentMembers','УЧАСТНИКИ: '+session.members.filter(member => member.online).length,members)+section('persistentActions','ДЕЙСТВИЯ','<div class="actions">'+controls+'</div>');
-        for (const name of ['computeVps','shareVps','manageVps','uploadVps','permissions','restartVps','recoverVps','leaveVps']) {
-          const button = document.getElementById(name); if (button) button.onclick = () => command(name);
+        const identity = [session.endpoint, session.id, session.memberId].join('|');
+        if (passwordIdentity !== identity || session.connected === false) { revealedPassword = undefined; passwordRequested = false; passwordIdentity = identity; }
+        const detailsOpen = document.getElementById('moreActions')?.open ?? false;
+        const online = session.members.filter(member => member.online);
+        const people = online.map(member => participantCard(member.name, member.id === session.ownerId ? 'Owner' : member.role === 'admin' ? 'Administrator' : 'Participant', member.id === session.memberId ? 'You' : '', '')).join('') || '<div class="tiny">No participants online</div>';
+        const kernel = session.activeKernel;
+        const scope = kernel?.scope === 'private' ? 'Private' : 'Shared';
+        const password = '<div class="password-row"><span class="tiny">Session password</span><div class="row"><input id="sessionPassword" readonly aria-label="Session password" type="'+(revealedPassword === undefined ? 'password' : 'text')+'" value="'+esc(revealedPassword === undefined ? '************' : revealedPassword)+'" /><button id="togglePassword" class="secondary icon-button" aria-label="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'" title="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'">'+(revealedPassword === undefined ? eyeIcon : eyeOffIcon)+'</button>'+(revealedPassword === undefined ? '' : action('copyVpsPassword','Copy',''))+'</div></div>';
+        const connectionCard = '<div class="card"><div class="tiny">Server address</div><div class="endpoint">'+esc(session.endpoint)+'</div><div class="row"><span>Owner</span><strong>'+esc(owner?.name || 'Unknown')+(own ? ' (you)' : '')+'</strong></div>'+password+'</div>';
+        const hostCard = '<div class="card"><div class="row"><strong>VPS</strong><span class="badge">Host</span></div><div class="tiny">'+esc(session.endpoint)+'</div></div>';
+        const kernelDetail = kernel ? '<div class="row"><span>'+scope+' kernel</span><strong>'+esc(kernel.notebook)+'</strong></div><div class="tiny">'+(kernel.scope === 'private' ? 'Only the project owner can access this kernel and its results.' : 'Everyone with access to this notebook shares its Python variables and results.')+'</div>' : '<div class="tiny">Open a notebook in this server project to select its kernel.</div>';
+        const computeCard = computeSummary(target?.name || session.target.deviceId, session.target.gpuUuid ? 'GPU' : 'CPU', target?.cpu || '', target?.online ? 'Online' : 'Offline', kernelDetail);
+        const controls = action('computeVps','Compute',target?.name || session.target.deviceId)+action('restartVps','Restart '+scope.toLowerCase()+' kernel','Restart',{disabled:!kernel?.canRestart || session.connected === false,title:kernel ? 'Restart '+scope.toLowerCase()+' kernel for '+kernel.notebook+'; clear Python variables' : 'Open a server notebook first'})+(own ? action('inviteVps','Invitation','Copy',{secondary:false})+action('uploadVps','Upload files','Upload') : '')+action('leaveVps','Leave session','Leave',{danger:true});
+        root.innerHTML = sessionHeader(session.connected === false ? 'pending' : session.state === 'running' ? 'online' : 'offline', session.connected === false ? 'Reconnecting' : session.state === 'running' ? 'Connected' : 'Stopped', session.name, 'Server project')+
+          section('connectionSection','Connection',connectionCard,'section-connection')+
+          section('host','Session host',hostCard)+
+          section('participants','Participants online: '+online.length,people,'section-participants')+
+          section('compute','Compute',computeCard,'section-compute')+
+          section('quickActions','Quick actions','<div class="actions">'+controls+'</div>')+
+          '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary>More actions</summary><div class="actions">'+action('shareVps','My computer','Configure')+action('manageVps','Manage session','Manage')+(own ? action('permissions','Participant permissions','Configure')+action('changeVpsPassword','Session password','Change') : '')+action('recoverVps','Recover interrupted run','Recover',{title:'Restore an interrupted execution into its notebook cells'})+'</div></details>';
+        document.getElementById('togglePassword').onclick = () => {
+          if (revealedPassword !== undefined || passwordRequested) { revealedPassword = undefined; passwordRequested = false; render(); }
+          else { passwordRequested = true; command('revealVpsPassword'); }
+        };
+        for (const name of ['computeVps','shareVps','manageVps','uploadVps','permissions','restartVps','recoverVps','leaveVps','copyVpsPassword','changeVpsPassword','inviteVps']) {
+          const button = document.getElementById(name); if (button && !button.disabled) button.onclick = () => command(name);
         }
         return;
       }
@@ -488,20 +535,20 @@ function html(): string {
       const people = visibleParticipants.map(p => {
         const recovering = p.connectionState === 'recovering';
         const indicator = recovering ? '🟡' : '🟢';
-        const stateLine = recovering ? '<div class="tiny q-warn">↻ Восстанавливает соединение</div>' : '';
-        const latency = recovering || p.latency < 0 ? '—' : p.latency+' мс';
-        return '<div class="card participant"><div class="row"><strong>'+indicator+' '+esc(p.name)+'</strong><span>'+latency+'</span></div>'+(p.role?'<div class="role">'+esc(p.role)+'</div>':'')+stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div></div>';
-      }).join('') || '<div class="tiny">Нет подключённых участников</div>';
+        const stateLine = recovering ? '<div class="tiny q-warn">↻ Reconnecting</div>' : '';
+        const latency = recovering || p.latency < 0 ? '—' : p.latency+' ms';
+        return participantCard(indicator+' '+p.name,p.role,latency,stateLine+'<div class="tiny">'+esc(p.active)+'</div><div class="tiny">'+esc(p.hardware)+'</div><div class="tiny">'+esc(p.load)+'</div>');
+      }).join('') || '<div class="tiny">No participants online</div>';
       const connectionState = connection();
       const conn = state.connection;
       const remoteStatusLines = { 'checking-better-route': 'проверяет лучший маршрут…', 'switching-path': 'переключает сетевой путь…', 'switched-path': 'сменил(а) сетевой путь' };
       const upgradeLines = { requesting: 'Проверяем возможность прямого соединения…', 'waiting-peer': 'Согласуем проверку нового маршрута…', authenticating: 'Проверяем новое соединение…', verifying: 'Проверяем стабильность прямого канала…', promoting: 'Переключаемся на лучшее соединение…', completed: 'Соединение улучшено', failed: 'Улучшить не удалось — текущее соединение сохранено' };
-      let connCard = '<div class="tiny">Нет подключённых участников</div>';
+      let connCard = '<div class="tiny">No participants online</div>';
       if (conn && conn.peers.length) {
         const rows = conn.peers.map(p => {
           const cls = p.quality === 'good' ? 'q-good' : p.quality === 'degraded' ? 'q-degraded' : 'q-unknown';
           const routeLabel = p.routeType === 'direct' ? 'Прямой P2P · WebRTC' : 'Резервный шифрованный релей';
-          const rtt = p.latencyMs >= 0 ? ' · ' + p.latencyMs + ' мс' : '';
+          const rtt = p.latencyMs >= 0 ? ' · ' + p.latencyMs + ' ms' : '';
           let line = '<div class="row"><span class="dot ' + cls + '" role="img" aria-label="' + esc(qualityLabel(p.quality)) + '"></span><strong>' + esc(p.name) + '</strong><span class="muted">' + esc(routeLabel) + esc(rtt) + '</span></div>';
           if (p.upgradeStatus && !['completed','failed'].includes(p.upgradeStatus)) {
             line += '<div class="tiny q-warn">↻ ' + esc(upgradeLines[p.upgradeStatus] || 'Проверяем лучший маршрут…') + ' Текущее соединение активно.</div>';
@@ -513,29 +560,29 @@ function html(): string {
           return line;
         }).join('');
         const assessmentCls = conn.optimizing ? 'q-warn' : (conn.peers.some(p => p.routeType === 'relay') ? 'q-warn' : 'q-ok');
-        const improveBtn = action('improve', 'Попробовать улучшить', conn.optimizing ? 'ПРОВЕРЯЕМ…' : 'ЗАПУСТИТЬ', { disabled: conn.optimizing, secondary: true, wide: true, title: 'Текущее соединение не будет разорвано: новый путь проверяется параллельно' });
+        const improveBtn = action('improve', 'Попробовать улучшить', conn.optimizing ? 'ПРОВЕРЯЕМ…' : 'RUN', { disabled: conn.optimizing, secondary: true, wide: true, title: 'Текущее соединение не будет разорвано: новый путь проверяется параллельно' });
         connCard = '<div class="card">' + rows + '<div class="tiny ' + assessmentCls + '">' + esc(conn.assessment) + '</div>' + improveBtn + '</div>';
       }
       const statusCard = '<div class="card"><strong>'+esc(stateNames[state.runtimeState]||state.runtimeState)+'</strong><div class="tiny">'+esc(state.runtimeDetail)+'</div></div>';
       const hostCard = '<div class="card"><strong>👑 '+esc(state.hostName)+'</strong></div>';
-      const computeCard = '<div class="card"><div class="row"><strong>🖥 '+esc(state.compute?.name)+'</strong><span class="badge">'+esc(state.compute?.device)+'</span></div><div class="tiny">'+esc(state.compute?.cpu)+'</div><div class="tiny">'+esc(state.compute?.execution)+'</div><div class="tiny">Python '+esc(state.compute?.python)+' • '+esc(kernelNames[state.compute?.kernel]||state.compute?.kernel)+'</div></div>';
+      const computeCard = computeSummary(state.compute?.name,state.compute?.device,state.compute?.cpu,state.compute?.execution,'<div class="tiny">Python '+esc(state.compute?.python)+' • '+esc(kernelNames[state.compute?.kernel]||state.compute?.kernel)+'</div>');
       const networkCard = '<div class="card"><div class="row"><span>Прямые P2P-подключения</span><span>'+esc(state.network?.direct)+'</span></div><div class="row"><span>↓ '+bytes(state.network?.down||0)+'</span><span>↑ '+bytes(state.network?.up||0)+'</span></div><div class="tiny">'+esc(state.network?.address)+'</div></div>';
-      const autosaveFolder = state.autosave?.folder || 'Папка не выбрана';
+      const autosaveFolder = state.autosave?.folder || 'No folder selected';
       const paused = Boolean(state.waitingForHostFolder);
-      const quickActions = '<div class="actions">'+action('shell','Терминал хоста',state.isHost?'ВВОД КОМАНД':'ПРОСМОТР')+action('invite','Приглашение',state.isHost?'КОПИРОВАТЬ':'ТОЛЬКО ХОСТ',{secondary:false,disabled:!state.isHost||paused})+action('compute','⚙ Вычисления',state.isHost?state.compute?.device:'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('flush','Сохранить',state.isHost?'ХОСТ':'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveNow','Автосейв',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'ТОЛЬКО ХОСТ',{disabled:!state.isHost||paused})+action('autosaveFolder','Папка автосейвов',autosaveFolder,{disabled:!state.isHost||paused,title:'Папка автосейвов: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
-      const transferAction = state.isHost && paused ? '' : action('transfer','Передать хоста',state.hostName,{disabled:!state.isHost});
-      const endAction = state.isHost && !paused ? action('end','Завершить сессию','ДЛЯ ВСЕХ',{danger:true,title:'Завершить сессию для всех участников'}) : '';
-      const pauseAction = paused && state.isHost ? '<div class="actions">'+action('backingFolder','Настроить папку нового хоста','ПРОДОЛЖИТЬ',{secondary:false,wide:true})+action('transfer','Передать хоста','ДРУГОМУ УЧАСТНИКУ',{secondary:true,wide:true})+action('end','Завершить сессию','БЕЗ НОВОЙ ПАПКИ',{danger:true,wide:true,title:'Завершить сессию и сохранить состояние в локальных рабочих копиях'})+'</div>' : '';
+      const quickActions = '<div class="actions">'+action('shell','Host terminal',state.isHost?'TYPE COMMANDS':'VIEW')+action('invite','Invitation',state.isHost?'COPY':'HOST ONLY',{secondary:false,disabled:!state.isHost||paused})+action('compute','Compute',state.isHost?state.compute?.device:'HOST ONLY',{disabled:!state.isHost||paused})+action('flush','Save',state.isHost?'ХОСТ':'HOST ONLY',{disabled:!state.isHost||paused})+action('autosaveNow','Autosave',state.isHost?(state.autosave?.copies||0)+'/'+(state.autosave?.retention||3):'HOST ONLY',{disabled:!state.isHost||paused})+action('autosaveFolder','Autosave folder',autosaveFolder,{disabled:!state.isHost||paused,title:'Autosave folder: '+autosaveFolder,tooltip:true,wide:true,path:true})+'</div>';
+      const transferAction = state.isHost && paused ? '' : action('transfer','Transfer host',state.hostName,{disabled:!state.isHost});
+      const endAction = state.isHost && !paused ? action('end','End session','FOR EVERYONE',{danger:true,title:'End session for everyone'}) : '';
+      const pauseAction = paused && state.isHost ? '<div class="actions">'+action('backingFolder','Choose new host folder','CONTINUE',{secondary:false,wide:true})+action('transfer','Transfer host','TO ANOTHER PARTICIPANT',{secondary:true,wide:true})+action('end','End session','WITHOUT A NEW FOLDER',{danger:true,wide:true,title:'End session и сохранить состояние в локальных рабочих копиях'})+'</div>' : '';
       const pauseNotice = paused ? '<div class="card"><strong>Совместная сессия приостановлена</strong><div class="tiny">'+esc(state.isHost?'Настройте общую папку, передайте роль хоста или завершите сессию. Отменённый выбор папки можно открыть снова.':'Новый хост выбирает папку, передаёт роль или завершает сессию. Дождитесь его решения.')+'</div>'+pauseAction+'</div>' : '';
-      root.innerHTML = '<div class="connection '+connectionState.className+'">'+esc(connectionState.text)+'</div><div class="titleline"><div class="title">'+esc(state.projectName)+'</div><span class="badge" title="Режим сессии">'+esc(state.mode)+'</span></div><div class="muted">'+duration(state.durationSeconds||0)+'</div>'+pauseNotice+
-        section('connectionSection','СОЕДИНЕНИЕ',connCard,'section-connection')+
-        section('status','СОСТОЯНИЕ',statusCard)+
-        section('host','ХОСТ СЕССИИ',hostCard)+
-        section('participants','УЧАСТНИКИ В СЕТИ: '+onlineParticipants.length,people,'section-participants')+
-        section('compute','ВЫЧИСЛЕНИЯ',computeCard,'section-compute')+
-        section('network','СЕТЬ',networkCard)+
-        section('quickActions','БЫСТРЫЕ ДЕЙСТВИЯ',quickActions)+
-        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">Дополнительные действия</summary><div class="actions">'+transferAction+action('permissions','Права участников','НАСТРОИТЬ',{disabled:!state.isHost})+action('diagnostics','Диагностика','ОТКРЫТЬ')+action('advancedDiag','Расширенная диагностика','ЗАПУСТИТЬ',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Покинуть сессию','ВЫЙТИ',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
+      root.innerHTML = sessionHeader(connectionState.className,connectionState.text,state.projectName,state.mode)+'<div class="muted">'+duration(state.durationSeconds||0)+'</div>'+pauseNotice+
+        section('connectionSection','CONNECTION',connCard,'section-connection')+
+        section('status','STATUS',statusCard)+
+        section('host','SESSION HOST',hostCard)+
+        section('participants','PARTICIPANTS ONLINE: '+onlineParticipants.length,people,'section-participants')+
+        section('compute','COMPUTE',computeCard,'section-compute')+
+        section('network','NETWORK',networkCard)+
+        section('quickActions','QUICK ACTIONS',quickActions)+
+        '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary id="moreActionsSummary">More actions</summary><div class="actions">'+transferAction+action('permissions','Participant permissions','CONFIGURE',{disabled:!state.isHost})+action('diagnostics','Diagnostics','OPEN')+action('advancedDiag','Advanced diagnostics','RUN',{secondary:true,title:'Пассивная проверка сети: адаптеры (VPN/TUN), DNS, прокси, TURN-транспорты. Только чтение; права администратора не требуются и ничего в системе не изменяется.'})+action('leave','Leave session','LEAVE',{danger:true,disabled:paused&&state.isHost})+endAction+'</div></details>';
       for (const name of ['permissions','backingFolder','shell','invite','compute','flush','autosaveNow','autosaveFolder','transfer','diagnostics','leave','end','improve','advancedDiag']) {
         const button = document.getElementById(name);
         if (button && !button.disabled) button.onclick = () => command(name);
@@ -544,7 +591,12 @@ function html(): string {
     }
     window.addEventListener('message', event => {
       const message = event.data;
-      if (!message || typeof message !== 'object' || message.type !== 'state' || !message.patch || typeof message.patch !== 'object') return;
+      if (!message || typeof message !== 'object') return;
+      if (message.type === 'sessionPassword') {
+        if (passwordRequested && message.sessionId === state.persistent?.id && message.memberId === state.persistent?.memberId) { revealedPassword = typeof message.value === 'string' ? message.value : undefined; passwordRequested = false; render(); }
+        return;
+      }
+      if (message.type !== 'state' || !message.patch || typeof message.patch !== 'object') return;
       state = message.replace ? message.patch : Object.assign({}, state, message.patch);
       render();
     });
@@ -552,7 +604,7 @@ function html(): string {
       render();
       command('webviewReady');
     } catch (error) {
-      document.getElementById('content').innerHTML = '<div class="card danger"><strong>Панель не загрузилась</strong><div class="tiny">'+esc(error?.message||error)+'</div></div>';
+      document.getElementById('content').innerHTML = '<div class="card danger"><strong>Panel could not load</strong><div class="tiny">'+esc(error?.message||error)+'</div></div>';
       vscode.postMessage({ command:'webviewError', detail:String(error?.stack||error) });
     }
   </script>

@@ -1,4 +1,5 @@
 import { LineCommentController, peerCommentBackend } from './vscode/lineComments';
+import { prepareExtensionStorage, clearLocalConnections } from './vscode/extensionStorage';
 import { editParticipantPermissions } from './vscode/permissions';
 import { lstat, mkdir, open, rm } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
@@ -112,6 +113,7 @@ let lifecycleWatchdog: NodeJS.Timeout | undefined;
 let lifecycleReadyRuntime: SessionRuntime | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  context = await prepareExtensionStorage(context);
   activationContext = context;
   output = vscode.window.createOutputChannel('Pair Notebook');
   output.appendLine(`[info] Activated Pair Notebook ${context.extension.packageJSON.version}; path=${context.extensionPath}; protocol=1`);
@@ -122,13 +124,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (proxyMigrationPending) {
     await context.globalState.update(PROXY_CREDENTIAL_MIGRATION_KEY, PROXY_CREDENTIAL_MIGRATION_VERSION);
   }
-  dashboard = new DashboardProvider(context, output);
+  dashboard = new DashboardProvider(context, output, async () => persistentController?.getSessionPassword());
   notebookController = new PairNotebookController(output);
   const vpsCompute = new VpsComputeController(context, () => runtime);
   persistentController = new PersistentSessionController(context, output, notebookController.controller,
     (view, endpoint, connected) => dashboard.setPersistentSession(view, endpoint, connected), () => !runtime);
   notebookController.persistent = persistentController;
   context.subscriptions.push(persistentController);
+  register(context, 'pairNotebook.forgetAllConnections', async () => {
+    if (runtime) await vscode.commands.executeCommand('pairNotebook.leaveSession');
+    await persistentController?.leave();
+    await clearLocalConnections(context);
+    dashboard.refresh();
+    void vscode.window.showInformationMessage('Pair Notebook connections and local session caches cleared. Server files were retained.');
+  });
   context.subscriptions.push(new LineCommentController((document) => persistentController?.commentBackend(document) ?? (runtime ? peerCommentBackend(runtime, document) : undefined)));
   register(context, 'pairNotebook.managePermissions', async () => {
     const active = runtime;

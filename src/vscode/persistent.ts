@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { open, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
+import type { ServerSessionView } from './serverSessionView';
 import * as vscode from 'vscode';
 import type { JupyterKernelEvent } from '../core/pythonKernel';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
@@ -27,6 +29,9 @@ interface ActiveConnection extends SavedConnection { client: PersistentClient }
 
 function membershipKey(connection: SavedConnection): string {
   return `pairNotebook.persistentMembership.${createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId])).digest('hex')}`;
+}
+function sessionPasswordKey(connection: Pick<SavedConnection, 'endpoint' | 'sessionId'>): string {
+  return `pairNotebook.sessionPassword.${createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId])).digest('hex')}`;
 }
 function filePath(uri: vscode.Uri): string {
   const value = uri.path.replace(/^\//, '');
@@ -286,10 +291,11 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private readonly latestExecutions = new Map<string, { connection: ActiveConnection; execution: PersistentExecution }>();
 
   public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel, notebook: vscode.NotebookController,
-    private readonly sessionChanged: (view: PersistentSessionView | undefined, endpoint?: string, connected?: boolean) => void = () => undefined,
+    private readonly sessionChanged: (view: ServerSessionView | undefined, endpoint?: string, connected?: boolean) => void = () => undefined,
     private readonly canAttach: () => boolean = () => true) {
     this.notebook = notebook;
     this.status.command = 'pairNotebook.manageVpsSession';
+    if (vscode.window.onDidChangeActiveNotebookEditor) this.disposables.push(vscode.window.onDidChangeActiveNotebookEditor(() => this.updateUi()));
     const timer = setInterval(() => { void this.poll(); }, 2_000);
     timer.unref();
     this.textSync = new PersistentTextSynchronizer(context, () => this.connection, log);
@@ -338,17 +344,21 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       'pairNotebook.shareVpsComputer': () => this.shareComputer(),
       'pairNotebook.recoverVpsExecution': () => this.recoverExecution(),
       'pairNotebook.restartVpsKernel': () => this.restartKernel(),
+      'pairNotebook.copyVpsSessionPassword': () => this.copySessionPassword(),
+      'pairNotebook.changeVpsSessionPassword': () => this.changeSessionPassword(),
+      'pairNotebook.copyVpsInvitation': () => this.copyInvitation(),
       'pairNotebook.releaseVpsKernel': () => this.releaseKernel(),
       'pairNotebook.refreshVpsSession': () => this.refresh(),
       'pairNotebook.vpsFolderPublic': (uri: vscode.Uri) => this.visibility(uri, 'public'),
       'pairNotebook.vpsFolderPrivate': (uri: vscode.Uri) => this.visibility(uri, 'private'),
     };
     for (const [id, callback] of Object.entries(commands)) this.disposables.push(vscode.commands.registerCommand(id, async (...args: never[]) => {
-      try { await callback(...args); }
+      try { return await callback(...args); }
       catch (error) {
         if (isPermanentConnectionError(error)) { this.connectionProblem(error); return; }
         this.log.appendLine('[error] Server project command failed; see the VS Code notification.');
         void vscode.window.showErrorMessage(`Pair Notebook server: ${error instanceof Error ? error.message : 'Operation failed.'}`);
+        return undefined;
       }
     }));
     let restoreAttempt = this.connectionAttempt;
@@ -464,7 +474,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       { label: 'Join using an invitation link', action: 'invitation' },
       { label: 'Create a persistent session', action: 'create' },
       { label: 'Import existing owner / member credential', action: 'import' },
-      ...saved.map((connection) => ({ label: `Подключиться: ${connection.name}`, description: `${connection.endpoint} · ${connection.role ?? 'saved identity'} · ${connection.memberId.slice(0, 8)}`, action: 'resume', connection })),
+      ...saved.map((connection) => ({ label: `Connect: ${connection.name}`, description: `${connection.endpoint} · ${connection.role ?? 'saved identity'} · ${connection.memberId.slice(0, 8)}`, action: 'resume', connection })),
     ], { title: 'Server project sessions' });
     if (!selection) return;
     if (selection.action === 'join') await this.join();
@@ -482,18 +492,18 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (this.connection) { await this.manage(); return; }
     const saved = this.context.globalState.get<SavedConnection[]>(CONNECTIONS_KEY, []);
     const selected = await vscode.window.showQuickPick([
-      { label: 'Добавить подключение к постоянной сессии', action: 'add' },
+      { label: 'Add server connection', action: 'add' },
       ...saved.map(connection => ({ label: connection.name, description: `${connection.endpoint} · ${connection.role ?? 'saved identity'} · ${connection.memberId.slice(0, 8)}`, action: 'saved', connection })),
-    ], { title: 'Настроить свои постоянные сессии' });
+    ], { title: 'Saved server connections' });
     if (!selected) return;
     if (selected.action === 'add' || !('connection' in selected)) { await this.connect(); return; }
     const connection = selected.connection;
-    const action = await vscode.window.showQuickPick(['Подключиться', 'Забыть это подключение'], { title: connection.name });
-    if (action === 'Подключиться') {
+    const action = await vscode.window.showQuickPick(['Connect', 'Forget connection'], { title: connection.name });
+    if (action === 'Connect') {
       const token = await this.context.secrets.get(membershipKey(connection));
       if (!token) throw new Error('This saved identity has no credential. Join the session again.');
       await this.attach(connection, token);
-    } else if (action === 'Забыть это подключение') {
+    } else if (action === 'Forget connection') {
       if (this.connection && membershipKey(this.connection) === membershipKey(connection)) await this.leave();
       await this.context.globalState.update(CONNECTIONS_KEY, saved.filter(item => membershipKey(item) !== membershipKey(connection)));
       await this.context.secrets.delete(membershipKey(connection));
@@ -534,9 +544,12 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (admin === undefined) return;
     const name = await vscode.window.showInputBox({ title: 'Persistent session name', ignoreFocusOut: true, validateInput: (value) => value.trim() ? undefined : 'Enter a name.' });
     if (name === undefined) return;
+    const memberName = await vscode.window.showInputBox({ title: 'Project owner name', value: vscode.workspace.getConfiguration('pairNotebook').get<string>('displayName', '') || os.userInfo().username, ignoreFocusOut: true, validateInput: (value) => value.trim() ? undefined : 'Enter your name.' });
+    if (!memberName?.trim()) return;
     const password = await this.password('Set session password');
     if (password === undefined) return;
-    const membership = await new PersistentClient(endpoint, { kind: 'admin', token: admin }).call<PersistentMembership>('create', { name: name.trim(), password });
+    const membership = await new PersistentClient(endpoint, { kind: 'admin', token: admin }).call<PersistentMembership>('create', { name: name.trim(), password, memberName: memberName.trim() });
+    await this.context.secrets.store(sessionPasswordKey({ endpoint, sessionId: membership.sessionId }), password);
     await this.attach({ endpoint, ...membership }, membership.token);
   }
   public async join(): Promise<void> {
@@ -554,6 +567,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (attempt !== this.connectionAttempt || this.disposed) throw new Error('The persistent connection changed during join.');
     const membership = await client.call<PersistentMembership>('join', { sessionId: selected.id, name: name.trim(), password });
     if (attempt !== this.connectionAttempt || this.disposed) throw new Error('The persistent connection changed during join.');
+    await this.context.secrets.store(sessionPasswordKey({ endpoint, sessionId: membership.sessionId }), password);
     await this.attach({ endpoint, ...membership }, membership.token);
   }
   private async joinInvitation(): Promise<void> {
@@ -624,10 +638,6 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
     } catch (error) { await this.leave(false, false); throw error; }
     this.updateUi();
-    if (view.memberId === view.ownerId) {
-      this.agent ??= new PersistentAgentLauncher(this.context, this.log);
-      void this.agent.start(connection, token).catch(() => this.log.appendLine('[info] Local owner compute is not ready; the Server remains available. Use My computer to prepare the isolated runtime.'));
-    }
     void vscode.window.showInformationMessage('Server project ready. Notebook edits and participant presence synchronize live. Closing VS Code leaves the server session running.');
   }
   private claim(notebook: vscode.NotebookDocument): void {
@@ -671,6 +681,49 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
     }
   }
+  private panelView(): ServerSessionView | undefined {
+    if (!this.view) return undefined;
+    const notebook = vscode.window.activeNotebookEditor?.notebook;
+    if (!notebook || !this.owns(notebook)) return this.view;
+    const key = filePath(notebook.uri);
+    const scope = this.files.visibilityOf(key) ?? 'public';
+    const selected = this.view.devices.find(device => device.id === this.view!.target.deviceId);
+    const deviceId = scope === 'private' && selected?.ownerId !== this.view.memberId ? 'vps' : this.view.target.deviceId;
+    const member = this.view.members.find(item => item.id === this.view!.memberId);
+    return { ...this.view, activeKernel: { notebook: key, scope, deviceId, canRestart: this.view.state === 'running' && (member?.id === this.view.ownerId || member?.permissions?.execute !== false) } };
+  }
+  public async getSessionPassword(): Promise<string | undefined> {
+    const connection = this.requireConnection();
+    const key = sessionPasswordKey(connection);
+    const password = await this.context.secrets.get(key);
+    if (password) {
+      const result = await new PersistentClient(connection.endpoint, { kind: 'anonymous' }).call<{ sessions: { id: string }[] }>('discover', { password });
+      this.assertConnection(connection);
+      if (result.sessions.some(session => session.id === connection.sessionId)) return password;
+      await this.context.secrets.delete(key);
+    }
+    void vscode.window.showInformationMessage('No current session password is saved on this computer. The owner can change it under More actions > Session password.');
+    return undefined;
+  }
+  public async copySessionPassword(): Promise<void> {
+    const password = await this.getSessionPassword();
+    if (password) await vscode.env.clipboard.writeText(password);
+  }
+  public async changeSessionPassword(): Promise<void> {
+    const connection = this.requireConnection();
+    const password = await this.password('Change session password');
+    if (password === undefined) return;
+    await this.rpcFor(connection, 'password', { password });
+    await this.context.secrets.store(sessionPasswordKey(connection), password);
+    this.updateUi();
+  }
+  public async copyInvitation(): Promise<void> {
+    const connection = this.requireConnection();
+    const invite = await this.rpcFor<{ sessionId: string; invitationToken: string }>(connection, 'createInvitation', { lifetimeSeconds: 86400, readOnly: false });
+    this.assertConnection(connection);
+    await vscode.env.clipboard.writeText(`${connection.endpoint}/#pair-invite=${invite.sessionId}.${invite.invitationToken}`);
+    void vscode.window.showInformationMessage('Invitation copied. It expires in 24 hours.');
+  }
   private updateUi(): void {
     if (!this.view) return;
     const target = this.view.devices.find((device) => device.id === this.view!.target.deviceId);
@@ -678,7 +731,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     this.status.tooltip = `Session ${this.view.id} · kernel generation ${this.view.generation} · ${target?.online ? 'online' : 'offline'} · continuous notebook and folder synchronization`;
     this.status.show();
     this.changed.fire(undefined);
-    this.sessionChanged?.(this.view, this.connection?.endpoint);
+    this.sessionChanged?.(this.panelView(), this.connection?.endpoint);
   }
   private async poll(): Promise<void> {
     if (this.polling || !this.connection || this.disposed) return;
@@ -715,7 +768,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     } catch (error) {
       if (connection === this.connection) {
         if (isPermanentConnectionError(error)) { await this.leave(false); this.connectionProblem(error); return; }
-        this.sessionChanged?.(this.view, connection.endpoint, false);
+        this.sessionChanged?.(this.panelView(), connection.endpoint, false);
         this.status.text = '$(warning) Server disconnected — reconnecting';
         this.status.tooltip = error instanceof Error ? error.message : 'Connection unavailable';
       }
@@ -824,7 +877,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (!this.view) throw new Error('Connect to a session first.');
     const own = this.view.devices.filter((device) => device.ownerId === this.view!.memberId);
     const action = await vscode.window.showQuickPick([
-      { label: 'Подготовить и подключить мой компьютер автоматически', action: 'automatic' },
+      { label: 'Set up and share my computer', action: 'automatic' },
       { label: 'Set up compute agent on this computer', action: 'setup' },
       ...own.map((device) => ({ label: `${device.enabled ? 'Stop' : 'Enable'} sharing ${device.name}`, action: 'toggle', device })),
       ...this.view.consents.filter((consent) => consent.status === 'approved' && own.some((device) => device.id === consent.deviceId)).map((consent) => ({ label: `Revoke consent: ${consent.requesterId} → ${consent.deviceId}`, action: 'revoke', consent })),
@@ -872,9 +925,9 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     const member = view.members.find((member) => member.id === view.memberId);
     const owner = member?.role === 'owner';
     const admin = owner || member?.role === 'admin';
-    const actions = [{ label: 'Покинуть сессию', action: 'leave' }, { label: 'Synchronize a local folder continuously', action: 'folderSync' }, { label: 'Stop local folder synchronization', action: 'stopFolderSync' }, { label: 'Copy session connection details', action: 'invite' }, { label: 'Choose compute device', action: 'compute' }];
+    const actions = [{ label: 'Leave session', action: 'leave' }, { label: 'Synchronize a local folder continuously', action: 'folderSync' }, { label: 'Stop local folder synchronization', action: 'stopFolderSync' }, { label: 'Copy session connection details', action: 'invite' }, { label: 'Choose compute device', action: 'compute' }];
     if (admin) actions.push({ label: 'Stop session', action: 'stop' }, { label: 'Start session', action: 'start' }, { label: 'Restart session', action: 'restart' }, { label: 'Delete session permanently', action: 'delete' });
-    if (owner) actions.push({ label: 'Права участников', action: 'permissions' }, { label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
+    if (owner) actions.push({ label: 'Participant permissions', action: 'permissions' }, { label: 'Create expiring invitation', action: 'createInvitation' }, { label: 'Revoke invitation', action: 'revokeInvitation' }, { label: 'Revoke participant access', action: 'revoke' }, { label: view.allowMemberSwitch ? 'Disallow participant compute switching' : 'Allow participant compute switching', action: 'settings' }, { label: 'Change password', action: 'password' }, { label: 'Grant / revoke participant administration', action: 'role' });
     const action = await vscode.window.showQuickPick(actions, { title: `${view.name} · ${view.id}` });
     if (!action) return;
     this.assertConnection(connection);
@@ -900,7 +953,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (action.action === 'settings') await this.rpcFor(connection, 'settings', { allowMemberSwitch: !view.allowMemberSwitch });
     else if (action.action === 'password') {
       const password = await this.password('Change session password');
-      if (password !== undefined) await this.rpcFor(connection, 'password', { password });
+      if (password !== undefined) { await this.rpcFor(connection, 'password', { password }); await this.context.secrets.store(sessionPasswordKey(connection), password); }
     } else if (action.action === 'role' || action.action === 'revoke') {
       const target = await vscode.window.showQuickPick(view.members.filter((member) => member.role !== 'owner' && member.id !== view.memberId).map((member) => ({ label: member.name, description: member.role, member })), { title: 'Select participant' });
       if (!target) return;
@@ -932,7 +985,8 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   public async restartKernel(): Promise<void> {
     const uri = vscode.window.activeNotebookEditor?.notebook.uri;
     if (!uri) throw new Error('Open a Server notebook first.');
-    if (await vscode.window.showWarningMessage('Restart this Jupyter kernel? Its Python variables will be lost. Restart waits for already accepted computations without interrupting them.', { modal: true }, 'Restart kernel') === 'Restart kernel') {
+    const scope = this.files?.visibilityOf(filePath(uri)) === 'private' ? 'private (owner only)' : 'shared (everyone using this notebook)';
+    if (await vscode.window.showWarningMessage(`Restart the ${scope} kernel for ${path.posix.basename(filePath(uri))}? Python variables will be cleared. Accepted computations finish first.`, { modal: true }, 'Restart kernel') === 'Restart kernel') {
       await this.kernel(uri, 'restart');
       void vscode.window.showInformationMessage('Notebook kernel restarted. Python variables were cleared; saved cell outputs remain.');
     }

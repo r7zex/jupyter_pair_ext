@@ -19,3 +19,4 @@ media/native/
 
 # Generated source provenance bundled in the VSIX.
 PAIR_BUILD.json
+media/storage-locations.json

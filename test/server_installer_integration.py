@@ -51,6 +51,9 @@ def main() -> None:
     evidence = {"image": args.image, "mode": args.mode, "scope": "isolated systemd container on one Docker host", "checks": []}
 
     def command(*values: str, input: str | None = None, success: bool = True) -> subprocess.CompletedProcess:
+        if args.setup_launcher and "sh" in values and values[values.index("sh") + 1] == "/release/" + args.launcher_name:
+            subprocess.run([*docker, "cp", str(args.artifacts / args.launcher_name), args.name + ":/root/pair-notebook-server-setup.sh"], check=True, capture_output=True)
+            values = tuple("/root/pair-notebook-server-setup.sh" if value == "/release/" + args.launcher_name else value for value in values)
         result = subprocess.run([*docker, *values], input=input, text=True, capture_output=True, timeout=900)
         if success and result.returncode:
             # Installer stdout contains generated test credentials: do not print it.
@@ -108,6 +111,9 @@ for identity in identities.values():
                      ["python3", "/release/pair-notebook-install.pyz", "--archive", "/release/pair-notebook-server-persistent.tar.gz"]) + ["--mode", args.mode]
         print(f"Installing {args.mode} on clean {args.image}", flush=True)
         command(*installer, input=f"lan\n{ip}\n8787\n" + ("\n" if args.occupied_https else "") + "yes\n")
+        if args.setup_launcher:
+            command("exec", args.name, "test", "!", "-e", "/root/pair-notebook-server-setup.sh")
+            check("downloaded setup removes itself after use")
         check("clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect" + ("; real isolated Jupyter cell returns 42" if args.mode == "full" else "; no Jupyter worker"))
         credential_hash = command("exec", args.name, "sha256sum", "/var/lib/pair-notebook-install/owner-server.json").stdout
         if args.mode == "full":

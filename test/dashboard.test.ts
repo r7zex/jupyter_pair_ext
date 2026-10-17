@@ -72,27 +72,27 @@ describe('dashboard webview startup', () => {
 
     provider.resolveWebviewView({ webview, show: () => undefined });
 
-    assert.match(assignedHtml, /Начать временную сессию/);
-    assert.match(assignedHtml, /Подключиться/);
+    assert.match(assignedHtml, /Start self-host session/);
+    assert.match(assignedHtml, /Connect to server/);
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
-    assert.match(assignedHtml, /command:pairNotebook\.configureVpsSessions">Настроить свои постоянные сессии/);
-    assert.match(assignedHtml, /Создать постоянную vps-сессию/);
-    assert.match(assignedHtml, /Подключиться к постоянной сессии/);
+    assert.match(assignedHtml, /command:pairNotebook\.configureVpsSessions">Saved connections/);
+    assert.match(assignedHtml, /Create server project/);
+    assert.match(assignedHtml, /Connect to server/);
     assert.doesNotMatch(assignedHtml, /command:pairNotebook\.connectVpsCompute/);
     assert.match(assignedHtml, /webviewReady/);
     assert.match(assignedHtml, /Content-Security-Policy/);
-    assert.match(assignedHtml, /Сессия:/);
-    assert.match(assignedHtml, /Хост:/);
-    assert.match(assignedHtml, /Вы вышли/);
+    assert.match(assignedHtml, /Session:/);
+    assert.match(assignedHtml, /Host:/);
+    assert.match(assignedHtml, /Left/);
     assert.match(assignedHtml, /Отменённый выбор папки можно открыть снова/);
-    assert.match(assignedHtml, /Настроить папку нового хоста/);
-    assert.match(assignedHtml, /Передать хоста','ДРУГОМУ УЧАСТНИКУ/);
-    assert.match(assignedHtml, /Завершить сессию','БЕЗ НОВОЙ ПАПКИ/);
+    assert.match(assignedHtml, /Choose new host folder/);
+    assert.match(assignedHtml, /Transfer host','TO ANOTHER PARTICIPANT/);
+    assert.match(assignedHtml, /End session','WITHOUT A NEW FOLDER/);
     assert.match(assignedHtml, /p\.online \|\| p\.connectionState === 'recovering'/, 'connected and recovering participants remain visible');
     assert.match(assignedHtml, /const recovering = p\.connectionState === 'recovering'/);
-    assert.match(assignedHtml, /Восстанавливает соединение/);
+    assert.match(assignedHtml, /Reconnecting/);
     assert.match(assignedHtml, /indicator = recovering \? '🟡' : '🟢'/, 'recovering is not rendered with the green online indicator');
-    assert.match(assignedHtml, /const latency = recovering \|\| p\.latency < 0 \? '—' : p\.latency\+' мс'/, 'recovering hides stale latency');
+    assert.match(assignedHtml, /const latency = recovering \|\| p\.latency < 0 \? '—' : p\.latency\+' ms'/, 'recovering hides stale latency');
     assert.doesNotMatch(assignedHtml, /action\('transfer'[^\n]+disabled:!state\.isHost\|\|paused/);
     assert.doesNotMatch(assignedHtml, /action\('end'[^\n]+disabled:paused/);
     assert.doesNotMatch(assignedHtml, new RegExp(['Tail', 'scale'].join(''), 'i'));
@@ -124,16 +124,30 @@ describe('dashboard webview startup', () => {
     provider.setPersistentSession(persistent, 'https://relay.example');
     const elements = new Map<string, { innerHTML: string; onclick?: () => void }>();
     const getElementById = (id: string) => { let element = elements.get(id); if (!element) { element = { innerHTML: '' }; elements.set(id, element); } return element; };
+    const renderCommands: unknown[] = [];
     let renderMessage: ((event: unknown) => void) | undefined;
     vm.runInNewContext(assignedHtml.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1]!, {
       document: { getElementById, activeElement: {} },
       window: { addEventListener: (_type: string, callback: (event: unknown) => void) => { renderMessage = callback; } },
-      acquireVsCodeApi: () => ({ postMessage: () => undefined }),
+      acquireVsCodeApi: () => ({ postMessage: (message: unknown) => renderCommands.push(message) }),
     });
     renderMessage?.({ data: posted.at(-1) });
     assert.match(getElementById('content').innerHTML, /&lt;Private project&gt;/);
-    assert.match(getElementById('content').innerHTML, /pair-vps:\/\/server-project/);
-    assert.match(getElementById('content').innerHTML, /Покинуть сессию/);
+    assert.doesNotMatch(getElementById('content').innerHTML, /pair-vps:|ID:|\/opt\/|persistentConnection/);
+    assert.match(getElementById('content').innerHTML, /section-connection/);
+    assert.match(getElementById('content').innerHTML, /Alice \(you\)/);
+    assert.match(getElementById('content').innerHTML, /Session host/);
+    assert.match(getElementById('content').innerHTML, /Show password/);
+    assert.doesNotMatch(getElementById('content').innerHTML, /id="copyVpsPassword"/);
+    assert.match(getElementById('content').innerHTML, /Leave session/);
+    getElementById('togglePassword').onclick?.();
+    assert.deepEqual(JSON.parse(JSON.stringify(renderCommands.at(-1))), { command: 'revealVpsPassword' });
+    renderMessage?.({ data: { type: 'sessionPassword', sessionId: 'server-project', memberId: 'owner', value: '<private-password>' } });
+    assert.match(getElementById('content').innerHTML, /Hide password/);
+    assert.match(getElementById('content').innerHTML, /&lt;private-password&gt;/);
+    assert.match(getElementById('content').innerHTML, /id="copyVpsPassword"/);
+    getElementById('togglePassword').onclick?.();
+    assert.doesNotMatch(getElementById('content').innerHTML, /private-password|id="copyVpsPassword"/);
     provider.setPersistentSession(undefined);
     assert.equal((posted.at(-1) as { patch: { live: boolean } }).patch.live, false);
     provider.dispose();

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.9
+
+- Reuse the self-host dashboard layout for server projects with English actions, a VPS host, a named owner, and a password eye/copy control.
+- Identify the active shared/private notebook kernel and restart it directly; move interrupted-run recovery into More actions.
+- Keep local connection history and credential encryption keys in uninstallable extension storage.
+- Add self-removing setup/removal utilities; removal exports Python sources and notebooks before deleting Pair-owned services, credentials and runtimes.
+- Include a Windows tray launcher in the WebSocket server ZIP with one-click stop/start, local TLS trust and automatic Node setup.
+- Put concise self-host, relay and domain/IP VPS instructions before What it provides.
+
 ## 0.6.8
 
 - Publish three clearly named downloads: extension, self-contained server setup and a standalone WebSocket server ZIP. Integrity checks and matching server payloads are embedded rather than separate release assets.

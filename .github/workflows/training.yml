@@ -78,6 +78,7 @@ jobs:
         run: |
           npm run package:persistent-server
           python -m unittest discover -s test -p server_installer_test.py -v
+          python -m unittest discover -s test -p test_server_removal.py -v
           python -m unittest discover -s test -p server_setup_archive_test.py -v
           npm run test:persistent:server
           node scripts/make-artifacts.mjs --preflight-only

@@ -1,4 +1,8 @@
 import http from 'node:http';
+import https from 'node:https';
+import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { VpsServer } from './server';
 
@@ -6,18 +10,22 @@ import { VpsServer } from './server';
 async function main(): Promise<void> {
   const port = Number(process.env.PAIR_VPS_PORT ?? '8787');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid relay port.');
-  const broker = new VpsServer({ clientToken: randomBytes(48).toString('base64url'), agentTokens: {},
-    dataDirectory: process.env.PAIR_VPS_DATA ?? './.pair-relay' });
+  const temporary = !process.env.PAIR_VPS_DATA;
+  const directory = process.env.PAIR_VPS_DATA ?? await mkdtemp(path.join(os.tmpdir(), 'pair-relay-'));
+  const broker = new VpsServer({ clientToken: randomBytes(48).toString('base64url'), agentTokens: {}, dataDirectory: directory });
   // The broker listens on an ephemeral loopback port. Only the temporary WS route
   // and health are forwarded through the externally configured listener.
   const upstream = await broker.start(0, '127.0.0.1');
   const instanceId = randomUUID();
-  const server = http.createServer((request, response) => {
+  const handler: http.RequestListener = (request, response) => {
     if (request.method === 'GET' && request.url === '/health') {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ status: 'ok', relayOnly: true, version: '0.6.7', instanceId }));
+      response.end(JSON.stringify({ status: 'ok', relayOnly: true, version: '0.6.9', instanceId }));
     } else { response.writeHead(404); response.end(); }
-  });
+  };
+  const server = process.env.PAIR_RELAY_TLS_PFX
+    ? https.createServer({ pfx: await readFile(process.env.PAIR_RELAY_TLS_PFX), passphrase: process.env.PAIR_RELAY_TLS_PASSWORD }, handler)
+    : http.createServer(handler);
   server.on('upgrade', (request, socket, head) => {
     if (new URL(request.url ?? '/', 'http://localhost').pathname !== '/v1/temporary-relay') { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); return; }
     const proxy = http.request({ host: '127.0.0.1', port: upstream, path: request.url, headers: request.headers });
@@ -35,7 +43,12 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, process.env.PAIR_VPS_BIND ?? '127.0.0.1', resolve); });
   console.log(`Pair Notebook relay listening on ${port}. No Python worker required.`);
   let stopping = false;
-  const stop = (): void => { if (stopping) return; stopping = true; server.close(); server.closeAllConnections(); void broker.stop().then(() => process.exit(0), () => process.exit(1)); };
+  const stop = (): void => { if (stopping) return; stopping = true; server.close(); server.closeAllConnections(); void broker.stop().then(async () => { if (temporary) await rm(directory, { recursive: true, force: true }); process.exit(0); }, () => process.exit(1)); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  if (process.env.PAIR_RELAY_CONTROL_STDIN === '1') {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (value: string) => { if (value.trim() === 'stop') stop(); });
+    process.stdin.on('end', stop);
+  }
 }
 void main().catch(() => { console.error('Relay could not start. Check its port and private data directory.'); process.exitCode = 1; });

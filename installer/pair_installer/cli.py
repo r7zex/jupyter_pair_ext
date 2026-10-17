@@ -16,13 +16,15 @@ import tempfile
 from urllib.error import URLError
 from urllib.parse import urlsplit
 
-from . import checks, legacy, network, recovery, services
+from . import checks, legacy, network, recovery, removal, services
 from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, switch, upgrade_version, write
 
 
 def prompt(label: str, default: str = "", choices: tuple[str, ...] = ()) -> str:
     while True:
         result = input(f"{label}{f' [{default}]' if default else ''}: ").strip() or default
+        if choices:
+            result = result.casefold()
         if result and (not choices or result in choices):
             return result
         print(f"Choose one of: {', '.join(choices)}" if choices else "A value is required.")
@@ -195,7 +197,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Install or maintain the prebuilt Pair Notebook server")
     parser.add_argument("--mode", choices=["full", "relay"], default="full")
     parser.add_argument("--archive", type=Path, help="Matching release archive with adjacent .sha256 (offline/local acceptance)")
-    parser.add_argument("--action", choices=["check", "repair", "update", "rollback", "recover-owner"], help="Maintenance action; omitted opens an interactive menu")
+    parser.add_argument("--action", choices=["check", "repair", "update", "rollback", "recover-owner", "uninstall"], help="Maintenance action; omitted opens an interactive menu")
+    parser.add_argument("--export", type=Path, help="Uninstall: preserve .py/.ipynb files in this new absolute directory")
     args = parser.parse_args()
     try:
         architecture = supported_system()
@@ -208,6 +211,13 @@ def main() -> None:
             path = STATE / "installation.json"
             if not path.exists() and (STATE / "installation-pending.json").exists():
                 path = STATE / "installation-pending.json"
+            if args.action == "uninstall":
+                config = json.loads(path.read_text()) if path.exists() else legacy.discover()
+                print("Remove all Pair Notebook services, sessions, credentials and runtimes. Python sources and notebooks will be exported first; active kernels stop.")
+                if prompt("Uninstall Pair Notebook? yes / no", "no", ("yes", "no")) != "yes":
+                    raise InstallError("Uninstall cancelled.")
+                removal.uninstall(config, args.export)
+                return
             if not path.exists() and legacy.present():
                 config = legacy.discover()
                 print(f"Detected existing Pair Notebook {config['version']}. Existing services, projects, credentials and HTTPS will be retained.")
