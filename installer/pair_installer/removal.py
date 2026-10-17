@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 
-from . import nginx, services, removal_volumes
+from . import nginx, services, removal_volumes, manager
 from .system import CONFIG, ROOT, STATE, InstallError, run, write
 
 
@@ -111,6 +111,7 @@ def uninstall(config: dict, destination: Path | None = None) -> tuple[Path, int]
         allowed += tuple(Path(root) / (machine_id + '.pair-notebook') for root in ('/var/log/journal', '/run/log/journal'))
     for directory in (*allowed, data, worker):
         safe_root(directory, allowed)
+    manager.validate_command()
     volumes = removal_volumes.plan((data, worker))
     source_files(data)  # Validate the export before interrupting services.
     profile = Path('/etc/apparmor.d/pair-notebook-bwrap')
@@ -124,7 +125,7 @@ def uninstall(config: dict, destination: Path | None = None) -> tuple[Path, int]
     resolved = destination.resolve()
     if not destination.is_absolute() or any(resolved.is_relative_to(directory) for directory in allowed):
         raise InstallError("Export sources outside the installation directories being removed.")
-    units = services.SERVICES + ["pair-notebook-certificate.timer", "pair-notebook-certificate", "pair-notebook-cert-renew.timer", "pair-notebook-cert-renew", "pair-notebook-tls-refresh.timer", "pair-notebook-tls-refresh", "pair-notebook-soak", "systemd-journald@pair-notebook", "pair-notebook.slice"]
+    units = services.SERVICES + ["pair-notebook-update.timer", "pair-notebook-update", "pair-notebook-certificate.timer", "pair-notebook-certificate", "pair-notebook-cert-renew.timer", "pair-notebook-cert-renew", "pair-notebook-tls-refresh.timer", "pair-notebook-tls-refresh", "pair-notebook-soak", "systemd-journald@pair-notebook", "pair-notebook.slice"]
     unit_files = [services.UNITS / (name if name.endswith(('.timer', '.slice')) else name + '.service') for name in units if not name.startswith('systemd-journald@')]
     for file in unit_files:
         dropins = file.with_name(file.name + '.d')
@@ -163,6 +164,7 @@ def uninstall(config: dict, destination: Path | None = None) -> tuple[Path, int]
         if directory.exists():
             shutil.rmtree(directory)
     removal_volumes.remove_images(volumes)
+    manager.remove_command()
     for name in ("pair-server", "pair-worker", "pair-proxy"):
         if subprocess.run(["id", "-u", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             run("userdel", name)

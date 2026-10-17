@@ -98,7 +98,8 @@ describe('secondary signalling family (MQTT)', function () {
     }
   });
 
-  it('normalizes a stale provisional join order across concurrent signalling families', async () => {
+  it('normalizes a stale provisional join order across crossed signalling admissions', async () => {
+    supportModule.setInMemoryAdmissionDelay((key, side) => key.includes('mqttD#') ? (side === 'left' ? 0 : 40) : (side === 'left' ? 40 : 0));
     const inMemory = supportModule.createInMemoryTrysteroFactory();
     const mqttFactory = (config: never, roomId: string, callbacks: never) =>
       inMemory(config, `mqttD#${roomId}`, callbacks);

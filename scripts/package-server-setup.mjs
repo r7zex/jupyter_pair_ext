@@ -26,7 +26,7 @@ export async function packageServerSetup({ root, installer, artifacts, relay, ve
 
 Run your own encrypted fallback relay when direct peer connections are unavailable.
 
-On Windows, double-click **pair-notebook-ws-server.cmd** and enter your hostname/IP. The launcher uses an existing Node.js 20+ or downloads a verified private runtime. Click the tray icon once to stop/start the server; right-click for its address, certificate and Exit.
+On Windows, double-click **pair-notebook-ws-server.cmd** and select the recommended physical Wi-Fi/Ethernet address, or enter your domain/IP. The address list also includes active VPN/virtual adapters. A LAN IP is reachable only from the corresponding LAN; it does not reveal your public address before a VPN. The launcher uses an existing Node.js 20+ or downloads a verified private runtime. Click the tray icon once to stop/start the server; right-click for its address, certificate and Exit.
 
 Trust the generated public certificate on every participating computer. On Windows, run \`certutil -user -addstore Root server\\relay-ca.crt\`, then fully restart VS Code. Keep the private files in \`server/\` on the host. Internet hosting requires a reachable port and may need port forwarding; the Windows launcher uses a local trust certificate.
 
@@ -40,10 +40,12 @@ Choose domain or public IP and enter your address. Setup installs HTTPS and an a
 
 In VS Code set Pair Notebook: Relay Url (pairNotebook.relayUrl) to the printed HTTPS origin, then create a temporary session and share its invitation. Participants receive the relay address automatically. Session contents remain end-to-end encrypted. This relay forwards collaboration; it does not run notebooks or store persistent projects. The full server setup already includes this relay.
 
+For Karing TUN split routing, add the selected LAN/server IP under IP Cidr in a custom diversion group, then select Direct connection. For one IPv4 address use /32; for IPv6 use /128. Keep certificate validation enabled. See the repository README and https://karing.app/en/tutorial/custom-diversion.
+
 For an existing HTTPS reverse proxy and Node.js 20+, run \`node relay.js\` with PAIR_VPS_BIND=127.0.0.1 and PAIR_VPS_PORT set to your private port. Forward /v1/temporary-relay with WebSocket upgrade support and /health. Verify with \`node check.js https://YOUR_SERVER\` from a participant's network.
 `);
-  for (const name of ['pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1']) await fs.copyFile(path.join(root, 'deploy/relay', name), path.join(relay, name));
-  const names = ['pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE'];
+  for (const name of ['pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay-addresses.ps1']) await fs.copyFile(path.join(root, 'deploy/relay', name), path.join(relay, name));
+  const names = ['pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay-addresses.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE'];
   const manifest = JSON.parse(await fs.readFile(path.join(relay, 'BUILD.json'), 'utf8'));
   manifest.files = {};
   for (const name of names) manifest.files[name] = createHash('sha256').update(await fs.readFile(path.join(relay, name))).digest('hex');

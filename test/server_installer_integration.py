@@ -114,6 +114,13 @@ for identity in identities.values():
         if args.setup_launcher:
             command("exec", args.name, "test", "!", "-e", "/root/pair-notebook-server-setup.sh")
             check("downloaded setup removes itself after use")
+        command("exec", args.name, "test", "-f", "/opt/pair-notebook/manager.pyz")
+        command("exec", args.name, "/usr/local/bin/pair-notebook-server", "auto-update", "enable")
+        command("exec", args.name, "systemctl", "is-active", "--quiet", "pair-notebook-update.timer")
+        command("exec", args.name, "/usr/local/bin/pair-notebook-server", "auto-update", "disable")
+        status = command("exec", args.name, "/usr/local/bin/pair-notebook-server", "auto-update", "status").stdout
+        assert "disabled" in status
+        check("installed management zipapp survives setup deletion; optional update timer enables/disables")
         check("clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect" + ("; real isolated Jupyter cell returns 42" if args.mode == "full" else "; no Jupyter worker"))
         credential_hash = command("exec", args.name, "sha256sum", "/var/lib/pair-notebook-install/owner-server.json").stdout
         if args.mode == "full":

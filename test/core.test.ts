@@ -2141,7 +2141,7 @@ describe('compute launch and recent projects', () => {
       source.indexOf('async function leaveSession'),
     );
     assert.match(leaveSource, /const wasEstablished = establishedSessionRuntime\(active, lifecycleReadyRuntime\) === active/);
-    assert.match(leaveSource, /if \(wasEstablished\) \{[\s\S]+rememberProject\(/);
+    assert.match(leaveSource, /if \(wasEstablished && active\.descriptor\.role !== 'peer'\) \{[\s\S]+rememberProject\(/);
     const offerSource = source.slice(
       source.indexOf('function offerWorkspaceSessionRestore'),
       source.indexOf('function startWorkspaceSessionRestore'),

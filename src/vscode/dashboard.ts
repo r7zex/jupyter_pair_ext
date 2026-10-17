@@ -375,13 +375,15 @@ function html(): string {
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style nonce="${nonce}">
-    :root { color-scheme: light dark; }
+    :root { color-scheme: light dark; --pair-accent: #ffe66d; --pair-accent-hover: #ffed91; --pair-accent-foreground: #242116; }
     body { padding: 8px; color: var(--vscode-foreground); font: 12px var(--vscode-font-family); }
     h1 { font-size: 12px; letter-spacing: .08em; margin: 0 0 10px; }
     h2 { color: var(--vscode-sideBarSectionHeader-foreground, var(--vscode-foreground)); font-size: 11px; letter-spacing: .08em; margin: 0; }
     .hero { color: var(--vscode-descriptionForeground); line-height: 1.4; margin: 0 0 10px; }
     button, a.fallback-button { min-width: 0; min-height: 30px; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid var(--vscode-button-border, transparent); border-radius: 3px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); padding: 4px 7px; cursor: pointer; font: 11px/1.2 var(--vscode-font-family); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; }
+    button:not(.secondary), a.fallback-button { background: var(--pair-accent); color: var(--pair-accent-foreground); border-color: transparent; }
     button:hover, a.fallback-button:hover { background: var(--vscode-button-hoverBackground); }
+    button:not(.secondary):hover, a.fallback-button:hover { background: var(--pair-accent-hover); }
     button.secondary { color: var(--vscode-foreground); background: var(--vscode-button-secondaryBackground); }
     button:disabled { cursor: default; opacity: .55; }
     button:focus-visible, summary:focus-visible, .action-tooltip:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
@@ -401,7 +403,7 @@ function html(): string {
     .connection.offline { color: var(--vscode-errorForeground); }
     .titleline { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 4px 0; }
     .title { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
-    .badge { flex: none; border: 0; padding: 0; color: var(--vscode-button-background); font-size: 11px; font-weight: 600; }
+    .badge { flex: none; border: 0; padding: 0; color: var(--pair-accent); font-size: 11px; font-weight: 600; }
     .muted { color: var(--vscode-descriptionForeground); }
     .section { position: relative; overflow: visible; border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); border-radius: 6px; margin: 10px 0; background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background)); }
     .section > h2 { padding: 7px 8px; border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); background: var(--vscode-sideBarSectionHeader-background, var(--vscode-editorWidget-background)); }

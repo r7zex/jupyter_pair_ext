@@ -31,6 +31,9 @@ const clientsByKey = new Map<string, Set<TestClient>>();
 let nextPeerId = 1;
 let partitioned = false;
 let sendObserver: ((namespace: string, payload: DataPayload) => void) | undefined;
+let admissionDelay: ((key: string, side: 'left' | 'right') => number) | undefined;
+
+export function setInMemoryAdmissionDelay(delay: typeof admissionDelay): void { admissionDelay = delay; }
 
 export function createInMemoryTrysteroFactory(): TrysteroRoomFactory {
   return (config: NostrRoomConfig, roomId: string, callbacks?: JoinRoomCallbacks): Room => {
@@ -55,6 +58,7 @@ export function resetInMemoryTrystero(): void {
   nextPeerId = 1;
   partitioned = false;
   sendObserver = undefined;
+  admissionDelay = undefined;
 }
 
 export function setInMemoryTrysteroSendObserver(
@@ -213,8 +217,13 @@ async function connect(left: TestClient, right: TestClient): Promise<void> {
     const rightHandle = { id: left.id, close: leftHandle.close };
     left.peerHandles.set(right.id, leftHandle);
     right.peerHandles.set(left.id, rightHandle);
-    left.room.onPeerJoin?.(right.id);
-    right.room.onPeerJoin?.(left.id);
+    await Promise.all((['left', 'right'] as const).map(async side => {
+      const delay = admissionDelay?.(left.key, side) ?? 0;
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      if (!left.peers.has(right) || left.left || right.left) return;
+      if (side === 'left') left.room.onPeerJoin?.(right.id);
+      else right.room.onPeerJoin?.(left.id);
+    }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     left.callbacks?.onJoinError?.(joinError(left, right, message));

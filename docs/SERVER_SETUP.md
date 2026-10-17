@@ -46,7 +46,11 @@ Older embedded Node runtimes may need `NODE_EXTRA_CA_CERTS` pointing to the tran
 
 ## Update, repair and reinstall
 
-Download the current setup utility again and run the same command. Existing managed installations offer **check**, **repair**, **update**, **rollback**, and **recover-owner**. Choose **update** for a newer release. An older utility refuses to downgrade a newer server.
+After setup, run `sudo pair-notebook-server check` to check GitHub, or `sudo pair-notebook-server update` to download, verify and install the latest stable release. The installed manager remains available after the setup download removes itself. An older server needs the current setup once to install this command.
+
+For daily updates run `sudo pair-notebook-server auto-update enable`; use `disable` or `status` to control the timer. The timer is disabled by default. Automatic installation is deferred while any saved project is running or work is queued/running. Stop projects through session management before the maintenance window; idle interactive kernels are still stateful. Relay-only servers require the explicit update command because their live participant inventory is not persisted. The manager accepts only this repository's stable GitHub release asset over HTTPS with a matching GitHub SHA-256 digest. Failed checks leave services unchanged; a failed installation uses the installer's rollback.
+
+For repair, rollback or owner recovery, download the current setup utility and run it. Existing managed installations offer **check**, **repair**, **update**, **rollback**, and **recover-owner**. An older utility refuses to downgrade a newer server.
 
 Packaged manual installations from 0.6.3 onward are detected through documented server/environment/service paths. Confirm the HTTPS address and backed-up update. Both server directories and symlinks are supported. Existing ports, projects, identities, service limits, Python environment and HTTPS remain in place. Unsupported layouts fail before services change.
 

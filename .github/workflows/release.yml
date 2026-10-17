@@ -112,6 +112,7 @@ jobs:
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository
           node scripts/make-artifacts.mjs
           python -m unittest discover -s test -p server_installer_test.py -v
+          python -m unittest discover -s test -p server_manager_test.py -v
           python -m unittest discover -s test -p test_server_removal.py -v
           python -m unittest discover -s test -p server_setup_archive_test.py -v
           node test/relay_archive_smoke.mjs

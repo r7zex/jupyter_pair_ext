@@ -159,6 +159,7 @@ export const RELAY_NEGOTIATION_TIMEOUT_MS = 12_000;
 export const LOGICAL_PEER_RECOVERY_MS = 30_000;
 const ROUTE_PING_FAILURE_LIMIT = 3;
 const ROUTE_PING_STALE_MS = 3_000;
+const ROUTE_PING_TIMEOUT_MS = 2_000;
 
 export type RouteUpgradeStatus =
   | 'requesting'
@@ -338,6 +339,7 @@ interface ConnectedPeer {
   connectedAt: number;
   lastSeen: number;
   pingFailures: number;
+  awaitingPongAt?: number;
   snapshotRequested: boolean;
 }
 
@@ -562,7 +564,7 @@ export class MeshTransport extends EventEmitter {
             // Same participant already connected via the other signalling
             // family: close this duplicate transport instead of admitting it.
             try { this.room?.getPeers()[transportPeerId]?.close(); } catch { /* gone */ }
-            return;
+            throw error;
           }
           this.noteSignallingError('nostr', error);
           throw error;
@@ -571,6 +573,7 @@ export class MeshTransport extends EventEmitter {
         }
       },
       onJoinError: (details) => {
+        if (isDuplicateSignallingMessage(details.error)) return;
         this.noteSignallingError('nostr', details.error);
         this.onJoinError(details);
       },
@@ -676,7 +679,7 @@ export class MeshTransport extends EventEmitter {
               // The same logical participant is already connected through the
               // other signalling family: drop this duplicate transport.
               try { this.mqttRoom?.getPeers()[rawId]?.close(); } catch { /* already gone */ }
-              return;
+              throw error;
             }
             this.noteSignallingError('mqtt', error);
             throw error;
@@ -684,7 +687,11 @@ export class MeshTransport extends EventEmitter {
             this.endSignallingHandshake('mqtt');
           }
         },
-        onJoinError: (details) => this.noteSignallingError('mqtt', details.error),
+        onJoinError: (details) => {
+          if (isDuplicateSignallingMessage(details.error)) return;
+          this.noteSignallingError('mqtt', details.error);
+          this.onJoinError({ ...details, peerId: MQTT_TRANSPORT_PREFIX + details.peerId });
+        },
       });
       this.mqttRoom = room;
       this.mqttAction = room.makeAction<ArrayBuffer>(ACTION_NAMESPACE);
@@ -2518,19 +2525,17 @@ public improvablePeerIds(): string[] {
       // exactly as before, so lost-leave recovery is unchanged.
       const existing = this.connections.get(activeTransport);
       const routeLive = this.isTransportRouteLive(activeTransport);
-      if (existing && routeLive && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
+      if (existing && routeLive && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS
+        && !this.preferInitialSignallingRoute(activeTransport, transportPeerId, existing)) {
         throw new DuplicateSignallingPeerError(identity.peerId);
       }
-      this.retireIdentityRoute(activeTransport);
+      if (!existing || !routeLive || Date.now() - existing.lastSeen >= DUPLICATE_HANDSHAKE_WINDOW_MS) this.retireIdentityRoute(activeTransport);
     }
     // An explicit make-before-break upgrade keeps the working route mapped
     // until the candidate has been verified; promotion happens later in
     // promoteCandidate() only after the stability window passes.
-    for (const [pendingTransport, pending] of this.pendingHandshakes) {
-      if (pendingTransport !== transportPeerId && pending.peer.peerId === identity.peerId) {
-        this.retireIdentityRoute(pendingTransport);
-      }
-    }
+    // Independently authenticated families may still be waiting for their
+    // room's admission callback. Retiring either here races the other end.
     const conflictingPeer = this.connectedDisplayNameOwner(identity, transportPeerId);
     if (conflictingPeer) {
       throw new Error(`Display name is already in use: ${conflictingPeer.displayName}.`);
@@ -2598,11 +2603,13 @@ public improvablePeerIds(): string[] {
         const active = this.identityToTransport.get(handshake.peer.peerId);
     if (active && active !== transportPeerId) {
       const existing = this.connections.get(active);
-      if (existing && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS) {
+      if (existing && Date.now() - existing.lastSeen < DUPLICATE_HANDSHAKE_WINDOW_MS
+        && !this.preferInitialSignallingRoute(active, transportPeerId, existing)) {
         const owner = this.roomForTransport(transportPeerId);
         try { owner.room?.getPeers()[owner.rawId]?.close(); } catch { /* already gone */ }
         return;
       }
+      this.retireIdentityRoute(active);
     }
     const connection: ConnectedPeer = {
       transportPeerId,
@@ -3155,6 +3162,9 @@ public improvablePeerIds(): string[] {
     const pingAt = Number(frame.meta.pingAt);
     const now = Date.now();
     if (!Number.isSafeInteger(pingAt) || pingAt < now - 60_000 || pingAt > now + 5_000) return;
+    const route = this.identityToTransport.get(sourceId);
+    const connection = route ? this.connections.get(route) : undefined;
+    if (connection?.awaitingPongAt === pingAt) delete connection.awaitingPongAt;
     const current = Math.max(0, Math.min(60_000, now - pingAt));
     const previous = this.latency.get(sourceId)?.ema ?? current;
     this.latency.set(sourceId, { current, ema: previous * 0.7 + current * 0.3 });
@@ -3171,16 +3181,27 @@ public improvablePeerIds(): string[] {
 
   private async pingTick(): Promise<void> {
     const roomRef = this.room;
-    if ((!roomRef && !this.upgradeRoom && !this.mqttRoom) || this.stopped || this.pingInFlight) return;
+    if ((!roomRef && !this.upgradeRoom && !this.mqttRoom && !this.relay) || this.stopped || this.pingInFlight) return;
     this.pingInFlight = true;
     try {
       await Promise.all([...this.connections.values()].map(async (connection) => {
         try {
+          if (connection.transportPeerId.startsWith(RELAY_TRANSPORT_PREFIX)) {
+            if (connection.awaitingPongAt !== undefined) {
+              if (Date.now() - connection.awaitingPongAt < ROUTE_PING_TIMEOUT_MS) return;
+              delete connection.awaitingPongAt;
+              throw new Error('Relay peer did not answer its heartbeat.');
+            }
+            connection.awaitingPongAt = Date.now();
+            this.sendTo(connection.identity.peerId, 'appPing', { pingAt: connection.awaitingPongAt });
+            return;
+          }
           // Promoted routes and MQTT-family routes live in their own rooms.
           const owner = this.roomForTransport(connection.transportPeerId);
           const room = owner.room;
-          if (!room) return;
-          const current = await room.ping(owner.rawId);
+          if (!room) throw new Error('The route owner is unavailable.');
+          const current = await boundedRoutePing(() => room.ping(owner.rawId));
+          if (this.connections.get(connection.transportPeerId) !== connection) return;
           if (!Number.isFinite(current) || current < 0) throw new Error('Route ping returned an invalid latency.');
           const bounded = Math.min(60_000, current);
           const previous = this.latency.get(connection.identity.peerId)?.ema ?? bounded;
@@ -3267,6 +3288,12 @@ public improvablePeerIds(): string[] {
       if (normalizeDisplayName(pending.peer.displayName) === wanted) return pending.peer;
     }
     return undefined;
+  }
+
+  private preferInitialSignallingRoute(active: string, candidate: string, connection: ConnectedPeer): boolean {
+    return active.startsWith(MQTT_TRANSPORT_PREFIX)
+      && !candidate.includes(':')
+      && Date.now() - connection.connectedAt < DUPLICATE_HANDSHAKE_WINDOW_MS;
   }
 
   private acceptInboundRate(transportPeerId: string, bytes: number): void {
@@ -3499,6 +3526,19 @@ class DuplicateSignallingPeerError extends Error {
 
 function isDuplicatePeerError(error: unknown): boolean {
   return error instanceof DuplicateSignallingPeerError;
+}
+
+function isDuplicateSignallingMessage(message: string): boolean {
+  return /already connected through another signalling family/.test(message);
+}
+
+export async function boundedRoutePing(ping: () => Promise<number>, timeoutMs = ROUTE_PING_TIMEOUT_MS): Promise<number> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([ping(), new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('Route ping timed out.')), timeoutMs);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
 }
 
 function ensureWebSocketRuntime(): void {

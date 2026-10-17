@@ -731,6 +731,47 @@ describe('signalling socket refresh', () => {
 });
 
 describe('mesh relay fallback integration', function () {
+  it('bounds a Trystero ping that never settles and keeps probing healthy peers', async () => {
+    const { MeshTransport, boundedRoutePing } = await import('../src/runtime/mesh.js');
+    await assert.rejects(boundedRoutePing(() => new Promise(() => undefined), 10), /timed out/);
+    const transport = new MeshTransport({ sessionId: 'stuck-probe', token: 'stuck-probe-token-that-is-long-enough',
+      localPeer: { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'host' }), isHost: () => true });
+    const internals = transport as any;
+    let healthyProbes = 0;
+    internals.room = { getPeers: () => ({}), leave: async () => undefined,
+      ping: (id: string) => id === 'stuck' ? new Promise(() => undefined) : Promise.resolve(++healthyProbes) };
+    for (const id of ['stuck', 'healthy']) {
+      const peer = { peerId: id, displayName: id, joinOrder: 1 };
+      internals.directory.set(id, peer); internals.identityToTransport.set(id, id);
+      internals.connections.set(id, { transportPeerId: id, identity: peer, purpose: 'runtime', connectedAt: 1, lastSeen: 1, pingFailures: 0, snapshotRequested: false });
+    }
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) await internals.pingTick();
+      assert.equal(transport.hasRoute('stuck'), false);
+      assert.equal(transport.hasRoute('healthy'), true);
+      assert.equal(healthyProbes, 3);
+    } finally { await transport.stop(); }
+  });
+
+  it('retires a silent encrypted relay route without a socket-close event', async () => {
+    const { MeshTransport } = await import('../src/runtime/mesh.js');
+    const transport = new MeshTransport({ sessionId: 'silent-relay', token: 'silent-relay-token-that-is-long-enough',
+      localPeer: { peerId: 'host', displayName: 'Host', joinOrder: 0 },
+      hostClock: () => ({ sessionEpoch: 1, hostEpoch: 0, hostId: 'host' }), isHost: () => true });
+    const internals = transport as any;
+    internals.room = { getPeers: () => ({}), leave: async () => undefined };
+    const peer = { peerId: 'guest', displayName: 'Guest', joinOrder: 1 };
+    const connection = { transportPeerId: 'relay:guest', identity: peer, purpose: 'runtime', connectedAt: 1, lastSeen: 1, pingFailures: 0, snapshotRequested: false, awaitingPongAt: 1 };
+    internals.directory.set('guest', peer); internals.identityToTransport.set('guest', 'relay:guest');
+    internals.connections.set('relay:guest', connection);
+    transport.sendTo = () => 'probe';
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) { connection.awaitingPongAt = 1; await internals.pingTick(); }
+      assert.equal(transport.hasRoute('guest'), false);
+      assert.equal(transport.isPeerRecovering('guest'), true);
+    } finally { await transport.stop(); }
+  });
   it('retires a half-open direct route after repeated failed VPN-era probes', async () => {
     const { MeshTransport } = await import('../src/runtime/mesh.js');
     const clock = { sessionEpoch: 1, hostEpoch: 0, hostId: 'host' };

@@ -2,7 +2,7 @@ param([switch]$SmokeTest, [string]$DataDirectory, [string]$Address, [int]$Port =
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName Microsoft.VisualBasic
+. (Join-Path $PSScriptRoot 'relay-addresses.ps1')
 if (-not $DataDirectory) { $DataDirectory = Join-Path $PSScriptRoot 'server' }
 $DataDirectory = [IO.Path]::GetFullPath($DataDirectory)
 New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
@@ -40,8 +40,8 @@ function Get-NodeRuntime {
 function Set-RelaySettings {
     $hostName = $Address
     if (-not $hostName) {
-        $default = if ($script:settings) { $script:settings.Address } else { 'localhost' }
-        $hostName = [Microsoft.VisualBasic.Interaction]::InputBox('Enter the DNS name or IP other computers will use. A local TLS certificate is created; trust relay-ca.crt on each computer. Internet hosting also needs a reachable/forwarded port.', 'Pair Notebook relay address', $default).Trim()
+        $default = if ($script:settings) { $script:settings.Address } else { '' }
+        $hostName = Select-RelayAddress -CurrentAddress $default
     }
     if (-not $hostName) { return $false }
     $ip = $null
@@ -88,7 +88,7 @@ function Start-Relay {
     $start.Arguments = '"' + (Join-Path $PSScriptRoot 'relay.js') + '"'
     $start.UseShellExecute = $false; $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
-    $start.EnvironmentVariables['PAIR_VPS_BIND'] = '0.0.0.0'
+    $start.EnvironmentVariables['PAIR_VPS_BIND'] = if ($script:settings.Address.Contains(':')) { '::' } else { '0.0.0.0' }
     $start.EnvironmentVariables['PAIR_VPS_PORT'] = [string]$script:settings.Port
     $start.EnvironmentVariables['PAIR_RELAY_TLS_PFX'] = Join-Path $DataDirectory 'relay.pfx'
     $credential = New-Object Net.NetworkCredential('', (ConvertTo-SecureString $script:settings.Password))

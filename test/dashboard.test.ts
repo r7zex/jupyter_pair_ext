@@ -73,6 +73,8 @@ describe('dashboard webview startup', () => {
     provider.resolveWebviewView({ webview, show: () => undefined });
 
     assert.match(assignedHtml, /Start self-host session/);
+    assert.match(assignedHtml, /--pair-accent:\s*#ffe66d/);
+    assert.match(assignedHtml, /button:not\(\.secondary\), a\.fallback-button\s*\{[^}]*var\(--pair-accent\)/);
     assert.match(assignedHtml, /Connect to server/);
     assert.match(assignedHtml, /command:pairNotebook\.startSession/);
     assert.match(assignedHtml, /command:pairNotebook\.configureVpsSessions">Saved connections/);

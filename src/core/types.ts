@@ -155,6 +155,8 @@ export interface SessionDescriptor {
   notebookPythonPaths?: Record<string, string> | undefined;
   pythonPath: string;
   freshStart?: boolean;
+  joinPending?: boolean;
+  temporaryGuest?: boolean;
   knownPeers?: PeerIdentity[];
   fileStates?: Record<string, FileLifecycleState> | undefined;
   fileRevisionCounter?: number | undefined;

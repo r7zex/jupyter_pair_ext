@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.10
+
+- Keep primary dashboard actions yellow across editor themes.
+- Resolve crossed Nostr/MQTT admissions without discarding an authenticated pending handshake; reject duplicate room admissions correctly.
+- Bound stuck WebRTC pings and probe encrypted relay peers so a missing close event cannot keep a participant green indefinitely.
+- Retry missing initial project state and allow a progressing transfer beyond the idle timeout.
+- Request Workspace Trust on an empty guest workspace before connecting and downloading files. Remove temporary guest workspaces after leave, failed join and editor exit, with deferred cleanup for busy Windows folders.
+- List WS-server adapter addresses, recommend physical Wi-Fi/Ethernet before VPN interfaces, and document Karing TUN split routing.
+- Install a persistent server update command and an optional daily update timer with stable-release, HTTPS and SHA-256 checks. Defer automatic installation while saved projects are running.
+
 ## 0.6.9
 
 - Reuse the self-host dashboard layout for server projects with English actions, a VPS host, a named owner, and a password eye/copy control.

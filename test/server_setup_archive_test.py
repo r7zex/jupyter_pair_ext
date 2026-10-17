@@ -41,7 +41,7 @@ class SetupArchiveTests(unittest.TestCase):
 
     def test_ws_server_zip_has_clear_launcher_bundled_relay_and_matching_manifest(self):
         with zipfile.ZipFile(ARTIFACTS / 'pair-notebook-ws-server.zip') as archive:
-            self.assertEqual(set(archive.namelist()), {'pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE', 'BUILD.json'})
+            self.assertEqual(set(archive.namelist()), {'pair-notebook-ws-server.sh', 'pair-notebook-ws-server.cmd', 'pair-notebook-ws-server.ps1', 'relay-addresses.ps1', 'relay.js', 'check.js', 'README.md', 'LICENSE', 'BUILD.json'})
             manifest = json.loads(archive.read('BUILD.json'))
             self.assertEqual(manifest['version'], VERSION)
             for name, digest in manifest['files'].items():

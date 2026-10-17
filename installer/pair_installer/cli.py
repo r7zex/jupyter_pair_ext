@@ -16,7 +16,7 @@ import tempfile
 from urllib.error import URLError
 from urllib.parse import urlsplit
 
-from . import checks, legacy, network, recovery, removal, services
+from . import checks, legacy, network, recovery, removal, services, manager
 from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, switch, upgrade_version, write
 
 
@@ -177,6 +177,9 @@ def install(config: dict, architecture: str, archive: Path | None) -> None:
 
 
 def show(config: dict) -> None:
+    if manager.install():
+        print('Future updates: sudo pair-notebook-server update (no new setup download).')
+        print('Optional daily updates: sudo pair-notebook-server auto-update enable. Saved projects must be stopped first; active kernels are protected.')
     print(f"\nServer: {config['endpoint']}\nInstalled Pair Notebook: {config.get('version', VERSION)}")
     if config["mode"] == "full":
         credentials = json.loads((STATE / "owner-server.json").read_text())

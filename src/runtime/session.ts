@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { atomicWriteFile } from '../core/atomicFile';
+import { waitForInitialState } from '../core/initialState';
 import { awaitFailedStartupCleanup, SessionStartCancelledError } from '../core/startupRecovery';
 import { CadencedTask, OUTPUT_STATE_CADENCE_MS } from '../core/cadencedTask';
 import * as Y from 'yjs';
@@ -703,6 +704,8 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
   private lastDisplayNameWarning = '';
   /** When the mesh last became "every known peer online" (0 while incomplete). */
   private fullPresenceSince = 0;
+  private initialStateProgressAt = 0;
+  private readonly projectStateTransfers = new Map<string, Promise<void>>();
   private stateReadyResolve!: () => void;
   private readonly stateReady = new Promise<void>((resolve) => { this.stateReadyResolve = resolve; });
   private initialized = false;
@@ -985,7 +988,12 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
       const host = resolveHostIdentity(this.descriptor, this.descriptor.hostPeerId);
       this.coordinator.upsertPeer(this.asRuntime(host, true));
       this.transport.connect(host);
-      await withTimeout(this.stateReady, 45_000, 'Host did not provide project state within 45 seconds.');
+      await waitForInitialState({
+        ready: this.stateReady, progressAt: () => this.initialStateProgressAt, signal,
+        request: () => {
+          if (this.transport.hasRoute(host.peerId)) this.transport.sendTo(host.peerId, 'stateRequest', {});
+        },
+      });
       checkStartup();
     }
     this.installFileWatcher();
@@ -3311,6 +3319,13 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
         return;
       }
       switch (frame.type) {
+        case 'stateRequest':
+          if (this.coordinator.isCurrentHost()) {
+            void this.sendProjectState(sourceId).catch(error => {
+              this.log.appendLine(`[error] Project state retry: ${formatError(error)}`);
+            });
+          }
+          break;
         case 'collaborationState': {
           if (sourceId !== this.coordinator.clock.hostId || !clock || !sameClock(clock, this.coordinator.clock)
             || !Number.isSafeInteger(frame.meta.revision) || Number(frame.meta.revision) < (this.descriptor.collaborationRevision ?? 0) || frame.payload.length > 8 * 1024 * 1024) break;
@@ -3391,6 +3406,7 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
             }
             const textTarget = projectUpdateTextTarget(kind, scope);
             this.project.applyRemoteUpdate(key, kind, frame.payload, scope);
+            if (sourceId === this.coordinator.clock.hostId) this.initialStateProgressAt = Date.now();
             if (frame.type === 'projectUpdate' && textTarget
               && sourceId === this.coordinator.clock.hostId && !this.coordinator.isCurrentHost()) {
               const revision = Number(frame.meta.textRevision);
@@ -3938,7 +3954,15 @@ export class SessionRuntime extends EventEmitter implements vscode.Disposable {
     }
   }
 
-  private async sendProjectState(peerId: string): Promise<void> {
+  private sendProjectState(peerId: string): Promise<void> {
+    const existing = this.projectStateTransfers.get(peerId);
+    if (existing) return existing;
+    const transfer = this.sendProjectStateOnce(peerId).finally(() => this.projectStateTransfers.delete(peerId));
+    this.projectStateTransfers.set(peerId, transfer);
+    return transfer;
+  }
+
+  private async sendProjectStateOnce(peerId: string): Promise<void> {
     for (const key of this.project.keys()) {
       const kind = this.project.kindOf(key);
       const fileState = this.fileStates.get(key);
@@ -7306,18 +7330,6 @@ function resolveHostIdentity(descriptor: SessionDescriptor, hostPeerId: string):
   };
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  try {
-    return await Promise.race([promise, expired]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 function lineFromSelection(position: unknown): number | undefined {
   if (!position || typeof position !== 'object') return undefined;
   const line = (position as { line?: unknown }).line;
@@ -8240,7 +8252,7 @@ function sameBinaryVersion(a: BinaryFileVersion, b: BinaryFileVersion): boolean 
 
 function isClockAgnosticFrame(type: string): boolean {
   return new Set([
-    'helloAck', 'projectUpdate', 'stateDocument', 'stateDiff', 'stateVector', 'filesystemState', 'fileState', 'stateEnd', 'awareness',
+    'helloAck', 'projectUpdate', 'stateRequest', 'stateDocument', 'stateDiff', 'stateVector', 'filesystemState', 'fileState', 'stateEnd', 'awareness',
     'snapshotRequest', 'snapshotCheckpointAck', 'snapshotFileRetry', 'binaryStart', 'binaryChunk', 'binaryEnd', 'binaryAck', 'binarySyncRequest',
     'fileDelete', 'directoryCreate', 'fileRename', 'computeChanged', 'computeState', 'hostTransferFinalize',
     'executionBarrierCheck', 'executionBarrierStatus', 'executionBarrierCommit', 'executionBarrierAck',

@@ -1,5 +1,6 @@
 import { LineCommentController, peerCommentBackend } from './vscode/lineComments';
 import { prepareExtensionStorage, clearLocalConnections } from './vscode/extensionStorage';
+import { claimGuestWorkspace, isTemporaryGuestWorkspace, retireGuestWorkspace, sweepGuestWorkspaces } from './vscode/temporarySessions';
 import { editParticipantPermissions } from './vscode/permissions';
 import { lstat, mkdir, open, rm } from 'node:fs/promises';
 import { lookup } from 'node:dns/promises';
@@ -108,6 +109,7 @@ let observedSystemProxyFingerprint: string | undefined;
 let systemProxyPollInFlight = false;
 let lastLifecycleDiagnostics: LifecycleDiagnosticEvent[] = [];
 let workspaceSessionRestore: Promise<void> | undefined;
+let stagedGuestDescriptor: SessionDescriptor | undefined;
 let localSessionExit: Promise<void> | undefined;
 let lifecycleWatchdog: NodeJS.Timeout | undefined;
 let lifecycleReadyRuntime: SessionRuntime | undefined;
@@ -273,6 +275,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   register(context, 'pairNotebook.openRecentProject', () => openRecentProject(context));
 
   startLifecycleWatchdog(context);
+  runUiBackground('Remove abandoned guest workspaces', async () => {
+    const retired = await sweepGuestWorkspaces(context, (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath));
+    let recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+    for (const folder of retired) recent = forgetRecentProject(recent, folder);
+    if (retired.length) { await context.globalState.update('pairNotebook.recent', recent); dashboard.refresh(); }
+  });
   // Start/Join may authorize one continuation across the folder reload in this
   // VS Code process. Every other marker remains manual-only.
   offerWorkspaceSessionRestore(context);
@@ -289,7 +297,11 @@ export async function deactivate(): Promise<void> {
       establishedRuntime?.shutdownForEditorExit() ?? runtime?.shutdownForEditorExit(),
       persistentController?.shutdown(),
     ]);
-    if (context && establishedRuntime) await forgetWorkspaceSession(context, establishedRuntime.descriptor);
+    const descriptor = (establishedRuntime ?? runtime)?.descriptor ?? stagedGuestDescriptor;
+    if (context && descriptor) {
+      await retireGuestWorkspace(context, descriptor);
+      await forgetWorkspaceSession(context, descriptor);
+    }
   } finally {
     lifecycleReadyRuntime = undefined; runtime = undefined;
     synchronizer?.dispose(); presence?.dispose(); notebookController?.dispose();
@@ -398,7 +410,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
   const invite = parseInvite(raw);
   invitedRelayUrl = invite.relayUrl;
   await applyMeshNetworkConfiguration(context, { checkProxy: true });
-  let nickname = await promptDisplayName(
+  const nickname = await promptDisplayName(
     displayName(),
     'Введите имя для этой совместной сессии. Имена участников не могут повторяться.',
   );
@@ -412,44 +424,7 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     identityKey: identity.publicKey,
   };
   const workingFolder = sessionWorkingFolder(invite.sessionId, peerId, context);
-  let lastCompletedFiles = 0;
-  for (;;) {
-    try {
-      await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'Pair Notebook: receiving project snapshot',
-        cancellable: true,
-      }, async (progress, cancellation) => {
-        const controller = new AbortController();
-        const subscription = cancellation.onCancellationRequested(() => controller.abort());
-        if (cancellation.isCancellationRequested) controller.abort();
-        try {
-          await downloadProjectSnapshot(invite, localPeer, workingFolder, (state) => {
-            const completedDelta = Math.max(0, state.completedFiles - lastCompletedFiles);
-            lastCompletedFiles = state.completedFiles;
-            progress.report({
-              ...(state.currentFile !== undefined ? { message: state.currentFile } : {}),
-              ...(state.totalFiles ? { increment: completedDelta * 100 / state.totalFiles } : {}),
-            });
-          }, undefined, identity.privateKey, controller.signal);
-        } finally { subscription.dispose(); }
-      });
-      break;
-    } catch (error) {
-      if (!(error instanceof SnapshotBootstrapError) || error.kind !== 'display-name-conflict') {
-        await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
-        if (error instanceof SessionStartCancelledError) return;
-        throw error;
-      }
-      const replacement = await promptDisplayName(nickname, 'Этот никнейм уже занят подключённым участником.');
-      if (!replacement) {
-        await rm(workingFolder, { recursive: true, force: true }).catch(() => undefined);
-        return;
-      }
-      nickname = replacement;
-      localPeer.displayName = replacement;
-    }
-  }
+  await mkdir(workingFolder, { recursive: true });
   await vscode.workspace.getConfiguration('pairNotebook').update(
     'displayName',
     localPeer.displayName,
@@ -474,6 +449,8 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     computeExecutorId: invite.hostPeerId,
     pythonPath: vscode.workspace.getConfiguration('pairNotebook').get<string>('pythonPath', 'python'),
     freshStart: false,
+    joinPending: true,
+    temporaryGuest: true,
     knownPeers: [{
       peerId: invite.hostPeerId,
       displayName: invite.hostDisplayName,
@@ -488,6 +465,34 @@ async function joinSession(context: vscode.ExtensionContext): Promise<void> {
     throw error;
   }
   await openSessionWorkingFolder(context, descriptor);
+}
+
+async function receiveTrustedGuestSnapshot(descriptor: SessionDescriptor, secret: StoredSessionSecret): Promise<void> {
+  if (!vscode.workspace.isTrusted) throw new Error('Trust the empty session folder before receiving host files.');
+  if (!secret.identityPrivateKey) throw new Error('Guest identity is unavailable. Rejoin using a fresh invitation.');
+  const host = descriptor.knownPeers?.find(peer => peer.peerId === descriptor.hostPeerId);
+  if (!host?.identityKey) throw new Error('Rejoin using a fresh authenticated invitation.');
+  const invite: InviteData = { sessionId: descriptor.sessionId, projectId: descriptor.projectId, projectName: descriptor.projectName, mode: descriptor.mode, token: secret.token, sessionEpoch: descriptor.sessionEpoch, hostEpoch: descriptor.hostEpoch, hostPeerId: host.peerId, hostDisplayName: host.displayName, hostIdentityKey: host.identityKey, ...(descriptor.relayUrl ? { relayUrl: descriptor.relayUrl } : {}) };
+  for (;;) {
+    try {
+      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Pair Notebook: connecting and receiving project files', cancellable: true }, async (progress, cancellation) => {
+        const controller = new AbortController();
+        const subscription = cancellation.onCancellationRequested(() => controller.abort());
+        if (cancellation.isCancellationRequested) controller.abort();
+        try {
+          await downloadProjectSnapshot(invite, descriptor.localPeer, descriptor.workingFolder, state => progress.report({ message: state.currentFile ?? `${state.completedFiles}/${state.totalFiles} files` }), undefined, secret.identityPrivateKey, controller.signal);
+        } finally { subscription.dispose(); }
+      });
+      descriptor.joinPending = false;
+      await saveDescriptor(requireActivationContext(), descriptor, secret.token, secret.identityPrivateKey!);
+      return;
+    } catch (error) {
+      if (!(error instanceof SnapshotBootstrapError) || error.kind !== 'display-name-conflict') throw error;
+      const replacement = await promptDisplayName(descriptor.localPeer.displayName, 'Choose another name; this name is already connected.');
+      if (!replacement) throw new SessionStartCancelledError();
+      descriptor.localPeer.displayName = replacement;
+    }
+  }
 }
 
 async function openSessionWorkingFolder(
@@ -555,6 +560,8 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
   try {
     await applyMeshNetworkConfiguration(context, { checkProxy: true });
     const identityPrivateKey = await ensureDescriptorIdentity(context, descriptor, storedSecret);
+    await claimGuestWorkspace(context, descriptor);
+    if (descriptor.joinPending) await receiveTrustedGuestSnapshot(descriptor, { ...storedSecret, identityPrivateKey });
     output.appendLine(`[info] Starting session ${descriptor.sessionId} in ${descriptor.mode} mode.`);
     startupRuntime = new SessionRuntime(descriptor, storedSecret.token, context, output, identityPrivateKey);
     runtime = startupRuntime;
@@ -671,6 +678,13 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
             });
             lastLifecycleDiagnostics = closedRuntime.lifecycleDiagnostics();
           }
+          if (descriptor.role === 'peer') {
+            await discardGuestWorkspace(context, descriptor);
+            if (reason === 'host-unreachable') void vscode.window.showWarningMessage(
+              'Pair Notebook: the host could not be reached. The temporary guest workspace was closed. Join again using the host invitation.',
+            );
+            return;
+          }
           if (reason !== 'host-unreachable') return;
           let reconnectable = true;
           try {
@@ -731,6 +745,7 @@ async function restoreWorkspaceSession(context: vscode.ExtensionContext): Promis
         output.appendLine(`[error] Failed startup cleanup: ${formatError(cleanupError)}`);
       });
     }
+    if (descriptor.role === 'peer') await discardGuestWorkspace(context, descriptor);
     if (error instanceof SessionStartCancelledError) return;
     if (error instanceof SessionTerminatedError) {
       await forgetEndedSession(context, descriptor).catch((cleanupError) => {
@@ -762,6 +777,12 @@ function offerWorkspaceSessionRestore(context: vscode.ExtensionContext): void {
       return;
     }
     const claimedLaunch = await claimPendingSessionLaunch(context, folder.uri.fsPath);
+    const markerBytes = await readBoundedRegularFile(path.join(folder.uri.fsPath, MARKER), MAX_SESSION_MARKER_BYTES);
+    const descriptor = normalizeSessionDescriptor(JSON.parse(markerBytes.toString('utf8')), folder.uri.fsPath);
+    if (isTemporaryGuestWorkspace(context, descriptor)) {
+      stagedGuestDescriptor = descriptor;
+      await claimGuestWorkspace(context, descriptor);
+    }
     const continueWhenTrusted = async () => {
       if (!vscode.workspace.isTrusted) return;
       if (claimedLaunch) {
@@ -887,7 +908,7 @@ async function leaveActiveSession(
   const wasEstablished = establishedSessionRuntime(active, lifecycleReadyRuntime) === active;
   if (wasEstablished) lifecycleReadyRuntime = undefined;
   localSessionExit = (async () => {
-    if (wasEstablished) {
+    if (wasEstablished && active.descriptor.role !== 'peer') {
       try {
         await rememberProject(context, active.descriptor, {
           leftAt,
@@ -899,6 +920,7 @@ async function leaveActiveSession(
       }
     }
     await active.leave();
+    if (active.descriptor.role === 'peer') await discardGuestWorkspace(context, active.descriptor);
   })().finally(() => {
     localSessionExit = undefined;
   });
@@ -908,7 +930,7 @@ async function leaveActiveSession(
 async function leaveSession(): Promise<void> {
   const active = requireRuntime();
   const answer = await vscode.window.showWarningMessage(
-    'Leave the editor session? Background jobs on the independent compute agent keep running and remain available in Compute Jobs. Active interactive kernels and the host shell require a separate CONFIRM before stopping. The isolated working copy is kept for recovery.',
+    'Leave the editor session? Guest files are temporary and will be removed. The host project and independent background jobs are preserved. Active interactive kernels and the host shell require a separate CONFIRM before stopping.',
     { modal: true },
     'Leave Session',
   );
@@ -924,8 +946,22 @@ async function leaveSession(): Promise<void> {
   );
   dashboard?.refresh();
   void vscode.window.showInformationMessage(
-    'Pair Notebook: вы вышли из сессии. Проект и время выхода сохранены в «Недавних проектах».',
+    active.descriptor.role === 'peer'
+      ? 'Pair Notebook: disconnected. The temporary guest workspace was removed.'
+      : 'Pair Notebook: вы вышли из сессии. Проект и время выхода сохранены в «Недавних проектах».',
   );
+}
+
+async function discardGuestWorkspace(context: vscode.ExtensionContext, descriptor: SessionDescriptor): Promise<void> {
+  if (!isTemporaryGuestWorkspace(context, descriptor)) return;
+  await retireGuestWorkspace(context, descriptor);
+  await forgetWorkspaceSession(context, descriptor);
+  const recent = normalizeRecentProjects(context.globalState.get<unknown>('pairNotebook.recent', []));
+  await context.globalState.update('pairNotebook.recent', forgetRecentProject(recent, descriptor.workingFolder));
+  await closeSessionTabs(descriptor.workingFolder);
+  const folder = vscode.workspace.workspaceFolders?.find(item => sameWorkspacePath(item.uri.fsPath, descriptor.workingFolder));
+  if (folder) vscode.workspace.updateWorkspaceFolders(folder.index, 1);
+  stagedGuestDescriptor = undefined;
 }
 
 /** Closes only editor tabs backed by this session's isolated working copy. */
@@ -1965,6 +2001,8 @@ function normalizeSessionDescriptor(value: unknown, workspaceFolder: string): Se
     projectName,
     mode: 'resilient',
     role: raw.role,
+    ...(raw.joinPending === true ? { joinPending: true } : {}),
+    ...(raw.temporaryGuest === true ? { temporaryGuest: true } : {}),
     localPeer,
     hostPeerId: raw.hostPeerId!,
     backingFolder: raw.role === 'host' && typeof raw.backingFolder === 'string' && path.isAbsolute(raw.backingFolder)
