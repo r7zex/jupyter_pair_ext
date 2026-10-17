@@ -22,7 +22,7 @@ const notes = `## Downloads
 On Ubuntu 24.04 LTS or Debian 12 with systemd, connect over SSH and run:
 
 \`\`\`sh
-curl -fL --proto '=https' --proto-redir '=https' ${base}/releases/download/v${version}/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
+curl -fL --proto '=https' --proto-redir '=https' ${base}/releases/download/v${version}/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sh pair-notebook-server-setup.sh
 \`\`\`
 
 Choose domain or public IP (LAN/existing Caddy/nginx also supported), enter the address and confirm. The utility contains its matching verified server; no separate installer, server-package or checksum downloads are needed. It sets up dependencies, HTTPS and automatic services, then checks real Jupyter execution and encrypted relay reconnect.
@@ -33,7 +33,7 @@ In VS Code use **Pair Notebook: Create Server Project** with the printed address
 
 ## WebSocket server only
 
-Extract **pair-notebook-ws-server.zip**, then run \`sudo sh pair-notebook-ws-server.sh\` on the Linux server. Set **Pair Notebook: Relay Url** to the printed HTTPS address and share a temporary-session invitation. Guests receive the relay address automatically. A home host needs reachable ports/port forwarding. The full setup already includes this relay.
+Extract **pair-notebook-ws-server.zip**, then run \`sh pair-notebook-ws-server.sh\` on the Linux server. Set **Pair Notebook: Relay Url** to the printed HTTPS address and share a temporary-session invitation. Guests receive the relay address automatically. A home host needs reachable ports/port forwarding. The full setup already includes this relay.
 
 ## Changes
 

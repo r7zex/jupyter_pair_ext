@@ -26,7 +26,7 @@ Pair Notebook is a self-contained VS Code extension for collaborative editing an
 Run the [interactive one-command installer](docs/SERVER_SETUP.md) on Ubuntu 24.04 LTS or Debian 12 with systemd. Dedicated, physical, cloud and LAN servers use the same workflow. Public domain/IP certificates, local trust, existing Caddy integration, repair, update, rollback and relay-only mode are documented there.
 
 ```sh
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sh pair-notebook-server-setup.sh
 ```
 
 ## Install the extension

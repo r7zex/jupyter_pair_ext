@@ -1,0 +1,86 @@
+{
+  "scope": "Development acceptance before immutable release build; systemd containers on one physical Windows/WSL2 host; not production migration or two physical editors",
+  "productionServerChanged": false,
+  "reports": {
+    "clean-ubuntu": {
+      "image": "pair-installer-minimal-067",
+      "mode": "full",
+      "scope": "isolated systemd container on one Docker host",
+      "checks": [
+        "clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect; real isolated Jupyter cell returns 42",
+        "owner creates a durable project; second participant joins by invitation and reads its file",
+        "repeat invocation detects installation and verifies it",
+        "repair retains owner credentials",
+        "update retains owner credentials",
+        "explicit rollback passes readiness checks",
+        "injected server-start failure automatically restores working previous release and owner access"
+      ],
+      "passed": true
+    },
+    "clean-debian": {
+      "image": "pair-installer-debian-067",
+      "mode": "full",
+      "scope": "isolated systemd container on one Docker host",
+      "checks": [
+        "clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect; real isolated Jupyter cell returns 42",
+        "owner creates a durable project; second participant joins by invitation and reads its file",
+        "repeat invocation detects installation and verifies it",
+        "repair retains owner credentials",
+        "update retains owner credentials",
+        "explicit rollback passes readiness checks",
+        "injected server-start failure automatically restores working previous release and owner access"
+      ],
+      "passed": true
+    },
+    "ws-only": {
+      "image": "pair-installer-minimal-067",
+      "mode": "relay",
+      "scope": "isolated systemd container on one Docker host",
+      "checks": [
+        "clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect; no Jupyter worker",
+        "repeat invocation detects installation and verifies it",
+        "repair retains owner credentials",
+        "update retains owner credentials",
+        "explicit rollback passes readiness checks",
+        "relay-only installation has no Python/Jupyter worker runtime or unit"
+      ],
+      "passed": true
+    },
+    "managed-upgrade": {
+      "scope": "disposable systemd container on one physical computer",
+      "targetVersion": "0.6.8",
+      "checks": [
+        "published 0.6.7 managed installation upgrades with new self-contained utility; owners, members, files and settings retained",
+        "fresh copy of utility detects existing version and passes real Jupyter, HTTPS and encrypted reconnect",
+        "lost local owner credential recovered; prior owner key revoked, private file retained, guest access preserved and private denial enforced",
+        "rollback to previous published server retains recovered identity and project data",
+        "same newly downloaded utility upgrades again after rollback without local VS Code state"
+      ],
+      "passed": true
+    },
+    "legacy-adoption": {
+      "scope": "disposable systemd container on one physical computer",
+      "checks": [
+        "real packaged 0.6.6 manual layout; broker 8788; HTTPS 9443; existing owner and participant access",
+        "failed adoption restores original symlink, active services, projects and credentials",
+        "symlink adoption passes trusted HTTPS, encrypted WebSocket/reconnect and isolated Jupyter 42",
+        "explicit rollback to 0.6.6 passes supported readiness checks; original access and proxy PID retained",
+        "failed adoption restores original directory, active services, projects and credentials",
+        "directory adoption passes trusted HTTPS, encrypted WebSocket/reconnect and isolated Jupyter 42"
+      ],
+      "passed": true
+    },
+    "legacy-063": {
+      "scope": "disposable systemd container on one physical computer",
+      "checks": [
+        "real packaged 0.6.3 manual layout; broker 8788; HTTPS 9443; existing owner and participant access",
+        "failed adoption restores original symlink, active services, projects and credentials",
+        "symlink adoption passes trusted HTTPS, encrypted WebSocket/reconnect and isolated Jupyter 42",
+        "explicit rollback to 0.6.3 passes supported readiness checks; original access and proxy PID retained",
+        "failed adoption restores original directory, active services, projects and credentials",
+        "directory adoption passes trusted HTTPS, encrypted WebSocket/reconnect and isolated Jupyter 42"
+      ],
+      "passed": true
+    }
+  }
+}

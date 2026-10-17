@@ -12,7 +12,7 @@ Once the agent starts a job, switching off the submitting laptop, leaving the co
 Use Node.js 20+ and Python 3.10+ for agents. For a manual background-job broker on a Linux server (new notebook servers use [the installer](SERVER_SETUP.md)):
 
 ```bash
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sh pair-notebook-server-setup.sh
 ```
 
 No npm install or source build is required. Place this verified directory at the service's `/opt/pair-notebook-vps` working directory before starting the manual unit below. Back up an existing deployment before replacing its binaries; retain its state and credentials.

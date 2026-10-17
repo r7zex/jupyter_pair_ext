@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import time
@@ -24,6 +25,9 @@ def main() -> None:
         target_version = json.load(archive.extractfile('server/BUILD.json'))['version']
     with tarfile.open(args.old_archive) as archive:
         old_version = json.load(archive.extractfile('server/BUILD.json'))['version']
+    if not re.fullmatch(r'\d+\.\d+\.\d+', old_version):
+        raise ValueError('Invalid old release version')
+    original_release = f'/opt/pair-notebook/releases/manual-{old_version}'
     docker = ["docker"] + (["--config", args.docker_config] if args.docker_config else [])
     evidence = {"scope": "disposable systemd container on one physical computer", "checks": []}
 
@@ -78,8 +82,8 @@ for identity in identities.values():
             command("cp", str(archive), f"{args.container}:/var/lib/pair-adoption-fixture/{label}/pair-notebook-server-persistent.tar.gz")
             command("cp", str(archive) + ".sha256", f"{args.container}:/var/lib/pair-adoption-fixture/{label}/pair-notebook-server-persistent.tar.gz.sha256")
         command("exec", args.container, "systemctl", "stop", "pair-notebook-worker", "pair-notebook-server", "pair-notebook-proxy")
-        command("exec", args.container, "mkdir", "-p", "/opt/pair-notebook/releases/manual-066")
-        command("exec", args.container, "tar", "-xzf", "/var/lib/pair-adoption-fixture/old/pair-notebook-server-persistent.tar.gz", "-C", "/opt/pair-notebook/releases/manual-066")
+        command("exec", args.container, "mkdir", "-p", original_release)
+        command("exec", args.container, "tar", "-xzf", "/var/lib/pair-adoption-fixture/old/pair-notebook-server-persistent.tar.gz", "-C", original_release)
         python('''import json, pathlib
 root = pathlib.Path('/opt/pair-notebook')
 server = root / 'server'
@@ -98,9 +102,9 @@ identity['endpoint'] = 'http://127.0.0.1:8788'
 identity_file.write_text(json.dumps(identity))
 for filename in ('installation.json', 'installation-pending.json', 'owner-server.json'):
     pathlib.Path('/var/lib/pair-notebook-install', filename).unlink(missing_ok=True)
-''')
+'''.replace('manual-066', 'manual-' + old_version))
         command("exec", args.container, "systemctl", "daemon-reload")
-        command("exec", args.container, "systemctl", "reset-failed", "pair-notebook-worker")
+        command("exec", args.container, "systemctl", "reset-failed", "pair-notebook-worker", success=False)
         command("exec", args.container, "systemctl", "start", "pair-notebook-server", "pair-notebook-worker", "pair-notebook-proxy")
         if command("exec", args.container, "systemctl", "is-active", "--quiet", "unrelated-vpn-fixture", success=False).returncode:
             command("exec", args.container, "systemd-run", "--unit=unrelated-vpn-fixture", "/usr/bin/python3", "-m", "http.server", "443", "--bind", "127.0.0.1")

@@ -28,7 +28,7 @@ Run your own encrypted fallback relay when direct peer connections are unavailab
 On Ubuntu 24.04 LTS or Debian 12 with systemd:
 
 \`\`\`sh
-sudo sh pair-notebook-ws-server.sh
+sh pair-notebook-ws-server.sh
 \`\`\`
 
 Choose domain or public IP and enter your address. Setup installs HTTPS and an automatic background service, without a Jupyter worker. TCP 80 and the selected HTTPS port must reach this server. A home computer behind NAT needs port forwarding; CGNAT requires another reachable server.

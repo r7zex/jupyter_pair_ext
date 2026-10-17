@@ -4,7 +4,10 @@ set -eu
 PAIR_VERSION=__PAIR_VERSION__
 PAIR_DEFAULT_MODE=__PAIR_DEFAULT_MODE__
 if [ "$(id -u)" != 0 ]; then
-    echo "Run this downloaded utility with sudo sh pair-notebook-server-setup.sh" >&2
+    if command -v sudo >/dev/null; then
+        exec sudo sh "$0" "$@"
+    fi
+    echo "Run this utility as root, or use an account with sudo access." >&2
     exit 1
 fi
 . /etc/os-release

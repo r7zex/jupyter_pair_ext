@@ -77,6 +77,8 @@ jobs:
       - name: Package the verified extension and agent sources
         run: |
           npm run package:persistent-server
+          python -m unittest discover -s test -p server_installer_test.py -v
+          python -m unittest discover -s test -p server_setup_archive_test.py -v
           npm run test:persistent:server
           node scripts/make-artifacts.mjs --preflight-only
           node node_modules/@vscode/vsce/vsce package --no-yarn --no-dependencies --no-rewrite-relative-links --allow-missing-repository

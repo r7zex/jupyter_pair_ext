@@ -19,10 +19,10 @@ The setup utility includes its matching verified server package. Separate checks
 Connect over SSH and run:
 
 ```sh
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sh pair-notebook-server-setup.sh
 ```
 
-If curl is absent, download the file in a browser, transfer it to the server and run `sudo sh pair-notebook-server-setup.sh`. Setup installs missing Python/download dependencies itself; no source build is required.
+If curl is absent, download the file in a browser, transfer it to the server and run `sh pair-notebook-server-setup.sh`. Setup requests sudo when needed and installs missing Python/download dependencies itself. Root accounts do not need sudo installed; no source build is required.
 
 1. Choose domain, public IP, LAN or a supported existing Caddy/nginx proxy.
 2. Enter the domain/IP, keep the suggested private port unless occupied, and confirm.
@@ -61,7 +61,7 @@ If the owner's local credential was lost, choose **recover-owner**, select the p
 The full setup already includes `/v1/temporary-relay`. For relay-only deployment, extract `pair-notebook-ws-server.zip` and run:
 
 ```sh
-sudo sh pair-notebook-ws-server.sh
+sh pair-notebook-ws-server.sh
 ```
 
 This installs HTTPS and automatic service startup without Jupyter. The full setup also accepts `--mode relay`. Set **Pair Notebook: Relay Url** (`pairNotebook.relayUrl`) to the printed HTTPS address, start a temporary session and share its invitation. Guests receive the relay address automatically. The extension uses it as an available fallback when direct transport fails. Contents remain end-to-end encrypted; the relay does not execute notebooks or store persistent projects.
