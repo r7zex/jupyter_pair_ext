@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.8
+
+- Publish three clearly named downloads: extension, self-contained server setup and a standalone WebSocket server ZIP. Integrity checks and matching server payloads are embedded rather than separate release assets.
+- Install or update Ubuntu 24.04/Debian 12 servers with a domain, public IP, LAN address or supported existing proxy. Adopt packaged manual installations while retaining projects, keys, service limits and HTTPS.
+- Recover lost project-owner credentials locally after reinstalling the extension, with an explicit confirmation, an authority backup and preservation of participant access.
+- Reject accidental downgrades from an older utility and verify updates, rollback, HTTPS, encrypted relay reconnect and isolated Jupyter execution.
+
 ## 0.6.7
 
 - Add an interactive server installer for Ubuntu 24.04 LTS and Debian 12, prebuilt runtime downloads, isolated Jupyter, service accounts, managed TLS, checks, repair and transactional upgrades.

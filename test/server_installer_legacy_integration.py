@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import tarfile
 import time
 
 from server_installer_integration import faulty_archive
@@ -19,6 +20,10 @@ def main() -> None:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--docker-config")
     args = parser.parse_args()
+    with tarfile.open(args.new_archive) as archive:
+        target_version = json.load(archive.extractfile('server/BUILD.json'))['version']
+    with tarfile.open(args.old_archive) as archive:
+        old_version = json.load(archive.extractfile('server/BUILD.json'))['version']
     docker = ["docker"] + (["--config", args.docker_config] if args.docker_config else [])
     evidence = {"scope": "disposable systemd container on one physical computer", "checks": []}
 
@@ -91,7 +96,7 @@ identity_file = pathlib.Path('/var/lib/pair-notebook-worker/identity.json')
 identity = json.loads(identity_file.read_text())
 identity['endpoint'] = 'http://127.0.0.1:8788'
 identity_file.write_text(json.dumps(identity))
-for filename in ('installation.json', 'owner-server.json'):
+for filename in ('installation.json', 'installation-pending.json', 'owner-server.json'):
     pathlib.Path('/var/lib/pair-notebook-install', filename).unlink(missing_ok=True)
 ''')
         command("exec", args.container, "systemctl", "daemon-reload")
@@ -107,9 +112,9 @@ pathlib.Path('/var/lib/pair-notebook-install/adoption-baseline.json').write_text
         pids = {name: command("exec", args.container, "systemctl", "show", name, "-p", "MainPID", "--value").stdout
                 for name in ("pair-notebook-proxy", "unrelated-vpn-fixture")}
         assert all(int(pid.strip()) > 0 for pid in pids.values())
-        assert version() == "0.6.6"
+        assert version() == old_version
         preserved()
-        check("real packaged 0.6.6 manual layout; broker 8788; HTTPS 9443; existing owner and participant access")
+        check(f"real packaged {old_version} manual layout; broker 8788; HTTPS 9443; existing owner and participant access")
         fault = args.report.parent / "adoption-fault.tar.gz"
         fault.parent.mkdir(parents=True, exist_ok=True)
         faulty_archive(args.new_archive, fault)
@@ -129,7 +134,7 @@ copy.rename(server)
             if failed.returncode == 0 or "Previous server restored and health checked" not in failed.stdout:
                 errors = [line for line in failed.stderr.splitlines() if line.startswith('Pair Notebook installation failed:')]
                 raise AssertionError("Expected automatic rollback: " + ' '.join(errors))
-            assert version() == "0.6.6"
+            assert version() == old_version
             if layout == "directory":
                 assert command("exec", args.container, "test", "-L", "/opt/pair-notebook/server", success=False).returncode != 0
             preserved()
@@ -137,16 +142,16 @@ copy.rename(server)
             # The second adoption downloads the actual immutable release itself.
             flags = ["--archive", "/var/lib/pair-adoption-fixture/new/pair-notebook-server-persistent.tar.gz"] if layout == "symlink" else []
             command(*installer, *flags, "--action", "update", input="\nyes\n")
-            assert version() == "0.6.7"
+            assert version() == target_version
             preserved()
             check(f"{layout} adoption passes trusted HTTPS, encrypted WebSocket/reconnect and isolated Jupyter 42")
             command(*installer, "--action", "check")
             preserved()
             if layout == "symlink":
                 command(*installer, "--action", "rollback")
-                assert version() == "0.6.6"
+                assert version() == old_version
                 preserved()
-                check("explicit rollback to 0.6.6 passes real execution; original access and proxy PID retained")
+                check(f"explicit rollback to {old_version} passes supported readiness checks; original access and proxy PID retained")
         evidence["passed"] = True
     finally:
         args.report.parent.mkdir(parents=True, exist_ok=True)

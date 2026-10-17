@@ -1,4 +1,4 @@
-export const SERVER_VERSION = '0.6.7';
+export const SERVER_VERSION = '0.6.8';
 export const PERSISTENT_PROTOCOL = 1;
 export const persistentCapabilities = {
   version: SERVER_VERSION,

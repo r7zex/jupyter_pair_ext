@@ -1,87 +1,44 @@
 import fs from 'node:fs';
 
 const [version, outputPath] = process.argv.slice(2);
-if (!version || !outputPath) {
-  console.error('Usage: node scripts/create-release-notes.mjs <version> <output-path>');
-  process.exit(1);
-}
+if (!version || !outputPath) throw new Error('Usage: node scripts/create-release-notes.mjs <version> <output-path>');
+const lines = fs.readFileSync('CHANGELOG.md', 'utf8').replace(/\r\n/g, '\n').split('\n');
+const start = lines.findIndex(line => line === `## ${version}` || line.startsWith(`## ${version} `));
+const next = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+const changes = start < 0 ? '' : lines.slice(start + 1, next < 0 ? undefined : next).join('\n').trim();
+if (!changes) throw new Error(`CHANGELOG.md has no release notes for ${version}.`);
+const base = `https://github.com/${process.env.GITHUB_REPOSITORY || 'r7zex/jupyter_pair_ext'}`;
+const asset = name => `[${name}](${base}/releases/download/v${version}/${name})`;
+const notes = `## Downloads
 
-const changelog = fs.readFileSync('CHANGELOG.md', 'utf8').replace(/\r\n/g, '\n');
-const changelogLines = changelog.split('\n');
-const heading = `## ${version}`;
-const sectionStart = changelogLines.findIndex(
-  (line) => line === heading || line.startsWith(`${heading} `),
-);
-const nextSection = sectionStart < 0
-  ? -1
-  : changelogLines.findIndex((line, index) => index > sectionStart && line.startsWith('## '));
-const sectionEnd = nextSection < 0 ? changelogLines.length : nextSection;
-const changes = sectionStart < 0
-  ? ''
-  : changelogLines.slice(sectionStart + 1, sectionEnd).join('\n').trim();
+| Download | Purpose |
+| --- | --- |
+| ${asset(`pair-notebook-${version}.vsix`)} | Install in VS Code using **Extensions: Install from VSIX...**, then reload. |
+| ${asset('pair-notebook-server-setup.sh')} | Install/update your server: projects, isolated Jupyter, HTTPS and WebSocket relay. |
+| ${asset('pair-notebook-ws-server.zip')} | Standalone encrypted WebSocket server for temporary peer sessions. |
 
-if (!changes) {
-  console.error(`CHANGELOG.md has no release notes for version ${version}.`);
-  process.exit(1);
-}
+## Set up or update your server
 
-const repository = process.env.GITHUB_REPOSITORY;
-const tag = `v${version}`;
-const vsixName = `pair-notebook-${version}.vsix`;
-const downloadUrl = repository
-  ? `https://github.com/${repository}/releases/download/${tag}/${vsixName}`
-  : undefined;
-const downloadLink = downloadUrl
-  ? `[Download ${vsixName}](${downloadUrl})`
-  : `\`${vsixName}\``;
+On Ubuntu 24.04 LTS or Debian 12 with systemd, connect over SSH and run:
 
-const notes = `# Pair Notebook ${version}
-
-Ready-to-install VS Code extension with all collaboration runtime dependencies bundled.
-
-## Install
-
-Install this version on every participating computer.
-
-1. ${downloadLink}.
-2. In VS Code, run **Extensions: Install from VSIX...**.
-3. Select the downloaded file and reload VS Code when prompted.
-
-Or install it from a terminal:
-
-\`\`\`text
-code --install-extension ${vsixName} --force
+\`\`\`sh
+curl -fL --proto '=https' --proto-redir '=https' ${base}/releases/download/v${version}/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
 \`\`\`
 
-## What's changed
+Choose domain or public IP (LAN/existing Caddy/nginx also supported), enter the address and confirm. The utility contains its matching verified server; no separate installer, server-package or checksum downloads are needed. It sets up dependencies, HTTPS and automatic services, then checks real Jupyter execution and encrypted relay reconnect.
+
+Rerun a freshly downloaded utility to check, repair, update or roll back an existing server. Projects and credentials are retained. Lost the owner key after reinstalling the extension? Choose **recover-owner** on the server, then import the private owner JSON. Updates/recovery restart Pair services and stop active Python kernels.
+
+In VS Code use **Pair Notebook: Create Server Project** with the printed address/administrative credential, or **Connect to Server** for an existing project. Participants use an invitation or project password. [Step-by-step guide](${base}/blob/v${version}/docs/SERVER_SETUP.md).
+
+## WebSocket server only
+
+Extract **pair-notebook-ws-server.zip**, then run \`sudo sh pair-notebook-ws-server.sh\` on the Linux server. Set **Pair Notebook: Relay Url** to the printed HTTPS address and share a temporary-session invitation. Guests receive the relay address automatically. A home host needs reachable ports/port forwarding. The full setup already includes this relay.
+
+## Changes
 
 ${changes}
 
-## Install your own server
-
-On Ubuntu 24.04 LTS or Debian 12 with systemd, run:
-
-\`\`\`sh
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/${repository || 'r7zex/jupyter_pair_ext'}/releases/download/${tag}/pair-notebook-install.sh -o pair-notebook-install.sh && sudo sh pair-notebook-install.sh
-\`\`\`
-
-Choose domain, public IP, LAN or an existing supported proxy and enter the server address. The installer prints the owner connection data after local readiness checks. Use \`--mode relay\` for a relay without a Jupyter worker. See \`SERVER_SETUP.md\` for certificate trust, external reachability, repair/update/rollback, owner and participant steps, and verification limits.
-
-## Download
-
-- \`${vsixName}\` — install this extension on every participating computer. GitHub displays its SHA-256 digest next to the file.
-- \`pair-notebook-complete-${version}.zip\` — full source and matching compute agent for compute owners. Update editors, broker and agent together.
-- \`pair-notebook-server-persistent.tar.gz\` and its \`.sha256\` file — the matching dependency-bundled server, interactive agent and service templates for server operators. Follow \`docs/PERSISTENT_VPS.md\` in the archive; preserve existing data and take a backup before updating.
-- \`pair-notebook-install.sh\` and \`pair-notebook-install.pyz\` — interactive installer and verified launcher.
-- \`pair-notebook-relay.tar.gz\` — standalone prebuilt relay: extract and run \`node relay/relay.js\` behind HTTPS; \`node relay/check.js https://SERVER\` verifies encrypted exchange and reconnect.
-- \`SHA256SUMS\` and \`SERVER_SETUP.md\` — checksums and beginner instructions.
-
-GitHub also adds automatic **Source code** archives. They are for reading the source and cannot be installed as a VS Code extension.
-
-## Verification
-
-GitHub Actions publishes this release only after a clean dependency install, Python bridge tests, production dependency audit, TypeScript lint/build/tests, and packaged extension/server validation succeed. Physical UI acceptance, macOS compute and an actually completed 24-hour soak are separate from this release gate; see the current acceptance document in the source archive.
+[Verification and limits](${base}/blob/v${version}/docs/SERVER_RELEASE_0_6_8.md). GitHub's automatic source archives are for developers. Detailed build artifacts/internal checksums are retained with the workflow run.
 `;
-
 fs.writeFileSync(outputPath, notes, 'utf8');
-console.log(`Release notes written to ${outputPath}.`);

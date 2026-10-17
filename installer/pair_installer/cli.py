@@ -16,8 +16,8 @@ import tempfile
 from urllib.error import URLError
 from urllib.parse import urlsplit
 
-from . import checks, legacy, network, services
-from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, switch, write
+from . import checks, legacy, network, recovery, services
+from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, runtime, supported_system, switch, upgrade_version, write
 
 
 def prompt(label: str, default: str = "", choices: tuple[str, ...] = ()) -> str:
@@ -84,6 +84,7 @@ def collect(mode: str) -> dict:
 
 
 def install(config: dict, architecture: str, archive: Path | None) -> None:
+    upgrade_version(config["version"])
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     ROOT.mkdir(parents=True, exist_ok=True)
     if (ROOT / "server").exists() and not (ROOT / "server").is_symlink():
@@ -181,6 +182,7 @@ def show(config: dict) -> None:
         print(credentials["adminToken"])
         print(f"Recovery copy (root only): {STATE / 'owner-server.json'}")
         print("Choose a project name and a session password (12+ characters). Share the project invitation or server address and session password with participants. Never share the administrative credential.")
+        print("Existing projects: reconnect your saved VS Code connection or import your existing owner JSON. If it was lost after reinstalling VS Code/the extension, rerun this utility and choose recover-owner.")
     else:
         print("Set Pair Notebook: Relay Url to this HTTPS server address, then create a temporary session. The invitation carries the relay address; no administrative credential is needed.")
     if config["network"] == "lan":
@@ -193,7 +195,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Install or maintain the prebuilt Pair Notebook server")
     parser.add_argument("--mode", choices=["full", "relay"], default="full")
     parser.add_argument("--archive", type=Path, help="Matching release archive with adjacent .sha256 (offline/local acceptance)")
-    parser.add_argument("--action", choices=["check", "repair", "update", "rollback"], help="Maintenance action; omitted opens an interactive menu")
+    parser.add_argument("--action", choices=["check", "repair", "update", "rollback", "recover-owner"], help="Maintenance action; omitted opens an interactive menu")
     args = parser.parse_args()
     try:
         architecture = supported_system()
@@ -211,8 +213,8 @@ def main() -> None:
                 print(f"Detected existing Pair Notebook {config['version']}. Existing services, projects, credentials and HTTPS will be retained.")
                 value = prompt("Existing server HTTPS address", legacy.default_endpoint())
                 config["endpoint"], config["host"] = network.endpoint(value, "existing")
-                if args.action == "rollback":
-                    raise InstallError("No previous installer-managed update is available to roll back.")
+                if args.action in {"rollback", "recover-owner"}:
+                    raise InstallError("Run this utility once to update the existing installation before rollback or owner recovery.")
                 if args.action == "check":
                     legacy.owner_credential(config)
                     checks.verify(config)
@@ -228,8 +230,26 @@ def main() -> None:
                 config = json.loads(path.read_text())
                 print(f"Detected Pair Notebook {config['version']} at {config['endpoint']}. Owner access and projects will be retained.")
                 default = "repair" if path.name == "installation-pending.json" else "check"
-                action = args.action or prompt("Action: check / repair / update / rollback", default, ("check", "repair", "update", "rollback"))
-                if config.get("layout") == "existing":
+                actions = ("check", "repair", "update", "rollback") + (("recover-owner",) if config["mode"] == "full" else ())
+                action = args.action or prompt("Action: " + " / ".join(actions), default, actions)
+                if action == "recover-owner":
+                    if config["mode"] != "full":
+                        raise InstallError("Relay-only servers have no persistent project owners.")
+                    projects = recovery.projects(config)
+                    if not projects:
+                        raise InstallError("No saved projects. Create one with Pair Notebook: Create Server Project.")
+                    for index, project in enumerate(projects, 1):
+                        print(f"{index}. {project['name']} ({project['id']})")
+                    selected = int(prompt("Project number")) - 1
+                    if not 0 <= selected < len(projects):
+                        raise InstallError("Invalid project selection.")
+                    print("Recovery replaces only this project's owner credential and restarts Pair server/worker. Previous owner credentials stop working; project data and other participants stay intact.")
+                    if prompt("Recover owner access? yes / no", "no", ("yes", "no")) != "yes":
+                        raise InstallError("Owner recovery cancelled.")
+                    output = recovery.recover(config, projects[selected])
+                    print(f"Owner JSON (private): {output}\nCopy this file securely to your computer. In VS Code choose Connect to Server > Import existing owner / member credential.")
+                    return
+                elif config.get("layout") == "existing":
                     if action == "check":
                         checks.verify(config)
                     elif action == "rollback":

@@ -42,6 +42,9 @@ def main() -> None:
     parser.add_argument("--keep-container", action="store_true", help="Retain this isolated test server for further acceptance")
     parser.add_argument("--occupied-https", action="store_true", help="Keep an unrelated TCP 443 service running and select 8443")
     parser.add_argument("--repair-runtime", action="store_true", help="Verify repair of a deliberately broken private Node executable")
+    parser.add_argument("--setup-launcher", action="store_true", help="Use the public self-contained shell download and its embedded server")
+    parser.add_argument("--launcher-name", default="pair-notebook-server-setup.sh")
+    parser.add_argument("--expect-no-python", action="store_true", help="Require the fixture to lack Python before setup")
     args = parser.parse_args()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     docker = ["docker"] + (["--config", args.docker_config] if args.docker_config else [])
@@ -91,6 +94,8 @@ for identity in identities.values():
                 break
             time.sleep(0.5)
         ip = command("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", args.name).stdout.strip()
+        if args.expect_no_python:
+            command("exec", args.name, "sh", "-c", "! command -v python3")
         unrelated_pid = None
         if args.occupied_https:
             command("exec", args.name, "systemd-run", "--unit=pair-unrelated-443", "/usr/bin/python3", "-m", "http.server", "443", "--bind", "127.0.0.1")
@@ -99,7 +104,8 @@ for identity in identities.values():
                     break
                 time.sleep(.1)
             unrelated_pid = command("exec", args.name, "systemctl", "show", "-p", "MainPID", "pair-unrelated-443").stdout
-        installer = ["exec", "-i", args.name, "python3", "/release/pair-notebook-install.pyz", "--archive", "/release/pair-notebook-server-persistent.tar.gz", "--mode", args.mode]
+        installer = ["exec", "-i", args.name] + (["sh", "/release/" + args.launcher_name] if args.setup_launcher else
+                     ["python3", "/release/pair-notebook-install.pyz", "--archive", "/release/pair-notebook-server-persistent.tar.gz"]) + ["--mode", args.mode]
         print(f"Installing {args.mode} on clean {args.image}", flush=True)
         command(*installer, input=f"lan\n{ip}\n8787\n" + ("\n" if args.occupied_https else "") + "yes\n")
         check("clean installation; trusted LAN HTTPS; real encrypted WebSocket exchange and reconnect" + ("; real isolated Jupyter cell returns 42" if args.mode == "full" else "; no Jupyter worker"))

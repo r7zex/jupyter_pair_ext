@@ -1,93 +1,75 @@
-# Install your own Pair Notebook server
+# Set up your own Pair Notebook server
 
-The server can be a dedicated server, a physical Linux computer, a cloud machine or a LAN host. No VPS provider is required. The interactive installer supports **Ubuntu 24.04 LTS and Debian 12 with systemd**, on x86_64 or aarch64. Other distributions, Windows/macOS servers and ordinary containers are not supported installer targets. Container acceptance is an isolated systemd test, not physical hardware acceptance. Architecture and OS testing details are recorded in the release verification report.
+Download from the [latest release](https://github.com/r7zex/jupyter_pair_ext/releases/latest). Setup runs on your Linux server over SSH, independently of VS Code. It works for a new user, an existing server or after reinstalling the extension.
 
-## First installation
+Supported: Ubuntu 24.04 LTS or Debian 12 with systemd; x86_64/aarch64. Dedicated, cloud, physical and LAN servers use the same workflow. Other OSes and ordinary containers are not installer targets. [Verification and tested environments](SERVER_RELEASE_0_6_8.md).
 
-Log into the server with an account allowed to use sudo. Run:
+## Downloads
 
-```sh
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-install.sh -o pair-notebook-install.sh && sudo sh pair-notebook-install.sh
-```
+| File | Purpose |
+| --- | --- |
+| `pair-notebook-0.6.8.vsix` | Install on each participating computer with Extensions: Install from VSIX..., then reload. |
+| `pair-notebook-server-setup.sh` | Install/update a full server with projects, isolated Jupyter, HTTPS and the encrypted relay. |
+| `pair-notebook-ws-server.zip` | Install only the encrypted WebSocket relay, without a Jupyter worker. |
 
-The downloaded launcher checks the OS and privileges, installs Python if necessary, verifies the installer checksum and opens the interactive installer. Nothing is built from source. The installer downloads the matching dependency-bundled server, verifies its checksum and file manifest, installs a private Node.js 22 runtime and Caddy, separate service identities and secrets, an isolated Python/Jupyter worker, systemd startup, TLS and all required routes. SSH, firewall rules, VPN services, routes and unrelated service units are not modified.
+The setup utility includes its matching verified server package. Separate checksum, Python-installer and server-package downloads are unnecessary. GitHub adds source archives for developers.
 
-If curl is absent, download `pair-notebook-install.sh` from the release in a browser, transfer it to the server and run `sudo sh ./pair-notebook-install.sh`. The launcher installs its missing download dependencies itself.
+## New server
 
-Enter only the connection mode, server address, private broker port (default 8787), and installation confirmation. In existing-proxy mode select the supported proxy. Full installation also accepts the Let's Encrypt subscriber agreement for public certificates. No configuration file editing is required.
-
-After local checks, the installer prints the HTTPS origin and the administrative credential. Keep the root-only recovery file `/var/lib/pair-notebook-install/owner-server.json`. The credential authorizes creating projects on this server; it is not a participant credential. Do not paste it into an invitation or public issue.
-
-Install the release VSIX on each computer and reload VS Code when prompted. The extension's output channel logs the version and path actually activated by Extension Host. The installed extension list alone does not establish the active version.
-
-1. Owner: run **Pair Notebook: Create Server Project**. Enter the printed HTTPS origin and administrative credential, then a project name and a session password of at least 12 characters.
-2. Participant: run **Pair Notebook: Connect to Server**, then use the invitation or the server origin and project password. The participant does not need SSH, the administrative credential or the worker secret.
-3. Open a notebook, edit the same cell together and select the server CPU to run it.
-4. **Leave Server Project** leaves the server data running. Explicit leave is remembered after restart. **Configure Server Connections → Forget connection** removes only the saved local identity; it does not delete server data or local history. **Manage Server Project → Delete** is a separate, confirmed owner operation.
-
-## Address and TLS choices
-
-- **domain**: point every public A/AAAA record to the server. Incoming TCP 80 and the chosen HTTPS port (default 443) must reach this machine. Certbot issues a publicly trusted certificate using HTTP-01 and automatically renews it. Incorrect DNS or inaccessible ACME validation fails installation.
-- **ip**: supply a globally routable IPv4 or IPv6 address. Certbot 5.4+ requests a Let's Encrypt `shortlived` IP certificate and an hourly systemd timer checks renewal. Private, reserved and CGNAT addresses are rejected in this mode. No invented DNS name is needed.
-- **lan**: use the LAN hostname or private IP. Caddy creates a private local CA and renews server certificates. Each client must trust `/etc/pair-notebook/local-ca.crt`; certificate verification is never disabled. Transfer that public certificate over a trusted channel, verify its SHA-256 fingerprint on the server, and install it into the client's trusted roots. On Windows: `certutil -user -addstore Root local-ca.crt`, then fully restart VS Code. On Debian/Ubuntu clients: copy it to `/usr/local/share/ca-certificates/pair-notebook-local.crt` and run `sudo update-ca-certificates`. On macOS: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain local-ca.crt`, then restart VS Code. The CA private key stays on the server.
-- **proxy**: automatic integration supports existing Caddy (`/etc/caddy/Caddyfile`) or nginx (`/etc/nginx/conf.d`), adding a separate virtual host with validation and backup. Caddy integration uses a new public domain; nginx also supports a public IP through managed Certbot. An existing hostname collision is rejected. Other proxy implementations are preserved and are not currently claimed as automatic installation targets. Managed public-IP certificates use the dedicated proxy mode; existing-Caddy mode uses Caddy's own certificate management.
-
-Ports are checked before installation. If managed HTTPS port 443 is busy, the installer offers an alternative (default 8443); the printed origin includes that port. You can also enter an explicit origin such as `https://192.168.1.20:8443`. LAN mode does not require port 80. Public certificates still require incoming TCP 80 for HTTP-01. Other conflicts produce an actionable error; the installer never stops the process that owns the port. A server behind NAT requires forwarding TCP 80 and the selected HTTPS port; CGNAT cannot be solved by issuing a certificate. Use LAN access or arrange a publicly reachable endpoint. A valid certificate or a request from the server to itself does not prove reachability from another network.
-
-Node.js 22.15+ clients include explicitly trusted OS certificates. With an older embedded Node runtime, start VS Code with `NODE_EXTRA_CA_CERTS` pointing to the transferred CA file, or update VS Code. This adds trust without bypassing certificate verification.
-
-Before inviting participants, run the packaged check **from their network**, using Node.js 20+:
+Connect over SSH and run:
 
 ```sh
-node server/out/src/vps/relayCheck.js https://YOUR_SERVER
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
 ```
 
-It requires a real WebSocket 101 upgrade, AES-256-GCM message exchange, a disconnect, reconnection using the same identity and a second exchange. The installer runs this locally and through the configured HTTPS origin; external client reachability must be checked separately. Installation output clearly distinguishes these scopes.
+If curl is absent, download the file in a browser, transfer it to the server and run `sudo sh pair-notebook-server-setup.sh`. Setup installs missing Python/download dependencies itself; no source build is required.
 
-Official TLS references, checked during development:
+1. Choose domain, public IP, LAN or a supported existing Caddy/nginx proxy.
+2. Enter the domain/IP, keep the suggested private port unless occupied, and confirm.
+3. Wait for dependencies, HTTPS, automatic services and real execution/relay checks.
+4. Keep the printed HTTPS address and administrative credential private.
+5. In VS Code run **Pair Notebook: Create Server Project**, enter these data, choose a project name and a password of at least 12 characters.
+6. Participants use **Connect to Server** with an invitation or the address and project password. They need no SSH or administrative credential.
 
-- [Let's Encrypt: six-day and IP certificates](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)
-- [Let's Encrypt: Certbot IP support and renewal](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)
-- [Caddy: local HTTPS and trust](https://caddyserver.com/docs/automatic-https)
+Removing the extension does not uninstall or erase the server. Setup does not depend on local VS Code caches or saved connections.
 
-## Check, repair, update and rollback
+## Domain, IP, LAN and existing services
 
-Rerun the same downloaded command. Existing installations offer **check**, **repair**, **update** and **rollback**. Projects and owner credentials stay in their original storage. Releases use separate versioned directories and an atomic `server` symlink. Downloads and hashes are verified before stopping Pair services; a failed upgrade restores the previous binary, configurations and previously running Pair services and checks their health. A private project backup is retained. Project data is not replaced with an older snapshot during automatic rollback, so edits accepted during a brief upgrade are retained. No storage migration is introduced in 0.6.7.
+- **Domain:** point public A/AAAA records to the server. Incoming TCP 80 and the selected HTTPS port must reach it. Setup obtains/renews a trusted certificate.
+- **Public IP:** enter a globally routable IPv4/IPv6 address. Certbot 5.4+ obtains a short-lived Let's Encrypt IP certificate; an hourly timer checks renewal. No purchased domain is required.
+- **LAN:** enter a private IP/hostname. Transfer the public `/etc/pair-notebook/local-ca.crt` over a trusted channel and trust it on every client. Windows: `certutil -user -addstore Root local-ca.crt`, then fully restart VS Code. Ubuntu/Debian: install under `/usr/local/share/ca-certificates/`, then `sudo update-ca-certificates`. macOS: trust it in Keychain Access. Never transfer the CA private key.
+- **Proxy:** existing Caddy/nginx integration adds a separate validated virtual host with backup. Existing hostname collisions are refused. Caddy integration uses a public domain; nginx also supports managed public-IP certificates. Unsupported proxy configurations are preserved and rejected with an actionable error.
 
-Update stops Pair workers and may interrupt active kernels. Schedule it while participants are idle. This does not stop unrelated services.
+If 443 is occupied, setup offers an alternate HTTPS port and prints it in the address. Public ACME validation still requires incoming TCP 80. NAT requires port forwarding; CGNAT needs a reachable public endpoint or LAN mode. Setup does not change SSH, firewall rules, VPN services or network routes, or stop unrelated port owners. Valid TLS/local checks do not prove reachability from another network.
 
-### Existing manually installed servers
+Older embedded Node runtimes may need `NODE_EXTRA_CA_CERTS` pointing to the transferred LAN CA or an updated VS Code. TLS verification is never disabled.
 
-The updated installer in this branch also recognizes packaged 0.6.6 and 0.6.7 installations using the documented `/opt/pair-notebook/server` service paths and `/etc/pair-notebook/server.env`. **The original published 0.6.7 installer does not include this follow-up.** Run the updated standalone utility on the server:
+## Update, repair and reinstall
+
+Download the current setup utility again and run the same command. Existing managed installations offer **check**, **repair**, **update**, **rollback**, and **recover-owner**. Choose **update** for a newer release. An older utility refuses to downgrade a newer server.
+
+Packaged manual installations from 0.6.3 onward are detected through documented server/environment/service paths. Confirm the HTTPS address and backed-up update. Both server directories and symlinks are supported. Existing ports, projects, identities, service limits, Python environment and HTTPS remain in place. Unsupported layouts fail before services change.
+
+Updates stop Pair workers and active Python kernels. Save needed Python objects and update while participants are idle. Downloads/manifest checks precede interruption. A failed update restores the retained previous server and previously running Pair services without replacing current project data. Root-only backups remain under `/var/lib/pair-notebook-install/backups`. Repair of an adopted manual installation replaces the server payload; it does not rebuild broken pre-existing Node/Python dependencies.
+
+After reinstalling the extension, reconnect a saved identity or use **Connect to Server → Import existing owner / member credential**. Members can join again with an invitation or password.
+
+If the owner's local credential was lost, choose **recover-owner**, select the project and explicitly confirm. Only that project's owner key is replaced; old owner credentials stop working. Files, ownership identity and other participants remain. Copy the printed private owner JSON securely to your computer and import it with **Connect to Server**. Recovery requires local server-administrator access; it is not a public project-takeover API.
+
+## WebSocket server
+
+The full setup already includes `/v1/temporary-relay`. For relay-only deployment, extract `pair-notebook-ws-server.zip` and run:
 
 ```sh
-sudo python3 pair-notebook-install.pyz
+sudo sh pair-notebook-ws-server.sh
 ```
 
-It reads the existing broker port, data directories, Node executable and worker configuration. Confirm the detected HTTPS address (or enter it if it cannot be inferred), then accept the update. No manual service, proxy or secret-file editing is required. The utility downloads and verifies the existing immutable 0.6.7 server package, backs up configuration and stopped server/worker data, and retains the previous server release. Only the Pair server and worker restart. Existing service files, resource limits, proxy/certificates, Python environment, membership credentials and project storage are preserved. Both an existing server directory and a server symlink are supported. A failed start or failed HTTPS/WebSocket/Jupyter check restores the previous release and previously active Pair services without replacing current project data.
+This installs HTTPS and automatic service startup without Jupyter. The full setup also accepts `--mode relay`. Set **Pair Notebook: Relay Url** (`pairNotebook.relayUrl`) to the printed HTTPS address, start a temporary session and share its invitation. Guests receive the relay address automatically. The extension uses it as an available fallback when direct transport fails. Contents remain end-to-end encrypted; the relay does not execute notebooks or store persistent projects.
 
-The final screen supplies the existing HTTPS address and administrative credential for **Pair Notebook: Create Server Project**. Existing owners should reconnect their saved identity or import their existing owner JSON instead of joining as a new participant. Subsequent invocations offer check, repair, update and rollback. For adopted installations repair replaces the server payload using existing dependencies; it does not rebuild a broken Node/Python environment. Unsupported layouts are rejected before services change. New installations continue to use the full dependency/proxy/worker setup above.
+Host it on a public VPS or another reachable Linux machine. A home host behind NAT needs forwarding; CGNAT needs another public route. The ZIP also includes bundled `relay.js` and `check.js` for Node.js 20+ behind an existing HTTPS proxy. Forward `/v1/temporary-relay` with WebSocket upgrade support and `/health`. From a participant's network run `node check.js https://YOUR_SERVER`. It requires WebSocket 101, AES-GCM exchange, disconnect, authenticated reconnect and another exchange. An open port/HTTP 200 alone is insufficient.
 
-The installer deliberately keeps the admin token outside notebook execution. Worker sandbox checks fail closed if user/mount namespaces are unavailable. On Ubuntu, a profile for a private Pair-only bubblewrap binary permits its user namespace without changing the system-wide user-namespace sysctl.
+## Saved connections
 
-## Relay only
+**Leave Server Project** preserves server data and is remembered after restart. **Configure Server Connections → Forget connection** removes only the local identity; **Manage Server Project → Delete** separately confirms server deletion. Keep dirty editors and local journals during upgrades; never delete globalStorage as a compatibility workaround. Interrupted managed setup offers repair. **Pair Notebook: Server Restore** supports automatic, ask and manual reconnection with bounded retries.
 
-Run the same installer with `--mode relay`:
-
-```sh
-curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-install.sh -o pair-notebook-install.sh && sudo sh pair-notebook-install.sh --mode relay
-```
-
-This installs the ready relay service and TLS without Python/Jupyter worker packages. Python itself is used only by the installer. For an existing managed TLS proxy and Node.js 20+, the extracted server package also supports:
-
-```sh
-PAIR_VPS_BIND=127.0.0.1 PAIR_VPS_PORT=8787 node server/out/src/vps/relayCli.js
-```
-
-Forward `/v1/temporary-relay` with WebSocket upgrade support and `/health` from your HTTPS proxy. The standalone relay rejects session RPC and legacy administrative relay routes. Set **Pair Notebook: Relay Url** to its HTTPS origin; the last connected server is used when the setting is empty. Temporary invitations carry this origin, never the administrative credential. Existing P2P and encrypted transports remain available; the UI distinguishes direct and relayed paths. A relay reachable by both participants provides a fallback route, not a promise of direct P2P.
-
-## Restored projects and unsaved notebooks
-
-The `pair-vps` URI scheme, existing command identifiers, settings, credentials and local histories are retained. The UI calls these server projects. Before mounting an editable project the client negotiates protocol support, checks membership, project state and snapshot availability, and initializes restored notebooks. Version 0.6.7 requires a server with compatibility discovery (0.6.7+); older servers produce one update action before editing begins.
-
-**Pair Notebook: Server Restore** has `automatic`, `ask` and `manual` modes. Automatic startup retries transient failures at bounded backoff, then waits for an explicit reconnect. Revoked membership, deleted projects and protocol incompatibility stop retries. Explicit leave disables automatic restoration of that saved identity. Forgetting it does not clear journals, dirty editors or server data. The old 0.6.5 empty-notebook request returns 426 on 0.6.6 because it lacks the `bootstrapEmpty` capability; keep the unsaved editor open while updating, and let the new client reconcile the first cell. Never delete globalStorage or discard a dirty notebook to solve a compatibility error.
+Official TLS references: [Certbot IP certificates](https://letsencrypt.org/2026/03/11/shorter-certs-certbot), [Caddy HTTPS](https://caddyserver.com/docs/automatic-https).

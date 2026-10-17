@@ -1,6 +1,6 @@
 # Your server and persistent compute machines
 
-Version 0.6.7. This guide covers **Connect to Server Compute**, the optional encrypted relay and independent background-job broker. **Connect to Server** instead opens a server-owned collaborative workspace with session credentials; follow [Persistent server sessions](PERSISTENT_VPS.md) for that mode.
+For normal installation use [Server setup](SERVER_SETUP.md); the manual configuration below is an operator reference. Version 0.6.8. This guide covers **Connect to Server Compute**, the optional encrypted relay and independent background-job broker. **Connect to Server** instead opens a server-owned collaborative workspace with session credentials; follow [Persistent server sessions](PERSISTENT_VPS.md) for that mode.
 
 
 Pair Notebook can use your own server as an additional **end-to-end encrypted P2P relay** and as a **durable background-job broker**. A standalone agent on a PC executes Python jobs using that PC's CPU or NVIDIA GPU. The PC connects outward over HTTPS; it does not need a public IP, inbound port, VS Code, or the Session Host role. You can also run an agent on the server itself.
@@ -12,11 +12,7 @@ Once the agent starts a job, switching off the submitting laptop, leaving the co
 Use Node.js 20+ and Python 3.10+ for agents. For a manual background-job broker on a Linux server (new notebook servers use [the installer](SERVER_SETUP.md)):
 
 ```bash
-curl -fL https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-server-persistent.tar.gz -o pair-notebook-server-persistent.tar.gz
-curl -fL https://github.com/r7zex/jupyter_pair_ext/releases/download/v0.6.7/pair-notebook-server-persistent.tar.gz.sha256 -o pair-notebook-server-persistent.tar.gz.sha256
-sha256sum --check pair-notebook-server-persistent.tar.gz.sha256
-tar -xzf pair-notebook-server-persistent.tar.gz
-cd server
+curl -fL --proto '=https' --proto-redir '=https' https://github.com/r7zex/jupyter_pair_ext/releases/latest/download/pair-notebook-server-setup.sh -o pair-notebook-server-setup.sh && sudo sh pair-notebook-server-setup.sh
 ```
 
 No npm install or source build is required. Place this verified directory at the service's `/opt/pair-notebook-vps` working directory before starting the manual unit below. Back up an existing deployment before replacing its binaries; retain its state and credentials.
@@ -113,7 +109,7 @@ On Windows, run the same script with the selected Python executable and Windows 
 
 ## 3. Connect every collaborator
 
-Install Pair Notebook 0.6.7 on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to Server Compute**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
+Install Pair Notebook 0.6.8 on every editor computer. Open a trusted workspace and run **Pair Notebook: Connect to Server Compute**, enter `https://pair.example.com` and the **team** token. The token is stored in VS Code SecretStorage, bound to the exact endpoint; settings contain only the server URL.
 
 Each collaborator keeps using the normal session invitation for editing. Start or rejoin the session after connecting the server to add its private relay. Direct P2P and the existing public relay paths remain available. Only holders of the session invite can decrypt relay frames; the server handles opaque ciphertext and routing metadata. The server service does not need the session invitation secret.
 

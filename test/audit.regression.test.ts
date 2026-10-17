@@ -98,18 +98,19 @@ describe('audit regressions', () => {
       assert.match(publishJob, /VERIFIED_COMMIT:\s+\$\{\{ needs\.verify\.outputs\.verified_commit \}\}/);
       assert.match(publishJob, /"\$\{REMOTE_TAG_COMMIT\}" != "\$\{VERIFIED_COMMIT\}"/);
       const declaredAssets = publishJob.match(/ASSETS=\(([^\n]*)\)/)?.[1] ?? '';
-      for (const asset of ['${VERSIONED_VSIX}', 'pair-notebook-complete-${RELEASE_VERSION}.zip',
-        'pair-notebook-server-persistent.tar.gz', 'pair-notebook-server-persistent.tar.gz.sha256',
-        'pair-notebook-install.pyz', 'pair-notebook-install.sh', 'pair-notebook-relay.tar.gz', 'SERVER_SETUP.md', 'SHA256SUMS']) {
+      for (const asset of ['${VERSIONED_VSIX}', 'pair-notebook-server-setup.sh', 'pair-notebook-ws-server.zip']) {
         assert.ok(declaredAssets.includes(`"${asset}"`), `release must publish ${asset}`);
       }
+      assert.equal((declaredAssets.match(/"[^"]+"/g) ?? []).length, 3);
+      assert.match(publishJob, /sha256sum --check SHA256SUMS/);
       assert.match(verifyJob, /npm run package:persistent-server\s+ npm run test:persistent:server/);
       assert.match(verifyJob, /sha256sum --check pair-notebook-server-persistent\.tar\.gz\.sha256/);
       assert.doesNotMatch(publishJob, /pair-notebook\.vsix|SOURCE_ZIP:|SHA256SUMS\.txt/);
-      assert.match(releaseNotesScript, /const vsixName = `pair-notebook-\$\{version\}\.vsix`/);
-      assert.match(releaseNotesScript, /pair-notebook-complete-\$\{version\}\.zip/);
+      assert.match(releaseNotesScript, /pair-notebook-\$\{version\}\.vsix/);
+      assert.match(releaseNotesScript, /pair-notebook-server-setup\.sh/);
+      assert.match(releaseNotesScript, /pair-notebook-ws-server\.zip/);
       assert.doesNotMatch(releaseNotesScript, /pair-notebook\.vsix/);
-      assert.match(releaseNotesScript, /SHA256SUMS/);
+      assert.doesNotMatch(releaseNotesScript, /pair-notebook-complete|SHA256SUMS/);
       assert.doesNotMatch(workflow, /--clobber/);
       const compareIndex = publishJob.indexOf('cmp --silent');
       const editIndex = publishJob.indexOf('gh release edit');

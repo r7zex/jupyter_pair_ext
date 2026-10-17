@@ -2,17 +2,17 @@
 
 For new servers use the [interactive installer](SERVER_SETUP.md). The manual procedure below remains for existing deployments. server command identifiers and `pair-vps` URIs remain compatible.
 
-# Persistent server sessions — 0.6.7
+# Persistent server sessions — 0.6.8
 
 Use the main Pair Notebook panel to create, join, configure or leave a persistent server session. The server retains session authority, membership, files and execution receipts while editors are offline. The panel displays the endpoint, session ID, matching Explorer folder, participants and selected compute device. Legacy broker commands remain callable for compatibility but have no separate sidebar view.
 
-Version 0.6.7 uses one Pair Notebook controller for both session types. When no session is connected, the panel exposes separate temporary-session and persistent-session actions. Saved connections display the project name and membership identity; Configure Server Connections can reconnect or forget a local saved connection without deleting the server project.
+Version 0.6.8 uses one Pair Notebook controller for both session types. When no session is connected, the panel exposes separate temporary-session and persistent-session actions. Saved connections display the project name and membership identity; Configure Server Connections can reconnect or forget a local saved connection without deleting the server project.
 
 **My computer** can prepare and launch the bundled isolated agent directly. Windows requires an existing Ubuntu/Debian WSL2 distribution; Linux requires working bubblewrap isolation. Preparation creates a dedicated Python environment rather than modifying system Python. A ready owner agent is reused automatically, and newly enabled owner sharing becomes the default compute target. If local isolation is unavailable, the server remains the fallback. Explicitly selected Python environments are preserved; the default temporary-session interpreter can discover Jupyter in the original project's `.venv`.
 
 Temporary invitations can carry an HTTPS Pair Notebook relay origin. Set `pairNotebook.relayUrl` once, or reuse the last connected persistent server. Guests need only the invitation; they do not receive the team administration token. The additional relay route is end-to-end encrypted, bounded and independent of WebRTC; direct P2P and existing public fallbacks are still used. Measured latency depends on the endpoints and route; 100 ms is a target, not an unconditional network guarantee.
 
-Install the same 0.6.7 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/server, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
+Install the same 0.6.8 release on editors, server and interactive agents. [Architecture](PERSISTENT_VPS_ARCHITECTURE.md) explains the boundaries; [acceptance evidence](PERSISTENT_VPS_ACCEPTANCE_2026_10_14.md) records target HTTPS/server, native editor API and WSL/CUDA checks with their source identities. Physical UI, macOS compute and a completed 24-hour soak are not implied by a release or short smoke test.
 
 ## Participant permissions and comments
 
@@ -20,22 +20,9 @@ The session owner can use **Manage Server Project → Права участни�
 
 ## Release files and requirements
 
-Download from [release v0.6.7](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.7):
+Download the extension and `pair-notebook-server-setup.sh` from [release v0.6.8](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.8). Follow [Server setup](SERVER_SETUP.md) for new installations, updates and lost owner credentials. The matching server, worker scripts and verified manifest are embedded in the setup utility; no source build or separate checksum download is needed. `pair-notebook-ws-server.zip` is optional for relay-only deployments. Full installations already include the relay.
 
-- `pair-notebook-0.6.7.vsix`: install on every editor, then reload VS Code.
-- `pair-notebook-server-persistent.tar.gz` and `.sha256`: bundled server, agent/bridge, operator guide and service templates. No npm install/build is needed on the server.
-- `pair-notebook-complete-0.6.7.zip`: matching source, tests and background agent.
-
-The server needs Node.js 20 or newer, private durable storage and verified HTTPS. The Linux worker needs its own non-root account, Python environment with `jupyter_client`/`ipykernel`, and working bubblewrap/user namespaces or an isolated Linux-container runtime. Python dependencies and CUDA belong to the selected executor. Do not silently switch interpreters when readiness fails.
-
-Verify the archive before extraction:
-
-```bash
-sha256sum --check pair-notebook-server-persistent.tar.gz.sha256
-tar -tzf pair-notebook-server-persistent.tar.gz
-```
-
-`server/BUILD.json` records the source commit, `localChangesIncluded` and every payload SHA-256. The installed VSIX contains `PAIR_BUILD.json` with corresponding provenance. A clean release has local changes set to false. Check the actual activated extension after reload; replacing its files does not reload an existing Extension Host.
+The following service settings and manual lifecycle commands are reference material for operators. Normal installation does not require editing them.
 
 ## Server and HTTPS
 
@@ -73,7 +60,7 @@ Owners control invitations, membership revocation, visibility and device policy.
 
 ## Notebook editing and saving
 
-Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension and server together to 0.6.7; the extension checks the server's text protocol before editing. Zero-byte notebooks are initialized as valid empty notebooks. Their first unsaved editor cells are committed against the server's initial state vector, without restoring cells deleted from an existing populated notebook.
+Typing, paste and deletion use local Yjs replicas and send character identities. Same-line concurrent editing is allowed; presence does not lock a row. Pending updates remain in a local journal until acknowledgement and retry idempotently. Cursors do not wait for text acknowledgements. Peer latency includes the network, server and editor application. Update the extension and server together to 0.6.8; the extension checks the server's text protocol before editing. Zero-byte notebooks are initialized as valid empty notebooks. Their first unsaved editor cells are committed against the server's initial state vector, without restoring cells deleted from an existing populated notebook.
 
 Native Save persists source, user metadata, outputs and execution counts. Editing an executed cell retains previous output. Results from a changed source/cell identity/generation remain fenced. Save immediately after Run settles the native execution lifecycle; a save racing with a later remote document version can require a further save. Reopen and verify the stored notebook when qualifying a new build.
 

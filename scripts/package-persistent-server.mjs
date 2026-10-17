@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sourceProvenance } from './build-provenance.mjs';
+import { packageServerSetup } from './package-server-setup.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
@@ -71,8 +72,6 @@ try {
   await fs.writeFile(`${archive}.sha256`, `${sha256(await fs.readFile(archive))}  ${path.basename(archive)}\n`);
   const installer = path.join(staging, 'installer');
   await fs.cp(path.join(root, 'installer'), installer, { recursive: true, filter: source => !source.split(path.sep).includes('__pycache__') && !source.endsWith('.pyc') });
-  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-m', 'zipapp', installer, '-o', path.join(artifacts, 'pair-notebook-install.pyz'), '-p', '/usr/bin/env python3'], { stdio: 'inherit' });
-  await fs.copyFile(path.join(root, 'deploy/install.sh'), path.join(artifacts, 'pair-notebook-install.sh'));
   await fs.copyFile(path.join(root, 'docs/SERVER_SETUP.md'), path.join(artifacts, 'SERVER_SETUP.md'));
   const relay = path.join(staging, 'relay');
   await fs.mkdir(relay);
@@ -86,6 +85,7 @@ try {
   const relayArchive = path.join(artifacts, 'pair-notebook-relay.tar.gz');
   execFileSync('tar', ['-czf', relayArchive, '-C', staging, 'relay'], { stdio: 'inherit' });
   await fs.writeFile(`${relayArchive}.sha256`, `${sha256(await fs.readFile(relayArchive))}  ${path.basename(relayArchive)}\n`);
+  await packageServerSetup({ root, installer, artifacts, relay, version: pkg.version });
   console.log(`Packaged matching persistent server ${pkg.version}: ${archive}`);
 } finally {
   await fs.rm(staging, { recursive: true, force: true });

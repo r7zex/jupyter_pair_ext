@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import resources
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import subprocess
 import tarfile
 import urllib.request
 
-VERSION = "0.6.7"
+VERSION = "0.6.8"
 REPOSITORY = "r7zex/jupyter_pair_ext"
 ROOT = Path("/opt/pair-notebook")
 CONFIG = Path("/etc/pair-notebook")
@@ -20,6 +21,13 @@ STATE = Path("/var/lib/pair-notebook-install")
 
 class InstallError(RuntimeError):
     pass
+
+
+def upgrade_version(current: str) -> None:
+    if not all(part.isdigit() for part in current.split('.')) or len(current.split('.')) != 3:
+        raise InstallError("Installed release version is invalid.")
+    if tuple(map(int, current.split('.'))) > tuple(map(int, VERSION.split('.'))):
+        raise InstallError("This setup utility is older than the installed server. Download the latest utility from GitHub; no services were changed.")
 
 
 def run(*args: str, capture: bool = False) -> str:
@@ -105,9 +113,11 @@ def release(directory: Path, local_archive: Path | None = None) -> Path:
         shutil.copyfile(local_archive, archive)
         checksums.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
     else:
-        base = f"https://github.com/{REPOSITORY}/releases/download/v{VERSION}"
-        fetch(f"{base}/{archive.name}", archive)
-        fetch(f"{base}/{checksums.name}", checksums)
+        payload = resources.files("pair_installer").joinpath("payload")
+        if not payload.joinpath(archive.name).is_file():
+            raise InstallError("Download pair-notebook-server-setup.sh from the matching GitHub release; it includes the verified server package.")
+        archive.write_bytes(payload.joinpath(archive.name).read_bytes())
+        checksums.write_bytes(payload.joinpath(checksums.name).read_bytes())
     verify(archive, checksums)
     extract(archive, directory / "unpacked")
     server = directory / "unpacked/server"

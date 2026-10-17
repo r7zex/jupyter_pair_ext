@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 from . import checks, services
-from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, switch, write
+from .system import CONFIG, ROOT, STATE, VERSION, InstallError, release, run, switch, upgrade_version, write
 
 PAIR_SERVICES = ("pair-notebook-server", "pair-notebook-worker")
 
@@ -39,8 +39,9 @@ def discover() -> dict:
     if not target.is_relative_to(ROOT.resolve()) or not (target / "BUILD.json").is_file():
         raise InstallError("Existing server must be a packaged release inside /opt/pair-notebook. No services were changed.")
     manifest = json.loads((target / "BUILD.json").read_text())
-    if not re.fullmatch(r"0\.6\.[67]", manifest.get("version", "")):
-        raise InstallError("Automatic adoption supports packaged 0.6.6 and 0.6.7 installations. No services were changed.")
+    version = manifest.get("version", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or tuple(map(int, version.split('.'))) < (0, 6, 3):
+        raise InstallError("Automatic adoption requires a packaged 0.6.3 or later installation. No services were changed.")
     host, worker = (settings(name) for name in PAIR_SERVICES)
     arguments = shlex.split(host.get("ExecStart", ""))
     if len(arguments) != 2 or arguments[1] != str(server / "out/src/vps/cli.js"):
@@ -130,6 +131,7 @@ def restore(target: Path, active: list[str]) -> None:
 def update(config: dict, archive: Path | None) -> None:
     # Recheck the live layout on maintenance runs; never trust stale paths.
     current = discover()
+    upgrade_version(current["version"])
     if any(current[key] != config[key] for key in ("port", "node", "data", "workerData")):
         raise InstallError("Existing service configuration changed. No services were changed.")
     owner_credential(config)
@@ -140,7 +142,7 @@ def update(config: dict, archive: Path | None) -> None:
     backup = STATE / "backups" / stamp
     backup.mkdir(parents=True, mode=0o700)
     shutil.copytree(CONFIG, backup / "configuration", symlinks=True)
-    for name in services.SERVICES:
+    for name in PAIR_SERVICES:
         write(backup / f"{name}.service", run("systemctl", "cat", name, capture=True))
     with tempfile.TemporaryDirectory(prefix="pair-update-") as temporary:
         # Download, checksum and manifest checks finish before interruption.
@@ -195,9 +197,16 @@ def rollback(config: dict) -> None:
         stop()
         switch(target)
         start()
-        # An older retained server may not implement compatibility discovery.
-        checks.verify(config)
         version = json.loads((target / "BUILD.json").read_text())["version"]
+        if tuple(map(int, version.split('.'))) >= (0, 6, 6):
+            checks.verify(config)
+        else:
+            # Pre-0.6.6 servers do not have the additional WebSocket relay.
+            local = f"http://127.0.0.1:{config['port']}"
+            checks.wait_health(local)
+            checks.wait_health(config["endpoint"])
+            admin = json.loads((STATE / "owner-server.json").read_text())["adminToken"]
+            checks.rpc(local, "list", token=admin)
         updated = {**config, "version": version, "previous": str(current)}
         write(STATE / "installation.json", json.dumps(updated, indent=2) + "\n")
         config.update(updated)

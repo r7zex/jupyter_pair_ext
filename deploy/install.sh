@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
-PAIR_VERSION=0.6.7
+# Release packaging embeds the installer and verified server payload below.
+PAIR_VERSION=__PAIR_VERSION__
+PAIR_DEFAULT_MODE=__PAIR_DEFAULT_MODE__
 if [ "$(id -u)" != 0 ]; then
-    echo "Run this downloaded installer with sudo sh pair-notebook-install.sh" >&2
+    echo "Run this downloaded utility with sudo sh pair-notebook-server-setup.sh" >&2
     exit 1
 fi
 . /etc/os-release
@@ -17,8 +19,9 @@ if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
 fi
 PAIR_DOWNLOAD=$(mktemp -d)
 trap 'rm -rf "$PAIR_DOWNLOAD"' EXIT HUP INT TERM
-PAIR_RELEASE="https://github.com/r7zex/jupyter_pair_ext/releases/download/v${PAIR_VERSION}"
-curl --fail --location --proto '=https' --proto-redir '=https' "$PAIR_RELEASE/pair-notebook-install.pyz" -o "$PAIR_DOWNLOAD/pair-notebook-install.pyz"
-curl --fail --location --proto '=https' --proto-redir '=https' "$PAIR_RELEASE/SHA256SUMS" -o "$PAIR_DOWNLOAD/SHA256SUMS"
-(cd "$PAIR_DOWNLOAD" && awk '$2 == "pair-notebook-install.pyz" { print }' SHA256SUMS > installer.sha256 && test -s installer.sha256 && sha256sum --check installer.sha256)
-python3 "$PAIR_DOWNLOAD/pair-notebook-install.pyz" "$@"
+awk 'payload { print } /^__PAIR_NOTEBOOK_PAYLOAD__$/ { payload = 1 }' "$0" | base64 --decode > "$PAIR_DOWNLOAD/pair-notebook-install.pyz"
+printf '%s  pair-notebook-install.pyz\n' '__PAIR_INSTALLER_SHA256__' > "$PAIR_DOWNLOAD/installer.sha256"
+(cd "$PAIR_DOWNLOAD" && sha256sum --check installer.sha256)
+python3 "$PAIR_DOWNLOAD/pair-notebook-install.pyz" --mode "$PAIR_DEFAULT_MODE" "$@"
+exit 0
+__PAIR_NOTEBOOK_PAYLOAD__

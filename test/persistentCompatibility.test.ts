@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { VpsServer } from '../src/vps/server';
 import { PersistentClient, PersistentHttpError } from '../src/vps/persistentClient';
-import { isPermanentConnectionError } from '../src/vps/compatibility';
+import { isPermanentConnectionError, SERVER_VERSION } from '../src/vps/compatibility';
 import type { PersistentMembership } from '../src/vps/persistentProtocol';
 
 describe('Server compatibility before editable project restoration', () => {
@@ -19,7 +19,7 @@ describe('Server compatibility before editable project restoration', () => {
     const anonymous = new PersistentClient(endpoint, { kind: 'anonymous' });
     await anonymous.checkCompatibility();
     const result = await anonymous.call<Record<string, unknown>>('compatibility');
-    assert.equal(result.version, '0.6.7'); assert.equal(result.protocol, 1);
+    assert.equal(result.version, SERVER_VERSION); assert.equal(result.protocol, 1);
     assert.equal(result.relayPath, '/v1/temporary-relay');
     assert(!JSON.stringify(result).includes('A'.repeat(40)));
     const admin = new PersistentClient(endpoint, { kind: 'admin', token: 'A'.repeat(40) });
