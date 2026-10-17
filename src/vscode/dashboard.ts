@@ -95,6 +95,18 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
         this.push(true);
         return;
       }
+      if (requested === 'copyVpsPassword') {
+        const session = this.persistent;
+        if (!session || session.connected === false) return;
+        this.runBackground('Copy session password', async () => {
+          const password = await this.sessionPassword();
+          if (this.persistent?.id !== session.id || this.persistent?.memberId !== session.memberId || this.persistent?.endpoint !== session.endpoint) return;
+          if (password === undefined) { void vscode.window.showInformationMessage('No session password is saved on this computer.'); return; }
+          await vscode.env.clipboard.writeText(password);
+          void vscode.window.showInformationMessage('Session password copied.');
+        });
+        return;
+      }
       if (requested === 'revealVpsPassword') {
         const session = this.persistent;
         if (!session || session.connected === false) return;

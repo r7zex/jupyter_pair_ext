@@ -6,13 +6,16 @@ describe('dashboard webview startup', () => {
   it('registers its message receiver before loading HTML and always ships a visible fallback', async () => {
     const executed: string[] = [];
     const errors: string[] = [];
+    let clipboard = "";
     const fakeVscode = {
+      env: { clipboard: { writeText: async (value: string) => { clipboard = value; } } },
       commands: {
         executeCommand: async (command: string) => {
           executed.push(command);
         },
       },
       window: {
+        showInformationMessage: async () => undefined,
         showErrorMessage: async (message: string) => {
           errors.push(message);
         },
@@ -152,6 +155,10 @@ describe('dashboard webview startup', () => {
     assert.match(getElementById('content').innerHTML, /&lt;private-password&gt;/);
     assert.match(getElementById('content').innerHTML, /id="copyVpsPassword"/);
     assert.match(getElementById('content').innerHTML, /aria-label="Copy password"/);
+    provider.sessionPassword = async () => '<private-password>';
+    receive?.({ command: 'copyVpsPassword' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(clipboard, '<private-password>');
     assert.doesNotMatch(getElementById('content').innerHTML, />Copy<|C\.\.\./);
     getElementById('togglePassword').onclick?.();
     assert.doesNotMatch(getElementById('content').innerHTML, /private-password|id="copyVpsPassword"/);

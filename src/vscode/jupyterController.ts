@@ -118,6 +118,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     }
     this.runtime = runtime;
     this.refreshSession();
+    if (runtime) void this.controller;
     if (runtime) for (const notebook of vscode.workspace.notebookDocuments) {
       if (runtime.notebookKey(notebook.uri)) {
         this.claimNotebook(notebook);

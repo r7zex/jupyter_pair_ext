@@ -5153,6 +5153,7 @@ function createVscodeBoundary(): any {
     notebooks: {
       createNotebookController: (_id: string, _type: string, _label: string, executeHandler: any) => {
         const controller = {
+          id: _id,
           executeHandler,
           interruptHandler: undefined as any,
           supportedLanguages: [],
