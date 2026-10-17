@@ -23,6 +23,7 @@ describe('extension storage lifecycle', () => {
         globalState: { keys: () => [...global.keys()], get: (key: string, fallback: unknown) => global.has(key) ? global.get(key) : fallback, update: async (key: string, value: unknown) => { if (value === undefined) global.delete(key); else global.set(key, value); } },
         secrets: { get: async (key: string) => rawSecrets.get(key), store: async (key: string, value: string) => { rawSecrets.set(key, value); }, delete: async (key: string) => { rawSecrets.delete(key); }, onDidChange: () => ({ dispose: () => undefined }) },
       };
+      Object.freeze(context); // VS Code exposes non-configurable context properties.
       const first = await prepareExtensionStorage(context);
       assert.deepEqual(first.globalState.get('pairNotebook.persistentConnections'), [connection]);
       assert.equal(global.has('pairNotebook.persistentConnections'), false, 'host records leave the shared VS Code state database');

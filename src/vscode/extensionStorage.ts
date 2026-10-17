@@ -104,11 +104,11 @@ export async function prepareExtensionStorage(context: vscode.ExtensionContext):
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   if (!Array.isArray(locations) || locations.some(item => typeof item !== 'string')) throw new Error('Invalid Pair Notebook storage registry.');
   await atomicWriteFile(registryFile, JSON.stringify([...new Set([...locations, root])]));
-  const prepared = new Proxy(context, { get(target, property) {
+  const prepared = new Proxy({} as vscode.ExtensionContext, { get(_target, property) {
     if (property === 'globalState') return memento;
     if (property === 'secrets') return secrets;
-    const value = Reflect.get(target, property);
-    return typeof value === 'function' ? value.bind(target) : value;
+    const value = Reflect.get(context, property);
+    return typeof value === 'function' ? value.bind(context) : value;
   } });
   cleanups.set(prepared, async () => {
     await pending;
