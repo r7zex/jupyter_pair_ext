@@ -8,6 +8,7 @@
 - Local connection metadata moves into extension-owned storage. Uninstall removes cached workspaces/history and its credential encryption key; reinstall starts with no remembered server. User-selected source folders and VPS data remain.
 - The full setup includes the relay. The standalone ZIP adds a Windows tray launcher with local TLS, a private verified Node runtime fallback and one-click stop/start.
 - Setup/removal downloads delete themselves. Server removal verifies and exports only `.py`/`.ipynb` files, then removes Pair services, credentials, session history and private runtimes. Shared OS packages and unrelated services remain.
+- Older adopted installations can also remove verified Pair loop volumes and their exact fstab entries, service overrides, certificate-copy timers and the dedicated journal namespace. Unrecognized mounted storage is rejected before services stop.
 
 ## Checks
 

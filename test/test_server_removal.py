@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "installer"))
-from pair_installer import removal
+from pair_installer import removal, removal_volumes
 from pair_installer.system import InstallError
 
 
@@ -70,6 +70,49 @@ class ServerRemovalTests(unittest.TestCase):
                 with self.assertRaises(InstallError):
                     removal.remove_proxy({"network": "proxy"})
             self.assertEqual(file.read_text(), content)
+
+    def test_detaches_only_verified_pair_loop_volumes_and_retains_other_mounts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            volumes = root / 'volumes'
+            volumes.mkdir()
+            images = [volumes / 'server.ext4', volumes / 'worker.ext4']
+            roots = (root / 'server', root / 'worker')
+            for image in images:
+                image.write_bytes(b'fixture volume')
+            fstab = root / 'fstab'
+            other = '# existing mounts\nUUID=unrelated /srv ext4 defaults 0 0\n'
+            original = other + ''.join(f'{image} {target} ext4 loop,nodev,nosuid,noexec 0 0\n' for image, target in zip(images, roots))
+            fstab.write_text(original)
+            commands = []
+            def run(*args, **kwargs):
+                commands.append(args)
+                if args[0] == 'findmnt':
+                    return '/dev/loop9' if args[4] == str(roots[0]) else '/dev/loop10'
+                if args[0] == 'losetup':
+                    return str(images[0] if args[-1] == '/dev/loop9' else images[1])
+                return ''
+            with patch.object(removal_volumes.os.path, 'ismount', side_effect=lambda p: p in roots), patch.object(removal_volumes, 'run', side_effect=run):
+                plan = removal_volumes.plan(roots, fstab, volumes)
+                removal_volumes.detach(plan)
+            self.assertEqual(fstab.read_text(), other)
+            self.assertEqual([command for command in commands if command[0] == 'umount'], [('umount', str(roots[1])), ('umount', str(roots[0]))])
+            with patch.object(removal_volumes.os.path, 'ismount', return_value=False), patch.object(removal_volumes, 'run') as mount:
+                removal_volumes.restore(plan)
+                self.assertEqual(fstab.read_text(), original)
+                self.assertEqual(mount.call_count, 2)
+            removal_volumes.remove_images(plan)
+            self.assertFalse(volumes.exists())
+
+    def test_rejects_unknown_mounted_storage_before_detaching_or_deleting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fstab = root / 'fstab'
+            fstab.write_text('/dev/unrelated /srv ext4 defaults 0 0\n')
+            with patch.object(removal_volumes.os.path, 'ismount', return_value=True), patch.object(removal_volumes, 'run') as run:
+                with self.assertRaisesRegex(InstallError, 'Unrecognized mounted'):
+                    removal_volumes.plan((root / 'server', root / 'worker'), fstab, root / 'volumes')
+                run.assert_not_called()
 
 
 if __name__ == "__main__":
