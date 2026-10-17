@@ -114,6 +114,16 @@ class ServerRemovalTests(unittest.TestCase):
                     removal_volumes.plan((root / 'server', root / 'worker'), fstab, root / 'volumes')
                 run.assert_not_called()
 
+    def test_accepts_both_owned_sandbox_profiles_and_rejects_unrelated_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = Path(temporary) / 'pair-notebook-bwrap'
+            for location in ('runtime/bin/bwrap', 'sandbox/bwrap'):
+                profile.write_text(str(removal.ROOT / location))
+                removal.validate_profile(profile)
+            profile.write_text('/usr/bin/unrelated')
+            with self.assertRaisesRegex(InstallError, 'no installation files were removed'):
+                removal.validate_profile(profile)
+
 
 if __name__ == "__main__":
     unittest.main()

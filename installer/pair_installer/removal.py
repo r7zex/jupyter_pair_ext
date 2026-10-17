@@ -19,6 +19,11 @@ def safe_root(value: Path, allowed: tuple[Path, ...]) -> Path:
     return value
 
 
+def validate_profile(profile: Path) -> None:
+    if profile.exists() and (profile.is_symlink() or not any(str(ROOT / name) in profile.read_text() for name in ('runtime/bin/bwrap', 'sandbox/bwrap'))):
+        raise InstallError('The Pair AppArmor profile was changed; no installation files were removed.')
+
+
 def source_files(data: Path) -> list[tuple[str, Path, str]]:
     result = []
     sessions = data / "sessions"
@@ -108,6 +113,13 @@ def uninstall(config: dict, destination: Path | None = None) -> tuple[Path, int]
         safe_root(directory, allowed)
     volumes = removal_volumes.plan((data, worker))
     source_files(data)  # Validate the export before interrupting services.
+    profile = Path('/etc/apparmor.d/pair-notebook-bwrap')
+    validate_profile(profile)
+    trust = Path('/usr/local/share/ca-certificates/pair-notebook-local.crt')
+    if trust.exists():
+        source = CONFIG / 'local-ca.crt'
+        if trust.is_symlink() or not source.is_file() or trust.read_bytes() != source.read_bytes():
+            raise InstallError('The Pair trust certificate was changed; no installation files were removed.')
     destination = destination or Path("/root/pair-notebook-files") / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     resolved = destination.resolve()
     if not destination.is_absolute() or any(resolved.is_relative_to(directory) for directory in allowed):
@@ -141,17 +153,10 @@ def uninstall(config: dict, destination: Path | None = None) -> tuple[Path, int]
             shutil.rmtree(dropins)
     Path('/etc/systemd/journald@pair-notebook.conf').unlink(missing_ok=True)
     run("systemctl", "daemon-reload")
-    profile = Path("/etc/apparmor.d/pair-notebook-bwrap")
     if profile.exists():
-        if str(ROOT / "runtime/bin/bwrap") not in profile.read_text():
-            raise InstallError("The Pair AppArmor profile was changed; retained for manual removal.")
         run("apparmor_parser", "-R", str(profile))
         profile.unlink()
-    trust = Path("/usr/local/share/ca-certificates/pair-notebook-local.crt")
     if trust.exists():
-        source = CONFIG / "local-ca.crt"
-        if trust.is_symlink() or not source.is_file() or trust.read_bytes() != source.read_bytes():
-            raise InstallError("The Pair trust certificate was changed; retained for manual removal.")
         trust.unlink()
         run("update-ca-certificates")
     for directory in dict.fromkeys((data, worker, *allowed)):
