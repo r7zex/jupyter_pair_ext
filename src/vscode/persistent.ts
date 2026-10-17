@@ -347,6 +347,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       'pairNotebook.copyVpsSessionPassword': () => this.copySessionPassword(),
       'pairNotebook.changeVpsSessionPassword': () => this.changeSessionPassword(),
       'pairNotebook.copyVpsInvitation': () => this.copyInvitation(),
+      'pairNotebook.saveVpsFiles': () => this.saveFiles(),
       'pairNotebook.releaseVpsKernel': () => this.releaseKernel(),
       'pairNotebook.refreshVpsSession': () => this.refresh(),
       'pairNotebook.vpsFolderPublic': (uri: vscode.Uri) => this.visibility(uri, 'public'),
@@ -683,14 +684,28 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   }
   private panelView(): ServerSessionView | undefined {
     if (!this.view) return undefined;
+    const network = this.connection?.client.networkSnapshot?.();
+    const view = { ...this.view, ...(network ? { network } : {}) };
     const notebook = vscode.window.activeNotebookEditor?.notebook;
-    if (!notebook || !this.owns(notebook)) return this.view;
+    if (!notebook || !this.owns(notebook)) return view;
     const key = filePath(notebook.uri);
     const scope = this.files.visibilityOf(key) ?? 'public';
     const selected = this.view.devices.find(device => device.id === this.view!.target.deviceId);
     const deviceId = scope === 'private' && selected?.ownerId !== this.view.memberId ? 'vps' : this.view.target.deviceId;
     const member = this.view.members.find(item => item.id === this.view!.memberId);
-    return { ...this.view, activeKernel: { notebook: key, scope, deviceId, canRestart: this.view.state === 'running' && (member?.id === this.view.ownerId || member?.permissions?.execute !== false) } };
+    return { ...view, activeKernel: { notebook: key, scope, deviceId, ...(deviceId === this.view.target.deviceId && this.view.target.gpuUuid ? { gpuUuid: this.view.target.gpuUuid } : {}), canRestart: this.view.state === 'running' && (member?.id === this.view.ownerId || member?.permissions?.execute !== false) } };
+  }
+  public async saveFiles(): Promise<void> {
+    const connection = this.requireConnection();
+    for (const notebook of vscode.workspace.notebookDocuments.filter(document => this.owns(document))) {
+      await this.notebookSync.flush(notebook, notebook.isDirty);
+      if (notebook.isDirty) await notebook.save();
+      this.assertConnection(connection);
+    }
+    for (const document of vscode.workspace.textDocuments.filter(document => document.uri.scheme === SCHEME && document.uri.authority === connection.sessionId && document.isDirty)) {
+      await document.save(); this.assertConnection(connection);
+    }
+    void vscode.window.showInformationMessage('Server project files saved on the VPS.');
   }
   public async getSessionPassword(): Promise<string | undefined> {
     const connection = this.requireConnection();

@@ -6,7 +6,7 @@ import type { ServerSessionView } from './serverSessionView';
 
 interface DashboardState {
   live: boolean;
-  persistent?: ServerSessionView & { endpoint?: string; connected?: boolean };
+  persistent?: ServerSessionView & { endpoint?: string; connected?: boolean; connectedAt?: number };
   isHost?: boolean;
   recent?: Array<{
     name: string;
@@ -97,7 +97,9 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
         const session = this.persistent;
         if (!session || session.connected === false) return;
         this.runBackground('Reveal session password', async () => {
-          const password = await this.sessionPassword();
+          let password: string | undefined;
+          try { password = await this.sessionPassword(); }
+          catch { void vscode.window.showErrorMessage('Could not load the saved session password. Reconnect or ask the owner to set a new password.'); }
           if (this.persistent?.id !== session.id || this.persistent?.memberId !== session.memberId || this.persistent?.endpoint !== session.endpoint) return;
           await this.view?.webview.postMessage({ type: 'sessionPassword', sessionId: session.id, memberId: session.memberId, value: password });
         });
@@ -133,7 +135,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider, vscode.Dis
   }
 
   public setPersistentSession(view: ServerSessionView | undefined, endpoint?: string, connected = true): void {
-    this.persistent = view ? { ...view, connected, ...(endpoint ? { endpoint } : {}) } : undefined;
+    const same = view && this.persistent?.id === view.id && this.persistent?.memberId === view.memberId && this.persistent?.endpoint === endpoint;
+    this.persistent = view ? { ...view, connected, connectedAt: (same ? this.persistent?.connectedAt : undefined) ?? Date.now(), ...(endpoint ? { endpoint } : {}) } : undefined;
     this.push(true);
   }
 
@@ -187,6 +190,7 @@ const commandMap: Record<string, string> = {
   copyVpsPassword: 'pairNotebook.copyVpsSessionPassword',
   changeVpsPassword: 'pairNotebook.changeVpsSessionPassword',
   inviteVps: 'pairNotebook.copyVpsInvitation',
+  saveVps: 'pairNotebook.saveVpsFiles',
   start: 'pairNotebook.startSession',
   join: 'pairNotebook.joinSession',
   vps: 'pairNotebook.configureVpsSessions',
@@ -385,8 +389,8 @@ function html(): string {
     button.toggle::before { content: '○'; }
     button.toggle[aria-pressed="true"]::before { content: '●'; color: var(--vscode-testing-iconPassed); }
     .button-label, .button-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-    .button-label { flex: 0 0 auto; }
-    .button-value { flex: 1 1 auto; font-size: 9px; font-weight: 700; letter-spacing: .04em; color: var(--vscode-descriptionForeground); }
+    .button-label { flex: 1 1 auto; text-align: left; }
+    .button-value { flex: 0 1 auto; text-align: right; font-size: 9px; font-weight: 700; letter-spacing: .04em; color: var(--vscode-descriptionForeground); }
     .path-action .button-value { text-align: left; direction: ltr; }
     .path-action:disabled { opacity: .8; }
     .button-value.on { color: var(--vscode-testing-iconPassed); }
@@ -397,7 +401,7 @@ function html(): string {
     .connection.offline { color: var(--vscode-errorForeground); }
     .titleline { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 4px 0; }
     .title { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
-    .badge { flex: none; border: 1px solid var(--vscode-widget-border); border-radius: 999px; padding: 2px 7px; color: var(--vscode-textLink-foreground); font-size: 10px; font-weight: 600; }
+    .badge { flex: none; border: 0; padding: 0; color: var(--vscode-button-background); font-size: 11px; font-weight: 600; }
     .muted { color: var(--vscode-descriptionForeground); }
     .section { position: relative; overflow: visible; border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); border-radius: 6px; margin: 10px 0; background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background)); }
     .section > h2 { padding: 7px 8px; border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border)); background: var(--vscode-sideBarSectionHeader-background, var(--vscode-editorWidget-background)); }
@@ -415,7 +419,7 @@ function html(): string {
     .row { display: flex; justify-content: space-between; gap: 6px; margin: 2px 0; }
     .role { color: var(--vscode-textLink-foreground); font-size: 11px; }
     .tiny { color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
-    .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(136px, 100%), 1fr)); gap: 5px; }
+    .actions { display: grid; grid-template-columns: 1fr; gap: 5px; }
     .actions .wide { grid-column: 1 / -1; }
     .action-tooltip { position: relative; display: flex; min-width: 0; }
     .action-tooltip > button { width: 100%; }
@@ -447,7 +451,7 @@ function html(): string {
     const command = (name) => vscode.postMessage({ command: name });
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const duration = (seconds) => [Math.floor(seconds/3600), Math.floor(seconds/60)%60, seconds%60].map(x => String(x).padStart(2,'0')).join(':');
-    const bytes = (value) => value < 1024 ? value + ' B/s' : (value/1024).toFixed(1) + ' KB/s';
+    const bytes = (value) => value < 1024 ? Math.round(value) + ' B/s' : (value/1024).toFixed(1) + ' KB/s';
     const qualityLabel = (quality) => quality === 'good' ? 'хорошее соединение' : quality === 'degraded' ? 'резервное соединение' : 'качество определяется';
     const stateNames = { connecting:'Подключение', connected:'Подключено', syncing:'Синхронизация', ready:'Готово', executing:'Выполнение', 'waiting-for-stdin':'Ожидание ввода', reconnecting:'Переподключение', 'host-unavailable':'Хост недоступен', 'executor-unavailable':'Вычислитель недоступен', 'waiting-for-host-folder':'Пауза: нужна папка нового хоста', 'kernel-starting':'Запуск ядра', 'kernel-failed':'Ошибка ядра', 'file-synchronization-failed':'Ошибка синхронизации файлов' };
     const kernelNames = { Idle:'ожидает', Busy:'занято', Offline:'выключено' };
@@ -466,7 +470,7 @@ function html(): string {
       if (!options.tooltip) return button;
       return '<span id="'+id+'Tooltip" class="action-tooltip'+(options.wide?' wide':'')+'" data-tooltip="'+esc(fullLabel)+'"'+(options.disabled?' tabindex="0" role="group" aria-label="'+esc(fullLabel)+'"':'')+'>'+button+'</span>';
     };
-    const section = (id, title, content, className='') => '<section class="section '+className+'" aria-labelledby="'+id+'Title"><h2 id="'+id+'Title">'+esc(title)+'</h2><div class="section-content">'+content+'</div></section>';
+    const section = (id, title, content, className='') => '<section class="section '+className+'" aria-labelledby="'+id+'Title"><h2 id="'+id+'Title">'+esc(title).toUpperCase()+'</h2><div class="section-content">'+content+'</div></section>';
     const eyeIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
     const eyeOffIcon = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m3 3 18 18M10 5c7-1 12 7 12 7s-2 4-6 6M6 6c-3 2-4 6-4 6s4 7 10 7h2"/></svg>';
     const sessionHeader = (status, label, name, mode) => '<div class="connection '+status+'">'+esc(label)+'</div><div class="titleline"><div class="title">'+esc(name)+'</div><span class="badge">'+esc(mode)+'</span></div>';
@@ -503,27 +507,30 @@ function html(): string {
         if (passwordIdentity !== identity || session.connected === false) { revealedPassword = undefined; passwordRequested = false; passwordIdentity = identity; }
         const detailsOpen = document.getElementById('moreActions')?.open ?? false;
         const online = session.members.filter(member => member.online);
-        const people = online.map(member => participantCard(member.name, member.id === session.ownerId ? 'Owner' : member.role === 'admin' ? 'Administrator' : 'Participant', member.id === session.memberId ? 'You' : '', '')).join('') || '<div class="tiny">No participants online</div>';
+        const people = online.map(member => participantCard('🟢 '+member.name, (member.id === session.ownerId ? '👑 OWNER' : member.role === 'admin' ? 'ADMINISTRATOR' : 'PARTICIPANT')+(member.id === session.memberId ? ' · YOU' : ''), '', '<div class="tiny">'+esc(member.id === session.memberId && session.activeKernel ? session.activeKernel.notebook : '')+'</div>')).join('') || '<div class="tiny">No participants online</div>';
         const kernel = session.activeKernel;
         const scope = kernel?.scope === 'private' ? 'Private' : 'Shared';
         const password = '<div class="password-row"><span class="tiny">Session password</span><div class="row"><input id="sessionPassword" readonly aria-label="Session password" type="'+(revealedPassword === undefined ? 'password' : 'text')+'" value="'+esc(revealedPassword === undefined ? '************' : revealedPassword)+'" /><button id="togglePassword" class="secondary icon-button" aria-label="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'" title="'+(revealedPassword === undefined ? 'Show password' : 'Hide password')+'">'+(revealedPassword === undefined ? eyeIcon : eyeOffIcon)+'</button>'+(revealedPassword === undefined ? '' : action('copyVpsPassword','Copy',''))+'</div></div>';
         const connectionCard = '<div class="card"><div class="tiny">Server address</div><div class="endpoint">'+esc(session.endpoint)+'</div><div class="row"><span>Owner</span><strong>'+esc(owner?.name || 'Unknown')+(own ? ' (you)' : '')+'</strong></div>'+password+'</div>';
-        const hostCard = '<div class="card"><div class="row"><strong>VPS</strong><span class="badge">Host</span></div><div class="tiny">'+esc(session.endpoint)+'</div></div>';
+        const hostCard = '<div class="card"><strong>🖥 VPS</strong><div class="tiny">Owner: '+esc(owner?.name || 'Unknown')+(own ? ' · You' : '')+'</div></div>';
         const kernelDetail = kernel ? '<div class="row"><span>'+scope+' kernel</span><strong>'+esc(kernel.notebook)+'</strong></div><div class="tiny">'+(kernel.scope === 'private' ? 'Only the project owner can access this kernel and its results.' : 'Everyone with access to this notebook shares its Python variables and results.')+'</div>' : '<div class="tiny">Open a notebook in this server project to select its kernel.</div>';
-        const computeCard = computeSummary(target?.name || session.target.deviceId, session.target.gpuUuid ? 'GPU' : 'CPU', target?.cpu || '', target?.online ? 'Online' : 'Offline', kernelDetail);
-        const controls = action('computeVps','Compute',target?.name || session.target.deviceId)+action('restartVps','Restart '+scope.toLowerCase()+' kernel','Restart',{disabled:!kernel?.canRestart || session.connected === false,title:kernel ? 'Restart '+scope.toLowerCase()+' kernel for '+kernel.notebook+'; clear Python variables' : 'Open a server notebook first'})+(own ? action('inviteVps','Invitation','Copy',{secondary:false})+action('uploadVps','Upload files','Upload') : '')+action('leaveVps','Leave session','Leave',{danger:true});
-        root.innerHTML = sessionHeader(session.connected === false ? 'pending' : session.state === 'running' ? 'online' : 'offline', session.connected === false ? 'Reconnecting' : session.state === 'running' ? 'Connected' : 'Stopped', session.name, 'Server project')+
+        const gpuUuid = kernel ? kernel.gpuUuid : session.target.gpuUuid;
+        const computeCard = computeSummary(target?.name || session.target.deviceId, gpuUuid ? 'GPU' : 'CPU', target?.cpu || '', target?.online ? 'Online' : 'Offline', kernelDetail);
+        const networkCard = '<div class="card"><div class="row"><span>Server response</span><span>'+esc(session.network?.latencyMs === undefined ? '—' : session.network.latencyMs+' ms')+'</span></div><div class="row"><span>↓ '+bytes(session.network?.down || 0)+'</span><span>↑ '+bytes(session.network?.up || 0)+'</span></div><div class="tiny">HTTPS · VPS payload traffic</div></div>';
+        const controls = (own ? action('inviteVps','Invitation','COPY',{secondary:false}) : '')+action('computeVps','Compute',gpuUuid ? 'GPU' : 'CPU')+action('restartVps','Restart '+scope.toLowerCase()+' kernel','RESTART',{disabled:!kernel?.canRestart || session.connected === false,title:kernel ? 'Restart '+scope.toLowerCase()+' kernel for '+kernel.notebook+'; clear Python variables' : 'Open a server notebook first'})+action('saveVps','Save','VPS')+(own ? action('uploadVps','Upload files','UPLOAD') : '');
+        root.innerHTML = sessionHeader(session.connected === false ? 'pending' : session.state === 'running' ? 'online' : 'offline', session.connected === false ? '◐ RECONNECTING' : session.state === 'running' ? '● ONLINE' : '○ STOPPED', session.name, 'Persistent host')+'<div class="muted">'+duration(Math.max(0,Math.floor((Date.now()-(session.connectedAt || Date.now()))/1000)))+'</div>'+
           section('connectionSection','Connection',connectionCard,'section-connection')+
           section('host','Session host',hostCard)+
           section('participants','Participants online: '+online.length,people,'section-participants')+
           section('compute','Compute',computeCard,'section-compute')+
+          section('network','Network',networkCard)+
           section('quickActions','Quick actions','<div class="actions">'+controls+'</div>')+
-          '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary>More actions</summary><div class="actions">'+action('shareVps','My computer','Configure')+action('manageVps','Manage session','Manage')+(own ? action('permissions','Participant permissions','Configure')+action('changeVpsPassword','Session password','Change') : '')+action('recoverVps','Recover interrupted run','Recover',{title:'Restore an interrupted execution into its notebook cells'})+'</div></details>';
+          '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary>More actions</summary><div class="actions">'+action('manageVps','Manage session','MANAGE')+(own ? action('permissions','Participant permissions','CONFIGURE')+action('changeVpsPassword','Session password','CHANGE') : '')+action('shareVps','My computer','CONFIGURE')+action('recoverVps','Recover interrupted run','RECOVER',{title:'Restore an interrupted execution into its notebook cells'})+action('leaveVps','Leave session','LEAVE',{danger:true})+'</div></details>';
         document.getElementById('togglePassword').onclick = () => {
           if (revealedPassword !== undefined || passwordRequested) { revealedPassword = undefined; passwordRequested = false; render(); }
           else { passwordRequested = true; command('revealVpsPassword'); }
         };
-        for (const name of ['computeVps','shareVps','manageVps','uploadVps','permissions','restartVps','recoverVps','leaveVps','copyVpsPassword','changeVpsPassword','inviteVps']) {
+        for (const name of ['computeVps','shareVps','manageVps','uploadVps','permissions','restartVps','recoverVps','leaveVps','copyVpsPassword','changeVpsPassword','inviteVps','saveVps']) {
           const button = document.getElementById(name); if (button && !button.disabled) button.onclick = () => command(name);
         }
         return;

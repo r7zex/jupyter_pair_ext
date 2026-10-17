@@ -26,6 +26,16 @@ export class PersistentHttpError extends Error {
 export class PersistentClient {
   private readonly requests = new Set<http.ClientRequest>();
   public readonly endpoint: string;
+  private receivedBytes = 0;
+  private sentBytes = 0;
+  private lastLatencyMs: number | undefined;
+  private lastSample = { time: Date.now(), received: 0, sent: 0 };
+  public networkSnapshot(): { down: number; up: number; latencyMs?: number } {
+    const now = Date.now(), seconds = Math.max((now - this.lastSample.time) / 1000, 0.001);
+    const result = { down: (this.receivedBytes - this.lastSample.received) / seconds, up: (this.sentBytes - this.lastSample.sent) / seconds, ...(this.lastLatencyMs !== undefined ? { latencyMs: this.lastLatencyMs } : {}) };
+    this.lastSample = { time: now, received: this.receivedBytes, sent: this.sentBytes };
+    return result;
+  }
   public async checkCompatibility(): Promise<void> {
     let result: { protocol: number; features: string[]; minimumClientVersion?: string };
     try { result = await this.call('compatibility'); }
@@ -58,6 +68,7 @@ export class PersistentClient {
     if (operation === 'write' && typeof input.content === 'string' && input.content.length > 350_000) return this.writeLarge<T>(input);
     const url = new URL(`${this.endpoint}/v1/sessions/rpc`);
     const bytes = Buffer.from(JSON.stringify({ ...input, operation }));
+    const started = Date.now();
     let agent: http.Agent | undefined;
     try { agent = createRuntimeProxyAgent(url.toString()); }
     catch { return Promise.reject(new Error('Cannot configure the VPS connection proxy.')); }
@@ -68,6 +79,7 @@ export class PersistentClient {
         settled = true;
         clearTimeout(deadline);
         this.requests.delete(request);
+        if (!error && operation === 'heartbeat') this.lastLatencyMs = Date.now() - started;
         if (error) reject(error); else resolve(value!);
       };
       const request = (url.protocol === 'https:' ? https : http).request(url, {
@@ -81,6 +93,7 @@ export class PersistentClient {
         let length = 0;
         response.on('data', (chunk: Buffer) => {
           length += chunk.length;
+          this.receivedBytes += chunk.length;
           if (length > 192 * 1024 * 1024) { finish(new Error('Persistent VPS response is too large.')); request.destroy(); return; }
           chunks.push(chunk);
         });
@@ -113,6 +126,7 @@ export class PersistentClient {
                 : 'Cannot reach the server. Check its address, HTTPS port, proxy and network connection.';
         finish(new Error(message));
       });
+      this.sentBytes += bytes.length;
       request.end(bytes);
     });
   }
@@ -149,6 +163,7 @@ export class PersistentClient {
       connected = true; response.setEncoding('utf8'); let pending = '';
       response.setTimeout(10_000, () => { response.destroy(); finish(); });
       response.on('data', (chunk: string) => {
+        this.receivedBytes += Buffer.byteLength(chunk);
         pending += chunk;
         if (Buffer.byteLength(pending) > 512 * 1024) { response.destroy(); finish(); return; }
         let boundary: number;
@@ -162,7 +177,7 @@ export class PersistentClient {
     });
     const finish = (): void => { clearTimeout(deadline); if (!closed) { closed = true; disconnected(); } };
     const deadline = setTimeout(() => { if (!connected) request.destroy(); finish(); }, this.deadlineMs); deadline.unref();
-    request.on('error', finish); request.end(bytes);
+    request.on('error', finish); this.sentBytes += bytes.length; request.end(bytes);
     return { dispose: () => { closed = true; clearTimeout(deadline); request.destroy(); } };
   }
 }

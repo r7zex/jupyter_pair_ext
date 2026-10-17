@@ -136,7 +136,10 @@ describe('dashboard webview startup', () => {
     assert.doesNotMatch(getElementById('content').innerHTML, /pair-vps:|ID:|\/opt\/|persistentConnection/);
     assert.match(getElementById('content').innerHTML, /section-connection/);
     assert.match(getElementById('content').innerHTML, /Alice \(you\)/);
-    assert.match(getElementById('content').innerHTML, /Session host/);
+    assert.match(getElementById('content').innerHTML, /SESSION HOST/);
+    assert.match(getElementById('content').innerHTML, /NETWORK/);
+    assert.match(getElementById('content').innerHTML, /QUICK ACTIONS/);
+    assert.doesNotMatch(getElementById('content').innerHTML, /id="status"|id="statusTitle"/);
     assert.match(getElementById('content').innerHTML, /Show password/);
     assert.doesNotMatch(getElementById('content').innerHTML, /id="copyVpsPassword"/);
     assert.match(getElementById('content').innerHTML, /Leave session/);
@@ -148,6 +151,13 @@ describe('dashboard webview startup', () => {
     assert.match(getElementById('content').innerHTML, /id="copyVpsPassword"/);
     getElementById('togglePassword').onclick?.();
     assert.doesNotMatch(getElementById('content').innerHTML, /private-password|id="copyVpsPassword"/);
+    provider.setPersistentSession({ ...persistent, target: { deviceId: 'guest-gpu', gpuUuid: 'GPU-other' }, activeKernel: { notebook: 'Private/research.ipynb', scope: 'private', deviceId: 'vps', canRestart: true } }, 'https://relay.example');
+    renderMessage?.({ data: posted.at(-1) });
+    assert.match(getElementById('content').innerHTML, /Private kernel/);
+    assert.match(getElementById('content').innerHTML, /Restart private kernel/);
+    assert.match(getElementById('content').innerHTML, /Private\/research.ipynb/);
+    assert.match(getElementById('content').innerHTML, /VPS CPU/);
+    assert.doesNotMatch(getElementById('content').innerHTML, />GPU<|guest-gpu/);
     provider.setPersistentSession(undefined);
     assert.equal((posted.at(-1) as { patch: { live: boolean } }).patch.live, false);
     provider.dispose();
