@@ -49,7 +49,7 @@ function Set-RelaySettings {
     if (-not $isIp -and $hostName -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$') { throw 'Enter only a DNS name or IP, without scheme or port.' }
     if ($Port -lt 1024 -or $Port -gt 65535) { throw 'Choose a port from 1024 to 65535.' }
     $san = if ($isIp) { "IPAddress=$hostName" } else { "DNS=$hostName" }
-    $certificate = New-SelfSignedCertificate -Type Custom -Subject "CN=$hostName" -TextExtension @("2.5.29.17={text}$san", '2.5.29.19={text}CA=true', '2.5.29.37={text}1.3.6.1.5.5.7.3.1') -KeyUsage DigitalSignature,KeyEncipherment,CertSign -KeyExportPolicy Exportable -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
+    $certificate = New-SelfSignedCertificate -Type Custom -Subject ("CN=Pair Notebook relay " + [guid]::NewGuid().ToString('N')) -TextExtension @("2.5.29.17={text}$san", '2.5.29.19={text}CA=true', '2.5.29.37={text}1.3.6.1.5.5.7.3.1') -KeyUsage DigitalSignature,KeyEncipherment,CertSign -KeyExportPolicy Exportable -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
     try {
         $passwordBytes = New-Object byte[] 32
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -95,6 +95,11 @@ function Start-Relay {
     $start.EnvironmentVariables['PAIR_RELAY_TLS_PASSWORD'] = $credential.Password
     $start.EnvironmentVariables['PAIR_RELAY_CONTROL_STDIN'] = '1'
     $script:relay = [Diagnostics.Process]::Start($start)
+    $ready = $script:relay.StandardOutput.ReadLineAsync()
+    if (-not $ready.Wait(15000) -or -not $ready.Result -or -not $ready.Result.StartsWith("Pair Notebook relay listening on $($script:settings.Port).")) {
+        Stop-Relay
+        throw 'The relay did not become ready. Check its port and private data directory.'
+    }
 }
 
 try {
@@ -103,7 +108,6 @@ try {
         if (-not $Address) { $Address = '127.0.0.1' }
         if (-not (Set-RelaySettings)) { throw 'Setup cancelled.' }
         Start-Relay
-        Start-Sleep -Milliseconds 800
         $env:NODE_EXTRA_CA_CERTS = Join-Path $DataDirectory 'relay-ca.crt'
         & $script:node (Join-Path $PSScriptRoot 'check.js') (Get-RelayAddress)
         if ($LASTEXITCODE -ne 0) { throw 'Encrypted relay check failed.' }

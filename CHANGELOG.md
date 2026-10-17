@@ -8,6 +8,7 @@
 - Retry missing initial project state and allow a progressing transfer beyond the idle timeout.
 - Request Workspace Trust on an empty guest workspace before connecting and downloading files. Remove temporary guest workspaces after leave, failed join and editor exit, with deferred cleanup for busy Windows folders.
 - List WS-server adapter addresses, recommend physical Wi-Fi/Ethernet before VPN interfaces, and document Karing TUN split routing.
+- Use a unique local certificate issuer on each WS reconfiguration and wait for actual relay readiness before checking it.
 - Install a persistent server update command and an optional daily update timer with stable-release, HTTPS and SHA-256 checks. Defer automatic installation while saved projects are running.
 
 ## 0.6.9

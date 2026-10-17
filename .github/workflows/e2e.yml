@@ -69,6 +69,14 @@ jobs:
       - name: Install Jupyter kernel dependencies
         run: python -m pip install jupyter_client==8.10.0 ipykernel==7.4.0
 
+      - name: Verify packaged Windows relay TLS and certificate regeneration
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          npm run package:persistent-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\test\relay_launcher_test.ps1 -Archive artifacts\pair-notebook-ws-server.zip
+
       - name: Install isolated VS Code E2E driver
         # The driver has its own node_modules tree. `npm ci` remains the exact
         # package-lock installation used to compile and exercise project code.
