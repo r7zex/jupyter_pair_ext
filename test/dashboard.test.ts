@@ -146,6 +146,8 @@ describe('dashboard webview startup', () => {
     assert.match(getElementById('content').innerHTML, /QUICK ACTIONS/);
     assert.doesNotMatch(getElementById('content').innerHTML, /id="status"|id="statusTitle"/);
     assert.match(getElementById('content').innerHTML, /Show password/);
+    assert.doesNotMatch(getElementById('content').innerHTML, /class="participant-color" style=/);
+    assert.match(getElementById('content').innerHTML, /<rect width="10" height="10" fill="#[0-9a-f]{6}"/);
     assert.doesNotMatch(getElementById('content').innerHTML, /id="copyVpsPassword"/);
     assert.match(getElementById('content').innerHTML, /Leave session/);
     getElementById('togglePassword').onclick?.();
