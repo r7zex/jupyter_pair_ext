@@ -65,6 +65,7 @@ def proxy_config(host: str, mode: str, port: int, certificate: str = "", https_p
     content = f"""{{
     admin off
     auto_https disable_redirects
+    default_sni {host}
 }}
 {site} {{
     {tls}

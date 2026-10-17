@@ -72,6 +72,7 @@ class InstallerTests(unittest.TestCase):
     def test_proxy_includes_real_websocket_and_rpc_routes(self):
         value = proxy_config("192.168.1.8", "lan", 8787)
         self.assertIn("tls internal", value)
+        self.assertIn("default_sni 192.168.1.8", value)
         self.assertIn("/v1/temporary-relay", value)
         self.assertIn("/v1/sessions/rpc", value)
         self.assertNotIn("insecure", value)
