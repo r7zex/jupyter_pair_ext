@@ -197,7 +197,8 @@ class ExistingInstallationTests(unittest.TestCase):
 
     def test_bad_release_never_stops_existing_services(self):
         config = {**legacy.discover(), "endpoint": "https://example.com"}
-        with patch.object(legacy.checks, "wait_health"), patch.object(legacy, "release", side_effect=InstallError("Checksum mismatch")):
+        with patch.object(legacy.checks, "wait_health", side_effect=InstallError("Old server is unavailable")), \
+                patch.object(legacy, "release", side_effect=InstallError("Checksum mismatch")):
             with self.assertRaisesRegex(InstallError, "Checksum mismatch"):
                 legacy.update(config, None)
         self.assertFalse(any(call[:2] == ("systemctl", "stop") for call in self.calls))

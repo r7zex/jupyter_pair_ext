@@ -136,8 +136,8 @@ def update(config: dict, archive: Path | None) -> None:
         raise InstallError("Existing service configuration changed. No services were changed.")
     owner_credential(config)
     local = f"http://127.0.0.1:{config['port']}"
-    checks.wait_health(local)
-    checks.wait_health(config["endpoint"])
+    # Repair must also work when the previous server cannot start. Readiness
+    # checks below qualify the replacement before the update is committed.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     backup = STATE / "backups" / stamp
     backup.mkdir(parents=True, mode=0o700)
@@ -184,7 +184,9 @@ def update(config: dict, archive: Path | None) -> None:
             run("systemctl", "start", name)
         if "pair-notebook-server" in active:
             checks.wait_health(local)
-        print("Previous server restored and health checked. Project data and owner credentials retained.")
+            print("Previous server restored and health checked. Project data and owner credentials retained.")
+        else:
+            print("Previous server restored. Previously stopped Pair services remain stopped; project data and owner credentials retained.")
         raise
 
 
