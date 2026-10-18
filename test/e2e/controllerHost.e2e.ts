@@ -140,6 +140,7 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
     const controller = new PairNotebookController(log);
     let calls = 0;
     controller.persistent = {
+      connected: true,
       owns: notebook => notebook === fixture.notebook,
       execute: async cells => {
         calls++;
