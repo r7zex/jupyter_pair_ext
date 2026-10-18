@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.6.11
+## 0.6.12
+
+- Correct the embedded installer version and reject mismatched client/server/installer versions before packaging. Version 0.6.11 was withdrawn after post-download verification found the mismatch.
 
 - Reconcile incomplete project state once through normal synchronization before remote execution; retain manifest, access and replay checks.
 - Keep open notebooks under the editor's save ownership, preventing stale raw working-copy writes.
@@ -13,6 +15,10 @@
 - Inspect saved execution outputs through meaningful run descriptions and lazy full-result loading, without rerunning code or replacing current notebook outputs.
 - Scope the Pair kernel to session notebook editors and clean extension-owned temporary workspaces for both host and member roles.
 - Update both participating extensions and the server/worker for package-installation fixes. Pair services restart during a server update; save work first. See the versioned verification record for performed checks and remaining physical/native acceptance limits.
+
+## 0.6.11 - withdrawn
+
+The release was withdrawn after downloaded-payload verification found an installer version mismatch. Its session fixes are included in 0.6.12; the tag and files are retained unchanged.
 
 ## 0.6.10
 

@@ -11,6 +11,9 @@ import { packageServerSetup } from './package-server-setup.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
+const installerSource = await fs.readFile(path.join(root, 'installer/pair_installer/system.py'), 'utf8');
+const installerVersion = installerSource.match(/^VERSION = "([^"]+)"/m)?.[1];
+if (installerVersion !== pkg.version) throw new Error(`Installer version ${installerVersion} does not match package version ${pkg.version}.`);
 const staging = await fs.mkdtemp(path.join(os.tmpdir(), 'pair-server-package-'));
 const server = path.join(staging, 'server');
 const artifacts = path.join(root, 'artifacts');

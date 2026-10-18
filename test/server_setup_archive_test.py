@@ -29,6 +29,9 @@ class SetupArchiveTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(payload)) as installer:
             names = installer.namelist()
             self.assertFalse(any('__pycache__' in name or name.endswith('.pyc') for name in names))
+            installer_version = re.search(rb'^VERSION = "([^"]+)"', installer.read('pair_installer/system.py'), re.MULTILINE)
+            self.assertIsNotNone(installer_version)
+            self.assertEqual(installer_version.group(1).decode(), VERSION)
             filename = 'pair_installer/payload/pair-notebook-server-persistent.tar.gz'
             server = installer.read(filename)
             expected = installer.read(filename + '.sha256').decode().split()[0]
