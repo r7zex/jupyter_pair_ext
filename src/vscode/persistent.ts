@@ -173,24 +173,30 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
         catch (error) {
           if (!(error instanceof PersistentHttpError) || error.status !== 409) throw error;
           if (operation === 'remove' && epoch) {
-            const current = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
-            if (connection !== this.connection || generation !== this.generations.get(key)) throw error;
-            const notebook = JSON.parse(Buffer.from(current.content, 'base64').toString('utf8'));
-            if (notebook.metadata?.pair_crdt?.epoch !== epoch) throw error;
-            snapshot = await connection.client.call<PersistentSnapshot>(operation, { ...request, expectedRevision: current.revision });
+            let removed: PersistentSnapshot | undefined;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const current = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
+              if (connection !== this.connection || generation !== this.generations.get(key)) throw error;
+              const notebook = JSON.parse(Buffer.from(current.content, 'base64').toString('utf8'));
+              if (notebook.metadata?.pair_crdt?.epoch !== epoch) throw error;
+              try { removed = await connection.client.call<PersistentSnapshot>(operation, { ...request, expectedRevision: current.revision }); break; }
+              catch (retryError) { if (!(retryError instanceof PersistentHttpError) || retryError.status !== 409 || attempt === 2) throw retryError; }
+            }
+            if (!removed) throw error;
+            snapshot = removed;
           } else {
-          if (operation !== 'write' || typeof input.path !== 'string' || typeof input.content !== 'string') throw error;
-          if (!baseline) throw error;
-          const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: input.path });
-          if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
-          if (generation !== this.generations.get(key)) throw vscode.FileSystemError.Unavailable('The file was deleted or replaced during the save.');
-          const latest = Buffer.from(response.content, 'base64');
-          const desired = Buffer.from(input.content, 'base64');
-          const merged = latest.equals(baseline) ? desired : input.path.endsWith('.ipynb') ? mergePersistentNotebookOutputs(baseline, desired, latest) : undefined;
-          if (!merged) throw error;
-          request = { ...request, expectedRevision: response.revision, content: Buffer.from(merged).toString('base64') };
-          // Exactly one CAS retry. A concurrent edit after this read still fails.
-          snapshot = await connection.client.call<PersistentSnapshot>(operation, request);
+            if (operation !== 'write' || typeof input.path !== 'string' || typeof input.content !== 'string') throw error;
+            if (!baseline) throw error;
+            const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: input.path });
+            if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
+            if (generation !== this.generations.get(key)) throw vscode.FileSystemError.Unavailable('The file was deleted or replaced during the save.');
+            const latest = Buffer.from(response.content, 'base64');
+            const desired = Buffer.from(input.content, 'base64');
+            const merged = latest.equals(baseline) ? desired : input.path.endsWith('.ipynb') ? mergePersistentNotebookOutputs(baseline, desired, latest) : undefined;
+            if (!merged) throw error;
+            request = { ...request, expectedRevision: response.revision, content: Buffer.from(merged).toString('base64') };
+            // Exactly one CAS retry. A concurrent edit after this read still fails.
+            snapshot = await connection.client.call<PersistentSnapshot>(operation, request);
           }
         }
         if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
@@ -691,6 +697,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     await vscode.commands.executeCommand('setContext', 'pairNotebook.vpsOwner', view.memberId === view.ownerId);
     current();
     const root = this.files.uri();
+    await vscode.workspace.fs.stat(root); current();
     if (!vscode.workspace.workspaceFolders?.some((folder) => folder.uri.toString() === root.toString())) {
       vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders?.length ?? 0, 0, { uri: root, name: `Server project: ${view.name}` });
     }

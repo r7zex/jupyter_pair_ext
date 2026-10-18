@@ -2,7 +2,7 @@
 
 Pair Notebook 0.6.13 supports encrypted peer sessions, [persistent server workspaces](docs/PERSISTENT_VPS.md), and independent [background compute jobs](docs/PERSISTENT_RESEARCH.md). Persistent notebooks use durable Yjs replicas, optimistic local input, shared cursors and unrestricted same-line editing. Public and owner-only Private execution use separate isolated kernels and results.
 
-See the [current documentation](docs/README.md) and [0.6.13 verification report](docs/SERVER_RELEASE_0_6_10.md) for executed installer, protocol and collaboration checks, measurement conditions and unverified acceptance layers. Historical evidence is source-specific and does not automatically qualify this release.
+See the [current documentation](docs/README.md) and [0.6.13 verification report](docs/SERVER_RELEASE_0_6_13.md) for executed installer, protocol and collaboration checks, measurement conditions and unverified acceptance layers. Historical evidence is source-specific and does not automatically qualify this release.
 
 [![Latest release](https://img.shields.io/github/v/release/r7zex/jupyter_pair_ext?display_name=tag&sort=semver)](https://github.com/r7zex/jupyter_pair_ext/releases/latest)
 [![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
