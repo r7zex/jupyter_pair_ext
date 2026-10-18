@@ -143,6 +143,17 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  for (const sameEpoch of [true, false]) it(`retries a delete after live editing only for the same notebook epoch=${sameEpoch}`, async () => {
+    const provider = new PersistentFileSystem(); let removals = 0;
+    provider.notebookEpoch = () => 'current-epoch';
+    provider.setConnection({ sessionId: 'session', client: { call: async (operation: string, input: Record<string, unknown>) => {
+      if (operation === 'remove') { if (++removals === 1) throw new PersistentHttpError(409); assert.equal(input.expectedRevision, 9); return { revision: 10, entries: [] }; }
+      assert.equal(operation, 'read'); return { revision: 9, content: Buffer.from(JSON.stringify({ metadata: { pair_crdt: { epoch: sameEpoch ? 'current-epoch' : 'replacement-epoch' } } })).toString('base64') };
+    } } } as never);
+    const removing = provider.delete({ scheme: 'pair-vps', authority: 'session', path: '/book.ipynb' } as vscode.Uri, { recursive: false });
+    if (sameEpoch) await removing; else await assert.rejects(removing, /conflict/);
+    assert.equal(removals, sameEpoch ? 2 : 1); provider.dispose();
+  });
   it('invalidates a delayed read when its file is deleted and recreated at the same path', async () => {
     const provider = new PersistentFileSystem(); let finish!: (reply: unknown) => void;
     const delayed = new Promise(resolve => { finish = resolve; });

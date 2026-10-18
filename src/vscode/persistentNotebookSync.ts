@@ -94,6 +94,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     if (this.retired.has(notebook)) throw new Error('This notebook instance was deleted or replaced. Its buffer is preserved; use Save As for recovery and close it before opening the current server file.');
   }
   public isRetired(notebook: vscode.NotebookDocument): boolean { return this.retired.has(notebook); }
+  public epochOf(notebook: vscode.NotebookDocument): string | undefined { return this.states.get(notebook)?.epoch || undefined; }
   public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced'): Promise<void> {
     if (this.retired.has(notebook)) return Promise.resolve();
     this.retired.add(notebook);

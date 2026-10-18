@@ -69,6 +69,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   private statsSession: string | undefined;
   private readonly generations = new Map<string, number>();
   public notebookManaged: ((uri: vscode.Uri) => boolean) | undefined;
+  public notebookEpoch: ((uri: vscode.Uri) => string | undefined) | undefined;
   public textManaged: ((uri: vscode.Uri) => boolean) | undefined;
   public removed: ((uri: vscode.Uri) => void) | undefined;
   public readonlyFiles = true;
@@ -158,6 +159,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     const connection = this.requireConnection();
     const key = String(input.path); const generation = this.generations.get(key);
     const baseline = this.readContents.get(key);
+    const epoch = operation === 'remove' && key.endsWith('.ipynb') ? this.notebookEpoch?.(this.uri(key)) : undefined;
     const work = this.mutation.then(async () => {
       if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed.');
       if (generation !== this.generations.get(key)) throw vscode.FileSystemError.Unavailable('The file was deleted or replaced before saving.');
@@ -167,7 +169,15 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
         let snapshot: PersistentSnapshot;
         try { snapshot = await connection.client.call<PersistentSnapshot>(operation, request); }
         catch (error) {
-          if (!(error instanceof PersistentHttpError) || error.status !== 409 || operation !== 'write' || typeof input.path !== 'string' || typeof input.content !== 'string') throw error;
+          if (!(error instanceof PersistentHttpError) || error.status !== 409) throw error;
+          if (operation === 'remove' && epoch) {
+            const current = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
+            if (connection !== this.connection || generation !== this.generations.get(key)) throw error;
+            const notebook = JSON.parse(Buffer.from(current.content, 'base64').toString('utf8'));
+            if (notebook.metadata?.pair_crdt?.epoch !== epoch) throw error;
+            snapshot = await connection.client.call<PersistentSnapshot>(operation, { ...request, expectedRevision: current.revision });
+          } else {
+          if (operation !== 'write' || typeof input.path !== 'string' || typeof input.content !== 'string') throw error;
           if (!baseline) throw error;
           const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: input.path });
           if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
@@ -179,6 +189,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
           request = { ...request, expectedRevision: response.revision, content: Buffer.from(merged).toString('base64') };
           // Exactly one CAS retry. A concurrent edit after this read still fails.
           snapshot = await connection.client.call<PersistentSnapshot>(operation, request);
+          }
         }
         if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the save.');
         if (operation === 'write' && generation !== this.generations.get(key)) throw vscode.FileSystemError.Unavailable('The file was deleted or replaced during the save.');
@@ -335,6 +346,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     });
     this.files.notebookManaged = (uri) => uri.scheme === SCHEME && uri.authority === this.connection?.sessionId && vscode.workspace.notebookDocuments.some((document) => !document.isClosed && document.uri.toString() === uri.toString());
     this.notebookSync.canEdit = (key) => this.canEdit(key);
+    this.files.notebookEpoch = (uri) => {
+      const notebook = vscode.workspace.notebookDocuments.find(document => document.uri.toString() === uri.toString());
+      return notebook ? this.notebookSync.epochOf(notebook) : undefined;
+    };
     this.files.removed = (uri) => {
       for (const notebook of vscode.workspace.notebookDocuments) if (notebook.uri.toString() === uri.toString()) {
         void this.notebookSync.retire(notebook, 'deleted').catch(error => this.log.appendLine(`[error] Notebook recovery archive: ${String(error)}`));
