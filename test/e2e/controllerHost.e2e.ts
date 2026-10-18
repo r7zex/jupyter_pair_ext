@@ -10,6 +10,51 @@ import { EditorSynchronizer } from '../../src/vscode/sync';
 
 suite('Pair Notebook — production NotebookController in real VS Code', () => {
   suiteSetup(async () => { await vscode.extensions.getExtension('pair-notebook.pair-notebook')!.activate(); });
+  for (const dirty of [false, true]) test(`switches one restored Jupyter model safely with dirty=${dirty}`, async function () {
+    this.timeout(20_000);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'pair-editor-switch-'));
+    const uri = vscode.Uri.file(path.join(root, 'test.ipynb'));
+    const localUri = vscode.Uri.file(path.join(root, 'local', 'test.ipynb'));
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(localUri.fsPath)));
+    const bytes = Buffer.from(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [
+      { cell_type: 'code', id: 'restored', source: ['print(1)'], metadata: {}, outputs: [], execution_count: null },
+    ] }));
+    await vscode.workspace.fs.writeFile(uri, bytes); await vscode.workspace.fs.writeFile(localUri, bytes);
+    const local = await vscode.workspace.openNotebookDocument(localUri);
+    const original = await vscode.workspace.openNotebookDocument(uri);
+    const editor = await vscode.window.showNotebookDocument(original, { preview: false });
+    assert.equal(original.notebookType, 'jupyter-notebook');
+    const log = vscode.window.createOutputChannel('Pair editor switch acceptance');
+    const controller = new PairNotebookController(log);
+    controller.persistent = { connected: true, owns: notebook => notebook.uri.toString() === uri.toString(), execute: async () => undefined, interrupt: async () => undefined };
+    const select = controller as unknown as { selectController(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> };
+    try {
+      if (dirty) {
+        const edit = new vscode.WorkspaceEdit(); edit.insert(original.cellAt(0).document.uri, new vscode.Position(0, 8), '\n# unsaved recovery');
+        assert.equal(await vscode.workspace.applyEdit(edit), true); assert.equal(original.isDirty, true);
+        await assert.rejects(select.selectController(editor), /unsaved/);
+        assert.equal(original.isClosed, false); assert.equal(original.isDirty, true);
+        assert.deepEqual(await vscode.workspace.fs.readFile(uri), bytes, 'switching must not save over the backing file');
+        await original.save();
+        assert.equal(original.isDirty, false);
+        await select.selectController(editor);
+        await waitFor(() => vscode.workspace.notebookDocuments.some(document => document.uri.toString() === uri.toString() && document.notebookType === SESSION_NOTEBOOK_TYPE), 6000, 'saved legacy notebook switch');
+      } else {
+        const reopened = await Promise.all([select.selectController(editor), select.selectController(editor), select.selectController(editor)]);
+        assert.equal(reopened[0]!.notebook, reopened[1]!.notebook);
+      }
+      const documents = vscode.workspace.notebookDocuments.filter(document => document.uri.toString() === uri.toString());
+      assert.equal(documents.length, 1); assert.equal(documents[0]!.notebookType, SESSION_NOTEBOOK_TYPE);
+      assert.equal(local.notebookType, 'jupyter-notebook');
+      if (dirty) assert.match(documents[0]!.cellAt(0).document.getText(), /unsaved recovery/);
+      await documents[0]!.save(); await documents[0]!.save();
+    } finally {
+      controller.dispose(); log.dispose();
+      for (const document of vscode.workspace.notebookDocuments.filter(document => document.uri.fsPath.startsWith(root))) {
+        await document.save(); await vscode.window.showNotebookDocument(document); await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+      }
+    }
+  });
   test('round-trips attachment, metadata, outputs and stable cell IDs in the session serializer', () => {
     const serializer = new SessionNotebookSerializer();
     const original = { nbformat: 4, nbformat_minor: 5, metadata: { customStudy: { name: 'Study' }, kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' }, language_info: { name: 'python' } }, cells: [

@@ -72,7 +72,7 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     }
   });
 
-  test('loads manifest configuration defaults through the real Configuration API', () => {
+  test('loads manifest configuration defaults through the real Configuration API', async () => {
     const configuration = vscode.workspace.getConfiguration('pairNotebook');
     assert.equal(configuration.get('displayName'), '');
     assert.equal(configuration.get('pythonPath'), 'python');
@@ -80,7 +80,9 @@ suite('Pair Notebook — real VS Code Extension Host', () => {
     assert.equal(configuration.get('persistenceDebounceMs'), 750);
     assert.equal(configuration.get('logLevel'), 'info');
     assert.equal(configuration.get('serverRestore'), 'automatic');
-    assert.equal(vscode.workspace.fs.isWritableFileSystem('pair-vps'), false, 'server editors must remain read-only until compatibility is established');
+    assert.equal(vscode.workspace.fs.isWritableFileSystem('pair-vps'), true, 'the provider must stay registered while connections change');
+    await assert.rejects(Promise.resolve(vscode.workspace.fs.writeFile(vscode.Uri.parse('pair-vps://disconnected/blocked.txt'), Buffer.from('blocked'))),
+      (error: Error) => !/ENOPRO|No file system provider/i.test(error.message));
     assert.deepEqual(configuration.get('turnUrls'), []);
     assert.equal(configuration.get('turnUsername'), '');
     assert.equal(configuration.get('proxyUrl'), '');

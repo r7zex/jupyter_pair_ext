@@ -4021,14 +4021,14 @@ describe('standard VS Code NotebookController production path', () => {
         fakeVscode.window.activeNotebookEditor = { notebook };
         activate?.(fakeVscode.window.activeNotebookEditor);
       }
-      await waitFor(() => selections.length === 3, 1000, 'kernel selection after tab switches');
-      assert.deepEqual(selections, [notebookA, notebookB, notebookA]);
+      await waitFor(() => selections.length === 2, 1000, 'kernel selection after tab switches');
+      assert.deepEqual(selections, [notebookA, notebookA]);
       activate?.(undefined);
       activate?.({ notebook: outside });
       controller.setRuntime(undefined);
       activate?.({ notebook: notebookB });
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(selections.length, 3, 'unshared files and ended sessions must not claim a kernel');
+      assert.equal(selections.length, 2, 'unshared files and ended sessions must not claim a kernel');
     } finally {
       controller.dispose();
       fakeVscode.commands.executeCommand = originalCommand;

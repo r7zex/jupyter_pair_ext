@@ -30,6 +30,9 @@ describe('Server compatibility before editable project restoration', () => {
     client.call = async () => { throw new PersistentHttpError(400); };
     await assert.rejects(client.checkCompatibility(), error => error instanceof PersistentHttpError && error.status === 426 && /Update the server/.test(error.message) && /Unsaved/.test(error.message));
     for (const status of [401, 403, 404, 426]) assert(isPermanentConnectionError(new PersistentHttpError(status)));
+    assert(!isPermanentConnectionError(new PersistentHttpError(404), 'file'));
+    assert(!isPermanentConnectionError(new PersistentHttpError(403), 'file'));
+    for (const status of [401, 426]) assert(isPermanentConnectionError(new PersistentHttpError(status), 'file'));
     for (const status of [409, 429, 500, 503]) assert(!isPermanentConnectionError(new PersistentHttpError(status)));
   });
   it('preserves an old empty notebook through 426 and accepts the capable client bootstrap', async () => {

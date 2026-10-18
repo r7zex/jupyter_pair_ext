@@ -123,10 +123,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const proxyMigrationPending = shouldMigrateLegacyProxyPassword(
     context.globalState.get<unknown>(PROXY_CREDENTIAL_MIGRATION_KEY),
   );
-  await applyMeshNetworkConfiguration(context, { allowLegacyProxyMigration: proxyMigrationPending });
-  if (proxyMigrationPending) {
-    await context.globalState.update(PROXY_CREDENTIAL_MIGRATION_KEY, PROXY_CREDENTIAL_MIGRATION_VERSION);
-  }
   dashboard = new DashboardProvider(context, output, async () => persistentController?.getSessionPassword());
   context.subscriptions.push(vscode.workspace.registerNotebookSerializer(SESSION_NOTEBOOK_TYPE, new SessionNotebookSerializer()));
   notebookController = new PairNotebookController(output);
@@ -138,6 +134,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, () => !runtime);
   notebookController.persistent = persistentController;
   context.subscriptions.push(persistentController);
+  await applyMeshNetworkConfiguration(context, { allowLegacyProxyMigration: proxyMigrationPending });
+  if (proxyMigrationPending) {
+    await context.globalState.update(PROXY_CREDENTIAL_MIGRATION_KEY, PROXY_CREDENTIAL_MIGRATION_VERSION);
+  }
   register(context, 'pairNotebook.forgetAllConnections', async () => {
     if (runtime) await vscode.commands.executeCommand('pairNotebook.leaveSession');
     await persistentController?.leave();

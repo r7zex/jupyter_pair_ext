@@ -18,7 +18,7 @@ export function notebookUserMetadata(value: Metadata): Metadata {
     if (depth >= 32) throw new Error('Notebook metadata nesting exceeds the supported repair limit. The local replica must be preserved.');
     metadata = object(metadata.metadata)!;
   }
-  const result = { ...metadata }; delete result.pair_crdt;
+  const result = { ...metadata }; delete result.pair_crdt; delete result.pairNotebookServerEpoch;
   return result;
 }
 

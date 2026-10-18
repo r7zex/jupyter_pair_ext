@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.13
+
+- Serialize session editor selection per URI and release clean Jupyter tabs before changing notebook type. Keep unsaved Jupyter documents open and defer switching until an explicit save; ordinary local notebooks retain their Jupyter editor.
+- Isolate missing files and per-file permission failures from project connectivity. Preserve permanent project authentication and compatibility checks.
+- Retire deleted/replaced notebook instances immediately, fence late callbacks and queued work, and preserve their complete notebook buffers and replica journals in recovery archives. New file epochs use separate journals and never inherit old input automatically.
+- Keep the `pair-vps` filesystem provider registered across startup, reconnect and readonly changes. Enforce disconnected and per-file permissions at the provider boundary.
+- Fence peer execution rendering by notebook identity when supplied by the server. Accepted computations and saved run recovery remain independent of editor lifetime.
+
 ## 0.6.12
 
 - Correct the embedded installer version and reject mismatched client/server/installer versions before packaging. Version 0.6.11 was withdrawn after post-download verification found the mismatch.

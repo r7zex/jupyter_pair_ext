@@ -69,12 +69,21 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly activeExecutions = new WeakSet<vscode.NotebookCell>();
   private readonly activeExecutionHandles = new Map<vscode.NotebookCell, vscode.NotebookCellExecution>();
   private readonly retiredCellStates = new WeakSet<vscode.NotebookCell>();
+  private readonly selections = new Map<string, Promise<vscode.NotebookEditor>>();
+  private readonly deferredSelections = new WeakSet<vscode.NotebookDocument>();
+  private selectionTimer: NodeJS.Timeout | undefined;
 
   public constructor(private readonly log: vscode.OutputChannel) {
     const claim = (notebook: vscode.NotebookDocument) => this.claimNotebook(notebook);
     this.disposables.push(
       vscode.workspace.onDidOpenNotebookDocument(claim),
       vscode.window.onDidChangeActiveNotebookEditor(this.selectActiveController),
+      vscode.workspace.onDidSaveNotebookDocument?.((notebook) => {
+        this.deferredSelections.delete(notebook);
+        setTimeout(() => {
+          if (vscode.window.activeNotebookEditor?.notebook === notebook) this.selectActiveController(vscode.window.activeNotebookEditor);
+        }, 0);
+      }) ?? { dispose: () => undefined },
     );
   }
 
@@ -128,21 +137,51 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private readonly selectActiveController = (editor: vscode.NotebookEditor | undefined): void => {
+    if (this.selectionTimer) clearTimeout(this.selectionTimer);
     if (!editor || (!this.runtime?.notebookKey(editor.notebook.uri) && !this.persistent?.owns(editor.notebook))) return;
     // Affinity alone does not bind the controller to a newly activated notebook.
-    void this.selectController(editor).catch((error: unknown) => {
-      this.log.appendLine(`[error] Could not restore Pair Notebook kernel selection: ${String(error)}`);
-    });
+    this.selectionTimer = setTimeout(() => {
+      this.selectionTimer = undefined;
+      if (vscode.window.activeNotebookEditor?.notebook !== editor.notebook || editor.notebook.isClosed) return;
+      void this.selectController(editor).catch((error: unknown) => {
+        this.log.appendLine(`[error] Could not restore Pair Notebook kernel selection: ${String(error)}`);
+      });
+    }, 250);
   };
 
-  private async selectController(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
+  private selectController(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
+    const key = editor.notebook.uri.toString();
+    const pending = this.selections.get(key);
+    if (pending) return pending;
+    const work = Promise.resolve().then(() => this.selectEditor(editor));
+    this.selections.set(key, work);
+    void work.finally(() => { if (this.selections.get(key) === work) this.selections.delete(key); }).catch(() => undefined);
+    return work;
+  }
+
+  private async selectEditor(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
     if (editor.notebook.notebookType && editor.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
-      await vscode.commands.executeCommand('vscode.openWith', editor.notebook.uri, SESSION_NOTEBOOK_TYPE);
-      const document = vscode.workspace.notebookDocuments.find(notebook => notebook.notebookType === SESSION_NOTEBOOK_TYPE && notebook.uri.toString() === editor.notebook.uri.toString());
-      const reopened = document ? await vscode.window.showNotebookDocument(document, { preview: false }) : undefined;
+      const original = editor.notebook;
+      if (original.isDirty) {
+        if (!this.deferredSelections.has(original)) {
+          this.deferredSelections.add(original);
+          void vscode.window.showWarningMessage('This session notebook is open in Jupyter with unsaved changes. Save it or use Save As to preserve a separate copy, then reopen it in Pair Notebook. Its editor has been kept open.');
+        }
+        throw new Error('Preserve the unsaved Jupyter notebook before switching its editor.');
+      }
+      const tabs = vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab => tab.input instanceof vscode.TabInputNotebook && tab.input.uri.toString() === original.uri.toString());
+      if (!tabs.length || tabs.some(tab => tab.isDirty) || !await vscode.window.tabGroups.close(tabs, true)) {
+        throw new Error('Close the existing notebook editor before switching to Pair Notebook. Unsaved changes were retained.');
+      }
+      // VS Code releases API-held model references while resolving the new type.
+      // Visible tabs must be closed first; their references cannot be transferred.
+      if (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original)) throw new Error('The notebook session changed during editor switching.');
+      await vscode.commands.executeCommand('vscode.openWith', original.uri, SESSION_NOTEBOOK_TYPE);
+      const reopened = vscode.window.activeNotebookEditor;
       if (!reopened || reopened.notebook.notebookType !== SESSION_NOTEBOOK_TYPE || reopened.notebook.uri.toString() !== editor.notebook.uri.toString()) throw new Error('Open this session notebook in the Pair Notebook session editor to execute it.');
       editor = reopened;
     }
+    if (vscode.window.activeNotebookEditor?.notebook !== editor.notebook) throw new Error('The active notebook changed during kernel selection. Select the intended notebook again.');
     const controller = this.controller;
     const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
       id: controller.id, extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
@@ -206,6 +245,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   public dispose(): void {
+    if (this.selectionTimer) clearTimeout(this.selectionTimer);
     this.runtimeGeneration += 1;
     this.finishActiveExecutions();
     this.finishMirroredExecutions();

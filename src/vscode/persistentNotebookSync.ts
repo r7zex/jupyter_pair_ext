@@ -10,7 +10,7 @@ import { CollaborativeProject, type NotebookSnapshot, type CellSnapshot, type Te
 import { createSharedCursorPosition, encodeRelativeOffset, resolveRelativeOffset, resolveSharedCursorPosition } from '../core/cursorPosition';
 import { rebaseTextChanges } from '../core/textChanges';
 import { StableCellIdRegistry } from '../core/notebookIdentity';
-import { normalizeNotebookMetadata, parseIpynb } from '../core/projectFiles';
+import { normalizeNotebookMetadata, parseIpynb, serializeIpynb } from '../core/projectFiles';
 import { REMOTE_ORIGIN } from '../core/types';
 import type { PresenceState } from '../runtime/session';
 import { PersistentClient, PersistentHttpError } from '../vps/persistentClient';
@@ -20,7 +20,8 @@ import type { PersistentLiveEvent, PersistentPresence } from '../vps/persistentL
 import { cellUserMetadata, hasLegacyNotebookMetadata, notebookUserMetadata } from './persistentNotebookMetadata';
 import { PresenceRenderer, type PresenceSource } from './presence';
 import { participantColor, commentColor, type LineComment, type LineCommentInput } from '../core/lineComments';
-import { EditorSynchronizer, type EditorTextIntentRequest, type NotebookCellStateRenderer } from './sync';
+import { EditorSynchronizer, executionFromCell, outputsFromCell, type EditorTextIntentRequest, type NotebookCellStateRenderer } from './sync';
+import { SESSION_NOTEBOOK_TYPE } from './sessionNotebook';
 import { rebaseInitialTextChanges } from './initialTextChanges';
 
 interface Connection { sessionId: string; memberId: string; endpoint: string; client: PersistentClient }
@@ -87,6 +88,46 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   }
   public fileEvent: ((event: PersistentLiveEvent) => void) | undefined;
   private readonly states = new Map<vscode.NotebookDocument, State>();
+  private readonly retired = new WeakSet<vscode.NotebookDocument>();
+  private readonly archives = new Set<Promise<void>>();
+  public assertAvailable(notebook: vscode.NotebookDocument): void {
+    if (this.retired.has(notebook)) throw new Error('This notebook instance was deleted or replaced. Its buffer is preserved; use Save As for recovery and close it before opening the current server file.');
+  }
+  public isRetired(notebook: vscode.NotebookDocument): boolean { return this.retired.has(notebook); }
+  public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced'): Promise<void> {
+    if (this.retired.has(notebook)) return Promise.resolve();
+    this.retired.add(notebook);
+    const state = this.states.get(notebook);
+    if (state) { state.blocked = true; state.editor?.dispose(); }
+    const connection = state?.connection ?? this.connection();
+    if (!connection) return Promise.resolve();
+    const file = state?.file ?? this.journalFile(connection, notebook);
+    const archive = `${file}.${reason}-${randomUUID()}`;
+    const snapshot = serializeIpynb({ metadata: normalizeNotebookMetadata(notebook.metadata), cells: notebook.getCells().map(cell => ({
+      id: state?.ids.knownId(cell) ?? cell.metadata.pairNotebookCellId ?? cell.metadata.id ?? randomUUID(),
+      kind: cell.kind, language: cell.document.languageId, source: cell.document.getText(), metadata: cell.metadata,
+      outputs: outputsFromCell(cell), execution: executionFromCell(cell),
+    })) });
+    // Capture the replica before destroying its editor; late callbacks are fenced immediately.
+    const journal = state && !state.closed ? this.journal(state) : Promise.resolve();
+    if (state) this.closeState(state);
+    const work = (async () => {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await atomicWriteFile(`${archive}.ipynb`, snapshot);
+      await journal;
+      if (state) {
+        try { await rename(file, `${archive}.json`); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      }
+      this.log.appendLine(`[info] ${reason} notebook buffer archived at ${archive}.ipynb`);
+    })();
+    this.archives.add(work);
+    void work.finally(() => this.archives.delete(work)).catch(() => undefined);
+    return work;
+  }
+  private journalFile(connection: Connection, notebook: vscode.NotebookDocument): string {
+    return path.join(this.context.globalStorageUri.fsPath, 'persistent-replicas', createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId, notebook.uri.path])).digest('hex') + '.json');
+  }
   private readonly remoteBootstrap = new WeakSet<vscode.NotebookDocument>();
   private readonly presenceEvents = new EventEmitter();
   private presence: PersistentPresence[] = [];
@@ -115,13 +156,14 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   }
   dispose(): void { clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose(); this.reset(); }
   async checkpoint(): Promise<void> {
-    await Promise.all([...this.states.values()].filter(state => state.initialized && !state.closed).map(state => this.journal(state)));
+    await Promise.all([...this.archives, ...[...this.states.values()].filter(state => state.initialized && !state.closed).map(state => this.journal(state))]);
   }
   async shutdown(): Promise<void> {
     clearInterval(this.heartbeat); for (const listener of this.listeners) listener.dispose();
     await Promise.all([...this.states.values()].filter((state) => state.initialized && !state.closed)
       .map((state) => this.journal(state).catch((error) => this.report(error))));
     this.reset(false);
+    await Promise.all(this.archives);
   }
   reset(preserve = true): void {
     this.stream?.dispose(); this.stream = undefined; this.streamConnection = undefined;
@@ -148,6 +190,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       if (state.closed || this.connection() !== state.connection) return;
       void vscode.window.showWarningMessage(rejected ? 'The server could not accept this edit. Local edits were archived for recovery; reconnecting to the saved version.' : 'The notebook was replaced or its access changed. Local edits were archived for recovery; reconnecting to the current version.');
       try { await rename(state.file, `${state.file}.conflict-journal-${randomUUID()}.json`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      if (!rejected) { await this.retire(state.notebook, 'replaced'); return; }
       this.remoteBootstrap.add(state.notebook); this.closeState(state); await this.flush(state.notebook);
     } finally { delete state.conflictPrompted; }
   }
@@ -248,9 +291,19 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     state.journalTail = write; return write;
   }
   private async initialize(state: State): Promise<void> {
+    const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, bootstrapEmpty: true }); this.current(state);
+    const marker = state.notebook.metadata.pairNotebookServerEpoch;
+    const legacyFile = this.journalFile(state.connection, state.notebook);
+    state.file = `${legacyFile}.epoch-${createHash('sha256').update(reply.epoch).digest('hex').slice(0, 24)}.json`;
+    if (typeof marker === 'string' && marker !== reply.epoch) {
+      await this.retire(state.notebook, 'replaced'); throw new Error('The server notebook has a new epoch. The previous editor was preserved for recovery.');
+    }
     let saved: { epoch: string; update: string; actor?: string; sequence?: number; intents?: Intent[]; snapshot?: SharedNotebook; structureUpdate?: string } | undefined;
     try {
-      saved = JSON.parse(await readFile(state.file, 'utf8'));
+      let bytes: string;
+      try { bytes = await readFile(state.file, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; bytes = await readFile(legacyFile, 'utf8'); }
+      saved = JSON.parse(bytes);
       if (!saved || typeof saved.epoch !== 'string' || typeof saved.update !== 'string' || (saved.intents !== undefined && !Array.isArray(saved.intents))) throw new SyntaxError('Invalid replica journal.');
       const probe = new Y.Doc(); try { Y.applyUpdate(probe, Buffer.from(saved.update, 'base64')); } finally { probe.destroy(); }
     } catch (error) {
@@ -262,8 +315,13 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     }
     this.current(state);
     if (saved && this.canEdit?.(state.key) === false) { await rename(state.file, `${state.file}.read-only-${randomUUID()}.json`); saved = undefined; this.remoteBootstrap.add(state.notebook); }
+    if (saved && saved.epoch !== reply.epoch) {
+      await atomicWriteFile(`${legacyFile}.conflict-${randomUUID()}.json`, JSON.stringify(saved));
+      saved = undefined;
+      if (state.notebook.isDirty) { await this.retire(state.notebook, 'replaced'); throw new Error('Old notebook changes were archived; close the preserved editor before opening the new file.'); }
+      this.remoteBootstrap.add(state.notebook);
+    }
     if (saved?.actor && /^[A-Za-z0-9_-]{32,64}$/.test(saved.actor) && Number.isSafeInteger(saved.sequence)) { state.actor = saved.actor; state.sequence = saved.sequence!; state.intents = saved.intents ?? []; }
-    const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, bootstrapEmpty: true }); this.current(state);
     if (reply.textProtocol !== 'yjs-intents-v1') throw new Error('The VPS server needs an update before live editing can connect safely.');
     if (reply.bootstrapEmpty && state.notebook.cellCount && this.canEdit?.(state.key) !== false && !this.remoteBootstrap.has(state.notebook)) {
       const cells = state.notebook.getCells().map((cell) => {
@@ -325,7 +383,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private projectSnapshot(state: State): NotebookSnapshot {
     const shared = sharedNotebook(state.doc);
     const localCells = new Map(state.notebook.getCells().map((cell) => [state.ids.knownId(cell) ?? cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell]));
-    return { metadata: normalizeNotebookMetadata(notebookUserMetadata(shared.metadata)), cells: shared.cells.map((cell) => {
+    return { metadata: { ...normalizeNotebookMetadata(notebookUserMetadata(shared.metadata)), pairNotebookServerEpoch: state.epoch }, cells: shared.cells.map((cell) => {
       const previous = state.project.has(state.key) ? state.project.notebookCellSnapshot(state.key, cell.id) : undefined;
       const local = localCells.get(cell.id);
       const saved = state.savedCells?.get(cell.id); const managing = !!local && this.cellStateRenderer?.isManagingCellState?.(local);
@@ -438,7 +496,8 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
           }
           this.applyCanonical(state); this.schedulePresence(); await this.journal(state);
         } catch (error) {
-          if (error instanceof PersistentHttpError && [400, 403, 409, 413].includes(error.status)) { state.blocked = true; void this.conflict(state, error.status !== 409).catch((failure) => this.report(failure)); }
+          if (error instanceof PersistentHttpError && error.status === 404) await this.retire(state.notebook, 'deleted');
+          else if (error instanceof PersistentHttpError && [400, 403, 409, 413].includes(error.status)) { state.blocked = true; void this.conflict(state, error.status !== 409).catch((failure) => this.report(failure)); }
           throw error;
         }
       }
@@ -455,10 +514,12 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private async synchronize(notebook: vscode.NotebookDocument, capture: boolean, refresh: boolean): Promise<NotebookSyncReply | undefined> {
     if (capture && notebook.isClosed) throw new Error('Cannot save a closed notebook.');
     const connection = this.connection(); if (!connection || notebook.uri.scheme !== 'pair-vps' || notebook.uri.authority !== connection.sessionId) return undefined;
+    if (this.retired.has(notebook)) { if (capture) this.assertAvailable(notebook); return undefined; }
+    if (notebook.isClosed || (notebook.notebookType && notebook.notebookType !== SESSION_NOTEBOOK_TYPE)) return undefined;
     this.ensureStream(); let state = this.states.get(notebook);
     if (state?.blocked) { await this.conflict(state); state = this.states.get(notebook); }
     if (!state) {
-      state = { connection, notebook, key: notebook.uri.path.slice(1), file: path.join(this.context.globalStorageUri.fsPath, 'persistent-replicas', createHash('sha256').update(JSON.stringify([connection.endpoint, connection.sessionId, connection.memberId, notebook.uri.path])).digest('hex') + '.json'),
+      state = { connection, notebook, key: notebook.uri.path.slice(1), file: this.journalFile(connection, notebook),
         doc: new Y.Doc(), project: new CollaborativeProject(), ids: new StableCellIdRegistry(), epoch: '', revision: 0, actor: randomUUID(), sequence: 0, acknowledgedSequence: 0, intents: [], ready: Promise.resolve(), structural: 0, closed: false, blocked: false,
         initial: new Map(notebook.getCells().map((cell) => [cell.metadata.id ?? cell.metadata.pairNotebookCellId, cell.document.getText()])), dirtyCells: new Set(), structureChanged: false, initialized: false };
       const observedState = state;
@@ -469,8 +530,9 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     }
     try { await state.ready; this.current(state); if (capture) await state.editor?.prepareWorkingCopy(false); await this.send(state); }
     catch (error) {
-      if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state);
-      else if (isPermanentConnectionError(error)) { state.blocked = true; }
+      if (error instanceof PersistentHttpError && error.status === 404) await this.retire(notebook, 'deleted');
+      else if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state);
+      else if (isPermanentConnectionError(error, 'file')) { state.blocked = true; }
       else if (!state.initialized && !state.closed) {
         // A rejected bootstrap promise must never poison all subsequent retries.
         state.editor?.dispose(); delete state.editor;
@@ -485,6 +547,10 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
       this.current(state); Y.applyUpdate(state.doc, Buffer.from(reply.update, 'base64')); state.revision = Math.max(state.revision, reply.revision); state.identity = reply.identity; state.acknowledgedSequence = Math.max(state.acknowledgedSequence, reply.acknowledgedSequence ?? 0); await this.readSavedCells(state); this.applyCanonical(state, true);
       await state.editor?.prepareWorkingCopy(false); await this.journal(state);
       return { ...reply, revision: state.revision, ...sharedNotebook(state.doc) };
-    } catch (error) { if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state); throw error; }
+    } catch (error) {
+      if (error instanceof PersistentHttpError && error.status === 404) await this.retire(notebook, 'deleted');
+      else if (error instanceof PersistentHttpError && error.status === 409) await this.conflict(state);
+      throw error;
+    }
   }
 }

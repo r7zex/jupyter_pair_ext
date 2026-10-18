@@ -223,9 +223,9 @@ export class PersistentWorkspace {
       if (name.endsWith('.ipynb') && !preserveNotebookIdentity) {
         // Raw file replacement must not retain an obsolete embedded replica.
         try { const notebook = JSON.parse(bytes.toString('utf8')) as { metadata?: Record<string, unknown> };
-          if (notebook.metadata?.pair_crdt || (notebook.metadata && hasLegacyNotebookMetadata(notebook.metadata))) {
+          if (notebook.metadata?.pair_crdt || notebook.metadata?.pairNotebookServerEpoch || (notebook.metadata && hasLegacyNotebookMetadata(notebook.metadata))) {
             const legacy = hasLegacyNotebookMetadata(notebook.metadata!);
-            notebook.metadata = legacy ? notebookUserMetadata(notebook.metadata!) : { ...notebook.metadata }; delete notebook.metadata.pair_crdt;
+            notebook.metadata = legacy ? notebookUserMetadata(notebook.metadata!) : { ...notebook.metadata }; delete notebook.metadata.pair_crdt; delete notebook.metadata.pairNotebookServerEpoch;
             bytes = Buffer.from(JSON.stringify(notebook));
           }
         } catch (error) { if (!(error instanceof SyntaxError)) throw error; }

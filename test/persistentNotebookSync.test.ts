@@ -239,9 +239,16 @@ describe('Persistent adapter through the existing production editor', () => {
     await sync.flush(notebook); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base-offline');
     const late = pause(); const pending = sync.flush(notebook); await late.reached; connection = { ...connection, memberId: 'replacement' }; late.release(); await assert.rejects(pending, /connection changed/);
   });
-  it('archives old-epoch input and automatically reconnects after a privacy change', async () => {
+  const reopen = (): void => {
+    const uri = notebook.uri; notebook.isClosed = true;
+    cell = fakeCell(sharedNotebook(doc).cells[0]!.source, 'stable'); notebook = fakeNotebook(root, [cell]); notebook.uri = uri;
+    notebook.metadata.pairNotebookServerEpoch = epoch; boundary.__reset(notebook);
+  };
+  it('archives old-epoch input and requires a fresh document after a privacy change', async () => {
     await sync.flush(notebook); epoch = 'public-epoch'; doc.destroy(); doc = new Y.Doc(); editSharedNotebook(doc, { metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'public', metadata: {} }] });
-    await assert.rejects(sync.flush(notebook), /changed/); await sync.flush(notebook);
+    await assert.rejects(sync.flush(notebook), /changed/); await sync.flush(notebook); assert.equal(cell.document.text, 'base');
+    assert.equal(sync.isRetired(notebook), true); await assert.rejects(sync.flush(notebook, true), /deleted or replaced/);
+    reopen(); await sync.flush(notebook);
     assert.equal(sharedNotebook(doc).cells[0]!.source, 'public'); assert.equal(cell.document.text, 'public');
     const files = await readdir(path.join(root, 'persistent-replicas')); const archive = files.find((file) => file.includes('conflict')); assert.ok(archive);
     const recovered = JSON.parse(await readFile(path.join(root, 'persistent-replicas', archive), 'utf8')); assert.equal(recovered.displayed[0].source, 'base');
@@ -261,8 +268,40 @@ describe('Persistent adapter through the existing production editor', () => {
     const warning = boundary.window.showWarningMessage; boundary.window.showWarningMessage = async () => 'Preserve replica and reload';
     try {
       epoch = 'new-public-epoch'; rawOutputs = []; doc.destroy(); doc = new Y.Doc(); editSharedNotebook(doc, { metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source: 'public', metadata: {} }] });
-      await assert.rejects(sync.flush(notebook), /changed/); await sync.flush(notebook); assert.equal(cell.document.text, 'public'); assert.deepEqual(cell.outputs, []);
+      await assert.rejects(sync.flush(notebook), /changed/); reopen(); await sync.flush(notebook); assert.equal(cell.document.text, 'public'); assert.deepEqual(cell.outputs, []);
     } finally { boundary.window.showWarningMessage = warning; }
+  });
+  it('retires only the missing notebook and never retries or resurrects its dirty buffer', async () => {
+    await sync.flush(notebook); const original = connection.client.call; let missing = true; let reads = 0;
+    const old = notebook; old.isDirty = true; cell.document.text = 'unsaved deleted input';
+    connection.client.call = async (operation: string, input: any) => {
+      if (operation === 'notebookSync' && input.path === 'book.ipynb' && missing) { reads++; throw new PersistentHttpError(404, 'Project path not found.'); }
+      return original(operation, input);
+    };
+    await assert.rejects(sync.flush(old));
+    await sync.flush(old); await sync.flush(old); assert.equal(reads, 1);
+    assert.equal(old.getCells()[0].document.text, 'unsaved deleted input');
+    const files = await readdir(path.join(root, 'persistent-replicas'));
+    const archive = files.find(file => file.includes('.deleted-') && file.endsWith('.ipynb'))!;
+    assert.match(await readFile(path.join(root, 'persistent-replicas', archive), 'utf8'), /unsaved deleted input/);
+    missing = false; epoch = 'recreated'; reopen(); await sync.flush(notebook);
+    assert.equal(cell.document.text, 'base'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base');
+    await sync.flush(old); assert.equal(reads, 1);
+  });
+  it('fences late initialization after deletion without retrying its RPC', async () => {
+    const late = pause(); const pending = sync.flush(notebook); await late.reached;
+    await sync.retire(notebook, 'deleted'); late.release(); await assert.rejects(pending, /connection changed/);
+    const call = connection.client.call; let calls = 0;
+    connection.client.call = async (...args: any[]) => { calls++; return call(...args); };
+    await sync.flush(notebook); assert.equal(calls, 0);
+    assert.equal((sync as any).states.size, 0);
+  });
+  it('keeps a restored old-epoch dirty document detached after Reload Window', async () => {
+    await sync.flush(notebook); notebook.metadata.pairNotebookServerEpoch = epoch;
+    await sync.shutdown(); epoch = 'new-file'; notebook.isDirty = true; cell.document.text = 'old offline input';
+    sync = new Sync({ globalStorageUri: { fsPath: root } } as vscode.ExtensionContext, () => connection);
+    await assert.rejects(sync.flush(notebook, true), /new epoch/);
+    assert.equal(cell.document.text, 'old offline input'); assert.equal(sharedNotebook(doc).cells[0]!.source, 'base');
   });
   it('keeps already displayed saved output while a source acknowledgement precedes its refreshed file snapshot', async () => {
     sync.dispose(); rawOutputs = [{ output_type: 'stream', name: 'stdout', text: 'saved 7\n' }];

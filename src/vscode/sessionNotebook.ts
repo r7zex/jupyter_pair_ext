@@ -11,6 +11,9 @@ export class SessionNotebookSerializer implements vscode.NotebookSerializer {
     const snapshot = parseIpynb(Buffer.from(content).toString('utf8'));
     const notebook = new vscode.NotebookData(snapshot.cells.map(toNotebookCellData));
     notebook.metadata = snapshot.metadata;
+    const stored = JSON.parse(Buffer.from(content).toString('utf8') || '{}');
+    const epoch = stored.metadata?.pair_crdt?.epoch ?? stored.metadata?.pairNotebookServerEpoch;
+    if (typeof epoch === 'string') notebook.metadata.pairNotebookServerEpoch = epoch;
     return notebook;
   }
 

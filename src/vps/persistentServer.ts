@@ -842,6 +842,7 @@ export class PersistentSessionHost {
       files: files.map((item) => ({ ...item, version: snapshot.entries.find((entry) => entry.path === item.path)?.version ?? 0 })), command: raw };
     if (Buffer.byteLength(JSON.stringify(command)) > MAX_COMMAND_BYTES) throw new SessionError(413, 'Compute command exceeds limits.');
     await this.writeMetadata(path.join(this.directory(session.record.id), 'commands', `${commandId}.json`), JSON.stringify(command));
+    execution.notebookIdentity = notebookIdentity;
     const run: ExecutionRecord = { execution, requestId, commandId, sourceHash: sha(source), cellIdentity, notebookIdentity, notebookVersion: snapshot.entries.find((entry) => entry.path === notebookPath)!.version, offset: 0, reports: [], aclEpoch: session.record.aclEpoch, controls: [],
       ...(body.operation === 'kernel' ? { kernelCommand: body.command as 'restart' | 'release' } : {}) };
     await session.history.reserve(run); session.record.executions.push(run);

@@ -79,6 +79,7 @@ const boundary = {
   },
   Uri: { from: (value: unknown) => value },
   FileType: { File: 1, Directory: 2 },
+  FilePermission: { Readonly: 1 },
   ProgressLocation: { Notification: 1 },
   NotebookCellKind: { Code: 2 },
   NotebookCellOutput: class { public constructor(public items: unknown[]) {} },
@@ -142,6 +143,17 @@ it('renders another participant\'s input request without prompting or replying o
 });
 
 describe('Persistent server file save conflicts', () => {
+  it('invalidates a delayed read when its file is deleted and recreated at the same path', async () => {
+    const provider = new PersistentFileSystem(); let finish!: (reply: unknown) => void;
+    const delayed = new Promise(resolve => { finish = resolve; });
+    const entry = { path: 'book.ipynb', type: 'file', size: 10, mtime: 1, version: 1, visibility: 'public' };
+    provider.setConnection({ sessionId: 'session', client: { call: () => delayed } } as never);
+    provider.accept({ revision: 1, entries: [entry] } as never);
+    const reading = provider.readFile({ scheme: 'pair-vps', authority: 'session', path: '/book.ipynb' } as vscode.Uri);
+    provider.accept({ revision: 2, entries: [] }); provider.accept({ revision: 3, entries: [{ ...entry, version: 3, mtime: 3 }] } as never);
+    finish({ revision: 1, content: Buffer.from('old instance').toString('base64') });
+    await assert.rejects(reading, /deleted or replaced/); provider.dispose();
+  });
   it('presents a completed peer execution once and keeps it protected until its compute generation changes', async () => {
     const previous = boundary.workspace.notebookDocuments; let presentations = 0;
     const run = { id: 'completed-peer', state: 'completed', notebook: 'peer.ipynb', cellId: 'peer-cell', generation: 1, events: [] };
@@ -580,6 +592,31 @@ describe('Persistent session actions preserve their original connection', () => 
 });
 
 describe('Server project startup safety', () => {
+  it('keeps the provider registered through reconnect and readonly changes', () => {
+    const original = boundary.workspace.registerFileSystemProvider; let registrations = 0; let disposals = 0;
+    boundary.workspace.registerFileSystemProvider = () => { registrations++; return { dispose: () => { disposals++; } }; };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), { files: {} }) as any;
+    try {
+      ui.setFilesReadonly(true); ui.setFilesReadonly(false); ui.setFilesReadonly(true); ui.setFilesReadonly(false);
+      assert.equal(registrations, 1); assert.equal(disposals, 0); assert.equal(ui.files.readonlyFiles, false);
+    } finally { boundary.workspace.registerFileSystemProvider = original; }
+  });
+  for (const status of [401, 403, 404, 426]) it(`isolates notebook HTTP ${status} while preserving project authentication checks`, async () => {
+    let leaves = 0; let refreshed = false;
+    const connection = { sessionId: 'project' };
+    const view = { consents: [], collaborationRevision: 1 };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, disposed: false, polling: false, commentsRevision: 1,
+      rpc: async () => view, files: { refresh: async () => { refreshed = true; } },
+      notebookSync: { flush: async () => { throw new PersistentHttpError(status); } },
+      leave: async () => { leaves++; }, connectionProblem: () => undefined, updateUi: () => undefined,
+      log: { appendLine: () => undefined },
+    }) as any;
+    const documents = boundary.workspace.notebookDocuments;
+    boundary.workspace.notebookDocuments = [{}] as vscode.NotebookDocument[];
+    try { await ui.poll(); assert(refreshed); assert.equal(leaves, [403, 404].includes(status) ? 0 : 1); }
+    finally { boundary.workspace.notebookDocuments = documents; }
+  });
   it('restores a saved file URI before reading its remote bytes', async () => {
     const files = new PersistentFileSystem();
     const uri = { scheme: 'pair-vps', authority: 'project', path: '/test.ipynb' } as vscode.Uri;

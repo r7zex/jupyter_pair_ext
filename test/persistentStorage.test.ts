@@ -23,6 +23,12 @@ describe('persistent workspace storage and server ACLs', function () {
     await workspace.init();
   });
   afterEach(async () => { await rm(directory, { recursive: true, force: true }); });
+  it('removes a local backup epoch when uploading a notebook as a new server instance', async () => {
+    const notebook = { nbformat: 4, nbformat_minor: 5, metadata: { pairNotebookServerEpoch: 'old-backup-epoch', study: 'retained' }, cells: [] };
+    await workspace.write('uploaded.ipynb', base64(JSON.stringify(notebook)), revision(), true);
+    const contents = JSON.parse(Buffer.from((await workspace.read('uploaded.ipynb', true)).content, 'base64').toString());
+    assert.deepEqual(contents.metadata, { study: 'retained' });
+  });
   it('removes Private outputs hidden in a legacy native serializer envelope before making the notebook Public', async () => {
     await workspace.mkdir('private', revision(), true, 'private');
     const output = { output_type: 'stream', name: 'stdout', text: 'PRIVATE_OUTPUT_CANARY' };

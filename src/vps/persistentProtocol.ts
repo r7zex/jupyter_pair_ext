@@ -47,6 +47,7 @@ export interface PersistentExecution {
   events: Record<string, unknown>[]; error?: string;
   scope?: 'public' | 'private';
   cellId?: string; sourceHash?: string; admittedRevision?: number;
+  notebookIdentity?: string;
 }
 export interface PersistentCommand {
   id: string; executionId: string; sessionId: string; kernelId: string;
