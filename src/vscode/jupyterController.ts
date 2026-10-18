@@ -72,6 +72,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   private readonly selections = new Map<string, Promise<vscode.NotebookEditor>>();
   private readonly deferredSelections = new WeakSet<vscode.NotebookDocument>();
   private selectionTimer: NodeJS.Timeout | undefined;
+  private disposed = false;
 
   public constructor(private readonly log: vscode.OutputChannel) {
     const claim = (notebook: vscode.NotebookDocument) => this.claimNotebook(notebook);
@@ -138,7 +139,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   private readonly selectActiveController = (editor: vscode.NotebookEditor | undefined): void => {
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
-    if (!editor || (!this.runtime?.notebookKey(editor.notebook.uri) && !this.persistent?.owns(editor.notebook))) return;
+    if (this.disposed || !editor || (!this.runtime?.notebookKey(editor.notebook.uri) && !this.persistent?.owns(editor.notebook))) return;
     // Affinity alone does not bind the controller to a newly activated notebook.
     this.selectionTimer = setTimeout(() => {
       this.selectionTimer = undefined;
@@ -160,6 +161,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private async selectEditor(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
+    if (this.disposed) throw new Error('The notebook controller was disposed.');
     if (editor.notebook.notebookType && editor.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
       const original = editor.notebook;
       if (original.isDirty) {
@@ -175,13 +177,13 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       }
       // VS Code releases API-held model references while resolving the new type.
       // Visible tabs must be closed first; their references cannot be transferred.
-      if (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original)) throw new Error('The notebook session changed during editor switching.');
+      if (this.disposed || (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original))) throw new Error('The notebook session changed during editor switching.');
       await vscode.commands.executeCommand('vscode.openWith', original.uri, SESSION_NOTEBOOK_TYPE);
       const reopened = vscode.window.activeNotebookEditor;
       if (!reopened || reopened.notebook.notebookType !== SESSION_NOTEBOOK_TYPE || reopened.notebook.uri.toString() !== editor.notebook.uri.toString()) throw new Error('Open this session notebook in the Pair Notebook session editor to execute it.');
       editor = reopened;
     }
-    if (vscode.window.activeNotebookEditor?.notebook !== editor.notebook) throw new Error('The active notebook changed during kernel selection. Select the intended notebook again.');
+    if (this.disposed || vscode.window.activeNotebookEditor?.notebook !== editor.notebook) throw new Error('The active notebook changed during kernel selection. Select the intended notebook again.');
     const controller = this.controller;
     const selected = await vscode.commands.executeCommand<boolean>('notebook.selectKernel', {
       id: controller.id, extension: 'pair-notebook.pair-notebook', notebookEditor: editor,
@@ -245,6 +247,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   public dispose(): void {
+    this.disposed = true;
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
     this.runtimeGeneration += 1;
     this.finishActiveExecutions();

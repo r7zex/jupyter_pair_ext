@@ -51,7 +51,11 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
     } finally {
       controller.dispose(); log.dispose();
       for (const document of vscode.workspace.notebookDocuments.filter(document => document.uri.fsPath.startsWith(root))) {
-        await document.save(); await vscode.window.showNotebookDocument(document); await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+        if (document.isClosed) continue;
+        try {
+          await document.save();
+          if (!document.isClosed) { await vscode.window.showNotebookDocument(document); await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); }
+        } catch (error) { if (!document.isClosed) throw error; }
       }
     }
   });
