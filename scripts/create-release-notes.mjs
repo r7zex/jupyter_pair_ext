@@ -40,6 +40,6 @@ Extract **pair-notebook-ws-server.zip**. On Windows, run **pair-notebook-ws-serv
 
 ${changes}
 
-[Verification and limits](${base}/blob/v${version}/docs/SERVER_RELEASE_0_6_9.md). GitHub's automatic source archives are for developers. Detailed build artifacts/internal checksums are retained with the workflow run.
+[Verification and limits](${base}/blob/v${version}/docs/SERVER_RELEASE_${version.replaceAll('.', '_')}.md). GitHub's automatic source archives are for developers. Detailed build artifacts/internal checksums are retained with the workflow run.
 `;
 fs.writeFileSync(outputPath, notes, 'utf8');

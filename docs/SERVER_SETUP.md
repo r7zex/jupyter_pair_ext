@@ -2,13 +2,13 @@
 
 Download from the [latest release](https://github.com/r7zex/jupyter_pair_ext/releases/latest). Setup runs on your Linux server over SSH, independently of VS Code. It works for a new user, an existing server or after reinstalling the extension.
 
-Supported: Ubuntu 24.04 LTS or Debian 12 with systemd; x86_64/aarch64. Dedicated, cloud, physical and LAN servers use the same workflow. Other OSes and ordinary containers are not installer targets. [Verification and tested environments](SERVER_RELEASE_0_6_8.md).
+Supported: Ubuntu 24.04 LTS or Debian 12 with systemd; x86_64/aarch64. Dedicated, cloud, physical and LAN servers use the same workflow. Other OSes and ordinary containers are not installer targets. [Verification and tested environments](SERVER_RELEASE_0_6_11.md).
 
 ## Downloads
 
 | File | Purpose |
 | --- | --- |
-| `pair-notebook-0.6.8.vsix` | Install on each participating computer with Extensions: Install from VSIX..., then reload. |
+| `pair-notebook-0.6.11.vsix` | Install on each participating computer with Extensions: Install from VSIX..., then reload. |
 | `pair-notebook-server-setup.sh` | Install/update a full server with projects, isolated Jupyter, HTTPS and the encrypted relay. |
 | `pair-notebook-ws-server.zip` | Install only the encrypted WebSocket relay, without a Jupyter worker. |
 
@@ -62,7 +62,7 @@ Removing the extension clears its local connection history, session working copi
 
 The dashboard uses the same layout as a self-host session. **VPS** is the host; **Owner** names the project creator. Creating a project asks for your owner name and retains the returned owner membership. Joining with a password creates a participant membership. The password eye toggles visibility; Copy appears only while visible. Passwords entered during creation/join are encrypted in client SecretStorage. A password cannot be recovered from its server hash; an owner who imports an old key can set a new password under **More actions**.
 
-**Compute** names the active notebook and its **Shared** or **Private** kernel. Shared variables/results belong to everyone with access to that notebook; Private execution is owner-only. **Restart shared/private kernel** targets that notebook and clears its variables after confirmation. Ordinary results appear in notebook cells. **Recover interrupted run**, under More actions, handles a previously accepted execution after a disconnect.
+**Compute** names the active notebook and its **Shared** or **Private** kernel. Shared variables/results belong to everyone with access to that notebook; Private execution is owner-only. **Restart shared/private kernel** targets that notebook and clears its variables after confirmation. Ordinary results appear in notebook cells. **Inspect saved run results**, under More actions, opens a separate summary of a previously accepted execution. It does not rerun code or replace current notebook outputs.
 
 ## Remove the server
 

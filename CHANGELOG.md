@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.11
+
+- Reconcile incomplete project state once through normal synchronization before remote execution; retain manifest, access and replay checks.
+- Keep open notebooks under the editor's save ownership, preventing stale raw working-copy writes.
+- Show remote presence as colored whole-line highlights without inline names or carets; match participant colors in the dashboard.
+- Install requested binary Python wheels in scoped, persistent package environments while keeping user kernels offline and isolated. Report failed `%pip install` requests as failed executions.
+- Prepare a compatible versioned WSL Python/Jupyter runtime before switching, with readiness checks and retryable setup errors.
+- Replace the shrinking password Copy text with an accessible icon and fence asynchronous password actions to the current session.
+- Preserve connected status while an authenticated route remains usable; failed background route optimization does not imply a disconnected session.
+- Explain compute preparation, credential export and file upload destinations/access. Preserve existing private files and require explicit decisions for upload collisions.
+- Inspect saved execution outputs through meaningful run descriptions and lazy full-result loading, without rerunning code or replacing current notebook outputs.
+- Scope the Pair kernel to session notebook editors and clean extension-owned temporary workspaces for both host and member roles.
+- Update both participating extensions and the server/worker for package-installation fixes. Pair services restart during a server update; save work first. See the versioned verification record for performed checks and remaining physical/native acceptance limits.
+
 ## 0.6.10
 
 - Keep primary dashboard actions yellow across editor themes.
