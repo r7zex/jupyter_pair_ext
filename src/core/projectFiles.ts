@@ -680,7 +680,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function splitLines(text: string): string[] {
   if (!text) return [];
-  const lines = text.match(/.*(?:\n|$)/g) ?? [];
+  const lines = text.match(/[^\n]*(?:\n|$)/g) ?? [];
   return lines.filter((line, index) => line || index < lines.length - 1);
 }
 

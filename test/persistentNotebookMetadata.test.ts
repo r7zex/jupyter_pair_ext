@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { cellUserMetadata, hasLegacyNotebookMetadata, nativeNotebookMetadata, notebookUserMetadata, renderedCellMetadata, renderedNotebookMetadata } from '../src/vscode/persistentNotebookMetadata';
+import { parseIpynb, serializeIpynb } from '../src/core/projectFiles';
 
 describe('Persistent notebook serializer metadata', () => {
+  for (const source of ['first\r\nsecond\r\n', 'first\r\n\r\nlast', 'first\r\nsecond\nthird\rfourth']) it(`preserves every character of notebook source with Windows line endings ${JSON.stringify(source)}`, () => {
+    const snapshot = parseIpynb(JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [{ id: 'stable', cell_type: 'code', source, metadata: {}, outputs: [], execution_count: null }] }));
+    const saved = JSON.parse(Buffer.from(serializeIpynb(snapshot)).toString('utf8'));
+    assert.equal(saved.cells[0].source.join(''), source);
+  });
   const user = { kernelspec: { name: 'python3' }, project: 'retained' };
   const cell = { id: 'stable-cell', cell_type: 'code', source: 'x = 42', metadata: { tags: ['retained'] } };
   it('extracts only user metadata from the native ipynb envelope', () => {

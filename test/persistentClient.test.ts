@@ -603,6 +603,20 @@ describe('Persistent session actions preserve their original connection', () => 
 });
 
 describe('Server project startup safety', () => {
+  it('opens a recreated path once with its current epoch while keeping the old document detached', async () => {
+    const execute = boundary.commands.executeCommand; let discoveries = 0; const opened: unknown[][] = [];
+    boundary.commands.executeCommand = (async (...args: unknown[]) => { opened.push(args); }) as typeof execute;
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/book.ipynb', toString: () => 'pair-vps://session/book.ipynb', with: (change: unknown) => ({ ...uri, ...change as object }) };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection: { sessionId: 'session', client: { call: async () => { discoveries++; return { epoch: 'new-epoch' }; } } },
+      notebookOpenings: new Map(), currentNotebookUris: new Map(), notebookSync: { isRetired: () => true },
+    }) as any;
+    try {
+      await Promise.all([ui.openCurrentNotebook(uri), ui.openCurrentNotebook(uri), ui.openCurrentNotebook({ ...uri, query: 'old-epoch' })]);
+      assert.equal(discoveries, 1); assert.equal(opened.length, 1); assert.equal(opened[0]![0], 'vscode.openWith');
+      assert.equal((opened[0]![1] as { query: string }).query, 'pairNotebookEpoch=new-epoch');
+    } finally { boundary.commands.executeCommand = execute; }
+  });
   it('keeps the provider registered through reconnect and readonly changes', () => {
     const original = boundary.workspace.registerFileSystemProvider; let registrations = 0; let disposals = 0;
     boundary.workspace.registerFileSystemProvider = () => { registrations++; return { dispose: () => { disposals++; } }; };

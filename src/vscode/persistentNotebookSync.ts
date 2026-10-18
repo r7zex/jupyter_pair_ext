@@ -90,14 +90,16 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private readonly states = new Map<vscode.NotebookDocument, State>();
   private readonly retired = new WeakSet<vscode.NotebookDocument>();
   private readonly archives = new Set<Promise<void>>();
+  public onRetired: ((notebook: vscode.NotebookDocument) => void) | undefined;
   public assertAvailable(notebook: vscode.NotebookDocument): void {
-    if (this.retired.has(notebook)) throw new Error('This notebook instance was deleted or replaced. Its buffer is preserved; use Save As for recovery and close it before opening the current server file.');
+    if (this.retired.has(notebook)) throw new Error('This notebook instance was deleted or replaced. Its buffer is preserved; use Open recovery copy to edit the archive locally.');
   }
   public isRetired(notebook: vscode.NotebookDocument): boolean { return this.retired.has(notebook); }
   public epochOf(notebook: vscode.NotebookDocument): string | undefined { return this.states.get(notebook)?.epoch || undefined; }
   public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced'): Promise<void> {
     if (this.retired.has(notebook)) return Promise.resolve();
     this.retired.add(notebook);
+    this.onRetired?.(notebook);
     const state = this.states.get(notebook);
     if (state) { state.blocked = true; state.editor?.dispose(); }
     const connection = state?.connection ?? this.connection();
@@ -121,6 +123,12 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       }
       this.log.appendLine(`[info] ${reason} notebook buffer archived at ${archive}.ipynb`);
+      void vscode.window.showWarningMessage('This server notebook instance was deleted or replaced. Its original editor is detached and preserved. Open the recovery copy to keep editing locally; a recreated server file opens as a separate instance.', 'Open recovery copy').then(async action => {
+        if (action === 'Open recovery copy') {
+          try { await vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(vscode.Uri.file(`${archive}.ipynb`)), { preview: false }); }
+          catch (error) { this.report(error); }
+        }
+      });
     })();
     this.archives.add(work);
     void work.finally(() => this.archives.delete(work)).catch(() => undefined);
@@ -294,28 +302,30 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private async initialize(state: State): Promise<void> {
     const reply = await state.connection.client.call<NotebookSyncReply>('notebookSync', { sessionId: state.connection.sessionId, path: state.key, actor: state.actor, bootstrapEmpty: true }); this.current(state);
     const marker = state.notebook.metadata.pairNotebookServerEpoch;
+    const requestedEpoch = new URLSearchParams(state.notebook.uri.query ?? '').get('pairNotebookEpoch');
     const legacyFile = this.journalFile(state.connection, state.notebook);
     state.file = `${legacyFile}.epoch-${createHash('sha256').update(reply.epoch).digest('hex').slice(0, 24)}.json`;
-    if (typeof marker === 'string' && marker !== reply.epoch) {
+    if ((typeof marker === 'string' && marker !== reply.epoch) || (requestedEpoch && requestedEpoch !== reply.epoch)) {
       await this.retire(state.notebook, 'replaced'); throw new Error('The server notebook has a new epoch. The previous editor was preserved for recovery.');
     }
     let saved: { epoch: string; update: string; actor?: string; sequence?: number; intents?: Intent[]; snapshot?: SharedNotebook; structureUpdate?: string } | undefined;
+    let savedFile = state.file;
     try {
       let bytes: string;
       try { bytes = await readFile(state.file, 'utf8'); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; bytes = await readFile(legacyFile, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; savedFile = legacyFile; bytes = await readFile(legacyFile, 'utf8'); }
       saved = JSON.parse(bytes);
       if (!saved || typeof saved.epoch !== 'string' || typeof saved.update !== 'string' || (saved.intents !== undefined && !Array.isArray(saved.intents))) throw new SyntaxError('Invalid replica journal.');
       const probe = new Y.Doc(); try { Y.applyUpdate(probe, Buffer.from(saved.update, 'base64')); } finally { probe.destroy(); }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code) throw error;
-        await rename(state.file, `${state.file}.invalid-${randomUUID()}.json`); saved = undefined;
+        await rename(savedFile, `${savedFile}.invalid-${randomUUID()}.json`); saved = undefined;
         this.log.appendLine('[warn] Invalid notebook replica journal archived; reconnecting from the server and current editor buffer.');
       }
     }
     this.current(state);
-    if (saved && this.canEdit?.(state.key) === false) { await rename(state.file, `${state.file}.read-only-${randomUUID()}.json`); saved = undefined; this.remoteBootstrap.add(state.notebook); }
+    if (saved && this.canEdit?.(state.key) === false) { await rename(savedFile, `${savedFile}.read-only-${randomUUID()}.json`); saved = undefined; this.remoteBootstrap.add(state.notebook); }
     if (saved && saved.epoch !== reply.epoch) {
       await atomicWriteFile(`${legacyFile}.conflict-${randomUUID()}.json`, JSON.stringify(saved));
       saved = undefined;
