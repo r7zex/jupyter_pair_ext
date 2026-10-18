@@ -140,6 +140,8 @@ class AgentProtocolTests(unittest.TestCase):
         agent.tick()
         self.assertEqual(len(FakeBridge.instances), 2)
         self.assertTrue(FakeBridge.instances[0].closed)
+        self.assertFalse(FakeBridge.instances[0].workspace.exists())
+        self.assertTrue(FakeBridge.instances[1].workspace.exists())
         resets = [event for report in transport.reports for event in report["events"] if event["type"] == "kernelState"]
         self.assertEqual(len(resets), 2)
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, writeFile, cp, access, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, writeFile, cp, access, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -35,11 +35,17 @@ describe('extension storage lifecycle', () => {
       assert.equal(await upgraded.secrets.get('pairNotebook.sessionPassword.test'), 'a-password-to-preserve');
       const source = path.join(root, 'analysis.py');
       await writeFile(source, 'print(42)');
-      await mkdir(path.join(storage, 'sessions', 'old-session'), { recursive: true });
-      await writeFile(path.join(storage, 'sessions', 'old-session', 'cached.py'), 'print(1)');
+      await mkdir(path.join(storage, 'sessions', 'old-session', 'old-peer', 'workspace'), { recursive: true });
+      await writeFile(path.join(storage, 'sessions', 'old-session', 'old-peer', 'workspace', 'cached.py'), 'print(1)');
+      await mkdir(path.join(storage, 'persistent-replicas'), { recursive: true });
+      await writeFile(path.join(storage, 'persistent-replicas', 'unsent.json'), 'pending edits');
       await cp(path.resolve('media/uninstall.cjs'), path.join(extension, 'media/uninstall.cjs'));
+      await cp(path.resolve('media/cleanup-session.cjs'), path.join(extension, 'media/cleanup-session.cjs'));
       await promisify(execFile)(process.execPath, [path.join(extension, 'media/uninstall.cjs')]);
-      await assert.rejects(access(storage));
+      await assert.rejects(access(path.join(storage, 'sessions', 'old-session')));
+      await assert.rejects(access(path.join(storage, 'state.json')));
+      assert.equal(await readFile(path.join(storage, 'persistent-replicas', 'unsent.json'), 'utf8'), 'pending edits');
+      assert.ok((await readdir(path.join(storage, 'recovery', 'temporary-sessions'))).some(name => name.startsWith('old-session-old-peer-') && name.endsWith('.jsonl.gz')));
       assert.equal(await readFile(source, 'utf8'), 'print(42)', 'user project files stay untouched');
       const reinstalled = await prepareExtensionStorage(context);
       assert.equal(reinstalled.globalState.get('pairNotebook.persistentConnections'), undefined);
@@ -54,6 +60,7 @@ describe('extension storage lifecycle', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-uninstall-'));
     try {
       await cp(path.resolve('media/uninstall.cjs'), path.join(root, 'uninstall.cjs'));
+      await cp(path.resolve('media/cleanup-session.cjs'), path.join(root, 'cleanup-session.cjs'));
       await writeFile(path.join(root, 'storage-locations.json'), JSON.stringify([root]));
       await writeFile(path.join(root, 'keep.py'), 'print(42)');
       await assert.rejects(promisify(execFile)(process.execPath, [path.join(root, 'uninstall.cjs')]));

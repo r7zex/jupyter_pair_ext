@@ -106,6 +106,7 @@ export class PersistentSessionHost {
           const states = session.record.executions.map((run) => run.execution.state).join(',');
           session.policy.setMembers(this.members(session));
           this.retireRevokedReporting(session);
+          session.policy.pruneRetiredDevices(session.record.executions.filter(run => run.execution.state === 'queued' || run.execution.state === 'running').map(run => run.execution.deviceId), true);
           if (JSON.stringify(session.policy.serialize()) !== before || states !== session.record.executions.map((run) => run.execution.state).join(',')) await this.persist(session);
         }
         const now = Date.now();
@@ -486,7 +487,7 @@ export class PersistentSessionHost {
       session.policy.setMembers(this.members(session)); this.retireRevokedReporting(session); await this.persist(session); return { revoked: true };
     }
     if (body.operation === 'view' || body.operation === 'heartbeat') { await this.persist(session); return this.view(session, member); }
-    if (body.operation === 'leave') { session.live.remove(member.id); session.seen.delete(member.id); session.policy.setMembers(this.members(session)); await this.persist(session); return { left: true }; }
+    if (body.operation === 'leave') { session.live.remove(member.id); session.seen.delete(member.id); session.policy.setMembers(this.members(session)); session.policy.pruneRetiredDevices(session.record.executions.filter(run => run.execution.state === 'queued' || run.execution.state === 'running').map(run => run.execution.deviceId), true); await this.persist(session); return { left: true }; }
     if (body.operation === 'lifecycle') return this.lifecycle(session, member, this.string(body, 'action'));
     if (body.operation === 'password') {
       this.owner(session, member); session.record.password = await this.password(body.password);

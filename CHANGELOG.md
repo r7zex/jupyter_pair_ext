@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15
+
+- Reclaim completed self-host workspaces, including markerless legacy copies and editor exits that skip deactivation. Preserve changed files, dirty buffers and journals in compressed recovery archives; keep recovery through uninstall.
+- Unregister the Pair kernel after Leave, reject stale selection callbacks, hide offline execution devices and prune departed server devices without disturbing accepted computations.
+- Collect superseded server blobs after durable saves and remove working directories for explicitly released or superseded idle executor kernels. Persistent projects, active work and recovery remain intact.
+
 ## 0.6.14
 
 - Block raw Overwrite of existing server notebooks from local or legacy Jupyter editors. Preserve the foreign editor in a recovery archive and open the current server epoch separately, keeping same-name local files and the rest of the project intact.

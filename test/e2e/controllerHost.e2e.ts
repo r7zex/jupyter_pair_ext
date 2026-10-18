@@ -1,15 +1,76 @@
 import { SESSION_NOTEBOOK_TYPE, SessionNotebookSerializer } from '../../src/vscode/sessionNotebook';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { gunzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { PairNotebookController } from '../../src/vscode/jupyterController';
 import type { SessionRuntime } from '../../src/runtime/session';
 import { EditorSynchronizer } from '../../src/vscode/sync';
+import { captureInitialWorkingCopy } from '../../src/vscode/initialWorkingCopy';
+import { claimGuestWorkspace, preserveGuestBuffers, retireGuestWorkspace } from '../../src/vscode/temporarySessions';
 
 suite('Pair Notebook — production NotebookController in real VS Code', () => {
   suiteSetup(async () => { await vscode.extensions.getExtension('pair-notebook.pair-notebook')!.activate(); });
+  test('unregisters the native Pair kernel on leave and rejects stale ownership callbacks', async () => {
+    const fixture = await openNotebookFixture('print(1)');
+    const log = vscode.window.createOutputChannel('Pair kernel lifecycle acceptance');
+    const controller = new PairNotebookController(log);
+    let connected = true;
+    controller.persistent = { get connected() { return connected; }, owns: () => true, execute: async () => undefined, interrupt: async () => undefined };
+    try {
+      const native = controller.controller;
+      connected = false;
+      controller.refreshSession();
+      assert.throws(() => controller.controller, /Join a Pair Notebook session/);
+      await assert.rejects((controller as any).selectController(vscode.window.activeNotebookEditor), /session ended/);
+      assert.equal((controller as any).registeredController, undefined);
+      assert.equal(await vscode.commands.executeCommand('notebook.selectKernel', { id: native.id, extension: 'pair-notebook.pair-notebook', notebookEditor: vscode.window.activeNotebookEditor }), false);
+      connected = true;
+      assert.notEqual(controller.controller, native);
+    } finally { connected = false; controller.dispose(); log.dispose(); await fixture.dispose(); }
+  });
+  test('preserves a real dirty notebook in recovery before removing its temporary workspace', async () => {
+    const fixture = await mkdtemp(path.join(os.tmpdir(), 'pair-native-recovery-'));
+    const base = path.join(fixture, 'pair-notebook.pair-notebook');
+    const workingFolder = path.join(base, 'sessions', 'native', 'peer', 'workspace');
+    const descriptor: any = { sessionId: 'native', localPeer: { peerId: 'peer' }, workingFolder };
+    const context: any = { extensionPath: vscode.extensions.getExtension('pair-notebook.pair-notebook')!.extensionPath, globalStorageUri: vscode.Uri.file(base) };
+    await mkdir(workingFolder, { recursive: true });
+    const uri = vscode.Uri.file(path.join(workingFolder, 'test.ipynb'));
+    await writeFile(uri.fsPath, JSON.stringify({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: [{ cell_type: 'code', id: 'native', source: ['print(1)'], metadata: {}, outputs: [], execution_count: null }] }));
+    await claimGuestWorkspace(context, descriptor);
+    await vscode.commands.executeCommand('vscode.openWith', uri, SESSION_NOTEBOOK_TYPE);
+    const notebook = vscode.window.activeNotebookEditor!.notebook;
+    try {
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(notebook.cellAt(0).document.uri, new vscode.Position(0, 0), '# unsaved native recovery\n');
+      assert.equal(await vscode.workspace.applyEdit(edit), true);
+      assert.equal(notebook.isDirty, true);
+      await preserveGuestBuffers(context, descriptor, captureInitialWorkingCopy(workingFolder, vscode.workspace.textDocuments, vscode.workspace.notebookDocuments));
+      assert.equal(notebook.isClosed, false);
+      assert.equal(notebook.isDirty, true);
+      assert.equal((await readFile(uri.fsPath, 'utf8')).includes('unsaved native recovery'), false);
+      // This fixture explicitly saves and closes its own editor after recovery;
+      // the production cleanup never forces a dirty editor to discard changes.
+      await notebook.save();
+      assert.equal(await vscode.window.tabGroups.close(vscode.window.tabGroups.activeTabGroup.activeTab!, true), true);
+      await retireGuestWorkspace(context, descriptor);
+      await waitFor(() => notebook.isClosed, 3000, 'closed recovery fixture');
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        try { await access(workingFolder); } catch { break; }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      await assert.rejects(access(workingFolder));
+      const directory = path.join(base, 'recovery', 'temporary-sessions');
+      const archive = path.join(directory, (await readdir(directory)).find(name => name.endsWith('.jsonl.gz'))!);
+      const entries = gunzipSync(await readFile(archive)).toString('utf8').trim().split('\n').map(line => JSON.parse(line));
+      const saved = entries.find(entry => entry.path === 'buffers/test.ipynb');
+      assert.match(Buffer.from(saved.content, 'base64').toString(), /unsaved native recovery/);
+    } finally { if (!notebook.isClosed) { await notebook.save(); await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } await rm(fixture, { recursive: true, force: true }); }
+  });
   for (const dirty of [false, true]) test(`switches one restored Jupyter model safely with dirty=${dirty}`, async function () {
     this.timeout(20_000);
     const root = await mkdtemp(path.join(os.tmpdir(), 'pair-editor-switch-'));

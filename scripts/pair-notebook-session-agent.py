@@ -779,6 +779,22 @@ class SessionAgent:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         return directory
 
+    def _retire_idle_kernel(self, key):
+        bridge = self.kernels.pop(key, None)
+        if bridge is None:
+            return
+        bridge.close()
+        # These kernels have completed their accepted work before the broker
+        # admits release or a replacement generation. Receipts live separately.
+        parent = self.state / "kernels" / hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        workspace = parent / key[4]
+        if any(item.is_symlink() for item in (self.state / "kernels", parent, workspace)):
+            raise AgentError("Kernel cleanup cannot follow directory links.")
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+
     def _claim(self, command, recover_only=False):
         directory = self._directory(command)
         receipt_file = directory / "receipt.json"
@@ -821,10 +837,9 @@ class SessionAgent:
                 # manufacture a kernel just to shut it down.
                 obsolete = [entry for entry in self.kernels if entry[0] == key[0] and entry[2] < key[2]]
                 for entry in obsolete:
-                    self.kernels.pop(entry).close()
-                bridge = self.kernels.pop(key, None)
-                if bridge is not None:
-                    bridge.close()
+                    self._retire_idle_kernel(entry)
+                bridge = self.kernels.get(key)
+                self._retire_idle_kernel(key)
                 self._append({"type": "kernelState", "requestId": self.active["requestId"],
                               "generation": command["generation"],
                               "message": "The selected notebook kernel was released; its variables were cleared."
@@ -845,7 +860,7 @@ class SessionAgent:
                 # them after their accepted execution has completed.
                 obsolete = [entry for entry in self.kernels if entry[0] == key[0] and (entry[2] != key[2] or entry[4] != key[4])]
                 for entry in obsolete:
-                    self.kernels.pop(entry).close()
+                    self._retire_idle_kernel(entry)
                 if len(self.kernels) >= getattr(self.args, "max_kernels", MAX_KERNELS):
                     raise AgentError("Live notebook kernel limit reached. Switch execution device or restart the interactive agent to release kernels; existing variables were retained.")
                 workspace = self.state / "kernels" / hashlib.sha256(json.dumps(key).encode()).hexdigest() / command.get("scope", "public")

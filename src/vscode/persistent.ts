@@ -1011,6 +1011,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (!this.view) throw new Error('Connect to a session first.');
     const choices: (vscode.QuickPickItem & { target: PersistentTarget })[] = [];
     for (const device of this.view.devices) {
+      if (!device.online) continue;
       const owner = this.view.members.find((member) => member.id === device.ownerId)?.name ?? device.ownerId;
       const detail = `${device.python}; ${device.cpu}; owner ${owner}; ${device.isolation}; ${device.enabled ? 'sharing enabled' : 'sharing disabled'}; ${this.deviceUsage(device)}`;
       choices.push({ label: `${device.name} — CPU`, description: device.online ? 'online' : 'offline', detail, target: { deviceId: device.id } });

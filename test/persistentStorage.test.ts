@@ -23,6 +23,15 @@ describe('persistent workspace storage and server ACLs', function () {
     await workspace.init();
   });
   afterEach(async () => { await rm(directory, { recursive: true, force: true }); });
+  it('reclaims superseded blobs on saves while preserving current Public and Private data', async () => {
+    await workspace.mkdir('private', revision(), true, 'private');
+    await workspace.write('private/secret.py', base64('private bytes'), revision(), true);
+    for (let index = 0; index < 12; index++) await workspace.write('shared.py', base64(`revision ${index}`), revision(), true);
+    assert.equal((await readdir(path.join(root, 'blobs'))).length, 2);
+    assert.equal(Buffer.from((await workspace.read('shared.py', false)).content, 'base64').toString(), 'revision 11');
+    assert.equal(Buffer.from((await workspace.read('private/secret.py', true)).content, 'base64').toString(), 'private bytes');
+    await assert.rejects(workspace.read('private/secret.py', false), errorCode('NOT_FOUND'));
+  });
   it('removes a local backup epoch when uploading a notebook as a new server instance', async () => {
     const notebook = { nbformat: 4, nbformat_minor: 5, metadata: { pairNotebookServerEpoch: 'old-backup-epoch', study: 'retained' }, cells: [] };
     await workspace.write('uploaded.ipynb', base64(JSON.stringify(notebook)), revision(), true);
