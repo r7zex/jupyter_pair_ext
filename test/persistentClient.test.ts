@@ -249,7 +249,28 @@ describe('Persistent server file save conflicts', () => {
     await provider.writeFile(uri, Buffer.from('saved native notebook'), { create: true, overwrite: true });
     assert.equal(saved, true); assert.equal((await provider.stat(uri)).mtime, 1);
     assert.equal((await provider.stat(uri)).size, Buffer.byteLength('saved native notebook'));
-    managed = false; provider.release(uri); assert.equal((await provider.stat(uri)).mtime, 5); provider.dispose();
+    managed = false; await provider.release(uri); assert.equal((await provider.stat(uri)).mtime, 5); provider.dispose();
+  });
+  it('restores a notebook save stamp before its dirty model is reclaimed after Reload Window', async () => {
+    const saved = new Map<string, unknown>();
+    const state = { get: (key: string, fallback?: unknown) => saved.get(key) ?? fallback, update: async (key: string, value: unknown) => { saved.set(key, value); } } as Pick<vscode.Memento, 'get' | 'update'>;
+    let revision = 1;
+    const snapshot = () => ({ revision, entries: [{ path: 'book.ipynb', type: 'file' as const, size: 12 + revision, mtime: revision, version: revision, visibility: 'public' as const }] });
+    const first = new PersistentFileSystem(state);
+    const connection = { endpoint: 'https://example.com', sessionId: 'session', client: { call: async (operation: string) => operation === 'read' ? { content: Buffer.from('{}').toString('base64'), revision } : snapshot() } } as Parameters<typeof first.setConnection>[0];
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/book.ipynb' } as vscode.Uri;
+    first.setConnection(connection); first.accept(snapshot());
+    await first.readFile(uri); first.notebookManaged = () => true; first.notebookSave = async () => true;
+    await first.writeFile(uri, Buffer.from('saved native notebook'), { create: true, overwrite: true });
+    const baseline = await first.stat(uri); first.dispose(); revision = 5;
+    const restored = new PersistentFileSystem(state); restored.setConnection(connection); restored.accept(snapshot());
+    assert.deepEqual(await restored.stat(uri), baseline);
+    await restored.readFile(uri); restored.notebookManaged = () => true;
+    assert.deepEqual(await restored.stat(uri), baseline);
+    await restored.release(uri); restored.notebookManaged = () => false;
+    assert.equal((await restored.stat(uri)).mtime, 5); restored.dispose();
+    const other = new PersistentFileSystem(state); other.setConnection({ ...connection!, endpoint: 'https://other.example.com' }); other.accept(snapshot());
+    assert.equal((await other.stat(uri)).mtime, 5); other.dispose();
   });
   it('rejects a delayed read from a disconnected session without poisoning the new editing baseline', async () => {
     const provider = new PersistentFileSystem();

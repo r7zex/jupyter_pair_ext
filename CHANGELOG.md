@@ -7,6 +7,7 @@
 - Retire deleted/replaced notebook instances immediately, fence late callbacks and queued work, and preserve their complete notebook buffers and replica journals in recovery archives. New file epochs use separate journals and never inherit old input automatically.
 - Open recreated notebook epochs with distinct editor URIs while retaining detached dirty buffers. Recovery copies open as ordinary local Jupyter notebooks. Preserve complete Windows CRLF source during notebook and recovery serialization.
 - Keep the `pair-vps` filesystem provider registered across startup, reconnect and readonly changes. Enforce disconnected and per-file permissions at the provider boundary.
+- Retain notebook save stamps across extension-host restarts so restored dirty models are not rejected after their own CRDT publications advance the server file timestamp.
 - Fence peer execution rendering by notebook identity when supplied by the server. Accepted computations and saved run recovery remain independent of editor lifetime.
 
 ## 0.6.12

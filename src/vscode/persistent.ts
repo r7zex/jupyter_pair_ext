@@ -67,6 +67,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   private readonly readContents = new Map<string, Buffer>();
   private readonly notebookStats = new Map<string, vscode.FileStat>();
   private statsSession: string | undefined;
+  public constructor(private readonly savedStats?: Pick<vscode.Memento, 'get' | 'update'>) {}
+  // VS Code restores dirty models with their last save stamp. CRDT publications
+  // can advance the server mtime while the extension host is stopped.
+  private async persistStats(): Promise<void> {
+    if (this.statsSession) await this.savedStats?.update(this.statsSession, Object.fromEntries(this.notebookStats));
+  }
   private readonly generations = new Map<string, number>();
   public notebookManaged: ((uri: vscode.Uri) => boolean) | undefined;
   public notebookEpoch: ((uri: vscode.Uri) => string | undefined) | undefined;
@@ -81,8 +87,10 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     this.snapshot = { revision: 0, entries: [] };
     this.readRevisions.clear();
     this.readContents.clear();
-    if (connection && connection.sessionId !== this.statsSession) {
-      this.notebookStats.clear(); this.statsSession = connection.sessionId;
+    const statsSession = connection ? `pairNotebook.fileStats:${connection.endpoint}:${connection.sessionId}` : undefined;
+    if (statsSession && statsSession !== this.statsSession) {
+      this.notebookStats.clear(); this.statsSession = statsSession;
+      for (const [key, stat] of Object.entries(this.savedStats?.get<Record<string, vscode.FileStat>>(statsSession, {}) ?? {})) this.notebookStats.set(key, stat);
     }
   }
   public get revision(): number { return this.snapshot.revision; }
@@ -124,8 +132,8 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!entry) throw vscode.FileSystemError.FileNotFound(uri);
     const current: vscode.FileStat = { type: entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size };
-    if (this.notebookManaged?.(uri) || this.textManaged?.(uri)) {
-      if (!this.notebookStats.has(key)) this.notebookStats.set(key, current);
+    if (this.notebookManaged?.(uri) || this.textManaged?.(uri) || (key.endsWith('.ipynb') && this.notebookStats.has(key))) {
+      if (!this.notebookStats.has(key)) { this.notebookStats.set(key, current); await this.persistStats(); }
       return { ...this.notebookStats.get(key)!, ...(this.readonlyFiles || this.canEdit?.(key) === false ? { permissions: vscode.FilePermission.Readonly } : {}) };
     }
     return { ...current, ...(this.readonlyFiles || this.canEdit?.(key) === false ? { permissions: vscode.FilePermission.Readonly } : {}) };
@@ -153,7 +161,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
       this.readRevisions.set(key, response.revision);
       this.readContents.set(key, content);
       const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
-      if (entry && !this.notebookStats.has(key)) this.notebookStats.set(key, { type: vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size });
+      if (entry && !this.notebookStats.has(key)) { this.notebookStats.set(key, { type: vscode.FileType.File, ctime: entry.mtime, mtime: entry.mtime, size: entry.size }); await this.persistStats(); }
     }
     return content;
   }
@@ -224,10 +232,10 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     if (!options.create && !entry) throw vscode.FileSystemError.FileNotFound(uri);
     if (!options.overwrite && entry) throw vscode.FileSystemError.FileExists(uri);
     if (entry && !key.endsWith('.ipynb') && await this.textSave?.(uri)) {
-      const stat = this.notebookStats.get(key); if (stat) this.notebookStats.set(key, { ...stat, size: content.length }); return;
+      const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); } return;
     }
     if (key.endsWith('.ipynb') && await this.notebookSave?.(uri)) {
-      const stat = this.notebookStats.get(key); if (stat) this.notebookStats.set(key, { ...stat, size: content.length });
+      const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); }
       return;
     }
     await this.mutate('write', { path: key, content: Buffer.from(content).toString('base64'), expectedRevision: this.readRevisions.get(key) ?? this.snapshot.revision });
@@ -246,11 +254,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   public async setVisibility(uri: vscode.Uri, visibility: 'public' | 'private'): Promise<void> {
     await this.mutate('visibility', { path: this.check(uri), visibility });
   }
-  public release(uri: vscode.Uri): void {
+  public async release(uri: vscode.Uri): Promise<void> {
     if (uri.scheme === SCHEME && uri.authority === this.connection?.sessionId) {
       this.readRevisions.delete(filePath(uri));
       this.readContents.delete(filePath(uri));
       this.notebookStats.delete(filePath(uri));
+      await this.persistStats();
     }
   }
   public dispose(): void { this.changed.dispose(); }
@@ -269,7 +278,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   public get connected(): boolean { return !!this.connection; }
   private readonly changed = new vscode.EventEmitter<PersistentItem | undefined>();
   public readonly onDidChangeTreeData = this.changed.event;
-  private readonly files = new PersistentFileSystem();
+  private readonly files: PersistentFileSystem;
   private readonly executionChanges = new Map<string, number>();
   private readonly executionWaiters = new Map<string, Set<() => void>>();
   private readonly disposables: vscode.Disposable[] = [];
@@ -340,6 +349,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel, notebook: vscode.NotebookController | PairNotebookController,
     private readonly sessionChanged: (view: ServerSessionView | undefined, endpoint?: string, connected?: boolean) => void = () => undefined,
     private readonly canAttach: () => boolean = () => true) {
+    this.files = new PersistentFileSystem(context.globalState);
     this.notebookSource = notebook;
     this.status.command = 'pairNotebook.manageVpsSession';
     if (vscode.window.onDidChangeActiveNotebookEditor) this.disposables.push(vscode.window.onDidChangeActiveNotebookEditor(editor => { this.updateUi(); if (editor) this.claim(editor.notebook); }));
@@ -395,9 +405,9 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       new vscode.Disposable(() => this.fileRegistration?.dispose()),
       vscode.workspace.onDidOpenNotebookDocument((notebook) => this.claim(notebook)),
       vscode.workspace.onDidCloseNotebookDocument((notebook) => {
-        if (!vscode.workspace.notebookDocuments.some(document => !document.isClosed && document.uri.scheme === notebook.uri.scheme && document.uri.authority === notebook.uri.authority && document.uri.path === notebook.uri.path)) this.files.release(notebook.uri);
+        if (!vscode.workspace.notebookDocuments.some(document => !document.isClosed && document.uri.scheme === notebook.uri.scheme && document.uri.authority === notebook.uri.authority && document.uri.path === notebook.uri.path)) void this.files.release(notebook.uri).catch(error => log.appendLine(`[error] Server file save stamp: ${String(error)}`));
       }),
-      vscode.workspace.onDidCloseTextDocument((document) => this.files.release(document.uri)),
+      vscode.workspace.onDidCloseTextDocument((document) => { void this.files.release(document.uri).catch(error => log.appendLine(`[error] Server file save stamp: ${String(error)}`)); }),
       this.status, this.files, this.changed, new vscode.Disposable(() => clearInterval(timer)),
     );
     const commands: Record<string, (...args: never[]) => unknown> = {

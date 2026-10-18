@@ -12,6 +12,8 @@ Notebook serialization now preserves every CRLF source line. Its former dot-base
 
 The `pair-vps` provider is registered once before asynchronous network setup. Connection changes use provider-side availability and per-file readonly permissions instead of unregister/register gaps. Execution responses optionally include their admitted notebook identity so newer clients can fence peer output rendering after replacement.
 
+The provider retains notebook save stamps in extension state across Reload Window. This keeps the restored model's save baseline consistent with its serialized backup while CRDT publications advance the server timestamp. Server revision checks, notebook epoch checks and access checks still control writes.
+
 ## Validation
 
 - Windows VS Code Extension Host: 34 tests passed, including real Jupyter-to-session model switching, concurrent selection, dirty deferral, same-name local notebooks, repeated saves, Python execution and the existing native editing cases.
