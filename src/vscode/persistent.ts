@@ -349,7 +349,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   public constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel, notebook: vscode.NotebookController | PairNotebookController,
     private readonly sessionChanged: (view: ServerSessionView | undefined, endpoint?: string, connected?: boolean) => void = () => undefined,
     private readonly canAttach: () => boolean = () => true) {
-    this.files = new PersistentFileSystem(context.globalState);
+    this.files = new PersistentFileSystem(context.workspaceState);
     this.notebookSource = notebook;
     this.status.command = 'pairNotebook.manageVpsSession';
     if (vscode.window.onDidChangeActiveNotebookEditor) this.disposables.push(vscode.window.onDidChangeActiveNotebookEditor(editor => { this.updateUi(); if (editor) this.claim(editor.notebook); }));
