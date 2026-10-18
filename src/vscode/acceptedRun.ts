@@ -10,6 +10,7 @@ export interface AcceptedRunReference {
   memberId?: string;
   projectName?: string;
   createdAt?: number;
+  deviceName?: string;
 }
 
 export function presentAcceptedRun(reference: AcceptedRunReference, execution: PersistentExecution) {
@@ -17,7 +18,7 @@ export function presentAcceptedRun(reference: AcceptedRunReference, execution: P
   const time = reference.createdAt ? new Date(reference.createdAt).toLocaleString() : 'Start time unavailable';
   return {
     label: `${path.posix.basename(execution.notebook)} · Cell ${execution.cellIndex + 1} · ${state}`,
-    description: `${time} · ${execution.deviceId === 'vps' ? 'VPS' : execution.deviceId} · ${execution.scope === 'private' ? 'Private' : 'Shared'}`,
-    detail: `${reference.projectName ? reference.projectName + ' / ' : ''}${execution.notebook} — Open saved results; code will not run again.`,
+    description: `${time} · ${execution.deviceId === 'vps' ? 'VPS' : reference.deviceName ?? 'Computer (name unavailable)'} · ${execution.scope === 'private' ? 'Private' : 'Shared'}`,
+    detail: `${reference.projectName ? reference.projectName + ' / ' : ''}${execution.notebook} — Inspect saved outputs in a separate summary; code will not run again.`,
   };
 }

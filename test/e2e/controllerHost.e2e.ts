@@ -1,6 +1,6 @@
 import { SESSION_NOTEBOOK_TYPE, SessionNotebookSerializer } from '../../src/vscode/sessionNotebook';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
@@ -81,6 +81,17 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
       assert.equal(await vscode.workspace.applyEdit(edit), true);
       await controller.executeActive();
       await waitFor(() => cell.outputs.some(output => output.items.some(item => Buffer.from(item.data).toString().includes('43'))), 3000, 'retained Python variable');
+      const physicalPath = path.join(fixture.root, 'controller.ipynb');
+      const beforeFallback = await readFile(physicalPath);
+      const writeFallback = runtime as unknown as { writeWorkingCopy: (key: string, bytes: Uint8Array) => Promise<boolean> };
+      assert.equal(await writeFallback.writeWorkingCopy('controller.ipynb', Buffer.from('stale raw notebook projection')), true);
+      assert.deepEqual(await readFile(physicalPath), beforeFallback, 'an open notebook must not be written behind the VS Code working copy');
+      assert.equal(await fixture.notebook.save(), true);
+      assert.equal(await fixture.notebook.save(), true);
+      const saved = JSON.parse(await readFile(physicalPath, 'utf8'));
+      assert.equal(saved.cells[0].source.join(''), 'print(a + 2)');
+      assert.equal(saved.cells[0].id, 'controller-fixture');
+      assert.match(JSON.stringify(saved.cells[0].outputs), /43/);
     } finally { controller.dispose(); synchronizer.dispose(); await runtime.leave(); log.dispose(); await fixture.dispose(); await rm(backing, { recursive: true, force: true }); }
   });
 

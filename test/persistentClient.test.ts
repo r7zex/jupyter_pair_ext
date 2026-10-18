@@ -79,6 +79,7 @@ const boundary = {
   },
   Uri: { from: (value: unknown) => value },
   FileType: { File: 1, Directory: 2 },
+  ProgressLocation: { Notification: 1 },
   NotebookCellKind: { Code: 2 },
   NotebookCellOutput: class { public constructor(public items: unknown[]) {} },
   NotebookCellOutputItem: {
@@ -94,6 +95,7 @@ const boundary = {
     showOpenDialog: async () => [{ scheme: 'file', path: '/selected.txt' }],
     showInputBox: async () => 'upload',
     showInformationMessage: async (message: string) => { informationMessages.push(message); },
+    showTextDocument: async (document: unknown) => { void document; },
   },
   commands: { executeCommand: async () => undefined },
   workspace: {
@@ -102,6 +104,7 @@ const boundary = {
     notebookDocuments: [] as vscode.NotebookDocument[],
     updateWorkspaceFolders: () => true,
     registerFileSystemProvider: () => ({ dispose: () => undefined }),
+    openTextDocument: async (options: { language: string; content: string }) => options,
     fs: { stat: async () => ({ type: 1, size: 5 }), readFile: async () => Buffer.from('local private fixture') },
   },
 };
@@ -471,6 +474,65 @@ describe('Persistent session actions preserve their original connection', () => 
     ui.connection = replacement; release();
     await assert.rejects(pending, /session changed/);
     assert.deepEqual(calls, action === 'recoverExecution' ? ['original'] : []);
+  });
+
+  for (const outcome of ['inspect', 'cancel', 'expired']) it(`loads only the selected saved result after showing summaries: ${outcome}`, async () => {
+    const requests: Record<string, unknown>[] = [];
+    const shown: unknown[] = [];
+    const showDocument = boundary.window.showTextDocument;
+    boundary.window.showTextDocument = async document => { shown.push(document); };
+    const connection = { sessionId: 'recovery', endpoint: 'https://example.com', memberId: 'member', name: 'Experiment', client: {
+      call: async (operation: string, fields: Record<string, unknown>) => {
+        assert.equal(operation, 'execution'); requests.push(fields);
+        if (!fields.summary && outcome === 'expired') throw new PersistentHttpError(404, 'Unavailable');
+        return { id: fields.executionId, notebook: 'data/test.ipynb', cellIndex: fields.executionId === 'newer' ? 2 : 0,
+          requesterId: 'member', deviceId: 'vps', generation: 1, state: 'completed',
+          events: fields.summary ? [] : [{ type: 'iopub', messageType: 'stream', content: { text: 'saved output sentinel' } }] };
+      },
+    } };
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, disposed: false, view: { devices: [] },
+      context: { globalState: { get: () => [{ id: 'older', createdAt: 1 }, { id: 'newer', createdAt: 2 }, { id: 'other-project', sessionId: 'another' }] } },
+    }) as { recoverExecution: () => Promise<void> };
+    quickPick = async items => {
+      assert.equal(requests.length, 2); assert.ok(requests.every(request => request.summary === true));
+      assert.match((items[0] as { label: string }).label, /Cell 3/);
+      return outcome === 'cancel' ? undefined : items[0];
+    };
+    try {
+      await ui.recoverExecution();
+      assert.equal(requests.length, outcome === 'cancel' ? 2 : 3);
+      if (outcome === 'inspect') {
+        assert.equal(requests[2]!.executionId, 'newer'); assert.equal(requests[2]!.summary, undefined);
+        assert.match((shown[0] as { content: string }).content, /saved output sentinel/);
+        assert.match((shown[0] as { content: string }).content, /No code was rerun/);
+      } else assert.deepEqual(shown, []);
+    } finally { boundary.window.showTextDocument = showDocument; }
+  });
+
+  for (const action of ['skip', 'replace', 'private']) it(`handles an upload collision with ${action} without publishing existing private files`, async () => {
+    const information = boundary.window.showInformationMessage;
+    const calls: boolean[] = []; const publications: string[] = [];
+    const connection = { sessionId: 'upload-session', endpoint: 'https://example.com', name: 'Upload test' };
+    (boundary.window as any).withProgress = async (_options: unknown, task: () => Promise<void>) => task();
+    (boundary.window as any).showInformationMessage = async () => 'Upload';
+    let choices = 0;
+    quickPick = async items => ++choices === 1 ? items[1] : items.find(item => (item as any).action === action);
+    const ui = Object.assign(Object.create(PersistentSessionController.prototype), {
+      connection, disposed: false, files: { refresh: async () => undefined, uri: (key: string) => ({ path: key }),
+        visibilityOf: (key: string) => action === 'private' && key.endsWith('/selected.txt') ? 'private' : 'public',
+        writeFile: async (_uri: unknown, _content: unknown, options: { overwrite: boolean }) => { calls.push(options.overwrite); if (!options.overwrite) throw Object.assign(new Error('exists'), { code: 'FileExists' }); },
+        setVisibility: async (uri: { path: string }) => { publications.push(uri.path); },
+      },
+    }) as { upload: () => Promise<void> };
+    try {
+      if (action === 'private') await assert.rejects(ui.upload(), /privacy was preserved/); else await ui.upload();
+      assert.deepEqual(calls, action === 'replace' ? [false, true] : [false]);
+      assert.deepEqual(publications, [], 'uploading into a public folder must not republish its unrelated private children');
+    } finally {
+      boundary.window.showInformationMessage = information;
+      delete (boundary.window as any).withProgress; quickPick = undefined;
+    }
   });
 
   it('does not clear a replacement connection when an old leave acknowledgement arrives late', async () => {

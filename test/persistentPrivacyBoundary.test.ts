@@ -69,6 +69,22 @@ describe('Persistent execution privacy boundaries', function () {
   });
   afterEach(async () => { await server.stop(); await rm(directory, { recursive: true, force: true }); });
 
+  it('returns output-free summaries without mutating retained results or bypassing privacy checks', async () => {
+    const { guest, command } = await launchGuest();
+    const text = 'saved output '.repeat(1024);
+    await report(command, text, 'completed');
+    const summary = await call('execution', { executionId: command.executionId, summary: true }, guest.token);
+    assert.equal(summary.status, 200); assert.equal(summary.data.id, command.executionId);
+    assert.deepEqual(summary.data.events, []);
+    const full = await call('execution', { executionId: command.executionId }, guest.token);
+    assert.equal(full.data.events[0].content.text, text);
+    const snapshot = await call('snapshot');
+    assert.equal((await call('visibility', { path: 'work.ipynb', visibility: 'private', expectedRevision: snapshot.data.revision })).status, 200);
+    const denied = await call('execution', { executionId: command.executionId, summary: true }, guest.token);
+    assert.ok([403, 404].includes(denied.status));
+    assert.deepEqual((await call('execution', { executionId: command.executionId, summary: true })).data.events, []);
+  });
+
   it('does not disclose old execution output through active kernel controls after a privacy change', async () => {
     const { guest, command } = await launchGuest();
     const snapshot = await call('snapshot');

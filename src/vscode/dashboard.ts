@@ -547,7 +547,7 @@ function html(): string {
           section('compute','Compute',computeCard,'section-compute')+
           section('network','Network',networkCard)+
           section('quickActions','Quick actions','<div class="actions">'+controls+'</div>')+
-          '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary>More actions</summary><div class="actions">'+action('manageVps','Manage session','MANAGE')+(own ? action('permissions','Participant permissions','CONFIGURE')+action('changeVpsPassword','Session password','CHANGE') : '')+action('shareVps','My computer','CONFIGURE')+action('recoverVps','Recover interrupted run','RECOVER',{title:'Restore an interrupted execution into its notebook cells'})+action('leaveVps','Leave session','LEAVE',{danger:true})+'</div></details>';
+          '<details id="moreActions"'+(detailsOpen?' open':'')+'><summary>More actions</summary><div class="actions">'+action('manageVps','Manage session','MANAGE')+(own ? action('permissions','Participant permissions','CONFIGURE')+action('changeVpsPassword','Session password','CHANGE') : '')+action('shareVps','My computer','CONFIGURE')+action('recoverVps','Inspect saved run results','RECOVER',{title:'Inspect saved outputs without rerunning code or replacing notebook content'})+action('leaveVps','Leave session','LEAVE',{danger:true})+'</div></details>';
         document.getElementById('togglePassword').onclick = () => {
           if (revealedPassword !== undefined || passwordRequested) { revealedPassword = undefined; passwordRequested = false; render(); }
           else { passwordRequested = true; command('revealVpsPassword'); }

@@ -827,6 +827,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (existingVisibility && existingVisibility !== selection.value) throw new Error('The destination has different access. Choose a new folder; uploading will not change access to existing files.');
     if (!existingVisibility) await this.files.createPrivateDirectory(this.files.uri(destination));
     let count = 0;
+    let skipped = 0;
     const visit = async (uri: vscode.Uri, key: string): Promise<void> => {
       if (++count > 2_000) throw new Error('Upload exceeds 2,000 entries; split this folder into smaller uploads.');
       const stat = await vscode.workspace.fs.stat(uri);
@@ -839,14 +840,38 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
         if (stat.size > 8 * 1024 * 1024) throw new Error('Individual upload files must be at most 8 MiB. Keep large datasets on the compute device.');
         const content = await vscode.workspace.fs.readFile(uri);
         this.assertConnection(connection);
-        await this.files.writeFile(this.files.uri(key), content, { create: true, overwrite: false });
+        try { await this.files.writeFile(this.files.uri(key), content, { create: true, overwrite: false }); }
+        catch (error) {
+          if ((error as { code?: string }).code !== 'FileExists') throw error;
+          if (this.files.visibilityOf(key) !== selection.value) throw new Error(`The existing file ${key} has different access. Upload with a different destination; its privacy was preserved.`);
+          const choice = await vscode.window.showQuickPick([
+            { label: 'Keep the existing file', description: `Skip ${key}`, action: 'skip' },
+            { label: 'Upload with another name', description: key, action: 'rename' },
+            { label: 'Replace this file', description: `Replace only ${key} in this upload`, action: 'replace' },
+          ], { title: `File already exists: ${key}` });
+          this.assertConnection(connection);
+          if (!choice) throw new Error(`Upload stopped at ${key}; files already transferred remain in ${destination}.`);
+          if (choice.action === 'skip') { skipped++; return; }
+          let targetKey = key;
+          if (choice.action === 'rename') {
+            const name = await vscode.window.showInputBox({ title: `New file name in ${path.posix.dirname(key)}`, value: path.posix.basename(key),
+              validateInput: value => safeJobPath(value) && !value.includes('/') ? undefined : 'Enter one safe file name.' });
+            this.assertConnection(connection);
+            if (!name) throw new Error(`Upload stopped at ${key}; files already transferred remain in ${destination}.`);
+            targetKey = `${path.posix.dirname(key)}/${name}`;
+          }
+          await this.files.refresh(); this.assertConnection(connection);
+          const targetVisibility = this.files.visibilityOf(targetKey);
+          if (targetVisibility && targetVisibility !== selection.value) throw new Error(`The destination ${targetKey} has different access; its privacy was preserved.`);
+          await this.files.writeFile(this.files.uri(targetKey), content, { create: true, overwrite: choice.action === 'replace' });
+        }
       }
     };
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Uploading to ${connection.name}/${destination} on the server`, cancellable: false }, () => visit(source, targetPath));
     this.assertConnection(connection);
-    if (selection.value === 'public') await this.files.setVisibility(this.files.uri(destination), 'public');
+    if (selection.value === 'public' && !existingVisibility) await this.files.setVisibility(this.files.uri(destination), 'public');
     this.assertConnection(connection);
-    const action = await vscode.window.showInformationMessage(`Uploaded ${count} entries to ${connection.name}/${targetPath} (${selection.value === 'private' ? 'Private: owner only' : 'Shared'}). Use paths relative to the notebook’s working directory to read them.`, 'Show in Explorer');
+    const action = await vscode.window.showInformationMessage(`Processed ${count} entries (${skipped} existing files kept) in ${connection.name}/${targetPath} (${selection.value === 'private' ? 'Private: owner only' : 'Shared'}). Use paths relative to the notebook’s working directory to read them.`, 'Show in Explorer');
     if (action === 'Show in Explorer') { this.assertConnection(connection); await vscode.commands.executeCommand('revealInExplorer', this.files.uri(targetPath)); }
   }
   private makeFolderSync(connection: ActiveConnection, localRoot: string, remoteRoot: string): PersistentFolderSync {
@@ -1233,8 +1258,9 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
     const entries = await Promise.all(saved.map(async item => {
       try {
-        const result = await this.rpcFor<PersistentExecution>(connection, 'execution', item.id ? { executionId: item.id } : { requestId: item.requestId });
-        return { ...presentAcceptedRun(item, result), result };
+        const result = await this.rpcFor<PersistentExecution>(connection, 'execution', { ...(item.id ? { executionId: item.id } : { requestId: item.requestId }), summary: true });
+        const deviceName = this.view?.devices.find(device => device.id === result.deviceId)?.name;
+        return { ...presentAcceptedRun({ ...item, ...(deviceName ? { deviceName } : {}) }, result), executionId: result.id };
       } catch (error) {
         if (error instanceof PersistentHttpError && [403, 404].includes(error.status)) return undefined;
         throw error;
@@ -1246,13 +1272,36 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       void vscode.window.showInformationMessage('No saved runs are available for this project and membership. Older or inaccessible runs were omitted.');
       return;
     }
-    const picked = await vscode.window.showQuickPick(available, { title: 'Open saved run results — no code is rerun', matchOnDescription: true, matchOnDetail: true });
+    const picked = await vscode.window.showQuickPick(available, { title: 'Inspect saved run results — no code is rerun', matchOnDescription: true, matchOnDetail: true });
     if (!picked) return;
     this.assertConnection(connection);
-    await this.files.refresh();
+    let run: PersistentExecution;
+    try { run = await this.rpcFor<PersistentExecution>(connection, 'execution', { executionId: picked.executionId }); }
+    catch (error) {
+      if (error instanceof PersistentHttpError && [403, 404].includes(error.status)) {
+        void vscode.window.showInformationMessage('This saved run is no longer available to this membership. No code was rerun.');
+        return;
+      }
+      throw error;
+    }
     this.assertConnection(connection);
-    await vscode.commands.executeCommand('vscode.open', this.files.uri(picked.result.notebook));
-    void vscode.window.showInformationMessage(`Opened ${picked.result.notebook}, cell ${picked.result.cellIndex + 1} (${picked.result.state}). Saved results are shown only while the original cell still matches; no code was rerun.`);
+    const details = [`${connection.name} / ${run.notebook} — Cell ${run.cellIndex + 1}`, `State: ${run.state}`, `Compute: ${this.view?.devices.find(device => device.id === run.deviceId)?.name ?? (run.deviceId === 'vps' ? 'VPS' : 'Computer (name unavailable)')}`, '', 'This is the saved run record. No code was rerun and no notebook outputs were replaced.', ''];
+    for (const event of run.events) {
+      const content = event.content as Record<string, unknown> | undefined;
+      if (event.messageType === 'stream' && typeof content?.text === 'string') details.push(content.text);
+      else if (event.messageType === 'error') details.push(String(content?.ename ?? 'Error') + ': ' + String(content?.evalue ?? 'Execution failed.'));
+      else if (event.messageType === 'execute_result' || event.messageType === 'display_data') {
+        const data = content?.data as Record<string, unknown> | undefined;
+        details.push(typeof data?.['text/plain'] === 'string' ? data['text/plain'] : 'Rich output retained in the saved run record.');
+      }
+    }
+    if (run.error) details.push(run.error);
+    const fullDetails = details.join('\n');
+    const shownDetails = fullDetails.length > 256 * 1024 ? fullDetails.slice(0, 256 * 1024) + '\n[Summary truncated; the full result remains on the server.]' : fullDetails;
+    const summary = await vscode.workspace.openTextDocument({ language: 'plaintext', content: shownDetails });
+    this.assertConnection(connection);
+    await vscode.window.showTextDocument(summary, { preview: false });
+    void vscode.window.showInformationMessage(`Saved results for ${run.notebook}, cell ${run.cellIndex + 1} (${run.state}) are open in a separate summary. No notebook content was replaced and no code was rerun.`);
   }
   public async shutdown(): Promise<void> {
     const connection = this.connection;

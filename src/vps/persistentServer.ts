@@ -725,7 +725,8 @@ export class PersistentSessionHost {
         ?? (typeof body.executionId === 'string' ? await session.history.lookupExecution(body.executionId) : typeof body.requestId === 'string' ? await session.history.lookupRequest(body.requestId) : undefined);
       if (!run || (run.execution.scope === 'private' && !owner)) throw new SessionError(404, 'Execution does not exist.');
       if (run.aclEpoch !== session.record.aclEpoch && !owner) throw new SessionError(403, 'Execution results predate a workspace privacy change.');
-      if (!owner) await session.workspace.read(run.execution.notebook, false); return run.execution;
+      if (!owner) await session.workspace.read(run.execution.notebook, false);
+      return body.summary === true ? { ...run.execution, events: [] } : run.execution;
     }
     else if (body.operation === 'artifacts') {
       const run = session.record.executions.find((candidate) => candidate.execution.id === body.executionId) ?? (typeof body.executionId === 'string' ? await session.history.lookupExecution(body.executionId) : undefined);
