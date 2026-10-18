@@ -162,8 +162,11 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
 
   private async selectEditor(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
     if (this.disposed) throw new Error('The notebook controller was disposed.');
+    const active = vscode.window.activeNotebookEditor;
+    if (active?.notebook.uri.toString() === editor.notebook.uri.toString() && active.notebook.notebookType === SESSION_NOTEBOOK_TYPE) editor = active;
     if (editor.notebook.notebookType && editor.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
       const original = editor.notebook;
+      if (original.isClosed) throw new Error('The previous notebook model was closed. Select the current notebook editor.');
       if (original.isDirty) {
         if (!this.deferredSelections.has(original)) {
           this.deferredSelections.add(original);
@@ -171,12 +174,13 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
         }
         throw new Error('Preserve the unsaved Jupyter notebook before switching its editor.');
       }
-      const tabs = vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab => tab.input instanceof vscode.TabInputNotebook && tab.input.uri.toString() === original.uri.toString());
+      const tabs = vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab => tab.input instanceof vscode.TabInputNotebook && tab.input.notebookType === original.notebookType && tab.input.uri.toString() === original.uri.toString());
       if (!tabs.length || tabs.some(tab => tab.isDirty) || !await vscode.window.tabGroups.close(tabs, true)) {
         throw new Error('Close the existing notebook editor before switching to Pair Notebook. Unsaved changes were retained.');
       }
       // VS Code releases API-held model references while resolving the new type.
       // Visible tabs must be closed first; their references cannot be transferred.
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
       if (this.disposed || (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original))) throw new Error('The notebook session changed during editor switching.');
       await vscode.commands.executeCommand('vscode.openWith', original.uri, SESSION_NOTEBOOK_TYPE);
       const reopened = vscode.window.activeNotebookEditor;
