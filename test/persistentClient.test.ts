@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import Module from 'node:module';
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, it } from 'mocha';
 import type * as vscode from 'vscode';
 import { installProxyAwareWebSocket } from '../src/runtime/proxyWebSocket';
@@ -111,14 +113,68 @@ const boundary = {
 };
 const loader = Module as typeof Module & { _load: (request: string, parent: unknown, isMain: boolean) => unknown };
 const originalLoad = loader._load;
-function loadPersistentUi(): typeof import('../src/vscode/persistent') {
+describe('Detached notebook save and close backing', () => {
+  const uri = (epoch: string): vscode.Uri => ({ scheme: 'pair-vps', authority: 'project', path: '/test.ipynb', toString: () => `pair-vps://project/test.ipynb?pairNotebookEpoch=${epoch}` }) as vscode.Uri;
+  it('saves a retired notebook locally without connecting, syncing or changing server files', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'pair-detached-save-'));
+    const { PersistentFileSystem, PersistentNotebookRecovery } = loadPersistentUi();
+    const provider = new PersistentFileSystem(), recovery = new PersistentNotebookRecovery(directory);
+    provider.notebookRecovery = recovery;
+    provider.restore = async () => { throw new Error('Recovery must not reconnect.'); };
+    provider.notebookSave = async () => { throw new Error('Recovery must not publish.'); };
+    try {
+      await recovery.save(uri('old'), Buffer.from('initial recovery'));
+      await provider.writeFile(uri('old'), Buffer.from('latest unsaved changes'), { create: false, overwrite: true });
+      assert.equal(Buffer.from(await provider.readFile(uri('old'))).toString(), 'latest unsaved changes');
+      assert.equal((await provider.stat(uri('old'))).mtime, 0);
+      assert.equal((await provider.stat(uri('old'))).permissions, undefined);
+      assert.equal(await readFile(recovery.file(uri('old')), 'utf8'), 'latest unsaved changes');
+    } finally { provider.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+  it('keeps epochs and queued saves separate across a provider restart', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'pair-detached-epochs-'));
+    const { PersistentNotebookRecovery } = loadPersistentUi();
+    try {
+      const recovery = new PersistentNotebookRecovery(directory);
+      await Promise.all([recovery.save(uri('old'), Buffer.from('old initial')), recovery.save(uri('new'), Buffer.from('new epoch')), recovery.save(uri('old'), Buffer.from('old latest'))]);
+      const restarted = new PersistentNotebookRecovery(directory);
+      assert.equal(await restarted.has(uri('old')), true);
+      assert.equal(Buffer.from(await restarted.read(uri('old'))).toString(), 'old latest');
+      assert.equal(Buffer.from(await restarted.read(uri('new'))).toString(), 'new epoch');
+      assert.notEqual(recovery.file(uri('old')), recovery.file(uri('new')));
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it('still rejects disconnected writes to unknown server URIs', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'pair-detached-unknown-'));
+    const { PersistentFileSystem, PersistentNotebookRecovery } = loadPersistentUi();
+    const provider = new PersistentFileSystem(); provider.notebookRecovery = new PersistentNotebookRecovery(directory);
+    try {
+      await assert.rejects(provider.writeFile(uri('unknown'), Buffer.from('do not create on server'), { create: true, overwrite: true }), /Connect to a server project first/);
+      assert.equal(await provider.notebookRecovery.has(uri('unknown')), false);
+    } finally { provider.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+  it('allows an existing detached buffer to recover when server restoration fails authorization', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'pair-detached-auth-'));
+    const { PersistentFileSystem, PersistentNotebookRecovery } = loadPersistentUi();
+    const provider = new PersistentFileSystem(), recovery = new PersistentNotebookRecovery(directory);
+    provider.notebookRecovery = recovery;
+    provider.restore = async () => { throw new PersistentHttpError(403, 'Access revoked'); };
+    provider.detachNotebook = async target => { if (!await recovery.has(target)) await recovery.save(target, Buffer.from('previously open local buffer')); return true; };
+    try {
+      assert.equal((await provider.stat(uri('revoked'))).permissions, undefined);
+      assert.equal(Buffer.from(await provider.readFile(uri('revoked'))).toString(), 'previously open local buffer');
+    } finally { provider.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+});
+
+function loadPersistentUi(): typeof import('../src/vscode/persistent') & typeof import('../src/vscode/persistentNotebookRecovery') {
   const cachedBefore = new Set(Object.keys(require.cache));
   loader._load = function (request, parent, isMain): unknown {
     return request === 'vscode' ? boundary : originalLoad.call(this, request, parent, isMain);
   };
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    return require('../src/vscode/persistent') as typeof import('../src/vscode/persistent');
+    return { ...require('../src/vscode/persistent'), ...require('../src/vscode/persistentNotebookRecovery') };
   } finally {
     loader._load = originalLoad;
     // Keep the captured UI classes for this suite, but let later suites load

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.16
+
+- Let deleted, replaced and disconnected notebook tabs save to durable local recovery and close normally. Keep detached epochs and save queues separate from current server editors, including dirty models restored from older extension hosts.
+- Keep server authorization and unknown-URI rejection intact; local recovery never overwrites or recreates a server notebook.
+
 ## 0.6.15
 
 - Reclaim completed self-host workspaces, including markerless legacy copies and editor exits that skip deactivation. Preserve changed files, dirty buffers and journals in compressed recovery archives; keep recovery through uninstall.
