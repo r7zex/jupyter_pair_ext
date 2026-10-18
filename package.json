@@ -2,7 +2,7 @@
   "name": "pair-notebook",
   "displayName": "Pair Notebook",
   "description": "Collaborative files and Jupyter notebooks with encrypted peer sessions, persistent server workspaces and controlled remote Python execution.",
-  "version": "0.6.13",
+  "version": "0.6.14",
   "publisher": "pair-notebook",
   "license": "MIT",
   "repository": {

@@ -226,7 +226,7 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   }
   public notebookSave: ((uri: vscode.Uri) => Promise<boolean>) | undefined;
   public textSave: ((uri: vscode.Uri) => Promise<boolean>) | undefined;
-  public async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean }): Promise<void> {
+  public async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean }, replaceNotebook = false): Promise<void> {
     const key = this.check(uri);
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!options.create && !entry) throw vscode.FileSystemError.FileNotFound(uri);
@@ -234,9 +234,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     if (entry && !key.endsWith('.ipynb') && await this.textSave?.(uri)) {
       const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); } return;
     }
-    if (key.endsWith('.ipynb') && await this.notebookSave?.(uri)) {
+    if (!replaceNotebook && key.endsWith('.ipynb') && await this.notebookSave?.(uri)) {
       const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); }
       return;
+    }
+    if (entry && key.endsWith('.ipynb') && !replaceNotebook) {
+      throw vscode.FileSystemError.NoPermissions('Save conflict: Overwrite cannot replace a server notebook from another editor or a local file. Preserve a local copy and open the current server notebook in Pair Notebook.');
     }
     await this.mutate('write', { path: key, content: Buffer.from(content).toString('base64'), expectedRevision: this.readRevisions.get(key) ?? this.snapshot.revision });
   }
@@ -390,7 +393,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       const document = vscode.workspace.notebookDocuments.find((notebook) => notebook.uri.toString() === uri.toString());
       if (!document) return false;
       this.notebookSync.assertAvailable(document);
-      if (document.notebookType !== SESSION_NOTEBOOK_TYPE) return false;
+      if (document.notebookType !== SESSION_NOTEBOOK_TYPE) {
+        await this.notebookSync.retire(document, 'foreign-editor');
+        throw vscode.FileSystemError.NoPermissions('The Jupyter buffer was preserved in a recovery copy. Save local changes separately; the current server notebook opens in Pair Notebook.');
+      }
       await this.notebookSync.flush(document, true); await this.files.refresh(); return true;
     };
     this.setFilesReadonly(true);
@@ -961,7 +967,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
           await this.files.refresh(); this.assertConnection(connection);
           const targetVisibility = this.files.visibilityOf(targetKey);
           if (targetVisibility && targetVisibility !== selection.value) throw new Error(`The destination ${targetKey} has different access; its privacy was preserved.`);
-          await this.files.writeFile(this.files.uri(targetKey), content, { create: true, overwrite: choice.action === 'replace' });
+          await this.files.writeFile(this.files.uri(targetKey), content, { create: true, overwrite: choice.action === 'replace' }, choice.action === 'replace');
         }
       }
     };

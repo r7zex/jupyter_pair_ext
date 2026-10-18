@@ -373,6 +373,19 @@ describe('Persistent server file save conflicts', () => {
     assert.match(content, /collaborator edit/);
     provider.dispose();
   });
+  for (const open of [false, true]) it(`blocks raw notebook Overwrite without replacing its epoch when an editor is open=${open}`, async () => {
+    const provider = new PersistentFileSystem(); const operations: string[] = [];
+    const snapshot = { revision: 7, entries: [{ path: 'test.ipynb', type: 'file' as const, size: 10, mtime: 1, version: 1, visibility: 'public' as const }] };
+    const client = { call: async (operation: string) => { operations.push(operation); return snapshot; } };
+    provider.setConnection({ endpoint: 'https://example.com', sessionId: 'session', memberId: 'member', name: 'Member', client } as unknown as Parameters<typeof provider.setConnection>[0]);
+    provider.accept(snapshot); if (open) provider.notebookSave = async () => false;
+    const uri = { scheme: 'pair-vps', authority: 'session', path: '/test.ipynb' } as vscode.Uri;
+    const local = Buffer.from('local same-name notebook');
+    await assert.rejects(provider.writeFile(uri, local, { create: true, overwrite: true }), /Overwrite cannot replace/);
+    assert.deepEqual(operations, []); assert.equal(local.toString(), 'local same-name notebook');
+    await provider.writeFile(uri, local, { create: true, overwrite: true }, true);
+    assert.deepEqual(operations, ['write'], 'only the separate confirmed upload replacement may replace a notebook'); provider.dispose();
+  });
 });
 
 describe('Persistent notebook execution connection ownership', () => {

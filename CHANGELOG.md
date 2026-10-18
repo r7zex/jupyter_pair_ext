@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.14
+
+- Block raw Overwrite of existing server notebooks from local or legacy Jupyter editors. Preserve the foreign editor in a recovery archive and open the current server epoch separately, keeping same-name local files and the rest of the project intact.
+- Keep deliberate Upload Files replacement behind its existing explicit confirmation and privacy checks.
+
 ## 0.6.13
 
 - Serialize session editor selection per URI and release clean Jupyter tabs before changing notebook type. Keep unsaved Jupyter documents open and defer switching until an explicit save; ordinary local notebooks retain their Jupyter editor.

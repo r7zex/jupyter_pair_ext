@@ -96,7 +96,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   }
   public isRetired(notebook: vscode.NotebookDocument): boolean { return this.retired.has(notebook); }
   public epochOf(notebook: vscode.NotebookDocument): string | undefined { return this.states.get(notebook)?.epoch || undefined; }
-  public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced'): Promise<void> {
+  public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced' | 'foreign-editor'): Promise<void> {
     if (this.retired.has(notebook)) return Promise.resolve();
     this.retired.add(notebook);
     this.onRetired?.(notebook);
@@ -123,7 +123,10 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       }
       this.log.appendLine(`[info] ${reason} notebook buffer archived at ${archive}.ipynb`);
-      void vscode.window.showWarningMessage('This server notebook instance was deleted or replaced. Its original editor is detached and preserved. Open the recovery copy to keep editing locally; a recreated server file opens as a separate instance.', 'Open recovery copy').then(async action => {
+      const message = reason === 'foreign-editor'
+        ? 'This Jupyter editor cannot overwrite the server notebook. Its complete buffer was archived and kept open. Open the recovery copy to edit locally; the current server notebook opens separately in Pair Notebook.'
+        : 'This server notebook instance was deleted or replaced. Its original editor is detached and preserved. Open the recovery copy to keep editing locally; a recreated server file opens as a separate instance.';
+      void vscode.window.showWarningMessage(message, 'Open recovery copy').then(async action => {
         if (action === 'Open recovery copy') {
           try { await vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(vscode.Uri.file(`${archive}.ipynb`)), { preview: false }); }
           catch (error) { this.report(error); }
