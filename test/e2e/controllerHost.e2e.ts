@@ -59,6 +59,7 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
   });
   test('round-trips attachment, metadata, outputs and stable cell IDs in the session serializer', () => {
     const serializer = new SessionNotebookSerializer();
+    assert.deepEqual(serializer.deserializeNotebook(new Uint8Array()).cells, [], 'Save As must accept its empty destination model');
     const original = { nbformat: 4, nbformat_minor: 5, metadata: { customStudy: { name: 'Study' }, kernelspec: { display_name: 'Python 3', language: 'python', name: 'python3' }, language_info: { name: 'python' } }, cells: [
       { cell_type: 'markdown', id: 'markdown', source: ['![image](attachment:tiny.png)'], metadata: { tags: ['note'] }, attachments: { 'tiny.png': { 'image/png': 'YWJj' } } },
       { cell_type: 'code', id: 'code', source: ['print(42)'], metadata: { tags: ['run'] }, execution_count: 3, outputs: [{ output_type: 'stream', name: 'stdout', text: ['42\n'] }] },
