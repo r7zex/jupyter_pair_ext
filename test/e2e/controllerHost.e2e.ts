@@ -65,7 +65,14 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
       }
       await assert.rejects(access(workingFolder));
       const directory = path.join(base, 'recovery', 'temporary-sessions');
-      const archive = path.join(directory, (await readdir(directory)).find(name => name.endsWith('.jsonl.gz'))!);
+      let archive: string | undefined;
+      const archiveDeadline = Date.now() + 5000;
+      while (Date.now() < archiveDeadline) {
+        const name = (await readdir(directory)).find(name => name.endsWith('.jsonl.gz'));
+        if (name) { archive = path.join(directory, name); break; }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      assert.ok(archive, 'the recovery archive must be published before reading it');
       const entries = gunzipSync(await readFile(archive)).toString('utf8').trim().split('\n').map(line => JSON.parse(line));
       const saved = entries.find(entry => entry.path === 'buffers/test.ipynb');
       assert.match(Buffer.from(saved.content, 'base64').toString(), /unsaved native recovery/);
