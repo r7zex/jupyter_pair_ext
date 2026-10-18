@@ -68,7 +68,8 @@ suite('Pair Notebook — production NotebookController in real VS Code', () => {
       let archive: string | undefined;
       const archiveDeadline = Date.now() + 5000;
       while (Date.now() < archiveDeadline) {
-        const name = (await readdir(directory)).find(name => name.endsWith('.jsonl.gz'));
+        const files = await readdir(directory).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+        const name = files.find(name => name.endsWith('.jsonl.gz'));
         if (name) { archive = path.join(directory, name); break; }
         await new Promise(resolve => setTimeout(resolve, 100));
       }
