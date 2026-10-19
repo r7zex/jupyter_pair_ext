@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.17
+
+- Share installed Python packages across all notebooks in a persistent session and access scope on each compute device. Keep packages across reconnect, kernel restart, notebook recreation and compute generation changes.
+- Let already open kernels discover newly published packages and `.pth` dependencies without clearing their variables. Preserve Public/Private and cross-session isolation.
+- Seed an empty session environment from the current notebook's legacy packages without deleting the original or overwriting an existing shared environment.
+
 ## 0.6.16
 
 - Let deleted, replaced and disconnected notebook tabs save to durable local recovery and close normally. Keep detached epochs and save queues separate from current server editors, including dirty models restored from older extension hosts.

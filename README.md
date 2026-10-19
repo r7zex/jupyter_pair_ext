@@ -1,8 +1,8 @@
 # Pair Notebook
 
-Pair Notebook 0.6.16 supports encrypted peer sessions, [persistent server workspaces](docs/PERSISTENT_VPS.md), and independent [background compute jobs](docs/PERSISTENT_RESEARCH.md). Persistent notebooks use durable Yjs replicas, optimistic local input, shared cursors and unrestricted same-line editing. Public and owner-only Private execution use separate isolated kernels and results.
+Pair Notebook 0.6.17 supports encrypted peer sessions, [persistent server workspaces](docs/PERSISTENT_VPS.md), and independent [background compute jobs](docs/PERSISTENT_RESEARCH.md). Persistent notebooks use durable Yjs replicas, optimistic local input, shared cursors and unrestricted same-line editing. Public and owner-only Private execution use separate isolated kernels and results.
 
-See the [current documentation](docs/README.md) and [0.6.16 verification report](docs/SERVER_RELEASE_0_6_16.md) for executed installer, protocol and collaboration checks, measurement conditions and unverified acceptance layers. Historical evidence is source-specific and does not automatically qualify this release.
+See the [current documentation](docs/README.md) and [0.6.17 verification report](docs/SERVER_RELEASE_0_6_17.md) for executed installer, protocol and collaboration checks, measurement conditions and unverified acceptance layers. Historical evidence is source-specific and does not automatically qualify this release.
 
 [![Latest release](https://img.shields.io/github/v/release/r7zex/jupyter_pair_ext?display_name=tag&sort=semver)](https://github.com/r7zex/jupyter_pair_ext/releases/latest)
 [![Release workflow](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml/badge.svg)](https://github.com/r7zex/jupyter_pair_ext/actions/workflows/release.yml)
@@ -64,18 +64,18 @@ These steps change only matching traffic. Sharing a VPN exit does not place two 
 
 ## Install the extension
 
-Open [release v0.6.16](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.16), download `pair-notebook-0.6.16.vsix`, and install it on every participating computer with **Extensions: Install from VSIX...**. Reload VS Code when prompted. The server setup utility contains its matching verified server package. The separate WebSocket server download provides a relay without Jupyter. GitHub adds source archives automatically. [Server installation and upgrades](docs/PERSISTENT_VPS.md) preserve session data and keep accepted execution separate from editor lifetime.
+Open [release v0.6.17](https://github.com/r7zex/jupyter_pair_ext/releases/tag/v0.6.17), download `pair-notebook-0.6.17.vsix`, and install it on every participating computer with **Extensions: Install from VSIX...**. Reload VS Code when prompted. The server setup utility contains its matching verified server package. The separate WebSocket server download provides a relay without Jupyter. GitHub adds source archives automatically. [Server installation and upgrades](docs/PERSISTENT_VPS.md) preserve session data and keep accepted execution separate from editor lifetime.
 
 ```powershell
-code --install-extension ".\path\to\pair-notebook-0.6.16.vsix" --force
+code --install-extension ".\path\to\pair-notebook-0.6.17.vsix" --force
 ```
 
 That is the extension setup for peer sessions. Trystero, the Nostr discovery client, WebSocket compatibility code, and the WebRTC implementation are bundled into the VSIX. Users do not install a mesh client, daemon, server, npm package, or port-forwarding rule. There is no account, no API key and no runtime download after installation.
 
-The 0.6.16 VSIX also contains Iroh native binaries for Windows x64/ARM64,
+The 0.6.17 VSIX also contains Iroh native binaries for Windows x64/ARM64,
 Linux x64/ARM64 (glibc and musl), and macOS ARM64. Other platforms retain the
 WebRTC/Nostr/MQTT paths. Iroh uses the existing authenticated invite identity;
-Install 0.6.16 on every participant to use the matching runtime. HTTPS address lookup verifies the participant's signature
+Install 0.6.17 on every participant to use the matching runtime. HTTPS address lookup verifies the participant's signature
 and complements native DNS TXT discovery.
 
 If an application proxy is selected, Iroh is disabled because its current native
@@ -192,7 +192,7 @@ Editing state remains in the CRDT during the short folder-selection pause, so an
 
 Before guest execution, Pair Notebook synchronizes edited project dependencies and materializes the host workspace. The Jupyter kernel runs from the host backing repository, so relative paths and `PAIR_NOTEBOOK_WORKSPACE` can read the host's own datasets, including files omitted from guest snapshots. Activating a shared notebook selects the Pair Jupyter controller without restarting its kernel; Pair Run also selects the controller explicitly. Stop first requests exact typed `CONFIRM` for the captured execution IDs, then cancels remaining Run All cells and queued batches for that notebook; a subsequent Run starts a new batch. Renaming a notebook keeps its live kernel and variables.
 
-The shared terminal uses the host's operating-system account and starts in that same repository. It keeps shell variables and `cd` changes between commands. `PAIR_NOTEBOOK_WORKSPACE` identifies the owner repository even after `cd`; the repository is also prepended to `PYTHONPATH` while preserving inherited module paths, so nested training scripts can import project modules and load owner-only datasets. A shell reset or repository change refreshes that environment. Guest terminals are view only by default. The host can disable access or explicitly grant command input per participant with **Pair Notebook: Права участников**. Incoming input and queued commands are checked against the current host policy. This command terminal supports line commands and streamed output; full-screen TTY tools and interactive password prompts require the host's ordinary local terminal. Closing its tab preserves the shell until the session ends; Ctrl+C first requests a separate empty-field `CONFIRM`; only valid consent stops that shell generation and its child commands, and the next command starts a fresh shell. Commands exceeding the 8192-character limit are rejected in full. Install 0.6.16 on every participant's computer for the current terminal, repository and launch fixes.
+The shared terminal uses the host's operating-system account and starts in that same repository. It keeps shell variables and `cd` changes between commands. `PAIR_NOTEBOOK_WORKSPACE` identifies the owner repository even after `cd`; the repository is also prepended to `PYTHONPATH` while preserving inherited module paths, so nested training scripts can import project modules and load owner-only datasets. A shell reset or repository change refreshes that environment. Guest terminals are view only by default. The host can disable access or explicitly grant command input per participant with **Pair Notebook: Права участников**. Incoming input and queued commands are checked against the current host policy. This command terminal supports line commands and streamed output; full-screen TTY tools and interactive password prompts require the host's ordinary local terminal. Closing its tab preserves the shell until the session ends; Ctrl+C first requests a separate empty-field `CONFIRM`; only valid consent stops that shell generation and its child commands, and the next command starts a fresh shell. Commands exceeding the 8192-character limit are rejected in full. Install 0.6.17 on every participant's computer for the current terminal, repository and launch fixes.
 
 Before each cell or terminal command, missing canonical project inputs are restored in the host repository. Text and notebooks are serialized from the shared project; binary files are copied atomically from the working copy with SHA-256 verification. Recovery retains the running kernel's variables, existing host files, private datasets and generated checkpoints. If the canonical binary is unavailable or has changed, preparation fails before execution and can be retried after the file is recovered. Files deleted from the shared project are not recreated.
 
@@ -232,9 +232,9 @@ npm run artifacts
 
 `npm test` uses in-memory Trystero, Nostr and MQTT relays to make transport, pinned-host authority, and route-recovery tests deterministic. `npm run test:live` verifies public Nostr discovery plus a real WebRTC data-channel exchange. `npm run test:live:relay` disables WebRTC and both signalling rooms, then verifies eight-by-64-KiB direct-to-system-proxy bursts across all seven compatible ordered Nostr-only, MQTT-only, and redundant-family combinations.
 
-Release 0.6.16 includes matching editor and server packages:
+Release 0.6.17 includes matching editor and server packages:
 
-- `pair-notebook-0.6.16.vsix` — the ready-to-install extension. GitHub displays its SHA-256 digest next to the file.
+- `pair-notebook-0.6.17.vsix` — the ready-to-install extension. GitHub displays its SHA-256 digest next to the file.
 - `pair-notebook-server-setup.sh` — install, update, repair or recover access to your own server; matching server and integrity checks are embedded.
 - `pair-notebook-ws-server.zip` — standalone encrypted WebSocket relay with an automatic HTTPS/service installer.
 
