@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.17
+
+- Share installed Python packages across all notebooks in a persistent session and access scope on each compute device. Keep packages across reconnect, kernel restart, notebook recreation and compute generation changes.
+- Let already open kernels discover newly published packages and `.pth` dependencies without clearing their variables. Preserve Public/Private and cross-session isolation.
+- Seed an empty session environment from the current notebook's legacy packages without deleting the original or overwriting an existing shared environment.
+
+## 0.6.16
+
+- Let deleted, replaced and disconnected notebook tabs save to durable local recovery and close normally. Keep detached epochs and save queues separate from current server editors, including dirty models restored from older extension hosts.
+- Keep server authorization and unknown-URI rejection intact; local recovery never overwrites or recreates a server notebook.
+
+## 0.6.15
+
+- Reclaim completed self-host workspaces, including markerless legacy copies and editor exits that skip deactivation. Preserve changed files, dirty buffers and journals in compressed recovery archives; keep recovery through uninstall.
+- Unregister the Pair kernel after Leave, reject stale selection callbacks, hide offline execution devices and prune departed server devices without disturbing accepted computations.
+- Collect superseded server blobs after durable saves and remove working directories for explicitly released or superseded idle executor kernels. Persistent projects, active work and recovery remain intact.
+
+## 0.6.14
+
+- Block raw Overwrite of existing server notebooks from local or legacy Jupyter editors. Preserve the foreign editor in a recovery archive and open the current server epoch separately, keeping same-name local files and the rest of the project intact.
+- Keep deliberate Upload Files replacement behind its existing explicit confirmation and privacy checks.
+
 ## 0.6.13
 
 - Serialize session editor selection per URI and release clean Jupyter tabs before changing notebook type. Keep unsaved Jupyter documents open and defer switching until an explicit save; ordinary local notebooks retain their Jupyter editor.

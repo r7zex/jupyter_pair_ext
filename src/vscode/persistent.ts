@@ -17,6 +17,7 @@ import type { PersistentDevice, PersistentExecution, PersistentMembership, Persi
 import { normalizeVpsUrl, safeJobPath } from '../vps/protocol';
 import { PersistentFolderSync } from '../vps/persistentFolderSync';
 import { PersistentNotebookSynchronizer } from './persistentNotebookSync';
+import { PersistentNotebookRecovery } from './persistentNotebookRecovery';
 import { PersistentTextSynchronizer } from './persistentTextSync';
 import { renderNotebookCellState, type MirroredCellState } from './notebookCellStateRenderer';
 import { applyJupyterEventToState, createJupyterRenderState } from './jupyterOutputState';
@@ -58,6 +59,14 @@ function sameEntries(left: PersistentSnapshot, right: PersistentSnapshot): vscod
 
 /** Server authoritative files. Stale saves fail and leave the editor's dirty changes intact. */
 export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.Disposable {
+  public notebookRecovery: PersistentNotebookRecovery | undefined;
+  public detachNotebook: ((uri: vscode.Uri) => Promise<boolean>) | undefined;
+  private async localNotebook(uri: vscode.Uri): Promise<boolean> {
+    if (!this.notebookRecovery || uri.scheme !== SCHEME || !uri.path.endsWith('.ipynb')) return false;
+    const saved = await this.notebookRecovery.has(uri);
+    const detached = await this.detachNotebook?.(uri);
+    return saved || detached === true;
+  }
   public restore: ((uri: vscode.Uri) => Promise<void>) | undefined;
   public canEdit: ((key: string) => boolean) | undefined;
   private readonly changed = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
@@ -125,7 +134,12 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   }
   public watch(): vscode.Disposable { return new vscode.Disposable(() => undefined); }
   public async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
-    if (!this.connection) await this.restore?.(uri);
+    if (await this.notebookRecovery?.has(uri)) { await this.localNotebook(uri); return this.notebookRecovery!.stat(uri); }
+    if (!this.connection) {
+      try { await this.restore?.(uri); }
+      catch (error) { if (!await this.localNotebook(uri)) throw error; }
+    }
+    if (await this.localNotebook(uri)) return this.notebookRecovery!.stat(uri);
     const key = this.check(uri);
     if (!key) return { type: vscode.FileType.Directory, ctime: 0, mtime: this.snapshot.revision, size: 0 };
     await this.refresh();
@@ -147,9 +161,18 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
       .map((entry): [string, vscode.FileType] => [entry.path.slice(prefix.length), entry.type === 'directory' ? vscode.FileType.Directory : vscode.FileType.File]);
   }
   public async readFile(uri: vscode.Uri): Promise<Uint8Array> {
-    if (!this.connection) await this.restore?.(uri);
+    const startedConnection = this.connection;
+    const startedGeneration = this.generations.get(filePath(uri));
+    if (await this.notebookRecovery?.has(uri)) { await this.localNotebook(uri); return this.notebookRecovery!.read(uri); }
+    if (!this.connection) {
+      try { await this.restore?.(uri); }
+      catch (error) { if (!await this.localNotebook(uri)) throw error; }
+    }
+    if (await this.localNotebook(uri)) return this.notebookRecovery!.read(uri);
     const key = this.check(uri);
     const connection = this.requireConnection();
+    if (startedConnection && startedConnection !== connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the read.');
+    if (startedConnection && startedGeneration !== this.generations.get(key)) throw vscode.FileSystemError.Unavailable('The file was deleted or replaced during the read.');
     const generation = this.generations.get(key);
     const response = await connection.client.call<{ content: string; revision: number }>('read', { sessionId: connection.sessionId, path: key });
     if (connection !== this.connection) throw vscode.FileSystemError.Unavailable('The persistent session changed during the read.');
@@ -226,7 +249,8 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
   }
   public notebookSave: ((uri: vscode.Uri) => Promise<boolean>) | undefined;
   public textSave: ((uri: vscode.Uri) => Promise<boolean>) | undefined;
-  public async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean }): Promise<void> {
+  public async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean }, replaceNotebook = false): Promise<void> {
+    if (!replaceNotebook && await this.localNotebook(uri)) { await this.notebookRecovery!.save(uri, content); return; }
     const key = this.check(uri);
     const entry = this.snapshot.entries.find((candidate) => candidate.path === key);
     if (!options.create && !entry) throw vscode.FileSystemError.FileNotFound(uri);
@@ -234,9 +258,21 @@ export class PersistentFileSystem implements vscode.FileSystemProvider, vscode.D
     if (entry && !key.endsWith('.ipynb') && await this.textSave?.(uri)) {
       const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); } return;
     }
-    if (key.endsWith('.ipynb') && await this.notebookSave?.(uri)) {
+    let notebookSaved = false;
+    if (!replaceNotebook && key.endsWith('.ipynb')) {
+      try { notebookSaved = await this.notebookSave?.(uri) === true; }
+      catch (error) {
+        if (!await this.localNotebook(uri)) throw error;
+        await this.notebookRecovery!.save(uri, content); return;
+      }
+    }
+    if (notebookSaved) {
+      if (await this.notebookRecovery?.has(uri)) { await this.notebookRecovery!.save(uri, content); return; }
       const stat = this.notebookStats.get(key); if (stat) { this.notebookStats.set(key, { ...stat, size: content.length }); await this.persistStats(); }
       return;
+    }
+    if (entry && key.endsWith('.ipynb') && !replaceNotebook) {
+      throw vscode.FileSystemError.NoPermissions('Save conflict: Overwrite cannot replace a server notebook from another editor or a local file. Preserve a local copy and open the current server notebook in Pair Notebook.');
     }
     await this.mutate('write', { path: key, content: Buffer.from(content).toString('base64'), expectedRevision: this.readRevisions.get(key) ?? this.snapshot.revision });
   }
@@ -337,6 +373,8 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
   private readonly notebookQueues = new Map<vscode.NotebookDocument, Promise<void>>();
   private readonly notebookOpenings = new Map<string, Promise<void>>();
   private readonly currentNotebookUris = new Map<string, vscode.Uri>();
+  private readonly recovery: PersistentNotebookRecovery;
+  private recoveryNoticeShown = false;
   private readonly cancellationGenerations = new Map<string, number>();
   private readonly localRunning = new WeakSet<vscode.NotebookCell>();
   private readonly mirroredRuns = new Map<string, Promise<void>>();
@@ -350,6 +388,15 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     private readonly sessionChanged: (view: ServerSessionView | undefined, endpoint?: string, connected?: boolean) => void = () => undefined,
     private readonly canAttach: () => boolean = () => true) {
     this.files = new PersistentFileSystem(context.workspaceState);
+    this.recovery = new PersistentNotebookRecovery(path.join(context.globalStorageUri.fsPath, 'persistent-detached'));
+    this.files.notebookRecovery = this.recovery;
+    this.files.detachNotebook = async uri => {
+      const document = vscode.workspace.notebookDocuments.find(notebook => !notebook.isClosed && notebook.uri.toString() === uri.toString());
+      if (!document || this.connection?.sessionId === uri.authority && !this.notebookSync.isRetired(document) && !this.recovery.isDetached(uri)) return false;
+      if (!await this.recovery.has(uri)) await this.recovery.preserve(document);
+      await this.notebookSync.retire(document, 'disconnected');
+      return true;
+    };
     this.notebookSource = notebook;
     this.status.command = 'pairNotebook.manageVpsSession';
     if (vscode.window.onDidChangeActiveNotebookEditor) this.disposables.push(vscode.window.onDidChangeActiveNotebookEditor(editor => { this.updateUi(); if (editor) this.claim(editor.notebook); }));
@@ -382,7 +429,15 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       }
     };
     this.files.created = reopenRetired;
-    this.notebookSync.onRetired = notebook => reopenRetired(notebook.uri);
+    this.notebookSync.onRetired = async (notebook, reason) => {
+      await this.recovery.preserve(notebook);
+      this.log.appendLine(`[info] Detached notebook saves locally to ${this.recovery.file(notebook.uri)}`);
+      if (reason === 'disconnected' && !this.recoveryNoticeShown) {
+        this.recoveryNoticeShown = true;
+        void vscode.window.showInformationMessage('Disconnected notebook tabs now save to local recovery and can be closed normally. These saves do not change the server project.');
+      }
+      if (reason !== 'disconnected') reopenRetired(notebook.uri);
+    };
     this.notebookSync.fileEvent = (event) => this.textSync.receive(event);
     this.files.textManaged = (uri) => this.textSync.manages(uri);
     this.files.textSave = async (uri) => { if (!this.textSync.manages(uri)) return false; await this.textSync.flushAll(); await this.files.refresh(); return true; };
@@ -390,7 +445,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       const document = vscode.workspace.notebookDocuments.find((notebook) => notebook.uri.toString() === uri.toString());
       if (!document) return false;
       this.notebookSync.assertAvailable(document);
-      if (document.notebookType !== SESSION_NOTEBOOK_TYPE) return false;
+      if (document.notebookType !== SESSION_NOTEBOOK_TYPE) {
+        await this.notebookSync.retire(document, 'foreign-editor');
+        return true;
+      }
       await this.notebookSync.flush(document, true); await this.files.refresh(); return true;
     };
     this.setFilesReadonly(true);
@@ -724,6 +782,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     void vscode.window.showInformationMessage('Server project ready. Notebook edits and participant presence synchronize live. Closing VS Code leaves the server session running.');
   }
   private claim(notebook: vscode.NotebookDocument): void {
+    if (this.recovery.isDetached(notebook.uri)) { void this.notebookSync.retire(notebook, 'disconnected').catch(error => this.log.appendLine(`[error] Detached notebook: ${String(error)}`)); return; }
     if (notebook.uri.scheme === SCHEME && notebook.uri.authority === this.connection?.sessionId) {
       const current = this.currentNotebookUris?.get(filePath(notebook.uri));
       if (this.notebookSync.isRetired(notebook) || (current && current.toString() !== notebook.uri.toString())) {
@@ -747,7 +806,10 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
       const reply = await connection.client.call<{ epoch: string }>('notebookSync', { sessionId: connection.sessionId, path: filePath(uri), bootstrapEmpty: true });
       if (this.disposed || connection !== this.connection) return;
       if (typeof reply.epoch !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(reply.epoch)) throw new Error('The server returned an invalid notebook epoch.');
-      const current = uri.with({ query: `pairNotebookEpoch=${encodeURIComponent(reply.epoch)}` });
+      let current = uri.with({ query: `pairNotebookEpoch=${encodeURIComponent(reply.epoch)}` });
+      const previous = this.currentNotebookUris.get(filePath(uri));
+      if (await this.recovery?.has(current)) current = previous && new URLSearchParams(previous.query).get('pairNotebookEpoch') === reply.epoch && !await this.recovery.has(previous) ? previous : current.with({ query: `${current.query}&pairNotebookAttachment=${randomUUID()}` });
+      if (this.disposed || connection !== this.connection) return;
       this.currentNotebookUris.set(filePath(uri), current);
       const existing = vscode.workspace.notebookDocuments.find(document => !document.isClosed && !this.notebookSync.isRetired(document) && document.uri.toString() === current.toString());
       if (existing) await vscode.window.showNotebookDocument(existing, { preview: false });
@@ -767,6 +829,8 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     }
     if (!connection) return;
     await Promise.all([this.notebookSync?.checkpoint(), this.textSync?.checkpoint()]);
+    await Promise.all(vscode.workspace.notebookDocuments.filter(notebook => !notebook.isClosed && notebook.uri.scheme === SCHEME && notebook.uri.authority === connection.sessionId)
+      .map(notebook => this.notebookSync.retire(notebook, 'disconnected')));
     if (connection === this.connection) this.setFilesReadonly(true);
     // Deactivation never stops a session or cancels accepted runs.
     try { if (notifyServer) await connection.client.call('leave', { sessionId: connection.sessionId }); }
@@ -961,7 +1025,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
           await this.files.refresh(); this.assertConnection(connection);
           const targetVisibility = this.files.visibilityOf(targetKey);
           if (targetVisibility && targetVisibility !== selection.value) throw new Error(`The destination ${targetKey} has different access; its privacy was preserved.`);
-          await this.files.writeFile(this.files.uri(targetKey), content, { create: true, overwrite: choice.action === 'replace' });
+          await this.files.writeFile(this.files.uri(targetKey), content, { create: true, overwrite: choice.action === 'replace' }, choice.action === 'replace');
         }
       }
     };
@@ -1005,6 +1069,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     if (!this.view) throw new Error('Connect to a session first.');
     const choices: (vscode.QuickPickItem & { target: PersistentTarget })[] = [];
     for (const device of this.view.devices) {
+      if (!device.online) continue;
       const owner = this.view.members.find((member) => member.id === device.ownerId)?.name ?? device.ownerId;
       const detail = `${device.python}; ${device.cpu}; owner ${owner}; ${device.isolation}; ${device.enabled ? 'sharing enabled' : 'sharing disabled'}; ${this.deviceUsage(device)}`;
       choices.push({ label: `${device.name} — CPU`, description: device.online ? 'online' : 'offline', detail, target: { deviceId: device.id } });
@@ -1165,7 +1230,7 @@ export class PersistentSessionController implements vscode.TreeDataProvider<Pers
     }
   }
   public owns(notebook: vscode.NotebookDocument): boolean {
-    return notebook.uri.scheme === SCHEME && notebook.uri.authority === this.connection?.sessionId && !this.notebookSync?.isRetired?.(notebook);
+    return notebook.uri.scheme === SCHEME && notebook.uri.authority === this.connection?.sessionId && !this.recovery?.isDetached(notebook.uri) && !this.notebookSync?.isRetired?.(notebook);
   }
   public async interrupt(notebook: vscode.NotebookDocument): Promise<void> { await this.kernel(notebook.uri, 'interrupt'); }
   public async execute(cells: vscode.NotebookCell[], notebook: vscode.NotebookDocument): Promise<void> {

@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   const handler: http.RequestListener = (request, response) => {
     if (request.method === 'GET' && request.url === '/health') {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ status: 'ok', relayOnly: true, version: '0.6.13', instanceId }));
+      response.end(JSON.stringify({ status: 'ok', relayOnly: true, version: '0.6.17', instanceId }));
     } else { response.writeHead(404); response.end(); }
   };
   const server = process.env.PAIR_RELAY_TLS_PFX

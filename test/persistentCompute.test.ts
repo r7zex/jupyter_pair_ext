@@ -342,6 +342,18 @@ describe('persistent session compute authorization', () => {
     assert.equal(policy.view().devices.find((entry) => entry.id === 'bob-pc')!.ownerId, 'charlie');
   });
 
+  it('retires departed devices while protecting accepted runs and the VPS', () => {
+    const { policy, presence } = setup();
+    presence(['owner']);
+    policy.pruneRetiredDevices(['alice-pc'], true);
+    assert.ok(policy.view().devices.some(device => device.id === 'alice-pc'));
+    assert.equal(policy.view().devices.some(device => device.id === 'bob-pc'), false);
+    assert.ok(policy.view().devices.some(device => device.id === 'vps'));
+    policy.pruneRetiredDevices([], true);
+    assert.equal(policy.view().devices.some(device => device.id === 'alice-pc'), false);
+    assert.equal(policy.registerDevice('alice', device('alice-pc')).enabled, false);
+  });
+
   it('reclaims terminal and superseded consent records before the lifetime limit can block new requests', () => {
     const { policy } = setup();
     policy.setAllowMemberSwitch('owner', true);

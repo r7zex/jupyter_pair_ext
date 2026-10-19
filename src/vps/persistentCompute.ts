@@ -210,11 +210,12 @@ export class PersistentComputePolicy {
   }
 
   /** Reclaim revoked memberships without disturbing devices retained for accepted executions. */
-  pruneRetiredDevices(protectedDeviceIds: readonly string[]): void {
+  pruneRetiredDevices(protectedDeviceIds: readonly string[], retireOffline = false): void {
     const protectedIds = new Set(protectedDeviceIds);
     const removed = new Set<string>();
     for (const device of this.devices.values()) {
-      if (device.id !== 'vps' && !this.members.has(device.ownerId) && !protectedIds.has(device.id)) {
+      const owner = this.members.get(device.ownerId);
+      if (device.id !== 'vps' && (!owner || retireOffline && !owner.online && !this.deviceOnline(device)) && !protectedIds.has(device.id)) {
         this.devices.delete(device.id);
         this.agentSeen.delete(device.id);
         removed.add(device.id);

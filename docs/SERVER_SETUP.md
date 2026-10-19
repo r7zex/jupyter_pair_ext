@@ -2,13 +2,13 @@
 
 Download from the [latest release](https://github.com/r7zex/jupyter_pair_ext/releases/latest). Setup runs on your Linux server over SSH, independently of VS Code. It works for a new user, an existing server or after reinstalling the extension.
 
-Supported: Ubuntu 24.04 LTS or Debian 12 with systemd; x86_64/aarch64. Dedicated, cloud, physical and LAN servers use the same workflow. Other OSes and ordinary containers are not installer targets. [Verification and tested environments](SERVER_RELEASE_0_6_13.md).
+Supported: Ubuntu 24.04 LTS or Debian 12 with systemd; x86_64/aarch64. Dedicated, cloud, physical and LAN servers use the same workflow. Other OSes and ordinary containers are not installer targets. [Verification and tested environments](SERVER_RELEASE_0_6_17.md).
 
 ## Downloads
 
 | File | Purpose |
 | --- | --- |
-| `pair-notebook-0.6.13.vsix` | Install on each participating computer with Extensions: Install from VSIX..., then reload. |
+| `pair-notebook-0.6.17.vsix` | Install on each participating computer with Extensions: Install from VSIX..., then reload. |
 | `pair-notebook-server-setup.sh` | Install/update a full server with projects, isolated Jupyter, HTTPS and the encrypted relay. |
 | `pair-notebook-ws-server.zip` | Install only the encrypted WebSocket relay, without a Jupyter worker. |
 

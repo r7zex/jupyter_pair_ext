@@ -90,20 +90,20 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
   private readonly states = new Map<vscode.NotebookDocument, State>();
   private readonly retired = new WeakSet<vscode.NotebookDocument>();
   private readonly archives = new Set<Promise<void>>();
-  public onRetired: ((notebook: vscode.NotebookDocument) => void) | undefined;
+  public onRetired: ((notebook: vscode.NotebookDocument, reason: string) => void | Promise<void>) | undefined;
   public assertAvailable(notebook: vscode.NotebookDocument): void {
     if (this.retired.has(notebook)) throw new Error('This notebook instance was deleted or replaced. Its buffer is preserved; use Open recovery copy to edit the archive locally.');
   }
   public isRetired(notebook: vscode.NotebookDocument): boolean { return this.retired.has(notebook); }
   public epochOf(notebook: vscode.NotebookDocument): string | undefined { return this.states.get(notebook)?.epoch || undefined; }
-  public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced'): Promise<void> {
+  public retire(notebook: vscode.NotebookDocument, reason: 'deleted' | 'replaced' | 'foreign-editor' | 'disconnected'): Promise<void> {
     if (this.retired.has(notebook)) return Promise.resolve();
     this.retired.add(notebook);
-    this.onRetired?.(notebook);
+    const detached = this.onRetired?.(notebook, reason);
     const state = this.states.get(notebook);
     if (state) { state.blocked = true; state.editor?.dispose(); }
     const connection = state?.connection ?? this.connection();
-    if (!connection) return Promise.resolve();
+    if (!connection) return Promise.resolve(detached);
     const file = state?.file ?? this.journalFile(connection, notebook);
     const archive = `${file}.${reason}-${randomUUID()}`;
     const snapshot = serializeIpynb({ metadata: normalizeNotebookMetadata(notebook.metadata), cells: notebook.getCells().map(cell => ({
@@ -115,6 +115,7 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
     const journal = state && !state.closed ? this.journal(state) : Promise.resolve();
     if (state) this.closeState(state);
     const work = (async () => {
+      await detached;
       await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
       await atomicWriteFile(`${archive}.ipynb`, snapshot);
       await journal;
@@ -123,7 +124,11 @@ export class PersistentNotebookSynchronizer implements vscode.Disposable {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       }
       this.log.appendLine(`[info] ${reason} notebook buffer archived at ${archive}.ipynb`);
-      void vscode.window.showWarningMessage('This server notebook instance was deleted or replaced. Its original editor is detached and preserved. Open the recovery copy to keep editing locally; a recreated server file opens as a separate instance.', 'Open recovery copy').then(async action => {
+      if (reason === 'disconnected') return;
+      const message = reason === 'foreign-editor'
+        ? 'This Jupyter editor cannot overwrite the server notebook. Save writes its complete buffer to local recovery, so it can be closed normally; the current server notebook opens separately in Pair Notebook.'
+        : 'This server notebook instance was deleted or replaced. Save now writes this detached editor to local recovery, so it can be closed normally. A recreated server file opens as a separate instance.';
+      void vscode.window.showWarningMessage(message, 'Open recovery copy').then(async action => {
         if (action === 'Open recovery copy') {
           try { await vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(vscode.Uri.file(`${archive}.ipynb`)), { preview: false }); }
           catch (error) { this.report(error); }

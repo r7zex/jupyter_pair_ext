@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 import urllib.request
 
-VERSION = "0.6.13"
+VERSION = "0.6.17"
 REPOSITORY = "r7zex/jupyter_pair_ext"
 ROOT = Path("/opt/pair-notebook")
 CONFIG = Path("/etc/pair-notebook")

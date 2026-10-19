@@ -35,15 +35,15 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
     return { dispose: () => { this.selectionEvents.off('selection', listener); } };
   };
   public get controller(): vscode.NotebookController {
-    const notebook = vscode.window.activeNotebookEditor?.notebook;
-    if (!this.runtime && !this.persistent?.connected
-      && !(notebook && this.persistent?.owns(notebook))) {
+    if (this.disposed || !this.runtime && !this.persistent?.connected) {
       throw new Error('Join a Pair Notebook session before selecting its kernel.');
     }
     return this.registeredController ?? this.registerController();
   }
   public refreshSession(): void {
     if (this.runtime || this.persistent?.connected) return;
+    if (this.selectionTimer) clearTimeout(this.selectionTimer);
+    this.selectionTimer = undefined;
     this.finishActiveExecutions();
     this.finishMirroredExecutions();
     this.selectionSubscription?.dispose();
@@ -161,7 +161,8 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
   }
 
   private async selectEditor(editor: vscode.NotebookEditor): Promise<vscode.NotebookEditor> {
-    if (this.disposed) throw new Error('The notebook controller was disposed.');
+    if (this.disposed || !this.runtime && !this.persistent?.connected) throw new Error('The notebook session ended.');
+    const generation = this.runtimeGeneration;
     const active = vscode.window.activeNotebookEditor;
     if (active?.notebook.uri.toString() === editor.notebook.uri.toString() && active.notebook.notebookType === SESSION_NOTEBOOK_TYPE) editor = active;
     if (editor.notebook.notebookType && editor.notebook.notebookType !== SESSION_NOTEBOOK_TYPE) {
@@ -181,7 +182,7 @@ export class PairNotebookController implements vscode.Disposable, NotebookCellSt
       // VS Code releases API-held model references while resolving the new type.
       // Visible tabs must be closed first; their references cannot be transferred.
       await new Promise<void>(resolve => setTimeout(resolve, 50));
-      if (this.disposed || (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original))) throw new Error('The notebook session changed during editor switching.');
+      if (this.disposed || generation !== this.runtimeGeneration || !this.runtime && !this.persistent?.connected || (!this.runtime?.notebookKey(original.uri) && !this.persistent?.owns(original))) throw new Error('The notebook session changed during editor switching.');
       await vscode.commands.executeCommand('vscode.openWith', original.uri, SESSION_NOTEBOOK_TYPE);
       const reopened = vscode.window.activeNotebookEditor;
       if (!reopened || reopened.notebook.notebookType !== SESSION_NOTEBOOK_TYPE || reopened.notebook.uri.toString() !== editor.notebook.uri.toString()) throw new Error('Open this session notebook in the Pair Notebook session editor to execute it.');

@@ -1,0 +1,11 @@
+# Pair Notebook 0.6.17 verification
+
+Cause: package environments were keyed by notebook kernel ID, which also included compute generation. Installing a dependency in one notebook did not make it available to other notebooks, and changing generation selected another environment.
+
+Fix: Linux bubblewrap agents now share one persistent package environment per session and access scope on that device. Notebook identities and compute generations no longer select separate dependency directories. Running kernels refresh package discovery, including `.pth` paths, after an atomic installation. Python variables remain independent. Sessions and Public/Private scopes stay isolated. An empty environment can copy the first available legacy notebook environment; originals remain intact and existing session packages are never replaced by legacy packages.
+
+Verification: six package parser/storage tests and nine bridge unit tests passed. A real non-root WSL bubblewrap/Jupyter integration installed NumPy once and imported it from three notebooks, including a kernel opened before installation. It checked independent variables, `.pth` discovery after a subsequent installation, kernel restart, new generations, agent restart, notebook recreation, rejected-package rollback, and separation of sessions and Public/Private. Python syntax checks passed for five changed sources. The existing 34-test agent suite had 33 passing tests and one CPU smoke failure because the selected runtime lacks PyTorch; the same failure was reproduced on the unchanged 0.6.16 source.
+
+Limits: these package checks exercised real WSL kernels, not the installed VS Code editor UI or a production VPS update. Container-runtime package installation remains unsupported. Different compute devices retain separate environments; imported upgraded libraries may require kernel restart. Legacy environments with conflicting dependency versions are preserved rather than merged automatically.
+
+Deployment: use the updated persistent server/agent package for VPS execution and the updated extension for extension-managed compute agents. Installing the VSIX alone does not update a running VPS worker. No production server, user notebook, recovery archive, VPN or unrelated service was modified during validation.

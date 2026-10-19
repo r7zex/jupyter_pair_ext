@@ -504,6 +504,7 @@ export class PersistentWorkspace {
     } finally {
       await unlink(temporary).catch((error: unknown) => { if (!hasCode(error, 'ENOENT')) throw error; });
     }
+    await this.collectGarbage(manifest);
   }
 
   private async collectGarbage(manifest = this.current()): Promise<void> {
