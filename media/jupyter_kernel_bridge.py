@@ -434,7 +434,21 @@ def main() -> int:
     manager = KernelManager(kernel_name="python3")
     manager.kernel_spec.argv = [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"]
     if os.environ.get("PAIR_NOTEBOOK_PACKAGES") == "/packages/current":
-        manager.kernel_spec.argv = [sys.executable, "-c", "import site,runpy; site.addsitedir('/packages/current'); runpy.run_module('ipykernel_launcher', run_name='__main__')", "-f", "{connection_file}"]
+        bootstrap = (
+            "def refresh_session_packages(info=None, version=[None]):\n"
+            "    import importlib, os, site\n"
+            "    current = os.path.realpath('/packages/current')\n"
+            "    if current != version[0]:\n"
+            "        site.addsitedir('/packages/current')\n"
+            "        importlib.invalidate_caches()\n"
+            "        version[0] = current\n"
+            "refresh_session_packages()\n"
+            "from ipykernel.kernelapp import IPKernelApp\n"
+            "app = IPKernelApp.instance(); app.initialize()\n"
+            "app.kernel.shell.events.register('pre_run_cell', refresh_session_packages)\n"
+            "app.start()\n"
+        )
+        manager.kernel_spec.argv = [sys.executable, "-c", bootstrap, "-f", "{connection_file}"]
     try:
         manager.start_kernel(cwd=working_directory, env=dict(os.environ),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

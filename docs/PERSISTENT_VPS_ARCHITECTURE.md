@@ -31,6 +31,14 @@ Public and owner-only Private notebooks use separate snapshots, kernels, result 
 
 Changing the device or generation creates a fresh Python namespace. Notebook kernels are keyed by stable notebook identity, so ordinary rename and unrelated removal preserve RAM. Files can transfer to the executor; Python RAM does not migrate. Inputs outside a 256 KiB inline budget are copied to immutable command storage and downloaded in checked chunks. Large artifacts use private staging, chunk retry verification and atomic content-addressed publication. Delayed output from an old source/identity/generation cannot publish into a replacement cell. Ordinary source edits preserving past output do not relax those fences.
 
+## Session Python packages
+
+On Linux bubblewrap compute, `%pip install numpy pandas` installs into one persistent Python package environment shared by all notebooks in the session and access scope on that device. Package storage is independent of notebook identity and compute generation. Reconnect, kernel restart and notebook recreation reuse it; Python variables remain local to each notebook kernel. Other sessions and the Public/Private scopes retain separate package environments. Packages do not migrate between compute devices.
+
+Already running kernels discover newly installed packages on their next cell without clearing variables. Kernels that imported a package before an upgrade may need a restart to use the new version. Downloads use verified HTTPS and installation is published atomically; a failed install preserves the previous environment. The system Python and other sessions are unchanged.
+
+An empty session environment can be seeded from the current notebook's legacy package environment. This copies the first available environment without deleting its source or merging conflicting versions from other notebooks. Existing session packages take precedence over subsequent legacy environments.
+
 ## Recovery and isolation
 
 The server retains membership, manifests, execution identities and terminal results across restart. Reservations precede dispatch; ambiguous accepted execution is reconciled under its original ID. Permanent receipts outlive bounded output retention. Interrupted result publication retries without overwriting newer edits or repeating side effects. Old idle generations are released so they cannot occupy the worker's sole kernel slot indefinitely.

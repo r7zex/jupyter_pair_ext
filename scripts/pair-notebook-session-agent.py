@@ -848,10 +848,9 @@ class SessionAgent:
                 receipt["state"] = "completed"
                 self._persist()
                 return
-            package_key = (command["sessionId"], command["kernelId"], command.get("scope", "public"))
-            package_root = self.state / "packages" / hashlib.sha256(json.dumps(package_key).encode()).hexdigest()
+            package_root = None
             if isinstance(self.sandbox, Sandbox):
-                package_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                package_root = _PACKAGES.session_environment(self.state, command["sessionId"], command.get("scope", "public"), command["kernelId"])
                 self.sandbox.package_root = package_root
             bridge = self.kernels.get(key)
             if bridge is None:
@@ -888,7 +887,7 @@ class SessionAgent:
                         if not isinstance(self.sandbox, Sandbox):
                             raise ValueError("Managed package installation currently requires Linux bubblewrap compute.")
                         message = _PACKAGES.install_wheels(self.sandbox, package_root, requirements)
-                        replacement = "import site, importlib; site.addsitedir('/packages/current'); importlib.invalidate_caches(); print(" + repr(message) + ")"
+                        replacement = "print(" + repr(message) + ")"
                         submitted = {**submitted, "codeBase64": base64.b64encode(replacement.encode()).decode()}
                 except (ValueError, OSError, subprocess.SubprocessError) as error:
                     raise PackageInstallationError(str(error) if isinstance(error, ValueError) else "Package installation failed; the previous environment is preserved.") from error
